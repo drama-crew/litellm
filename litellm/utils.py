@@ -9218,6 +9218,12 @@ class ProviderConfigManager:
             from litellm.llms.runwayml.videos.transformation import RunwayMLVideoConfig
 
             return RunwayMLVideoConfig()
+        elif LlmProviders.WAVESPEED == provider:
+            from litellm.llms.wavespeed.videos.transformation import (
+                WaveSpeedVideoConfig,
+            )
+
+            return WaveSpeedVideoConfig()
         return None
 
     @staticmethod

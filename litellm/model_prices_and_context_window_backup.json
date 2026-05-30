@@ -36800,6 +36800,39 @@
             "1792x1024"
         ]
     },
+    "wavespeed/bytedance/seedance-2.0-fast": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.03,
+        "supported_modalities": [
+            "text",
+            "image"
+        ],
+        "supported_output_modalities": [
+            "video"
+        ],
+        "supported_resolutions": [
+            "720x1280",
+            "1280x720"
+        ]
+    },
+    "wavespeed/bytedance/seedance-2.0/text-to-video": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.03,
+        "supported_modalities": [
+            "text",
+            "image",
+            "audio"
+        ],
+        "supported_output_modalities": [
+            "video"
+        ],
+        "supported_resolutions": [
+            "720x1280",
+            "1280x720"
+        ]
+    },
     "runwayml/gen4_turbo": {
         "litellm_provider": "runwayml",
         "mode": "video_generation",
