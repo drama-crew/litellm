@@ -49,6 +49,72 @@ def test_wavespeed_video_create_response_sets_usage_for_cost_calculator() -> Non
     assert video.usage == {"duration_seconds": 5.0, "video_resolution": "720p"}
 
 
+def test_wavespeed_video_create_defaults_duration_when_seconds_omitted() -> None:
+    config = WaveSpeedVideoConfig()
+    data, _files, _url = config.transform_video_create_request(
+        model="bytedance/seedance-2.0-fast",
+        prompt="POV walking through a rainy neon alley.",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={
+            "input_reference": "https://assets.local/first.png",
+        },
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+
+    assert data["duration"] == 5
+    assert data["duration_seconds"] == 5
+
+    video = config.transform_video_create_response(
+        model="bytedance/seedance-2.0-fast",
+        raw_response=httpx.Response(200, json={"id": "task-1", "status": "created"}),
+        logging_obj=None,
+        custom_llm_provider="wavespeed",
+        request_data=data,
+    )
+    assert video.usage["duration_seconds"] == 5.0
+
+
+def test_wavespeed_video_create_falls_back_to_input_duration_params() -> None:
+    config = WaveSpeedVideoConfig()
+
+    top_level, _f, _u = config.transform_video_create_request(
+        model="bytedance/seedance-2.0-fast",
+        prompt="A drone shot over a misty forest.",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={"duration": 8},
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+    assert top_level["duration"] == 8
+    assert top_level["duration_seconds"] == 8
+
+    via_extra_body, _f2, _u2 = config.transform_video_create_request(
+        model="bytedance/seedance-2.0-fast",
+        prompt="A drone shot over a misty forest.",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={"extra_body": {"duration_seconds": "12"}},
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+    assert via_extra_body["duration"] == 12
+    assert via_extra_body["duration_seconds"] == 12
+
+
+def test_wavespeed_video_create_prefers_seconds_over_input_duration() -> None:
+    config = WaveSpeedVideoConfig()
+    data, _files, _url = config.transform_video_create_request(
+        model="bytedance/seedance-2.0-fast",
+        prompt="A drone shot over a misty forest.",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={"seconds": "6", "duration": 8},
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+    assert data["duration"] == 6
+    assert data["duration_seconds"] == 6
+
+
 def test_wavespeed_video_status_poll_maps_completed_status_and_extracts_task_id() -> None:
     config = WaveSpeedVideoConfig()
     encoded_id = config.transform_video_create_response(

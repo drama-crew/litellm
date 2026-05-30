@@ -38,6 +38,7 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
     image_to_video_route = "/bytedance/seedance-2.0/image-to-video"
     text_to_video_route = "/bytedance/seedance-2.0/text-to-video"
     poll_route = "/predictions/{task_id}/result"
+    default_duration_seconds = 5
 
     def get_supported_openai_params(self, model: str) -> list:
         return [
@@ -60,9 +61,6 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         mapped: Dict[str, Any] = {}
         if video_create_optional_params.get("input_reference"):
             mapped["image"] = video_create_optional_params["input_reference"]
-        if video_create_optional_params.get("seconds") is not None:
-            mapped["duration"] = int(float(str(video_create_optional_params["seconds"])))
-            mapped["duration_seconds"] = mapped["duration"]
         if video_create_optional_params.get("size"):
             size = str(video_create_optional_params["size"])
             mapped["aspect_ratio"] = self._aspect_ratio(size)
@@ -70,7 +68,23 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         extra_body = video_create_optional_params.get("extra_body") or {}
         if isinstance(extra_body, dict):
             mapped.update(extra_body)
+        duration = self._resolve_duration_seconds(video_create_optional_params, mapped)
+        mapped["duration"] = duration
+        mapped["duration_seconds"] = duration
         return mapped
+
+    @classmethod
+    def _resolve_duration_seconds(cls, params: Dict[str, Any], mapped: Dict[str, Any]) -> int:
+        for value in (
+            params.get("seconds"),
+            params.get("duration"),
+            params.get("duration_seconds"),
+            mapped.get("duration"),
+            mapped.get("duration_seconds"),
+        ):
+            if value is not None:
+                return int(float(str(value)))
+        return cls.default_duration_seconds
 
     def validate_environment(
         self,
