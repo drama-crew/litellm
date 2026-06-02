@@ -32,6 +32,41 @@ def test_wavespeed_video_create_maps_openai_params_to_seedance_image_to_video() 
     assert data["generate_audio"] is False
 
 
+def test_wavespeed_video_create_maps_480p_portrait_size_to_480p_resolution() -> None:
+    config = WaveSpeedVideoConfig()
+    data, _files, _url = config.transform_video_create_request(
+        model="bytedance/seedance-2.0-fast",
+        prompt="First-person POV inside a dim old elevator, vertical.",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={"seconds": "15", "size": "480x854"},
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+
+    assert data["aspect_ratio"] == "9:16"
+    assert data["resolution"] == "480p"
+
+
+def test_wavespeed_video_resolution_tiers_floor_on_shorter_side() -> None:
+    config = WaveSpeedVideoConfig()
+    assert config._resolution("480x854") == "480p"
+    assert config._resolution("720x1280") == "720p"
+    assert config._resolution("1080x1920") == "1080p"
+    assert config._resolution("1920x1080") == "1080p"
+
+
+def test_wavespeed_map_openai_params_idempotent_preserves_aspect_and_resolution() -> None:
+    config = WaveSpeedVideoConfig()
+    first = config.map_openai_params(
+        {"seconds": "5", "size": "480x854"}, "bytedance/seedance-2.0-fast", drop_params=False
+    )
+    assert first["aspect_ratio"] == "9:16"
+    assert first["resolution"] == "480p"
+    second = config.map_openai_params(first, "bytedance/seedance-2.0-fast", drop_params=False)
+    assert second["aspect_ratio"] == "9:16"
+    assert second["resolution"] == "480p"
+
+
 def test_wavespeed_video_create_response_sets_usage_for_cost_calculator() -> None:
     config = WaveSpeedVideoConfig()
     response = httpx.Response(200, json={"id": "task-1", "status": "created"})

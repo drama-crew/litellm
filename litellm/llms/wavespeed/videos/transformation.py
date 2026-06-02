@@ -65,6 +65,11 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
             size = str(video_create_optional_params["size"])
             mapped["aspect_ratio"] = self._aspect_ratio(size)
             mapped["resolution"] = self._resolution(size)
+        else:
+            for key in ("aspect_ratio", "resolution"):
+                value = video_create_optional_params.get(key)
+                if value is not None:
+                    mapped[key] = value
         extra_body = video_create_optional_params.get("extra_body") or {}
         if isinstance(extra_body, dict):
             mapped.update(extra_body)
@@ -326,4 +331,9 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
     @staticmethod
     def _resolution(size: str) -> str:
         width, height = (int(part) for part in size.lower().split("x", 1))
-        return "720p" if min(width, height) <= 720 else "1080p"
+        shorter = min(width, height)
+        if shorter <= 480:
+            return "480p"
+        if shorter <= 720:
+            return "720p"
+        return "1080p"
