@@ -36816,21 +36816,24 @@
             "1280x720"
         ]
     },
-    "wavespeed/bytedance/seedance-2.0/text-to-video": {
+    "wavespeed/bytedance/seedance-2.0": {
         "litellm_provider": "wavespeed",
         "mode": "video_generation",
-        "output_cost_per_video_per_second": 0.03,
+        "output_cost_per_video_per_second": 0.045,
         "supported_modalities": [
             "text",
-            "image",
-            "audio"
+            "image"
         ],
         "supported_output_modalities": [
             "video"
         ],
         "supported_resolutions": [
+            "480x854",
+            "854x480",
             "720x1280",
-            "1280x720"
+            "1280x720",
+            "1080x1920",
+            "1920x1080"
         ]
     },
     "runwayml/gen4_turbo": {

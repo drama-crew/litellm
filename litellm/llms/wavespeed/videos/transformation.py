@@ -25,26 +25,51 @@ from litellm.types.videos.utils import (
 
 class WaveSpeedVideoConfig(BaseVideoConfig):
     """
-    Configuration for WaveSpeed Seedance image-to-video generation.
+    Configuration for WaveSpeed Seedance video generation.
 
     WaveSpeed exposes an async task API:
-    1. POST /bytedance/seedance-2.0/image-to-video creates a prediction task
+    1. POST /bytedance/{model_slug}/{image-to-video|text-to-video} creates a prediction task
     2. The task returns a task id immediately
     3. GET /predictions/{task_id}/result polls status and, when complete,
        returns the output video URL(s) which are then downloaded.
+
+    The route is derived from the model id (slug) and whether a first-frame
+    image is present: an image routes image-to-video, otherwise text-to-video.
     """
 
     default_api_base = "https://api.wavespeed.ai/api/v3"
-    image_to_video_route = "/bytedance/seedance-2.0/image-to-video"
-    text_to_video_route = "/bytedance/seedance-2.0/text-to-video"
     poll_route = "/predictions/{task_id}/result"
     default_duration_seconds = 5
+    default_model_slug = "seedance-2.0"
+    allowed_model_slugs = ("seedance-2.0", "seedance-2.0-fast")
+
+    @classmethod
+    def _model_slug(cls, model: str) -> str:
+        slug = model.split("/")[-1].strip().lower()
+        if slug in cls.allowed_model_slugs:
+            return slug
+        return cls.default_model_slug
+
+    @classmethod
+    def _image_to_video_route(cls, model: str) -> str:
+        return f"/bytedance/{cls._model_slug(model)}/image-to-video"
+
+    @classmethod
+    def _text_to_video_route(cls, model: str) -> str:
+        return f"/bytedance/{cls._model_slug(model)}/text-to-video"
 
     def get_supported_openai_params(self, model: str) -> list:
         return [
             "model",
             "prompt",
             "input_reference",
+            "image",
+            "last_image",
+            "reference_images",
+            "reference_audios",
+            "generate_audio",
+            "aspect_ratio",
+            "resolution",
             "seconds",
             "size",
             "user",
@@ -58,19 +83,28 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         model: str,
         drop_params: bool,
     ) -> Dict:
+        params = video_create_optional_params
         mapped: Dict[str, Any] = {}
-        if video_create_optional_params.get("input_reference"):
-            mapped["image"] = video_create_optional_params["input_reference"]
-        if video_create_optional_params.get("size"):
-            size = str(video_create_optional_params["size"])
+        first_frame = params.get("image") or params.get("input_reference")
+        if first_frame:
+            mapped["image"] = first_frame
+        if params.get("last_image"):
+            mapped["last_image"] = params["last_image"]
+        if params.get("reference_images"):
+            mapped["reference_images"] = list(params["reference_images"])
+        if params.get("reference_audios"):
+            mapped["reference_audios"] = list(params["reference_audios"])
+        if params.get("generate_audio") is not None:
+            mapped["generate_audio"] = params["generate_audio"]
+        if params.get("size"):
+            size = str(params["size"])
             mapped["aspect_ratio"] = self._aspect_ratio(size)
             mapped["resolution"] = self._resolution(size)
-        else:
-            for key in ("aspect_ratio", "resolution"):
-                value = video_create_optional_params.get(key)
-                if value is not None:
-                    mapped[key] = value
-        extra_body = video_create_optional_params.get("extra_body") or {}
+        for key in ("aspect_ratio", "resolution"):
+            value = params.get(key)
+            if value is not None:
+                mapped[key] = value
+        extra_body = params.get("extra_body") or {}
         if isinstance(extra_body, dict):
             mapped.update(extra_body)
         duration = self._resolve_duration_seconds(video_create_optional_params, mapped)
@@ -124,7 +158,13 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
     ) -> Tuple[Dict, RequestFiles, str]:
         params = self.map_openai_params(video_create_optional_request_params, model, drop_params=False)
         data: Dict[str, Any] = {"prompt": prompt, **params}
-        route = self.image_to_video_route if data.get("image") else self.text_to_video_route
+        if data.get("image"):
+            route = self._image_to_video_route(model)
+            for key in ("reference_images", "reference_audios"):
+                data.pop(key, None)
+        else:
+            route = self._text_to_video_route(model)
+            data.pop("last_image", None)
         return data, [], f"{api_base.rstrip('/')}{route}"
 
     def transform_video_create_response(
