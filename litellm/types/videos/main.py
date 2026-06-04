@@ -76,6 +76,12 @@ class VideoCreateOptionalRequestParams(TypedDict, total=False):
     image: Optional[
         Any
     ]  # Image for image-to-video; dict with gcsUri/bytesBase64Encoded, or file-like object
+    last_image: Optional[Any]
+    reference_images: Optional[List[Any]]
+    reference_audios: Optional[List[Any]]
+    generate_audio: Optional[bool]
+    aspect_ratio: Optional[str]
+    resolution: Optional[str]
     parameters: Optional[
         Dict[str, Any]
     ]  # Provider-specific parameters block passed directly to the API

@@ -344,7 +344,13 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
         if litellm_call_id:
             return_headers["x-litellm-call-id"] = litellm_call_id
         if custom_headers:
-            return_headers.update(custom_headers)
+            # Ensure custom headers don't override actual upstream response headers or let framework defaults (like content-length: 0) interfere.
+            sanitized_custom_headers = {
+                key: value
+                for key, value in custom_headers.items()
+                if key.lower() not in excluded_headers
+            }
+            return_headers.update(sanitized_custom_headers)
 
         return return_headers
 
@@ -537,8 +543,6 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             )
         )
 
-        _metadata["user_api_key"] = user_api_key_dict.api_key
-
         litellm_metadata = litellm_params_in_body.pop("litellm_metadata", None)
         metadata = litellm_params_in_body.pop("metadata", None)
         if litellm_metadata:
@@ -550,6 +554,12 @@ class HttpPassThroughEndpointHelpers(BasePassthroughUtils):
             request=request,
             metadata=_metadata,
         )
+
+        # Set internal keys after merging client-supplied metadata so a request
+        # body that mirrors them cannot clobber the authenticated key or the
+        # real parent span.
+        _metadata["user_api_key"] = user_api_key_dict.api_key
+        _metadata["litellm_parent_otel_span"] = user_api_key_dict.parent_otel_span
 
         kwargs = {
             "litellm_params": {

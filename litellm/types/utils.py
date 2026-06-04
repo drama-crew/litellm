@@ -3249,6 +3249,7 @@ class LlmProviders(str, Enum):
     REPLICATE = "replicate"
     REDUCTO = "reducto"
     RUNWAYML = "runwayml"
+    WAVESPEED = "wavespeed"
     AWS_POLLY = "aws_polly"
     HUGGINGFACE = "huggingface"
     TOGETHER_AI = "together_ai"
