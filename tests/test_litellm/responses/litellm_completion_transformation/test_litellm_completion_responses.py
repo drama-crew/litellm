@@ -2052,6 +2052,7 @@ class TestEnsureOutputItemContentPartAdded:
         iterator._cached_item_id = None
         iterator._cached_reasoning_item_id = None
         iterator._reasoning_active = False
+        iterator._reasoning_item_added_emitted = False
         iterator._pending_response_events = []
         return iterator
 
