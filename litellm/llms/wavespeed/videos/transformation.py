@@ -114,6 +114,14 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
                 mapped["resolution"] = normalized
             else:
                 mapped.pop("resolution", None)
+            # litellm core (videos/utils.py) re-merges the request's raw extra_body
+            # over this mapping right after, which would re-inject the un-normalized
+            # value. Drop the consumed resolution from the source extra_body so that
+            # re-merge is a no-op and the normalized value reaches the wire without
+            # depending on transform_video_create_request re-mapping a third time.
+            source_extra_body = params.get("extra_body")
+            if isinstance(source_extra_body, dict):
+                source_extra_body.pop("resolution", None)
         duration = self._resolve_duration_seconds(video_create_optional_params, mapped)
         mapped["duration"] = duration
         mapped["duration_seconds"] = duration
@@ -398,9 +406,9 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
             payload.get("url") if isinstance(payload, dict) else None,
         ]
         for candidate in candidates:
-            if isinstance(candidate, str) and candidate:
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
                 return candidate
-        raise ValueError("no download_url in WaveSpeed upload response")
+        raise ValueError("no http(s) download_url in WaveSpeed upload response")
 
     def transform_video_remix_request(
         self,

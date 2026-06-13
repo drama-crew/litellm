@@ -561,13 +561,112 @@ def test_prepare_request_media_noop_without_api_key():
 
 def test_require_download_url_fallbacks():
     config = WaveSpeedVideoConfig()
-    assert config._require_download_url({"data": {"download_url": "a"}}) == "a"
-    assert config._require_download_url({"data": {"url": "b"}}) == "b"
-    assert config._require_download_url({"url": "c"}) == "c"
+    assert config._require_download_url({"data": {"download_url": "https://h/a"}}) == "https://h/a"
+    assert config._require_download_url({"data": {"url": "https://h/b"}}) == "https://h/b"
+    assert config._require_download_url({"url": "https://h/c"}) == "https://h/c"
     import pytest
 
     with pytest.raises(ValueError):
         config._require_download_url({"data": {}})
+    # A non-http(s) value (e.g. a relative path or a data: URL echoed back) must be
+    # rejected so the caller fails open and drops the reference rather than handing
+    # the provider something it cannot fetch.
+    with pytest.raises(ValueError):
+        config._require_download_url({"data": {"download_url": "/relative/path.png"}})
+    with pytest.raises(ValueError):
+        config._require_download_url({"data": {"download_url": _PNG_DATA_URL}})
+
+
+def test_prepare_request_media_dedups_distinct_urls_upload_once_each_in_order():
+    # Two DISTINCT data URLs must upload twice (the dedup key is the data URL, not
+    # a constant), and the hosted results must land in the original slot order.
+    config = WaveSpeedVideoConfig()
+    a = "data:image/png;base64,QUFB"
+    b = "data:image/png;base64,QkJC"
+    client = _StubClient(
+        [
+            _StubResponse({"data": {"download_url": "https://ws.host/a.png"}}),
+            _StubResponse({"data": {"download_url": "https://ws.host/b.png"}}),
+        ]
+    )
+    params = {"reference_images": [a, b, a]}
+    out = config.prepare_request_media(
+        params, api_key="k", api_base="https://api.wavespeed.ai/api/v3", headers={}, client=client
+    )
+    assert out["reference_images"] == [
+        "https://ws.host/a.png",
+        "https://ws.host/b.png",
+        "https://ws.host/a.png",
+    ]
+    assert len(client.calls) == 2
+
+
+def test_resolution_normalized_through_full_optional_params_chain():
+    # The real proxy path routes resolution through extra_body, and litellm core
+    # re-merges that raw extra_body after map_openai_params. Drive the actual chain
+    # (get_requested -> get_optional_params -> transform) and assert 1k is 720p at
+    # BOTH the optional-params boundary and on the final request, so the fix does
+    # not silently depend on transform re-mapping a third time.
+    from litellm.videos.utils import VideoGenerationRequestUtils as U
+
+    config = WaveSpeedVideoConfig()
+    model = "wavespeed/bytedance/seedance-2.0-fast"
+    local_vars = {
+        "resolution": "1k",
+        "aspect_ratio": "9:16",
+        "seconds": "4",
+        "prompt": "p",
+        "model": model,
+        "kwargs": {},
+    }
+    optional = U.get_requested_video_generation_optional_param(local_vars)
+    request_params = U.get_optional_params_video_generation(
+        model=model, video_generation_provider_config=config, video_generation_optional_params=optional
+    )
+    assert request_params.get("resolution") == "720p"
+    data, _files, _url = config.transform_video_create_request(
+        model=model,
+        prompt="p",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params=request_params,
+        litellm_params=GenericLiteLLMParams(api_key="k"),
+        headers={},
+    )
+    assert data["resolution"] == "720p"
+
+
+def test_async_prepare_request_media_dedups_distinct_and_fails_open():
+    # Async parity: distinct URLs upload once each, a failed upload drops only that
+    # reference, and an http URL passes through — mirroring the sync path exactly.
+    config = WaveSpeedVideoConfig()
+    a = "data:image/png;base64,QUFB"
+    b = "data:image/png;base64,QkJC"
+    client = _AsyncStubClient(
+        [
+            _StubResponse({"data": {"download_url": "https://ws.host/a.png"}}),
+            _StubResponse({}, status=500),
+        ]
+    )
+    params = {"reference_images": [a, b, "https://already.hosted/x.png"]}
+    out = asyncio.run(
+        config.async_prepare_request_media(
+            params, api_key="k", api_base="https://api.wavespeed.ai/api/v3", headers={}, client=client
+        )
+    )
+    assert out["reference_images"] == ["https://ws.host/a.png", "https://already.hosted/x.png"]
+    assert len(client.calls) == 2
+
+
+def test_async_prepare_request_media_scalar_image_drop_routes_text_to_video():
+    config = WaveSpeedVideoConfig()
+    client = _AsyncStubClient([_StubResponse({}, status=500)])
+    params = {"image": _PNG_DATA_URL, "reference_images": []}
+    out = asyncio.run(
+        config.async_prepare_request_media(
+            params, api_key="k", api_base="https://api.wavespeed.ai/api/v3", headers={}, client=client
+        )
+    )
+    assert "image" not in out
 
 
 def test_decode_data_url_extracts_mime_and_bytes():
