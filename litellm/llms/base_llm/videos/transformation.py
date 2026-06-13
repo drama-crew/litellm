@@ -11,6 +11,7 @@ from litellm.types.videos.main import VideoCreateOptionalRequestParams
 
 if TYPE_CHECKING:
     from litellm.litellm_core_utils.litellm_logging import Logging as _LiteLLMLoggingObj
+    from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
     from litellm.types.videos.main import CharacterObject as _CharacterObject
     from litellm.types.videos.main import VideoObject as _VideoObject
 
@@ -25,6 +26,8 @@ else:
     BaseLLMException = Any
     VideoObject = Any
     CharacterObject = Any
+    AsyncHTTPHandler = Any
+    HTTPHandler = Any
 
 
 class BaseVideoConfig(ABC):
@@ -90,6 +93,28 @@ class BaseVideoConfig(ABC):
         if api_base is None:
             raise ValueError("api_base is required")
         return api_base
+
+    async def async_prepare_request_media(
+        self,
+        optional_params: dict,
+        *,
+        api_key: Optional[str],
+        api_base: str,
+        headers: dict,
+        client: "AsyncHTTPHandler",
+    ) -> dict:
+        return optional_params
+
+    def prepare_request_media(
+        self,
+        optional_params: dict,
+        *,
+        api_key: Optional[str],
+        api_base: str,
+        headers: dict,
+        client: "HTTPHandler",
+    ) -> dict:
+        return optional_params
 
     @abstractmethod
     def transform_video_create_request(
@@ -282,18 +307,14 @@ class BaseVideoConfig(ABC):
         Returns:
             Tuple[str, list]: (url, files_list) for the multipart POST request
         """
-        raise NotImplementedError(
-            "video create character is not supported for this provider"
-        )
+        raise NotImplementedError("video create character is not supported for this provider")
 
     def transform_video_create_character_response(
         self,
         raw_response: httpx.Response,
         logging_obj: LiteLLMLoggingObj,
     ) -> CharacterObject:
-        raise NotImplementedError(
-            "video create character is not supported for this provider"
-        )
+        raise NotImplementedError("video create character is not supported for this provider")
 
     def transform_video_get_character_request(
         self,
@@ -308,18 +329,14 @@ class BaseVideoConfig(ABC):
         Returns:
             Tuple[str, Dict]: (url, params) for the GET request
         """
-        raise NotImplementedError(
-            "video get character is not supported for this provider"
-        )
+        raise NotImplementedError("video get character is not supported for this provider")
 
     def transform_video_get_character_response(
         self,
         raw_response: httpx.Response,
         logging_obj: LiteLLMLoggingObj,
     ) -> CharacterObject:
-        raise NotImplementedError(
-            "video get character is not supported for this provider"
-        )
+        raise NotImplementedError("video get character is not supported for this provider")
 
     def get_video_edit_prefetch_params(
         self,
