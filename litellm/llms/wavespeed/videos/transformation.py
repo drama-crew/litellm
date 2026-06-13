@@ -104,14 +104,16 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         if params.get("aspect_ratio") is not None:
             mapped["aspect_ratio"] = params["aspect_ratio"]
         if params.get("resolution") is not None:
-            normalized = self._normalize_resolution(params["resolution"])
+            mapped["resolution"] = params["resolution"]
+        extra_body = params.get("extra_body") or {}
+        if isinstance(extra_body, dict):
+            mapped.update(extra_body)
+        if "resolution" in mapped:
+            normalized = self._normalize_resolution(mapped["resolution"])
             if normalized is not None:
                 mapped["resolution"] = normalized
             else:
                 mapped.pop("resolution", None)
-        extra_body = params.get("extra_body") or {}
-        if isinstance(extra_body, dict):
-            mapped.update(extra_body)
         duration = self._resolve_duration_seconds(video_create_optional_params, mapped)
         mapped["duration"] = duration
         mapped["duration_seconds"] = duration

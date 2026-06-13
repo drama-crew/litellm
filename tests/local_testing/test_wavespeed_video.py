@@ -587,6 +587,14 @@ def test_map_openai_params_normalizes_image_dialect_resolution():
     assert "resolution" not in mapped2
 
 
+def test_map_openai_params_normalizes_resolution_arriving_via_extra_body():
+    config = WaveSpeedVideoConfig()
+    mapped = config.map_openai_params({"extra_body": {"resolution": "1k"}}, model="m", drop_params=False)
+    assert mapped["resolution"] == "720p"
+    dropped = config.map_openai_params({"extra_body": {"resolution": "weird"}}, model="m", drop_params=False)
+    assert "resolution" not in dropped
+
+
 import asyncio
 
 
