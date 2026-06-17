@@ -8,8 +8,10 @@ from litellm.llms.libtv.client import (
     build_node_batch_body,
     parse_progress,
     parse_task_id,
+    parse_upload_url,
 )
-from litellm.llms.libtv.common import LibTVError, build_libtv_headers
+from litellm.llms.libtv.common import LibTVError, build_libtv_headers, build_upload_path
+from litellm.llms.libtv.handler import _reference_payload
 from litellm.llms.libtv.transform import build_generation_params, size_to_ratio
 
 _SEEDANCE_SPEC = {
@@ -175,6 +177,91 @@ def test_parse_project_extracts_uuid_and_team():
     assert parse_project({"data": {"projectMeta": {"uuid": "u2"}}}) == {"project_uuid": "u2", "team_id": None}
     with pytest.raises(LibTVError):
         parse_project({"data": {"projectMeta": {}}})
+
+
+class UploadFake:
+    """Routes by URL substring: passport getUserInfo, bridge init/complete, presigned PUT."""
+
+    def __init__(self, put_status=200):
+        self.calls = []
+        self.put_status = put_status
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append(("POST", url, json, headers))
+        if "getUserInfo" in url:
+            return FakeResponse({"code": 0, "data": {"uuid": "user-xyz"}})
+        if url.endswith("/init/4"):
+            return FakeResponse(
+                {"code": 0, "data": {"uploadId": "up-1", "parts": [{"partNumber": 1, "url": "https://oss/put/1"}]}}
+            )
+        if url.endswith("/complete/4"):
+            return FakeResponse({"code": 0, "data": {"cdnUrl": "https://libtv-res/uploaded.png"}})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def put(self, url, content=None, timeout=None, headers=None):
+        self.calls.append(("PUT", url, len(content) if content else 0, None))
+
+        class _R:
+            status_code = self.put_status
+
+        return _R()
+
+
+def test_build_upload_path():
+    assert build_upload_path("u1", "abc123", "photo.PNG") == "upload-images/u1/abc123.PNG"
+    assert build_upload_path("u1", "abc123", "noext") == "upload-images/u1/abc123"
+
+
+def test_parse_upload_url_prefers_cdn():
+    assert parse_upload_url({"data": {"cdnUrl": "c", "ossUrl": "o", "path": "p"}}) == "c"
+    assert parse_upload_url({"data": {"ossUrl": "o", "path": "p"}}) == "o"
+    assert parse_upload_url({"data": {"path": "p"}}) == "p"
+    with pytest.raises(LibTVError):
+        parse_upload_url({"data": {}})
+
+
+def test_resolve_user_uuid_caches():
+    fake = UploadFake()
+    lt = LibTVClient(token="t", webid="w", sync_client=fake)
+    assert lt.resolve_user_uuid() == "user-xyz"
+    assert lt.resolve_user_uuid() == "user-xyz"  # cached
+    assert sum(1 for c in fake.calls if "getUserInfo" in c[1]) == 1
+
+
+def test_upload_media_orchestrates_init_put_complete():
+    fake = UploadFake()
+    lt = LibTVClient(token="t", webid="w", sync_client=fake)
+    url = lt.upload_media(b"\x89PNG-bytes", "ref.png")
+    assert url == "https://libtv-res/uploaded.png"
+    methods_urls = [(m, u) for m, u, *_ in fake.calls]
+    assert ("POST", "https://passport.liblib.art/api/www/user/getUserInfo") in methods_urls
+    assert any(m == "POST" and u.endswith("/init/4") for m, u in methods_urls)
+    assert ("PUT", "https://oss/put/1") in methods_urls
+    assert any(m == "POST" and u.endswith("/complete/4") for m, u in methods_urls)
+    init_body = next(c[2] for c in fake.calls if c[1].endswith("/init/4"))
+    assert (
+        init_body["path"]
+        == "upload-images/user-xyz/" + __import__("hashlib").sha1(b"\x89PNG-bytes").hexdigest() + ".png"
+    )
+
+
+def test_upload_media_raises_on_put_failure():
+    lt = LibTVClient(token="t", webid="w", sync_client=UploadFake(put_status=403))
+    with pytest.raises(LibTVError):
+        lt.upload_media(b"x", "ref.png")
+
+
+def test_reference_payload_url_passthrough():
+    assert _reference_payload("https://x/a.png") == ("url", "https://x/a.png", None)
+
+
+def test_reference_payload_bytes_and_tuple():
+    assert _reference_payload(b"abc") == ("bytes", "reference.png", b"abc")
+    assert _reference_payload(("my.png", b"data")) == ("bytes", "my.png", b"data")
+
+
+def test_reference_payload_none():
+    assert _reference_payload(None) is None
 
 
 def test_parse_task_id_variants():

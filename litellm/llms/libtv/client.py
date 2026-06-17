@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import time
 import uuid
@@ -7,13 +8,27 @@ from typing import Any, Dict, List, Optional
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 
 from .common import (
+    BRIDGE_BIZ_CODE,
+    BRIDGE_PART_SIZE,
     LIBTV_API_BASE,
+    LIBTV_BRIDGE_BASE,
+    LIBTV_PASSPORT_BASE,
     NODE_ACTION,
     NODE_DEFAULT_NAME,
     NODE_TYPE_BACKEND,
     LibTVError,
+    build_bridge_headers,
     build_libtv_headers,
+    build_upload_path,
 )
+
+
+def parse_upload_url(complete_payload: Dict[str, Any]) -> str:
+    data = complete_payload.get("data") or {}
+    url = data.get("cdnUrl") or data.get("ossUrl") or data.get("path")
+    if not url or not isinstance(url, str):
+        raise LibTVError(status_code=502, message=f"libtv upload complete returned no url: {complete_payload}")
+    return url
 
 
 def build_node_batch_body(
@@ -155,10 +170,106 @@ class LibTVClient:
         self.poll_max_attempts = poll_max_attempts
         self.request_timeout = request_timeout
         self._tool_spec_cache: Optional[Dict[str, Dict[str, Any]]] = None
+        self._user_uuid: Optional[str] = None
 
     @property
     def headers(self) -> Dict[str, str]:
         return build_libtv_headers(self.token, self.webid)
+
+    def _parse_user_uuid(self, payload: Dict[str, Any]) -> str:
+        user_uuid = (payload.get("data") or {}).get("uuid")
+        if not user_uuid:
+            raise LibTVError(status_code=502, message="libtv getUserInfo returned no uuid")
+        return str(user_uuid)
+
+    def _bridge_url(self, action: str) -> str:
+        return f"{LIBTV_BRIDGE_BASE}/gateway/oss-server-api/oss-service/api/oss/pre-sign/multipart/{action}/{BRIDGE_BIZ_CODE}"
+
+    def resolve_user_uuid(self) -> str:
+        if self._user_uuid is None:
+            assert self.sync_client is not None, "sync_client required"
+            resp = self.sync_client.post(
+                url=f"{LIBTV_PASSPORT_BASE}/api/www/user/getUserInfo",
+                json={},
+                headers=self.headers,
+                timeout=self.request_timeout,
+            )
+            self._user_uuid = self._parse_user_uuid(self._check(resp, "getUserInfo"))
+        return self._user_uuid
+
+    def upload_media(self, buffer: bytes, filename: str) -> str:
+        user_uuid = self.resolve_user_uuid()
+        path = build_upload_path(user_uuid, hashlib.sha1(buffer).hexdigest(), filename)
+        init = self._check(
+            self.sync_client.post(
+                url=self._bridge_url("init"),
+                json={"path": path, "fileSize": len(buffer), "partSize": BRIDGE_PART_SIZE},
+                headers=build_bridge_headers(self.token),
+                timeout=self.request_timeout,
+            ),
+            "upload/init",
+        )
+        data = init.get("data") or {}
+        for i, part in enumerate(data.get("parts") or []):
+            chunk = buffer[i * BRIDGE_PART_SIZE : (i + 1) * BRIDGE_PART_SIZE]
+            put_resp = self.sync_client.put(url=part["url"], content=chunk, timeout=self.request_timeout)
+            if put_resp.status_code not in (200, 204):
+                raise LibTVError(
+                    status_code=put_resp.status_code, message=f"libtv upload part {part.get('partNumber')} failed"
+                )
+        complete = self._check(
+            self.sync_client.post(
+                url=self._bridge_url("complete"),
+                json={"path": path, "uploadId": data.get("uploadId")},
+                headers=build_bridge_headers(self.token),
+                timeout=self.request_timeout,
+            ),
+            "upload/complete",
+        )
+        return parse_upload_url(complete)
+
+    async def aresolve_user_uuid(self) -> str:
+        if self._user_uuid is None:
+            assert self.async_client is not None, "async_client required"
+            resp = await self.async_client.post(
+                url=f"{LIBTV_PASSPORT_BASE}/api/www/user/getUserInfo",
+                json={},
+                headers=self.headers,
+                timeout=self.request_timeout,
+            )
+            self._user_uuid = self._parse_user_uuid(self._check(resp, "getUserInfo"))
+        return self._user_uuid
+
+    async def aupload_media(self, buffer: bytes, filename: str) -> str:
+        user_uuid = await self.aresolve_user_uuid()
+        path = build_upload_path(user_uuid, hashlib.sha1(buffer).hexdigest(), filename)
+        init = self._check(
+            await self.async_client.post(
+                url=self._bridge_url("init"),
+                json={"path": path, "fileSize": len(buffer), "partSize": BRIDGE_PART_SIZE},
+                headers=build_bridge_headers(self.token),
+                timeout=self.request_timeout,
+            ),
+            "upload/init",
+        )
+        data = init.get("data") or {}
+        for i, part in enumerate(data.get("parts") or []):
+            chunk = buffer[i * BRIDGE_PART_SIZE : (i + 1) * BRIDGE_PART_SIZE]
+            put_resp = await self.async_client.put(url=part["url"], content=chunk, timeout=self.request_timeout)
+            if put_resp.status_code not in (200, 204):
+                raise LibTVError(
+                    status_code=put_resp.status_code, message=f"libtv upload part {part.get('partNumber')} failed"
+                )
+        complete = self._check(
+            await self.async_client.post(
+                url=self._bridge_url("complete"),
+                json={"path": path, "uploadId": data.get("uploadId")},
+                headers=build_bridge_headers(self.token),
+                timeout=self.request_timeout,
+            ),
+            "upload/complete",
+        )
+        return parse_upload_url(complete)
 
     def _index_tool_spec(self, payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         index: Dict[str, Dict[str, Any]] = {}

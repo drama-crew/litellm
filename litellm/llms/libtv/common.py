@@ -3,6 +3,12 @@ import uuid
 from typing import Optional
 
 LIBTV_API_BASE = "https://api.liblib.tv"
+LIBTV_PASSPORT_BASE = "https://passport.liblib.art"
+LIBTV_BRIDGE_BASE = "https://bridge.liblib.art"
+
+BRIDGE_BIZ_CODE = "4"
+BRIDGE_PART_SIZE = 5 * 1024 * 1024
+BRIDGE_UPLOAD_PREFIX = "upload-images"
 
 NODE_TYPE_BACKEND = {"image": 2, "video": 3}
 NODE_ACTION = {"image": "image_generate", "video": "video_generate"}
@@ -41,3 +47,12 @@ def build_libtv_headers(token: str, webid: str) -> dict:
         "X-from-client": "cli",
         "Content-Type": "application/json",
     }
+
+
+def build_bridge_headers(token: str) -> dict:
+    return {"Token": token, "Content-Type": "application/json", "X-from-client": "cli"}
+
+
+def build_upload_path(user_uuid: str, sha1_hex: str, filename: str) -> str:
+    ext = filename[filename.rfind(".") :] if "." in filename else ""
+    return f"{BRIDGE_UPLOAD_PREFIX}/{user_uuid}/{sha1_hex}{ext}"

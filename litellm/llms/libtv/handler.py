@@ -1,5 +1,6 @@
+import os
 import time
-from typing import Any, Optional, Union
+from typing import Any, Optional, Tuple, Union
 
 import httpx
 
@@ -9,7 +10,7 @@ from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.main import VideoObject
 
 from .client import LibTVClient
-from .common import resolve_libtv_credentials
+from .common import LibTVError, resolve_libtv_credentials
 from .transform import build_generation_params
 
 
@@ -19,6 +20,27 @@ def _project_name(model: str) -> str:
 
 def _resolve_mode(optional_params: dict, default_mode: str) -> str:
     return optional_params.get("modeType") or optional_params.get("mode_type") or default_mode
+
+
+def _reference_payload(ref: Any) -> Optional[Tuple[str, str, Optional[bytes]]]:
+    """Normalize a litellm input_reference into ('url', url, None) or ('bytes', filename, data)."""
+    if ref is None:
+        return None
+    if isinstance(ref, str):
+        if ref.startswith("http://") or ref.startswith("https://"):
+            return ("url", ref, None)
+        with open(ref, "rb") as f:
+            return ("bytes", os.path.basename(ref) or "reference.png", f.read())
+    if isinstance(ref, (bytes, bytearray)):
+        return ("bytes", "reference.png", bytes(ref))
+    if isinstance(ref, tuple) and len(ref) >= 2:
+        body = ref[1]
+        data = body.read() if hasattr(body, "read") else (bytes(body) if isinstance(body, (bytes, bytearray)) else None)
+        if data is not None:
+            return ("bytes", ref[0] or "reference.png", data)
+    if hasattr(ref, "read"):
+        return ("bytes", getattr(ref, "name", "reference.png"), ref.read())
+    raise LibTVError(status_code=400, message=f"unsupported input_reference type: {type(ref).__name__}")
 
 
 class LibTVLLM(CustomLLM):
@@ -108,7 +130,11 @@ class LibTVLLM(CustomLLM):
     ) -> VideoObject:
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
-        params = build_generation_params(prompt, optional_params, spec, _resolve_mode(optional_params, "text2video"))
+        ref = _reference_payload(optional_params.get("input_reference"))
+        mode = _resolve_mode(optional_params, "image2video" if ref else "text2video")
+        params = build_generation_params(prompt, optional_params, spec, mode)
+        if ref:
+            params["imageList"] = [ref[1] if ref[0] == "url" else lt.upload_media(ref[2], ref[1])]
         result = lt.generate(model, spec["vendor"], "video", params, _project_name(model))
         return self._build_video_object(model, result)
 
@@ -125,6 +151,10 @@ class LibTVLLM(CustomLLM):
     ) -> VideoObject:
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
-        params = build_generation_params(prompt, optional_params, spec, _resolve_mode(optional_params, "text2video"))
+        ref = _reference_payload(optional_params.get("input_reference"))
+        mode = _resolve_mode(optional_params, "image2video" if ref else "text2video")
+        params = build_generation_params(prompt, optional_params, spec, mode)
+        if ref:
+            params["imageList"] = [ref[1] if ref[0] == "url" else await lt.aupload_media(ref[2], ref[1])]
         result = await lt.agenerate(model, spec["vendor"], "video", params, _project_name(model))
         return self._build_video_object(model, result)
