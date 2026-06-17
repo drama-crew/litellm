@@ -16,14 +16,21 @@ from .common import (
 )
 
 
-def build_node_batch_body(project_uuid: str, node_kind: str, node_key: str, name: str) -> Dict[str, Any]:
+def build_node_batch_body(
+    project_uuid: str,
+    node_kind: str,
+    node_key: str,
+    name: str,
+    model_key: str,
+    params: Dict[str, Any],
+) -> Dict[str, Any]:
     node_data: Dict[str, Any] = {
         "type": node_kind,
         "name": name,
         "url": [],
         "action": NODE_ACTION[node_kind],
         "generatorType": "default",
-        "params": {},
+        "params": {**params, "model": model_key},
     }
     if node_kind == "video":
         node_data["poster"] = ""
@@ -50,8 +57,9 @@ def build_generation_body(
     params: Dict[str, Any],
     node_key: str,
     project_uuid: str,
+    team_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    return {
+    body: Dict[str, Any] = {
         "params": params,
         "metadata": {"node_id": node_key, "project_id": project_uuid},
         "provider": vendor,
@@ -59,6 +67,18 @@ def build_generation_body(
         "taskType": task_type,
         "requestId": str(uuid.uuid4()),
     }
+    if isinstance(team_id, int) and team_id > 0:
+        body["teamId"] = team_id
+    return body
+
+
+def parse_project(payload: Dict[str, Any]) -> Dict[str, Any]:
+    meta = (payload.get("data") or {}).get("projectMeta") or {}
+    uuid_val = meta.get("uuid")
+    if not uuid_val:
+        raise LibTVError(status_code=502, message=f"libtv project/create returned no uuid: {payload}")
+    team_id = meta.get("teamId")
+    return {"project_uuid": str(uuid_val), "team_id": team_id if isinstance(team_id, int) else None}
 
 
 def parse_task_id(payload: Dict[str, Any]) -> str:
@@ -211,18 +231,17 @@ class LibTVClient:
         project_name: str,
     ) -> Dict[str, Any]:
         project = self._post("/api/canvas/project/create", {"name": project_name}, "project/create")
-        project_uuid = (project.get("data") or {}).get("projectMeta", {}).get("uuid")
-        if not project_uuid:
-            raise LibTVError(status_code=502, message=f"libtv project/create returned no uuid: {project}")
+        meta = parse_project(project)
+        project_uuid, team_id = meta["project_uuid"], meta["team_id"]
         node_key = str(uuid.uuid4())
         self._post(
             "/api/canvas/nodes/batch",
-            build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type]),
+            build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params),
             "nodes/batch",
         )
         created = self._post(
             "/api/task/generation/create",
-            build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid),
+            build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
             "generation/create",
         )
         task_id = parse_task_id(created)
@@ -253,18 +272,17 @@ class LibTVClient:
         project_name: str,
     ) -> Dict[str, Any]:
         project = await self._apost("/api/canvas/project/create", {"name": project_name}, "project/create")
-        project_uuid = (project.get("data") or {}).get("projectMeta", {}).get("uuid")
-        if not project_uuid:
-            raise LibTVError(status_code=502, message=f"libtv project/create returned no uuid: {project}")
+        meta = parse_project(project)
+        project_uuid, team_id = meta["project_uuid"], meta["team_id"]
         node_key = str(uuid.uuid4())
         await self._apost(
             "/api/canvas/nodes/batch",
-            build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type]),
+            build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params),
             "nodes/batch",
         )
         created = await self._apost(
             "/api/task/generation/create",
-            build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid),
+            build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
             "generation/create",
         )
         task_id = parse_task_id(created)

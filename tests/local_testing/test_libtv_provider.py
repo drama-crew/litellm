@@ -128,8 +128,10 @@ def test_build_params_unknown_mode_has_empty_settings():
     assert params["settings"] == {}
 
 
-def test_build_node_batch_body_video():
-    body = build_node_batch_body("proj-uuid", "video", "nk-1", "视频节点")
+def test_build_node_batch_body_video_carries_model_and_params():
+    body = build_node_batch_body(
+        "proj-uuid", "video", "nk-1", "视频节点", "wanxiang-plus", {"prompt": "p", "settings": {"ratio": "16:9"}}
+    )
     node = body["nodes"]["create"][0]
     assert body["projectUuid"] == "proj-uuid"
     assert node["type"] == 3
@@ -138,15 +140,20 @@ def test_build_node_batch_body_video():
     assert data["action"] == "video_generate"
     assert data["type"] == "video"
     assert data["poster"] == ""
+    # node must carry the model + generation params (not a hollow placeholder)
+    assert data["params"]["model"] == "wanxiang-plus"
+    assert data["params"]["prompt"] == "p"
+    assert data["params"]["settings"] == {"ratio": "16:9"}
 
 
 def test_build_node_batch_body_image_has_no_poster():
-    node = build_node_batch_body("p", "image", "nk", "图片节点")["nodes"]["create"][0]
+    node = build_node_batch_body("p", "image", "nk", "图片节点", "nebula-ultra", {"prompt": "p"})["nodes"]["create"][0]
     assert node["type"] == 2
     assert "poster" not in json.loads(node["data"])
+    assert json.loads(node["data"])["params"]["model"] == "nebula-ultra"
 
 
-def test_build_generation_body_shape():
+def test_build_generation_body_shape_and_team_id():
     body = build_generation_body("seedance2.0", "seedance2.0", "video", {"prompt": "x"}, "nk", "proj")
     assert body["model"] == "seedance2.0"
     assert body["provider"] == "seedance2.0"
@@ -154,6 +161,18 @@ def test_build_generation_body_shape():
     assert body["metadata"] == {"node_id": "nk", "project_id": "proj"}
     assert body["params"] == {"prompt": "x"}
     assert body["requestId"]
+    assert "teamId" not in body  # personal project: omitted
+    team_body = build_generation_body("m", "v", "video", {}, "nk", "proj", team_id=42)
+    assert team_body["teamId"] == 42
+
+
+def test_parse_project_extracts_uuid_and_team():
+    from litellm.llms.libtv.client import parse_project
+
+    assert parse_project({"data": {"projectMeta": {"uuid": "u1", "teamId": 7}}}) == {"project_uuid": "u1", "team_id": 7}
+    assert parse_project({"data": {"projectMeta": {"uuid": "u2"}}}) == {"project_uuid": "u2", "team_id": None}
+    with pytest.raises(LibTVError):
+        parse_project({"data": {"projectMeta": {}}})
 
 
 def test_parse_task_id_variants():
@@ -194,7 +213,7 @@ def test_parse_progress_loading_has_no_urls():
 def test_generate_orchestrates_full_sequence():
     client = FakeSyncClient(
         post_by_path={
-            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "proj-9"}}},
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "proj-9", "teamId": 55}}},
             "/api/canvas/nodes/batch": {"code": 0, "data": {}},
             "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-9"}},
             "/api/task/generation/progress": [
@@ -211,7 +230,9 @@ def test_generate_orchestrates_full_sequence():
         }
     )
     lt = LibTVClient(token="t", webid="w", sync_client=client, poll_interval=0)
-    result = lt.generate("seedance2.0", "seedance2.0", "video", {"prompt": "hi"}, "proj-name")
+    result = lt.generate(
+        "seedance2.0", "seedance2.0", "video", {"prompt": "hi", "settings": {"ratio": "16:9"}}, "proj-name"
+    )
     assert result["urls"] == ["https://x/done.mp4"]
     assert result["project_uuid"] == "proj-9"
     paths = [c[0] for c in client.calls]
@@ -222,9 +243,14 @@ def test_generate_orchestrates_full_sequence():
         "/api/task/generation/progress",
         "/api/task/generation/progress",
     ]
+    # node must be created carrying the model + params, not hollow
+    node_data = json.loads(client.calls[1][1]["nodes"]["create"][0]["data"])
+    assert node_data["params"]["model"] == "seedance2.0"
+    assert node_data["params"]["prompt"] == "hi"
     gen_body = client.calls[2][1]
     assert gen_body["metadata"]["project_id"] == "proj-9"
     assert gen_body["metadata"]["node_id"] == result["node_key"]
+    assert gen_body["teamId"] == 55  # teamId propagated from projectMeta
 
 
 def test_generate_raises_on_failed_status():
@@ -277,7 +303,9 @@ def test_video_generation_forwards_named_params_to_custom_handler():
     captured = {}
 
     class StubLLM(CustomLLM):
-        def video_generation(self, model, prompt, api_key, api_base, optional_params, logging_obj, timeout=None, client=None):
+        def video_generation(
+            self, model, prompt, api_key, api_base, optional_params, logging_obj, timeout=None, client=None
+        ):
             captured.update(optional_params)
             return VideoObject(id="v", object="video", status="completed", model=model)
 
