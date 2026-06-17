@@ -8,6 +8,12 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM
 from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.main import VideoObject
+from litellm.types.videos.utils import (
+    decode_video_id_with_provider,
+    encode_video_id_with_provider,
+)
+
+LIBTV_PROVIDER = "libtv"
 
 from .client import LibTVClient
 from .common import LibTVError, resolve_libtv_credentials
@@ -54,9 +60,18 @@ def _as_list(value: Any) -> list:
 
 
 def _collect_reference_groups(optional_params: dict) -> Tuple[list, list, list]:
-    images = _as_list(optional_params.get("input_reference")) + _as_list(optional_params.get("image_references"))
-    videos = _as_list(optional_params.get("video_references"))
-    audios = _as_list(optional_params.get("audio_references"))
+    # Accept both libtv-native keys and the wavespeed-shaped keys the drama
+    # platform sends (reference_images / image / last_image / reference_audios),
+    # so the same payload works whether the request lands on libtv or wavespeed.
+    images = (
+        _as_list(optional_params.get("input_reference"))
+        + _as_list(optional_params.get("image_references"))
+        + _as_list(optional_params.get("reference_images"))
+        + _as_list(optional_params.get("image"))
+        + _as_list(optional_params.get("last_image"))
+    )
+    videos = _as_list(optional_params.get("video_references")) + _as_list(optional_params.get("reference_videos"))
+    audios = _as_list(optional_params.get("audio_references")) + _as_list(optional_params.get("reference_audios"))
     return images, videos, audios
 
 
@@ -68,6 +83,13 @@ def _default_video_mode(images: list, videos: list, audios: list) -> str:
     if images:
         return "image2video"
     return "text2video"
+
+
+def _infer_video_mode(optional_params: dict, images: list, videos: list, audios: list) -> str:
+    # wavespeed first/last-frame request: image (first) + last_image (last).
+    if optional_params.get("last_image"):
+        return "frames2video"
+    return _default_video_mode(images, videos, audios)
 
 
 class LibTVLLM(CustomLLM):
@@ -95,13 +117,85 @@ class LibTVLLM(CustomLLM):
 
     def _build_video_object(self, model: str, result: dict) -> VideoObject:
         urls = result.get("urls") or []
-        vo = VideoObject(id=result.get("task_id", ""), object="video", status="completed", model=model)
+        url = urls[0] if urls else ""
+        # Encode the result url + provider into the video id so the proxy routes
+        # subsequent /v1/videos/{id} status and /content calls back to libtv.
+        video_id = encode_video_id_with_provider(url, LIBTV_PROVIDER) if url else result.get("task_id", "")
+        vo = VideoObject(id=video_id, object="video", status="completed", model=model)
         vo._hidden_params = {
             "libtv_video_urls": urls,
-            "url": urls[0] if urls else None,
+            "url": url or None,
             "project_uuid": result.get("project_uuid"),
         }
         return vo
+
+    @staticmethod
+    def _decode_result_url(video_id: str) -> str:
+        url = (decode_video_id_with_provider(video_id) or {}).get("video_id") or ""
+        if not url.startswith("http"):
+            raise LibTVError(status_code=400, message="libtv video id does not carry a result url")
+        return url
+
+    def video_status(
+        self,
+        video_id: str,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[HTTPHandler] = None,
+    ) -> VideoObject:
+        url = self._decode_result_url(video_id)
+        vo = VideoObject(id=video_id, object="video", status="completed")
+        vo._hidden_params = {"url": url, "libtv_video_urls": [url]}
+        return vo
+
+    async def avideo_status(
+        self,
+        video_id: str,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[AsyncHTTPHandler] = None,
+    ) -> VideoObject:
+        return self.video_status(video_id, api_key, api_base, optional_params, logging_obj, timeout, None)
+
+    def video_content(
+        self,
+        video_id: str,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[HTTPHandler] = None,
+    ) -> bytes:
+        url = self._decode_result_url(video_id)
+        http = client or HTTPHandler()
+        resp = http.get(url=url)
+        if resp.status_code != 200:
+            raise LibTVError(status_code=resp.status_code, message="libtv video content download failed")
+        return resp.content
+
+    async def avideo_content(
+        self,
+        video_id: str,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[AsyncHTTPHandler] = None,
+    ) -> bytes:
+        url = self._decode_result_url(video_id)
+        http = client or AsyncHTTPHandler()
+        resp = await http.get(url=url)
+        if resp.status_code != 200:
+            raise LibTVError(status_code=resp.status_code, message="libtv video content download failed")
+        return resp.content
 
     @staticmethod
     def _apply_video_references(params: dict, mode: str, img_urls: list, vid_urls: list, aud_urls: list) -> None:
@@ -173,7 +267,7 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
         images, videos, audios = _collect_reference_groups(optional_params)
-        mode = _resolve_mode(optional_params, _default_video_mode(images, videos, audios))
+        mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
         params = build_generation_params(prompt, optional_params, spec, mode)
 
         def url_for(ref):
@@ -200,7 +294,7 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
         images, videos, audios = _collect_reference_groups(optional_params)
-        mode = _resolve_mode(optional_params, _default_video_mode(images, videos, audios))
+        mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
         params = build_generation_params(prompt, optional_params, spec, mode)
 
         async def url_for(ref):

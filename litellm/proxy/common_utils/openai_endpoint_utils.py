@@ -33,6 +33,25 @@ def remove_sensitive_info_from_deployment(
     deployment_dict["litellm_params"].pop("aws_access_key_id", None)
     deployment_dict["litellm_params"].pop("aws_secret_access_key", None)
 
+    # Provider opacity: never expose which upstream provider/model/endpoint backs a
+    # public model_name. Callers see only the official model_name; the underlying
+    # provider-prefixed model id, provider, and infra endpoints are stripped.
+    for _provider_key in (
+        "model",
+        "custom_llm_provider",
+        "api_base",
+        "base_url",
+        "api_version",
+        "vertex_project",
+        "vertex_location",
+        "aws_region_name",
+    ):
+        deployment_dict["litellm_params"].pop(_provider_key, None)
+    _model_info = deployment_dict.get("model_info")
+    if isinstance(_model_info, dict):
+        for _provider_key in ("custom_llm_provider", "litellm_model_name"):
+            _model_info.pop(_provider_key, None)
+
     # Rate-limit config fields must never be masked — they are integers, not credentials.
     # The field names contain "key" which matches the masker's sensitive pattern, so we
     # explicitly exclude them here rather than widening the global non_sensitive_overrides.

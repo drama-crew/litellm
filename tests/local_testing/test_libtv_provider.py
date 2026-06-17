@@ -12,11 +12,14 @@ from litellm.llms.libtv.client import (
 )
 from litellm.llms.libtv.common import LibTVError, build_libtv_headers, build_upload_path
 from litellm.llms.libtv.handler import (
+    LIBTV_PROVIDER,
     LibTVLLM,
     _collect_reference_groups,
     _default_video_mode,
+    _infer_video_mode,
     _reference_payload,
 )
+from litellm.types.videos.utils import decode_video_id_with_provider
 from litellm.llms.libtv.transform import build_generation_params, size_to_ratio
 
 _SEEDANCE_SPEC = {
@@ -302,6 +305,95 @@ def test_apply_video_references_sets_lists():
     assert "videoList" not in params and "mixedList" not in params
 
 
+def test_collect_reference_groups_wavespeed_aliases():
+    images, videos, audios = _collect_reference_groups(
+        {
+            "reference_images": ["https://x/r1.png"],
+            "image": "https://x/first.png",
+            "last_image": "https://x/last.png",
+            "reference_audios": ["https://x/a.mp3"],
+        }
+    )
+    assert images == ["https://x/r1.png", "https://x/first.png", "https://x/last.png"]
+    assert audios == ["https://x/a.mp3"]
+
+
+def test_infer_video_mode_frames_when_last_image():
+    assert _infer_video_mode({"last_image": "u"}, ["a", "b"], [], []) == "frames2video"
+    assert _infer_video_mode({}, ["a"], [], []) == "image2video"
+    assert _infer_video_mode({}, [], [], ["x"]) == "audio2video"
+
+
+def test_build_video_object_encodes_url_into_id():
+    llm = LibTVLLM()
+    vo = llm._build_video_object("star-video2", {"urls": ["https://libtv-res/x.mp4"], "task_id": "t1"})
+    assert vo.status == "completed"
+    decoded = decode_video_id_with_provider(vo.id)
+    assert decoded["custom_llm_provider"] == LIBTV_PROVIDER
+    assert decoded["video_id"] == "https://libtv-res/x.mp4"
+    assert vo._hidden_params["url"] == "https://libtv-res/x.mp4"
+
+
+def test_video_status_returns_completed_with_url():
+    llm = LibTVLLM()
+    vid = llm._build_video_object("m", {"urls": ["https://libtv-res/v.mp4"]}).id
+    status = llm.video_status(vid, None, None, {}, None)
+    assert status.status == "completed"
+    assert status._hidden_params["url"] == "https://libtv-res/v.mp4"
+
+
+def test_video_content_downloads_decoded_url():
+    llm = LibTVLLM()
+    vid = llm._build_video_object("m", {"urls": ["https://libtv-res/v.mp4"]}).id
+
+    class _DLClient:
+        def __init__(self):
+            self.got = None
+
+        def get(self, url):
+            self.got = url
+
+            class _R:
+                status_code = 200
+                content = b"MP4BYTES"
+
+            return _R()
+
+    dl = _DLClient()
+    data = llm.video_content(vid, None, None, {}, None, client=dl)
+    assert data == b"MP4BYTES"
+    assert dl.got == "https://libtv-res/v.mp4"
+
+
+def test_video_status_rejects_non_libtv_id():
+    with pytest.raises(LibTVError):
+        LibTVLLM().video_status("plain-id", None, None, {}, None)
+
+
+def test_video_status_routes_through_litellm():
+    import litellm
+    from litellm.llms.custom_llm import CustomLLM
+    from litellm.types.videos.main import VideoObject
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    class StubLLM(CustomLLM):
+        def video_status(self, video_id, api_key, api_base, optional_params, logging_obj, timeout=None, client=None):
+            return VideoObject(id=video_id, object="video", status="completed")
+
+        def video_content(self, video_id, api_key, api_base, optional_params, logging_obj, timeout=None, client=None):
+            return b"BYTES"
+
+    litellm.custom_provider_map = [{"provider": "libtvstub", "custom_handler": StubLLM()}]
+    try:
+        vid = encode_video_id_with_provider("https://x/v.mp4", "libtvstub")
+        status = litellm.video_status(video_id=vid)
+        assert status.status == "completed"
+        content = litellm.video_content(video_id=vid)
+        assert content == b"BYTES"
+    finally:
+        litellm.custom_provider_map = []
+
+
 def test_apply_video_references_mixed_builds_mixedlist():
     params = {}
     LibTVLLM._apply_video_references(params, "mixed2video", ["img"], ["vid"], ["aud"])
@@ -310,6 +402,38 @@ def test_apply_video_references_mixed_builds_mixedlist():
         {"url": "vid", "type": "video"},
         {"url": "aud", "type": "audio"},
     ]
+
+
+def test_model_info_redaction_strips_provider():
+    from litellm.proxy.common_utils.openai_endpoint_utils import (
+        remove_sensitive_info_from_deployment,
+    )
+
+    deployment = {
+        "model_name": "seedance-2.0",
+        "litellm_params": {
+            "model": "wavespeed/bytedance/seedance-2.0",
+            "custom_llm_provider": "wavespeed",
+            "api_base": "https://api.wavespeed.ai/api/v3",
+            "api_key": "secret",
+        },
+        "model_info": {
+            "mode": "video_generation",
+            "custom_llm_provider": "wavespeed",
+            "litellm_model_name": "wavespeed/bytedance/seedance-2.0",
+            "supports_vision": True,
+        },
+    }
+    out = remove_sensitive_info_from_deployment(deployment)
+    assert out["model_name"] == "seedance-2.0"  # public id kept
+    assert "model" not in out["litellm_params"]
+    assert "custom_llm_provider" not in out["litellm_params"]
+    assert "api_base" not in out["litellm_params"]
+    assert "api_key" not in out["litellm_params"]
+    assert "custom_llm_provider" not in out["model_info"]
+    assert "litellm_model_name" not in out["model_info"]
+    assert out["model_info"]["mode"] == "video_generation"  # classification kept
+    assert out["model_info"]["supports_vision"] is True
 
 
 def test_parse_task_id_variants():
