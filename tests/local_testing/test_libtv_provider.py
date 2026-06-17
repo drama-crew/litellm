@@ -11,7 +11,12 @@ from litellm.llms.libtv.client import (
     parse_upload_url,
 )
 from litellm.llms.libtv.common import LibTVError, build_libtv_headers, build_upload_path
-from litellm.llms.libtv.handler import _reference_payload
+from litellm.llms.libtv.handler import (
+    LibTVLLM,
+    _collect_reference_groups,
+    _default_video_mode,
+    _reference_payload,
+)
 from litellm.llms.libtv.transform import build_generation_params, size_to_ratio
 
 _SEEDANCE_SPEC = {
@@ -262,6 +267,49 @@ def test_reference_payload_bytes_and_tuple():
 
 def test_reference_payload_none():
     assert _reference_payload(None) is None
+
+
+def test_collect_reference_groups_merges_and_typed_keys():
+    images, videos, audios = _collect_reference_groups(
+        {
+            "input_reference": "https://x/a.png",
+            "image_references": ["https://x/b.png", "https://x/c.png"],
+            "video_references": ["https://x/v.mp4"],
+            "audio_references": ["https://x/s.mp3"],
+        }
+    )
+    assert images == ["https://x/a.png", "https://x/b.png", "https://x/c.png"]
+    assert videos == ["https://x/v.mp4"]
+    assert audios == ["https://x/s.mp3"]
+
+
+def test_collect_reference_groups_single_tuple_is_one_image():
+    images, _, _ = _collect_reference_groups({"input_reference": ("a.png", b"data")})
+    assert images == [("a.png", b"data")]
+
+
+def test_default_video_mode_priority():
+    assert _default_video_mode([], [], []) == "text2video"
+    assert _default_video_mode(["i"], [], []) == "image2video"
+    assert _default_video_mode(["i"], ["v"], []) == "video2video"
+    assert _default_video_mode(["i"], ["v"], ["a"]) == "audio2video"
+
+
+def test_apply_video_references_sets_lists():
+    params = {}
+    LibTVLLM._apply_video_references(params, "image2video", ["u1", "u2"], [], [])
+    assert params["imageList"] == ["u1", "u2"]
+    assert "videoList" not in params and "mixedList" not in params
+
+
+def test_apply_video_references_mixed_builds_mixedlist():
+    params = {}
+    LibTVLLM._apply_video_references(params, "mixed2video", ["img"], ["vid"], ["aud"])
+    assert params["mixedList"] == [
+        {"url": "img", "type": "image"},
+        {"url": "vid", "type": "video"},
+        {"url": "aud", "type": "audio"},
+    ]
 
 
 def test_parse_task_id_variants():
