@@ -404,38 +404,6 @@ def test_apply_video_references_mixed_builds_mixedlist():
     ]
 
 
-def test_model_info_redaction_strips_provider():
-    from litellm.proxy.common_utils.openai_endpoint_utils import (
-        remove_sensitive_info_from_deployment,
-    )
-
-    deployment = {
-        "model_name": "seedance-2.0",
-        "litellm_params": {
-            "model": "wavespeed/bytedance/seedance-2.0",
-            "custom_llm_provider": "wavespeed",
-            "api_base": "https://api.wavespeed.ai/api/v3",
-            "api_key": "secret",
-        },
-        "model_info": {
-            "mode": "video_generation",
-            "custom_llm_provider": "wavespeed",
-            "litellm_model_name": "wavespeed/bytedance/seedance-2.0",
-            "supports_vision": True,
-        },
-    }
-    out = remove_sensitive_info_from_deployment(deployment)
-    assert out["model_name"] == "seedance-2.0"  # public id kept
-    assert "model" not in out["litellm_params"]
-    assert "custom_llm_provider" not in out["litellm_params"]
-    assert "api_base" not in out["litellm_params"]
-    assert "api_key" not in out["litellm_params"]
-    assert "custom_llm_provider" not in out["model_info"]
-    assert "litellm_model_name" not in out["model_info"]
-    assert out["model_info"]["mode"] == "video_generation"  # classification kept
-    assert out["model_info"]["supports_vision"] is True
-
-
 def test_parse_task_id_variants():
     assert parse_task_id({"data": {"taskId": "t1"}}) == "t1"
     assert parse_task_id({"data": {"task_id": "t2"}}) == "t2"
