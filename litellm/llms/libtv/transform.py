@@ -122,9 +122,13 @@ def build_generation_params(
         "prompt": prompt,
         "modeType": mode,
         "count": int(count),
-        "settings": settings,
+        "textList": [],
+        "imageList": [],
+        "videoList": [],
+        "audioList": [],
     }
+    params.update(settings)
     advanced = op.get("advancedSettings")
-    if advanced:
-        params["advancedSettings"] = advanced
+    if isinstance(advanced, dict):
+        params.update(advanced)
     return params

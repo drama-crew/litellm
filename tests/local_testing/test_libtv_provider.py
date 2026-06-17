@@ -103,34 +103,36 @@ def test_build_params_flat_settings_seedance():
     assert params["prompt"] == "a cat"
     assert params["modeType"] == "text2video"
     assert params["count"] == 1
-    assert params["settings"]["ratio"] == "16:9"
-    assert params["settings"]["resolution"] == "720p"
-    assert params["settings"]["duration"] == 8
+    assert params["ratio"] == "16:9"
+    assert params["resolution"] == "720p"
+    assert params["duration"] == 8
 
 
 def test_build_params_filters_to_mode_keys_and_fills_defaults():
     # Wan text2video declares only ratio/resolution/duration; enableSound must NOT appear
     params = build_generation_params("a cat", {"enableSound": "off"}, _WAN_SPEC, "text2video")
-    assert set(params["settings"].keys()) == {"ratio", "resolution", "duration"}
-    assert "enableSound" not in params["settings"]
-    assert params["settings"]["ratio"] == "16:9"  # schema default
-    assert params["settings"]["duration"] == 5  # schema default
+    assert params["ratio"] == "16:9"  # schema default, flattened to top level
+    assert params["resolution"] == "720p"
+    assert params["duration"] == 5
+    assert "enableSound" not in params  # not declared for Wan text2video
+    assert "settings" not in params  # settings are flattened, never nested
 
 
 def test_build_params_coerces_resolution_enum_case():
     # user/size implies 480p; Wan enum is uppercase 480P -> must coerce to schema casing
     params = build_generation_params("x", {"size": "854x480"}, _WAN_SPEC, "text2video")
-    assert params["settings"]["resolution"] == "480P"
+    assert params["resolution"] == "480P"
 
 
 def test_build_params_unknown_mode_has_empty_settings():
     params = build_generation_params("x", {}, _WAN_SPEC, "image2video")
-    assert params["settings"] == {}
+    assert "ratio" not in params and "resolution" not in params and "duration" not in params
+    assert params["imageList"] == [] and params["textList"] == []
 
 
 def test_build_node_batch_body_video_carries_model_and_params():
     body = build_node_batch_body(
-        "proj-uuid", "video", "nk-1", "视频节点", "wanxiang-plus", {"prompt": "p", "settings": {"ratio": "16:9"}}
+        "proj-uuid", "video", "nk-1", "视频节点", "wanxiang-plus", {"prompt": "p", "ratio": "16:9"}
     )
     node = body["nodes"]["create"][0]
     assert body["projectUuid"] == "proj-uuid"
@@ -143,7 +145,7 @@ def test_build_node_batch_body_video_carries_model_and_params():
     # node must carry the model + generation params (not a hollow placeholder)
     assert data["params"]["model"] == "wanxiang-plus"
     assert data["params"]["prompt"] == "p"
-    assert data["params"]["settings"] == {"ratio": "16:9"}
+    assert data["params"]["ratio"] == "16:9"  # flattened, not nested
 
 
 def test_build_node_batch_body_image_has_no_poster():
@@ -348,9 +350,9 @@ def test_build_params_kling_style_keys():
         },
     }
     params = build_generation_params("x", {"size": "1280x720", "quality": "720p"}, spec, "text2video")
-    assert params["settings"]["ratio_auto"] == "16:9"
-    assert params["settings"]["quality_high"] == "720p"
-    assert params["settings"]["duration"] == 5
+    assert params["ratio_auto"] == "16:9"
+    assert params["quality_high"] == "720p"
+    assert params["duration"] == 5
 
 
 def test_build_params_resolution_480_key():
@@ -359,7 +361,7 @@ def test_build_params_resolution_480_key():
         "properties": {"resolution_480": {"default": "480p"}, "duration": {"default": 5}},
     }
     params = build_generation_params("x", {"size": "854x480"}, spec, "singleImage2video")
-    assert params["settings"]["resolution_480"] == "480p"
+    assert params["resolution_480"] == "480p"
 
 
 def test_count_list_property_does_not_crash():
