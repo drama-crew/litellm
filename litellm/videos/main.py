@@ -7,6 +7,8 @@ from typing import Any, Coroutine, Dict, List, Literal, Optional, Union, overloa
 import litellm
 from litellm.constants import DEFAULT_VIDEO_ENDPOINT_MODEL
 from litellm.constants import request_timeout as DEFAULT_REQUEST_TIMEOUT
+from litellm.exceptions import LiteLLMUnknownProvider
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.base_llm.videos.transformation import BaseVideoConfig
@@ -25,6 +27,60 @@ from litellm.videos.utils import VideoGenerationRequestUtils
 
 #################### Initialize provider clients ####################
 llm_http_handler: BaseLLMHTTPHandler = BaseLLMHTTPHandler()
+
+
+def _custom_video_generation(
+    model: str,
+    prompt: str,
+    custom_llm_provider: str,
+    optional_params: dict,
+    logging_obj: LiteLLMLoggingObj,
+    timeout: Union[int, float],
+    _is_async: bool,
+    api_key: Optional[str],
+    api_base: Optional[str],
+    client: Optional[Any],
+):
+    custom_handler = None
+    for item in litellm.custom_provider_map:
+        if item["provider"] == custom_llm_provider:
+            custom_handler = item["custom_handler"]
+    if custom_handler is None:
+        raise LiteLLMUnknownProvider(
+            model=model, custom_llm_provider=custom_llm_provider
+        )
+
+    logging_obj.update_environment_variables(
+        model=model,
+        user=optional_params.get("user"),
+        optional_params={},
+        litellm_params={},
+        custom_llm_provider=custom_llm_provider,
+    )
+
+    if _is_async:
+        async_client = client if isinstance(client, AsyncHTTPHandler) else None
+        return custom_handler.avideo_generation(
+            model=model,
+            prompt=prompt,
+            api_key=api_key,
+            api_base=api_base,
+            optional_params=optional_params,
+            logging_obj=logging_obj,
+            timeout=timeout,
+            client=async_client,
+        )
+    sync_client = client if isinstance(client, HTTPHandler) else None
+    return custom_handler.video_generation(
+        model=model,
+        prompt=prompt,
+        api_key=api_key,
+        api_base=api_base,
+        optional_params=optional_params,
+        logging_obj=logging_obj,
+        timeout=timeout,
+        client=sync_client,
+    )
 
 
 ##### Video Generation #######################
@@ -204,6 +260,31 @@ def video_generation(  # noqa: PLR0915
             model=model or DEFAULT_VIDEO_ENDPOINT_MODEL,
             custom_llm_provider=custom_llm_provider,
         )
+
+        if custom_llm_provider in litellm._custom_providers:
+            custom_optional_params = {
+                k: v
+                for k, v in {
+                    "seconds": seconds,
+                    "size": size,
+                    "user": user,
+                    "input_reference": input_reference,
+                }.items()
+                if v is not None
+            }
+            custom_optional_params.update(kwargs)
+            return _custom_video_generation(
+                model=model,
+                prompt=prompt,
+                custom_llm_provider=custom_llm_provider,
+                optional_params=custom_optional_params,
+                logging_obj=litellm_logging_obj,
+                timeout=timeout or DEFAULT_REQUEST_TIMEOUT,
+                _is_async=_is_async,
+                api_key=kwargs.get("api_key"),
+                api_base=local_vars.get("api_base"),
+                client=kwargs.get("client"),
+            )
 
         # get provider config
         video_generation_provider_config: Optional[BaseVideoConfig] = (

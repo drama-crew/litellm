@@ -29,6 +29,7 @@ from .base import BaseLLM
 
 if TYPE_CHECKING:
     from litellm import CustomStreamWrapper
+    from litellm.types.videos.main import VideoObject
 
 
 class CustomLLMError(Exception):  # use this for all your exceptions
@@ -165,6 +166,32 @@ class CustomLLM(BaseLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[AsyncHTTPHandler] = None,
     ) -> ImageResponse:
+        raise CustomLLMError(status_code=500, message="Not implemented yet!")
+
+    def video_generation(
+        self,
+        model: str,
+        prompt: str,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[HTTPHandler] = None,
+    ) -> "VideoObject":
+        raise CustomLLMError(status_code=500, message="Not implemented yet!")
+
+    async def avideo_generation(
+        self,
+        model: str,
+        prompt: str,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[AsyncHTTPHandler] = None,
+    ) -> "VideoObject":
         raise CustomLLMError(status_code=500, message="Not implemented yet!")
 
     def embedding(
