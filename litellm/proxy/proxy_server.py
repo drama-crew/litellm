@@ -8184,8 +8184,8 @@ async def model_list(
     )
 
     # Models flagged model_info.hidden=true (fallback peers / provider-specific
-    # channels) back a public model_name but must not surface on their own — keeps
-    # the public listing free of provider-revealing deployment names.
+    # channels) back a public model_name but must not surface on their own; this
+    # keeps the public listing free of provider-revealing deployment names.
     hidden_names: set = set()
     if llm_router is not None:
         for _dep in getattr(llm_router, "model_list", None) or []:
