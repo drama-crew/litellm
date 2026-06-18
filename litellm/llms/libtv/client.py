@@ -23,6 +23,9 @@ from .common import (
 )
 
 
+THIRD_ASSET_POLL_ATTEMPTS = 30
+
+
 def parse_upload_url(complete_payload: Dict[str, Any]) -> str:
     data = complete_payload.get("data") or {}
     url = data.get("cdnUrl") or data.get("ossUrl") or data.get("path")
@@ -102,6 +105,49 @@ def parse_task_id(payload: Dict[str, Any]) -> str:
     if not task_id:
         raise LibTVError(status_code=502, message=f"libtv generation/create returned no taskId: {payload}")
     return str(task_id)
+
+
+def parse_verify_passed(payload: Dict[str, Any]) -> Dict[str, bool]:
+    out: Dict[str, bool] = {}
+    for item in ((payload.get("data") or {}).get("list") or []):
+        url = item.get("url")
+        if not url:
+            continue
+        risk = item.get("riskLabels")
+        if isinstance(risk, str) and risk.strip():
+            try:
+                risk = json.loads(risk)
+            except json.JSONDecodeError:
+                risk = {}
+        out[str(url)] = bool(isinstance(risk, dict) and risk.get("passed"))
+    return out
+
+
+def parse_third_asset_uuid(payload: Dict[str, Any]) -> str:
+    uuid_val = (payload.get("data") or {}).get("uuid")
+    if not uuid_val:
+        raise LibTVError(status_code=502, message=f"libtv third_asset/create returned no uuid: {payload}")
+    return str(uuid_val)
+
+
+def parse_third_asset_item(payload: Dict[str, Any], asset_uuid: str) -> Optional[Dict[str, Any]]:
+    for item in ((payload.get("data") or {}).get("list") or []):
+        if item.get("uuid") == asset_uuid:
+            return item
+    return None
+
+
+def _asset_ref_from_item(item: Optional[Dict[str, Any]], cdn_url: str) -> Optional[str]:
+    # asset://<id> once the backend issues a verified asset id (portrait); the libtv cdn
+    # url once the asset reaches a terminal state without one (non-portrait, exempt); None
+    # while the check is still pending so the caller keeps polling.
+    if not item:
+        return None
+    if item.get("assetId"):
+        return f"asset://{item['assetId']}"
+    if item.get("status") == 1:
+        return cdn_url
+    return None
 
 
 def _pick_item_url(item: Dict[str, Any]) -> Optional[str]:
@@ -366,6 +412,57 @@ class LibTVClient:
             time.sleep(self.poll_interval)
         raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
 
+    def _fetch_bytes(self, url: str) -> bytes:
+        assert self.sync_client is not None, "sync_client required"
+        resp = self.sync_client.get(url=url)
+        if resp.status_code != 200:
+            raise LibTVError(status_code=resp.status_code, message=f"libtv reference fetch HTTP {resp.status_code}")
+        return resp.content
+
+    def _libtv_cdn_url(self, kind: str, url: str, data: Optional[bytes]) -> str:
+        if kind == "url":
+            if "libtv-res.liblib.art" in url:
+                return url
+            return self.upload_media(self._fetch_bytes(url), "reference.png")
+        return self.upload_media(data or b"", url or "reference.png")
+
+    def resolve_compliant_image_refs(self, refs: List[tuple]) -> List[str]:
+        """For an auto-compliance (portrait-capable) model: ensure each image reference
+        clears libtv moderation before generation. Returns one libtv reference per input:
+        ``asset://<assetId>`` for images the backend issues a verified asset id for
+        (portraits), or the libtv cdn url for images it exempts (no real person). Raises
+        if any reference fails moderation so the caller can fall back to another provider."""
+        cdn_urls = [self._libtv_cdn_url(kind, url, data) for (kind, url, data) in refs]
+        passed = parse_verify_passed(self._post("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify"))
+        resolved: List[str] = []
+        for cdn_url in cdn_urls:
+            if not passed.get(cdn_url):
+                raise LibTVError(
+                    status_code=400,
+                    message="libtv portrait compliance check did not pass for a reference image",
+                )
+            asset_uuid = parse_third_asset_uuid(
+                self._post(
+                    "/api/third_asset/create",
+                    {"assetUrl": cdn_url, "assetType": "image", "version": 1},
+                    "third_asset/create",
+                )
+            )
+            ref = None
+            for _ in range(THIRD_ASSET_POLL_ATTEMPTS):
+                ref = _asset_ref_from_item(
+                    parse_third_asset_item(
+                        self._post("/api/third_asset/check", {"uuids": [asset_uuid]}, "third_asset/check"),
+                        asset_uuid,
+                    ),
+                    cdn_url,
+                )
+                if ref:
+                    break
+                time.sleep(self.poll_interval)
+            resolved.append(ref or cdn_url)
+        return resolved
+
     # ---------- async ----------
     async def _apost(self, path: str, body: Dict[str, Any], step: str) -> Dict[str, Any]:
         assert self.async_client is not None, "async_client required for async calls"
@@ -406,3 +503,51 @@ class LibTVClient:
                 raise LibTVError(status_code=502, message=f"libtv generation failed: {state['failed_reason']}")
             await asyncio.sleep(self.poll_interval)
         raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
+
+    async def _afetch_bytes(self, url: str) -> bytes:
+        assert self.async_client is not None, "async_client required"
+        resp = await self.async_client.get(url=url)
+        if resp.status_code != 200:
+            raise LibTVError(status_code=resp.status_code, message=f"libtv reference fetch HTTP {resp.status_code}")
+        return resp.content
+
+    async def _alibtv_cdn_url(self, kind: str, url: str, data: Optional[bytes]) -> str:
+        if kind == "url":
+            if "libtv-res.liblib.art" in url:
+                return url
+            return await self.aupload_media(await self._afetch_bytes(url), "reference.png")
+        return await self.aupload_media(data or b"", url or "reference.png")
+
+    async def aresolve_compliant_image_refs(self, refs: List[tuple]) -> List[str]:
+        cdn_urls = [await self._alibtv_cdn_url(kind, url, data) for (kind, url, data) in refs]
+        passed = parse_verify_passed(
+            await self._apost("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify")
+        )
+        resolved: List[str] = []
+        for cdn_url in cdn_urls:
+            if not passed.get(cdn_url):
+                raise LibTVError(
+                    status_code=400,
+                    message="libtv portrait compliance check did not pass for a reference image",
+                )
+            asset_uuid = parse_third_asset_uuid(
+                await self._apost(
+                    "/api/third_asset/create",
+                    {"assetUrl": cdn_url, "assetType": "image", "version": 1},
+                    "third_asset/create",
+                )
+            )
+            ref = None
+            for _ in range(THIRD_ASSET_POLL_ATTEMPTS):
+                ref = _asset_ref_from_item(
+                    parse_third_asset_item(
+                        await self._apost("/api/third_asset/check", {"uuids": [asset_uuid]}, "third_asset/check"),
+                        asset_uuid,
+                    ),
+                    cdn_url,
+                )
+                if ref:
+                    break
+                await asyncio.sleep(self.poll_interval)
+            resolved.append(ref or cdn_url)
+        return resolved

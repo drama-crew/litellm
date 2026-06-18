@@ -92,6 +92,13 @@ def _infer_video_mode(optional_params: dict, images: list, videos: list, audios:
     return _default_video_mode(images, videos, audios)
 
 
+def _auto_compliance_enabled(spec: dict) -> bool:
+    # Portrait-capable models (e.g. star-video2) reject raw reference-image URLs that
+    # contain a real person; the upstream verify flow must run and convert each image
+    # to an ``asset://`` id before generation. The model schema advertises this.
+    return bool(((spec.get("properties") or {}).get("autoCompliance") or {}).get("enable"))
+
+
 class LibTVLLM(CustomLLM):
     def __init__(self, poll_interval: float = 3.0, poll_max_attempts: int = 200):
         super().__init__()
@@ -267,16 +274,26 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
         images, videos, audios = _collect_reference_groups(optional_params)
-        mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
-        params = build_generation_params(prompt, optional_params, spec, mode)
 
         def url_for(ref):
             p = _reference_payload(ref)
             return p[1] if p[0] == "url" else lt.upload_media(p[2], p[1])
 
-        self._apply_video_references(
-            params, mode, [url_for(r) for r in images], [url_for(r) for r in videos], [url_for(r) for r in audios]
-        )
+        if images and _auto_compliance_enabled(spec):
+            image_refs = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
+            params = build_generation_params(prompt, optional_params, spec, "mixed2video")
+            params["autoCompliance"] = 1
+            params["mixedList"] = (
+                [{"url": r, "type": "image"} for r in image_refs]
+                + [{"url": url_for(r), "type": "video"} for r in videos]
+                + [{"url": url_for(r), "type": "audio"} for r in audios]
+            )
+        else:
+            mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
+            params = build_generation_params(prompt, optional_params, spec, mode)
+            self._apply_video_references(
+                params, mode, [url_for(r) for r in images], [url_for(r) for r in videos], [url_for(r) for r in audios]
+            )
         result = lt.generate(model, spec["vendor"], "video", params, _project_name(model))
         return self._build_video_object(model, result)
 
@@ -294,19 +311,29 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
         images, videos, audios = _collect_reference_groups(optional_params)
-        mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
-        params = build_generation_params(prompt, optional_params, spec, mode)
 
         async def url_for(ref):
             p = _reference_payload(ref)
             return p[1] if p[0] == "url" else await lt.aupload_media(p[2], p[1])
 
-        self._apply_video_references(
-            params,
-            mode,
-            [await url_for(r) for r in images],
-            [await url_for(r) for r in videos],
-            [await url_for(r) for r in audios],
-        )
+        if images and _auto_compliance_enabled(spec):
+            image_refs = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
+            params = build_generation_params(prompt, optional_params, spec, "mixed2video")
+            params["autoCompliance"] = 1
+            params["mixedList"] = (
+                [{"url": r, "type": "image"} for r in image_refs]
+                + [{"url": await url_for(r), "type": "video"} for r in videos]
+                + [{"url": await url_for(r), "type": "audio"} for r in audios]
+            )
+        else:
+            mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
+            params = build_generation_params(prompt, optional_params, spec, mode)
+            self._apply_video_references(
+                params,
+                mode,
+                [await url_for(r) for r in images],
+                [await url_for(r) for r in videos],
+                [await url_for(r) for r in audios],
+            )
         result = await lt.agenerate(model, spec["vendor"], "video", params, _project_name(model))
         return self._build_video_object(model, result)

@@ -671,3 +671,125 @@ def test_resolve_model_spec_indexes_tool_spec():
     assert spec["task_type"] == "video"
     with pytest.raises(LibTVError):
         lt.resolve_model_spec("does-not-exist")
+
+
+def _tool_spec_payload(model_key="star-video2", auto_compliance=True):
+    props = {
+        "ratio": {"default": "9:16", "enum": ["16:9", "9:16"]},
+        "resolution": {"default": "720p", "enum": [{"value": "720p"}]},
+        "duration": {"default": 5},
+        "portrait": True,
+    }
+    if auto_compliance:
+        props["autoCompliance"] = {"enable": True, "default": 1}
+    meta = {
+        "modelKey": model_key,
+        "modelVendor": model_key,
+        "properties": props,
+        "config": {"settings": ["ratio", "resolution", "duration", "enableSound"]},
+    }
+    return {"data": {"tools": [{"type": "video", "metadata": json.dumps(meta)}]}}
+
+
+_LIBTV_REF = "https://libtv-res.liblib.art/upload-images/uid/abc.png"
+
+
+def _compliance_routes(verify_passed=True):
+    risk = json.dumps({"passed": verify_passed, "needsReview": False, "riskDescription": "正常"})
+    return {
+        "/api/community/image/verify": {"code": 0, "data": {"list": [{"url": _LIBTV_REF, "riskLabels": risk}]}},
+        "/api/third_asset/create": {"code": 0, "data": {"uuid": "u1"}},
+        "/api/third_asset/check": {"code": 0, "data": {"list": [{"uuid": "u1", "assetId": "asset-AAA", "status": 1}]}},
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {"progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]},
+        },
+    }
+
+
+def test_portrait_compliance_converts_image_to_asset_and_sets_flag():
+    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "subtle motion", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "completed"
+    paths = [c[0] for c in fake.calls]
+    assert "/api/community/image/verify" in paths
+    assert "/api/third_asset/create" in paths
+    assert "/api/third_asset/check" in paths
+    # verify request carries urlList (the field the upstream actually reads)
+    verify_body = next(body for path, body in fake.calls if path == "/api/community/image/verify")
+    assert verify_body == {"urlList": [_LIBTV_REF]}
+    # generation body routes the image as asset:// via mixedList, NOT raw imageList
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["autoCompliance"] == 1
+    assert gen_params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}]
+    assert gen_params.get("imageList") in ([], None)
+
+
+def test_portrait_compliance_blocks_generation_when_verify_fails():
+    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=False), get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    with pytest.raises(LibTVError):
+        llm.video_generation("star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake)
+    paths = [c[0] for c in fake.calls]
+    assert "/api/community/image/verify" in paths
+    assert "/api/task/generation/create" not in paths  # never submits a blocked portrait
+
+
+def test_non_compliance_model_keeps_raw_imagelist_no_verify():
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {"progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]},
+        },
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(auto_compliance=False))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "completed"
+    paths = [c[0] for c in fake.calls]
+    assert "/api/community/image/verify" not in paths
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["imageList"] == [_LIBTV_REF]
+    assert "autoCompliance" not in gen_params
+
+
+@pytest.mark.asyncio
+async def test_portrait_compliance_async_happy_path():
+    fake = FakeAsyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = await llm.avideo_generation(
+        "star-video2", "subtle motion", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "completed"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["autoCompliance"] == 1
+    assert gen_params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}]
+
+
+def test_compliance_exempt_image_keeps_cdn_url_not_asset():
+    # verify passes but the asset reaches a terminal state with no assetId (non-portrait
+    # exempt): the reference must fall back to the raw libtv cdn url, not asset://.
+    routes = _compliance_routes(verify_passed=True)
+    routes["/api/third_asset/check"] = {
+        "code": 0,
+        "data": {"list": [{"uuid": "u1", "assetId": None, "status": 1}]},
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "completed"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "type": "image"}]
