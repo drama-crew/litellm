@@ -6,6 +6,7 @@ import httpx
 from httpx._types import RequestFiles
 
 import litellm
+from litellm._logging import verbose_logger
 from litellm.llms.base_llm.chat.transformation import BaseLLMException
 from litellm.llms.base_llm.videos.transformation import BaseVideoConfig
 from litellm.llms.custom_httpx.http_handler import (
@@ -100,13 +101,27 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
             size = str(params["size"])
             mapped["aspect_ratio"] = self._aspect_ratio(size)
             mapped["resolution"] = self._resolution(size)
-        for key in ("aspect_ratio", "resolution"):
-            value = params.get(key)
-            if value is not None:
-                mapped[key] = value
+        if params.get("aspect_ratio") is not None:
+            mapped["aspect_ratio"] = params["aspect_ratio"]
+        if params.get("resolution") is not None:
+            mapped["resolution"] = params["resolution"]
         extra_body = params.get("extra_body") or {}
         if isinstance(extra_body, dict):
             mapped.update(extra_body)
+        if "resolution" in mapped:
+            normalized = self._normalize_resolution(mapped["resolution"])
+            if normalized is not None:
+                mapped["resolution"] = normalized
+            else:
+                mapped.pop("resolution", None)
+            # litellm core (videos/utils.py) re-merges the request's raw extra_body
+            # over this mapping right after, which would re-inject the un-normalized
+            # value. Drop the consumed resolution from the source extra_body so that
+            # re-merge is a no-op and the normalized value reaches the wire without
+            # depending on transform_video_create_request re-mapping a third time.
+            source_extra_body = params.get("extra_body")
+            if isinstance(source_extra_body, dict):
+                source_extra_body.pop("resolution", None)
         duration = self._resolve_duration_seconds(video_create_optional_params, mapped)
         mapped["duration"] = duration
         mapped["duration_seconds"] = duration
@@ -260,6 +275,141 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         video_response.raise_for_status()
         return video_response.content
 
+    _upload_route = "/media/upload/binary"
+    _media_scalar_keys = ("image", "input_reference", "last_image")
+    _media_list_keys = ("reference_images", "reference_audios")
+
+    async def async_prepare_request_media(
+        self,
+        optional_params: dict,
+        *,
+        api_key: Optional[str],
+        api_base: str,
+        headers: dict,
+        client: AsyncHTTPHandler,
+    ) -> dict:
+        key = api_key or get_secret_str("WAVESPEED_API_KEY")
+        if not key:
+            return optional_params
+        upload_url = f"{api_base.rstrip('/')}{self._upload_route}"
+        mapping: Dict[str, Optional[str]] = {}
+        for value in self._collect_data_urls(optional_params):
+            if value in mapping:
+                continue
+            try:
+                name, raw, mime = self._decode_data_url(value)
+                resp = await client.post(
+                    upload_url,
+                    headers={"Authorization": self._bearer(key)},
+                    files={"file": (name, raw, mime)},
+                )
+                resp.raise_for_status()
+                mapping[value] = self._require_download_url(resp.json())
+            except Exception as e:
+                verbose_logger.warning("WaveSpeed media upload failed, dropping reference: %s", e)
+                mapping[value] = None
+        return self._apply_media_mapping(optional_params, mapping)
+
+    def prepare_request_media(
+        self,
+        optional_params: dict,
+        *,
+        api_key: Optional[str],
+        api_base: str,
+        headers: dict,
+        client: HTTPHandler,
+    ) -> dict:
+        key = api_key or get_secret_str("WAVESPEED_API_KEY")
+        if not key:
+            return optional_params
+        upload_url = f"{api_base.rstrip('/')}{self._upload_route}"
+        mapping: Dict[str, Optional[str]] = {}
+        for value in self._collect_data_urls(optional_params):
+            if value in mapping:
+                continue
+            try:
+                name, raw, mime = self._decode_data_url(value)
+                resp = client.post(
+                    upload_url,
+                    headers={"Authorization": self._bearer(key)},
+                    files={"file": (name, raw, mime)},
+                )
+                resp.raise_for_status()
+                mapping[value] = self._require_download_url(resp.json())
+            except Exception as e:
+                verbose_logger.warning("WaveSpeed media upload failed, dropping reference: %s", e)
+                mapping[value] = None
+        return self._apply_media_mapping(optional_params, mapping)
+
+    def _collect_data_urls(self, optional_params: dict) -> list:
+        out: list = []
+        for k in self._media_scalar_keys:
+            v = optional_params.get(k)
+            if isinstance(v, str) and v.startswith("data:"):
+                out.append(v)
+        for k in self._media_list_keys:
+            for v in optional_params.get(k) or []:
+                if isinstance(v, str) and v.startswith("data:"):
+                    out.append(v)
+        return out
+
+    def _apply_media_mapping(self, optional_params: dict, mapping: Dict[str, Optional[str]]) -> dict:
+        for k in self._media_scalar_keys:
+            v = optional_params.get(k)
+            if isinstance(v, str) and v in mapping:
+                hosted = mapping[v]
+                if hosted is None:
+                    optional_params.pop(k, None)
+                else:
+                    optional_params[k] = hosted
+        for k in self._media_list_keys:
+            vals = optional_params.get(k)
+            if not isinstance(vals, list):
+                continue
+            rebuilt = [mapping[v] if isinstance(v, str) and v in mapping else v for v in vals]
+            rebuilt = [v for v in rebuilt if v is not None]
+            if rebuilt:
+                optional_params[k] = rebuilt
+            else:
+                optional_params.pop(k, None)
+        return optional_params
+
+    @staticmethod
+    def _bearer(key: str) -> str:
+        return key if str(key).lower().startswith("bearer ") else f"Bearer {key}"
+
+    @staticmethod
+    def _decode_data_url(value: str) -> Tuple[str, bytes, str]:
+        import base64
+
+        header, _, b64 = value.partition(",")
+        mime = "application/octet-stream"
+        if header.startswith("data:"):
+            mime = header[len("data:") :].split(";", 1)[0] or mime
+        raw = base64.b64decode(b64)
+        ext = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+            "audio/mpeg": "mp3",
+            "audio/mp4": "m4a",
+            "audio/wav": "wav",
+        }.get(mime, "bin")
+        return f"reference.{ext}", raw, mime
+
+    @staticmethod
+    def _require_download_url(payload: Any) -> str:
+        data = payload.get("data") if isinstance(payload, dict) else None
+        candidates = [
+            data.get("download_url") if isinstance(data, dict) else None,
+            data.get("url") if isinstance(data, dict) else None,
+            payload.get("url") if isinstance(payload, dict) else None,
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, str) and candidate.startswith(("http://", "https://")):
+                return candidate
+        raise ValueError("no http(s) download_url in WaveSpeed upload response")
+
     def transform_video_remix_request(
         self,
         video_id: str,
@@ -367,6 +517,13 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
     def _aspect_ratio(size: str) -> str:
         width, height = (int(part) for part in size.lower().split("x", 1))
         return "9:16" if height >= width else "16:9"
+
+    @staticmethod
+    def _normalize_resolution(value: Any) -> Optional[str]:
+        token = str(value).strip().lower()
+        if token in ("480p", "720p", "1080p"):
+            return token
+        return {"1k": "720p", "2k": "1080p", "4k": "1080p"}.get(token)
 
     @staticmethod
     def _resolution(size: str) -> str:
