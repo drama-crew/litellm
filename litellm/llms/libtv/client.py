@@ -5,6 +5,8 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+import httpx
+
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 
 from .common import (
@@ -206,6 +208,8 @@ class LibTVClient:
         poll_interval: float = 3.0,
         poll_max_attempts: int = 200,
         request_timeout: float = 60.0,
+        http_get=None,
+        http_put=None,
     ):
         self.token = token
         self.webid = webid
@@ -215,6 +219,11 @@ class LibTVClient:
         self.poll_interval = poll_interval
         self.poll_max_attempts = poll_max_attempts
         self.request_timeout = request_timeout
+        # Presigned object-store GET/PUT seams; default to bare httpx so the verbatim url
+        # reaches the store (the litellm http client breaks the signature on the async
+        # path). Injectable for tests.
+        self._http_get = http_get
+        self._http_put = http_put
         self._tool_spec_cache: Optional[Dict[str, Dict[str, Any]]] = None
         self._user_uuid: Optional[str] = None
 
@@ -258,10 +267,10 @@ class LibTVClient:
         data = init.get("data") or {}
         for i, part in enumerate(data.get("parts") or []):
             chunk = buffer[i * BRIDGE_PART_SIZE : (i + 1) * BRIDGE_PART_SIZE]
-            put_resp = self.sync_client.put(url=part["url"], content=chunk, timeout=self.request_timeout)
-            if put_resp.status_code not in (200, 204):
+            put_status = self._put_bytes(part["url"], chunk)
+            if put_status not in (200, 204):
                 raise LibTVError(
-                    status_code=put_resp.status_code, message=f"libtv upload part {part.get('partNumber')} failed"
+                    status_code=put_status, message=f"libtv upload part {part.get('partNumber')} failed"
                 )
         complete = self._check(
             self.sync_client.post(
@@ -301,10 +310,10 @@ class LibTVClient:
         data = init.get("data") or {}
         for i, part in enumerate(data.get("parts") or []):
             chunk = buffer[i * BRIDGE_PART_SIZE : (i + 1) * BRIDGE_PART_SIZE]
-            put_resp = await self.async_client.put(url=part["url"], content=chunk, timeout=self.request_timeout)
-            if put_resp.status_code not in (200, 204):
+            put_status = await asyncio.to_thread(self._put_bytes, part["url"], chunk)
+            if put_status not in (200, 204):
                 raise LibTVError(
-                    status_code=put_resp.status_code, message=f"libtv upload part {part.get('partNumber')} failed"
+                    status_code=put_status, message=f"libtv upload part {part.get('partNumber')} failed"
                 )
         complete = self._check(
             await self.async_client.post(
@@ -413,8 +422,15 @@ class LibTVClient:
         raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
 
     def _fetch_bytes(self, url: str) -> bytes:
-        assert self.sync_client is not None, "sync_client required"
-        resp = self.sync_client.get(url=url)
+        # Bare httpx, not the litellm http client wrappers: the async wrapper injects
+        # default headers that break the presigned object-store signature (it returns
+        # 403 for a url the sync client fetches fine). Restrict to http(s) so a
+        # reference url cannot read local files.
+        if self._http_get is not None:
+            return self._http_get(url)
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise LibTVError(status_code=400, message="libtv reference url must be http(s)")
+        resp = httpx.get(url, follow_redirects=True, timeout=self.request_timeout)
         if resp.status_code != 200:
             raise LibTVError(status_code=resp.status_code, message=f"libtv reference fetch HTTP {resp.status_code}")
         return resp.content
@@ -505,11 +521,17 @@ class LibTVClient:
         raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
 
     async def _afetch_bytes(self, url: str) -> bytes:
-        assert self.async_client is not None, "async_client required"
-        resp = await self.async_client.get(url=url)
-        if resp.status_code != 200:
-            raise LibTVError(status_code=resp.status_code, message=f"libtv reference fetch HTTP {resp.status_code}")
-        return resp.content
+        return await asyncio.to_thread(self._fetch_bytes, url)
+
+    def _put_bytes(self, url: str, data: bytes) -> int:
+        # See _fetch_bytes: the presigned PUT must carry no extra headers (raw body
+        # only) or the object store rejects the signature, so use bare httpx with
+        # content= (sends no Content-Type) rather than the litellm wrappers.
+        if self._http_put is not None:
+            return self._http_put(url, data)
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise LibTVError(status_code=400, message="libtv upload url must be http(s)")
+        return httpx.put(url, content=data, timeout=self.request_timeout).status_code
 
     async def _alibtv_cdn_url(self, kind: str, url: str, data: Optional[bytes]) -> str:
         if kind == "url":

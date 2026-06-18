@@ -206,13 +206,9 @@ class UploadFake:
             return FakeResponse({"code": 0, "data": {"cdnUrl": "https://libtv-res/uploaded.png"}})
         raise AssertionError(f"unexpected POST {url}")
 
-    def put(self, url, content=None, timeout=None, headers=None):
-        self.calls.append(("PUT", url, len(content) if content else 0, None))
-
-        class _R:
-            status_code = self.put_status
-
-        return _R()
+    def put_bytes(self, url, data):
+        self.calls.append(("PUT", url, len(data) if data else 0, None))
+        return self.put_status
 
 
 def test_build_upload_path():
@@ -238,7 +234,7 @@ def test_resolve_user_uuid_caches():
 
 def test_upload_media_orchestrates_init_put_complete():
     fake = UploadFake()
-    lt = LibTVClient(token="t", webid="w", sync_client=fake)
+    lt = LibTVClient(token="t", webid="w", sync_client=fake, http_put=fake.put_bytes)
     url = lt.upload_media(b"\x89PNG-bytes", "ref.png")
     assert url == "https://libtv-res/uploaded.png"
     methods_urls = [(m, u) for m, u, *_ in fake.calls]
@@ -254,7 +250,8 @@ def test_upload_media_orchestrates_init_put_complete():
 
 
 def test_upload_media_raises_on_put_failure():
-    lt = LibTVClient(token="t", webid="w", sync_client=UploadFake(put_status=403))
+    fake = UploadFake(put_status=403)
+    lt = LibTVClient(token="t", webid="w", sync_client=fake, http_put=fake.put_bytes)
     with pytest.raises(LibTVError):
         lt.upload_media(b"x", "ref.png")
 
