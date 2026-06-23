@@ -17,11 +17,24 @@ LIBTV_PROVIDER = "libtv"
 
 from .client import LibTVClient
 from .common import LibTVError, resolve_libtv_credentials
-from .transform import build_generation_params
+from .transform import _resolution_from_size, build_generation_params
 
 
 def _project_name(model: str) -> str:
     return f"litellm-{model}-{int(time.time())}"
+
+
+def _video_usage(optional_params: dict) -> Optional[dict]:
+    """duration_seconds + video_resolution for cost calc; None when no duration."""
+    try:
+        duration_seconds = float(optional_params.get("seconds") or optional_params.get("duration"))
+    except (TypeError, ValueError):
+        return None
+    usage: dict = {"duration_seconds": duration_seconds}
+    resolution = optional_params.get("resolution") or _resolution_from_size(optional_params.get("size"))
+    if resolution:
+        usage["video_resolution"] = resolution
+    return usage
 
 
 def _resolve_mode(optional_params: dict, default_mode: str) -> str:
@@ -122,13 +135,14 @@ class LibTVLLM(CustomLLM):
             poll_max_attempts=self.poll_max_attempts,
         )
 
-    def _build_video_object(self, model: str, result: dict) -> VideoObject:
+    def _build_video_object(self, model: str, result: dict, optional_params: Optional[dict] = None) -> VideoObject:
         urls = result.get("urls") or []
         url = urls[0] if urls else ""
         # Encode the result url + provider into the video id so the proxy routes
         # subsequent /v1/videos/{id} status and /content calls back to libtv.
         video_id = encode_video_id_with_provider(url, LIBTV_PROVIDER) if url else result.get("task_id", "")
         vo = VideoObject(id=video_id, object="video", status="completed", model=model)
+        vo.usage = _video_usage(optional_params or {})
         vo._hidden_params = {
             "libtv_video_urls": urls,
             "url": url or None,
@@ -295,7 +309,7 @@ class LibTVLLM(CustomLLM):
                 params, mode, [url_for(r) for r in images], [url_for(r) for r in videos], [url_for(r) for r in audios]
             )
         result = lt.generate(model, spec["vendor"], "video", params, _project_name(model))
-        return self._build_video_object(model, result)
+        return self._build_video_object(model, result, optional_params)
 
     async def avideo_generation(
         self,
@@ -336,4 +350,4 @@ class LibTVLLM(CustomLLM):
                 [await url_for(r) for r in audios],
             )
         result = await lt.agenerate(model, spec["vendor"], "video", params, _project_name(model))
-        return self._build_video_object(model, result)
+        return self._build_video_object(model, result, optional_params)

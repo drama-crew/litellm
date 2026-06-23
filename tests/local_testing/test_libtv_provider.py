@@ -702,7 +702,9 @@ def _compliance_routes(verify_passed=True):
         "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
         "/api/task/generation/progress": {
             "code": 0,
-            "data": {"progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]},
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
         },
     }
 
@@ -745,14 +747,14 @@ def test_non_compliance_model_keeps_raw_imagelist_no_verify():
         "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
         "/api/task/generation/progress": {
             "code": 0,
-            "data": {"progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]},
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
         },
     }
     fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(auto_compliance=False))
     llm = LibTVLLM(poll_interval=0)
-    vo = llm.video_generation(
-        "star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
-    )
+    vo = llm.video_generation("star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake)
     assert vo.status == "completed"
     paths = [c[0] for c in fake.calls]
     assert "/api/community/image/verify" not in paths
@@ -784,9 +786,60 @@ def test_compliance_exempt_image_keeps_cdn_url_not_asset():
     }
     fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload())
     llm = LibTVLLM(poll_interval=0)
-    vo = llm.video_generation(
-        "star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
-    )
+    vo = llm.video_generation("star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake)
     assert vo.status == "completed"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "type": "image"}]
+
+
+# --- video usage -> resolution-tiered cost (authoritative spend line) ---------
+from litellm.llms.libtv.handler import _video_usage  # noqa: E402
+from litellm.llms.openai.cost_calculation import video_generation_cost  # noqa: E402
+
+
+def test_video_usage_carries_duration_and_resolution():
+    assert _video_usage({"resolution": "720p", "seconds": 8}) == {
+        "duration_seconds": 8.0,
+        "video_resolution": "720p",
+    }
+    # resolution inferred from size when not given explicitly
+    assert _video_usage({"size": "1920x1080", "duration": 5}) == {
+        "duration_seconds": 5.0,
+        "video_resolution": "1080p",
+    }
+    # no duration -> no usage (cost calc would otherwise bill 0 anyway)
+    assert _video_usage({"resolution": "720p"}) is None
+
+
+def test_build_video_object_populates_usage():
+    vo = LibTVLLM()._build_video_object(
+        "seedance-2.0",
+        {"urls": ["http://x/v.mp4"]},
+        {"resolution": "1080p", "seconds": 8},
+    )
+    assert vo.usage == {"duration_seconds": 8.0, "video_resolution": "1080p"}
+
+
+def test_libtv_video_cost_is_resolution_tiered():
+    # The deployment model_info (litellm-config.yaml) carries the per-resolution
+    # tiers; with the usage above, litellm bills $/second@resolution x seconds.
+    model_info = {
+        "mode": "video_generation",
+        "output_cost_per_second_480p": 0.12,
+        "output_cost_per_second_720p": 0.24,
+        "output_cost_per_second_1080p": 0.60,
+    }
+    assert video_generation_cost(
+        model="seedance-2.0",
+        duration_seconds=8.0,
+        custom_llm_provider="libtv",
+        model_info=model_info,
+        video_resolution="1080p",
+    ) == pytest.approx(4.80)
+    assert video_generation_cost(
+        model="seedance-2.0",
+        duration_seconds=5.0,
+        custom_llm_provider="libtv",
+        model_info=model_info,
+        video_resolution="720p",
+    ) == pytest.approx(1.20)
