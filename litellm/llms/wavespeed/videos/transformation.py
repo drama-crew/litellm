@@ -34,8 +34,9 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
     3. GET /predictions/{task_id}/result polls status and, when complete,
        returns the output video URL(s) which are then downloaded.
 
-    The route is derived from the model id (slug) and whether a first-frame
-    image is present: an image routes image-to-video, otherwise text-to-video.
+    The route is derived from the model id (slug) and the request content: a
+    reference video routes video-edit (the driving video is sent as ``video``),
+    else a first-frame image routes image-to-video, else text-to-video.
     """
 
     default_api_base = "https://api.wavespeed.ai/api/v3"
@@ -59,6 +60,10 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
     def _text_to_video_route(cls, model: str) -> str:
         return f"/bytedance/{cls._model_slug(model)}/text-to-video"
 
+    @classmethod
+    def _video_edit_route(cls, model: str) -> str:
+        return f"/bytedance/{cls._model_slug(model)}/video-edit"
+
     def get_supported_openai_params(self, model: str) -> list:
         return [
             "model",
@@ -67,6 +72,7 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
             "image",
             "last_image",
             "reference_images",
+            "reference_videos",
             "reference_audios",
             "generate_audio",
             "aspect_ratio",
@@ -93,6 +99,8 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
             mapped["last_image"] = params["last_image"]
         if params.get("reference_images"):
             mapped["reference_images"] = list(params["reference_images"])
+        if params.get("reference_videos"):
+            mapped["reference_videos"] = list(params["reference_videos"])
         if params.get("reference_audios"):
             mapped["reference_audios"] = list(params["reference_audios"])
         if params.get("generate_audio") is not None:
@@ -173,7 +181,13 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
     ) -> Tuple[Dict, RequestFiles, str]:
         params = self.map_openai_params(video_create_optional_request_params, model, drop_params=False)
         data: Dict[str, Any] = {"prompt": prompt, **params}
-        if data.get("image"):
+        reference_videos = data.pop("reference_videos", None)
+        if reference_videos:
+            data["video"] = reference_videos[0]
+            route = self._video_edit_route(model)
+            for key in ("image", "last_image"):
+                data.pop(key, None)
+        elif data.get("image"):
             route = self._image_to_video_route(model)
             for key in ("reference_images", "reference_audios"):
                 data.pop(key, None)

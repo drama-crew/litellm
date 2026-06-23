@@ -708,3 +708,88 @@ def test_async_prepare_request_media_uploads_data_url():
     )
     assert out["reference_images"] == ["https://ws.host/x.png"]
     assert len(client.calls) == 1
+
+
+def test_wavespeed_reference_videos_in_supported_params() -> None:
+    # litellm core drops any param not advertised here, so reference_videos must
+    # be supported or mixed2video's driving video never reaches the fallback.
+    config = WaveSpeedVideoConfig()
+    assert "reference_videos" in config.get_supported_openai_params("bytedance/seedance-2.0")
+
+
+def test_wavespeed_reference_video_routes_to_video_edit() -> None:
+    # mixed2video fallback: a reference VIDEO must route to the video-edit
+    # endpoint with the driving video in the single `video` field, keeping
+    # reference_images for style/character guidance. The plural reference_videos
+    # is not a wavespeed wire field and must not leak; image/last_image absent.
+    config = WaveSpeedVideoConfig()
+    data, files, url = config.transform_video_create_request(
+        model="bytedance/seedance-2.0",
+        prompt="把整体色调改成梦幻蓝紫色",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={
+            "reference_videos": ["https://assets.local/clip.mp4"],
+            "reference_images": ["https://assets.local/ref.png"],
+            "seconds": "5",
+            "resolution": "720p",
+        },
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+
+    assert files == []
+    assert url == "https://api.wavespeed.ai/api/v3/bytedance/seedance-2.0/video-edit"
+    assert data["prompt"] == "把整体色调改成梦幻蓝紫色"
+    assert data["video"] == "https://assets.local/clip.mp4"
+    assert data["reference_images"] == ["https://assets.local/ref.png"]
+    assert "reference_videos" not in data
+    assert "image" not in data
+    assert "last_image" not in data
+
+
+def test_wavespeed_reference_video_video_edit_fast_slug() -> None:
+    config = WaveSpeedVideoConfig()
+    _data, _files, url = config.transform_video_create_request(
+        model="bytedance/seedance-2.0-fast",
+        prompt="edit",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={
+            "reference_videos": ["https://assets.local/clip.mp4"],
+        },
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+    assert url == ("https://api.wavespeed.ai/api/v3/bytedance/seedance-2.0-fast/video-edit")
+
+
+def test_wavespeed_no_reference_video_still_image_to_video() -> None:
+    # Regression: with a first frame and NO reference video, behaviour is unchanged.
+    config = WaveSpeedVideoConfig()
+    data, _files, url = config.transform_video_create_request(
+        model="bytedance/seedance-2.0",
+        prompt="p",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={
+            "input_reference": "https://assets.local/first.png",
+        },
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+    assert url == "https://api.wavespeed.ai/api/v3/bytedance/seedance-2.0/image-to-video"
+    assert data["image"] == "https://assets.local/first.png"
+    assert "video" not in data
+
+
+def test_wavespeed_no_reference_video_still_text_to_video() -> None:
+    # Regression: no first frame, no reference video → text-to-video.
+    config = WaveSpeedVideoConfig()
+    _data, _files, url = config.transform_video_create_request(
+        model="bytedance/seedance-2.0",
+        prompt="p",
+        api_base="https://api.wavespeed.ai/api/v3",
+        video_create_optional_request_params={"seconds": "5"},
+        litellm_params=GenericLiteLLMParams(api_key="test-key"),
+        headers={},
+    )
+    assert url == "https://api.wavespeed.ai/api/v3/bytedance/seedance-2.0/text-to-video"
+    assert "video" not in _data
