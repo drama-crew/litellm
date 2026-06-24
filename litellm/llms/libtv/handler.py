@@ -15,6 +15,8 @@ from litellm.types.videos.utils import (
 
 LIBTV_PROVIDER = "libtv"
 
+_REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
+
 from .client import LibTVClient
 from .common import LibTVError, resolve_libtv_credentials
 from .transform import _resolution_from_size, build_generation_params
@@ -113,10 +115,12 @@ def _auto_compliance_enabled(spec: dict) -> bool:
 
 
 class LibTVLLM(CustomLLM):
-    def __init__(self, poll_interval: float = 3.0, poll_max_attempts: int = 200):
+    def __init__(self, poll_interval: float = 3.0, poll_max_attempts: int = 200, http_get=None, http_put=None):
         super().__init__()
         self.poll_interval = poll_interval
         self.poll_max_attempts = poll_max_attempts
+        self._http_get = http_get
+        self._http_put = http_put
 
     def _make_client(
         self,
@@ -133,6 +137,8 @@ class LibTVLLM(CustomLLM):
             async_client=async_client,
             poll_interval=self.poll_interval,
             poll_max_attempts=self.poll_max_attempts,
+            http_get=self._http_get,
+            http_put=self._http_put,
         )
 
     def _build_video_object(self, model: str, result: dict, optional_params: Optional[dict] = None) -> VideoObject:
@@ -289,9 +295,9 @@ class LibTVLLM(CustomLLM):
         spec = lt.resolve_model_spec(model)
         images, videos, audios = _collect_reference_groups(optional_params)
 
-        def url_for(ref):
+        def url_for(ref, default_name):
             p = _reference_payload(ref)
-            return p[1] if p[0] == "url" else lt.upload_media(p[2], p[1])
+            return lt.ensure_libtv_url(p[0], p[1], p[2], default_name)
 
         if images and _auto_compliance_enabled(spec):
             image_refs = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
@@ -299,14 +305,18 @@ class LibTVLLM(CustomLLM):
             params["autoCompliance"] = 1
             params["mixedList"] = (
                 [{"url": r, "type": "image"} for r in image_refs]
-                + [{"url": url_for(r), "type": "video"} for r in videos]
-                + [{"url": url_for(r), "type": "audio"} for r in audios]
+                + [{"url": url_for(r, _REF_DEFAULT_NAME["video"]), "type": "video"} for r in videos]
+                + [{"url": url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
             )
         else:
             mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
             params = build_generation_params(prompt, optional_params, spec, mode)
             self._apply_video_references(
-                params, mode, [url_for(r) for r in images], [url_for(r) for r in videos], [url_for(r) for r in audios]
+                params,
+                mode,
+                [url_for(r, _REF_DEFAULT_NAME["image"]) for r in images],
+                [url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
+                [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
         result = lt.generate(model, spec["vendor"], "video", params, _project_name(model))
         return self._build_video_object(model, result, optional_params)
@@ -326,9 +336,9 @@ class LibTVLLM(CustomLLM):
         spec = await lt.aresolve_model_spec(model)
         images, videos, audios = _collect_reference_groups(optional_params)
 
-        async def url_for(ref):
+        async def url_for(ref, default_name):
             p = _reference_payload(ref)
-            return p[1] if p[0] == "url" else await lt.aupload_media(p[2], p[1])
+            return await lt.aensure_libtv_url(p[0], p[1], p[2], default_name)
 
         if images and _auto_compliance_enabled(spec):
             image_refs = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
@@ -336,8 +346,8 @@ class LibTVLLM(CustomLLM):
             params["autoCompliance"] = 1
             params["mixedList"] = (
                 [{"url": r, "type": "image"} for r in image_refs]
-                + [{"url": await url_for(r), "type": "video"} for r in videos]
-                + [{"url": await url_for(r), "type": "audio"} for r in audios]
+                + [{"url": await url_for(r, _REF_DEFAULT_NAME["video"]), "type": "video"} for r in videos]
+                + [{"url": await url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
             )
         else:
             mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
@@ -345,9 +355,9 @@ class LibTVLLM(CustomLLM):
             self._apply_video_references(
                 params,
                 mode,
-                [await url_for(r) for r in images],
-                [await url_for(r) for r in videos],
-                [await url_for(r) for r in audios],
+                [await url_for(r, _REF_DEFAULT_NAME["image"]) for r in images],
+                [await url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
+                [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
         result = await lt.agenerate(model, spec["vendor"], "video", params, _project_name(model))
         return self._build_video_object(model, result, optional_params)

@@ -208,7 +208,13 @@ class UploadFake:
 
     def put_bytes(self, url, data):
         self.calls.append(("PUT", url, len(data) if data else 0, None))
+        self.put_data = (self.put_data if hasattr(self, "put_data") else []) + [bytes(data or b"")]
         return self.put_status
+
+
+class AsyncUploadFake(UploadFake):
+    async def post(self, url, json=None, headers=None, timeout=None):
+        return UploadFake.post(self, url, json, headers, timeout)
 
 
 def test_build_upload_path():
@@ -843,3 +849,140 @@ def test_libtv_video_cost_is_resolution_tiered():
         model_info=model_info,
         video_resolution="720p",
     ) == pytest.approx(1.20)
+
+
+# --- reference media must be uploaded into the libtv project before generation -------
+# libtv (canvas/star-video2) cannot fetch arbitrary external presigned urls; every
+# reference (image/video/audio) must first land on libtv-res.liblib.art. Only the
+# portrait image path uploaded before; videos/audios and non-compliance images leaked
+# the external url verbatim. These lock the upload-before-generate contract.
+
+_EXT_VIDEO = "https://minio.internal/bucket/clip.mp4?X-Amz-Signature=abc"
+_LIBTV_UPLOADED = "https://libtv-res.liblib.art/upload-images/user-1/deadbeef.mp4"
+
+
+class _FullSyncFake:
+    """libtv api routes by path + passport getUserInfo + bridge init/complete by url substring."""
+
+    def __init__(self, api_routes, get_payload=None, upload_cdn=_LIBTV_UPLOADED):
+        self.api_routes = api_routes
+        self.get_payload = get_payload
+        self.upload_cdn = upload_cdn
+        self.calls = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append((url, json))
+        if "getUserInfo" in url:
+            return FakeResponse({"code": 0, "data": {"uuid": "user-1"}})
+        if url.endswith("/init/4"):
+            return FakeResponse(
+                {"code": 0, "data": {"uploadId": "up", "parts": [{"partNumber": 1, "url": "https://oss/put/1"}]}}
+            )
+        if url.endswith("/complete/4"):
+            return FakeResponse({"code": 0, "data": {"cdnUrl": self.upload_cdn}})
+        queue = self.api_routes[url.split("api.liblib.tv", 1)[-1]]
+        return FakeResponse(queue.pop(0) if isinstance(queue, list) else queue)
+
+    def get(self, url, headers=None, timeout=None, params=None):
+        self.calls.append((url, None))
+        return FakeResponse(self.get_payload)
+
+
+class _FullAsyncFake(_FullSyncFake):
+    async def post(self, url, json=None, headers=None, timeout=None):
+        return _FullSyncFake.post(self, url, json, headers, timeout)
+
+    async def get(self, url, headers=None, params=None):
+        return _FullSyncFake.get(self, url, headers, None, params)
+
+
+def _gen_params(calls):
+    return next(j["params"] for u, j in calls if u.endswith("/api/task/generation/create"))
+
+
+def test_ensure_libtv_url_uploads_external_url_and_keeps_extension():
+    fake = UploadFake()
+    lt = LibTVClient(
+        token="t", webid="w", sync_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"VIDEOBYTES"
+    )
+    out = lt.ensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+    assert out == "https://libtv-res/uploaded.png"  # UploadFake's complete cdnUrl
+    init_body = next(c[2] for c in fake.calls if c[1].endswith("/init/4"))
+    assert init_body["path"].endswith(".mp4")  # extension derived from clip.mp4, not hardcoded .png
+    assert fake.put_data == [b"VIDEOBYTES"]  # the fetched external bytes are what got uploaded
+
+
+def test_ensure_libtv_url_passes_through_libtv_res_url_without_upload():
+    fake = UploadFake()
+    lt = LibTVClient(token="t", webid="w", sync_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"x")
+    url = "https://libtv-res.liblib.art/upload-images/uid/abc.png"
+    assert lt.ensure_libtv_url("url", url, None, "reference.png") == url
+    assert fake.calls == []  # no getUserInfo / init / put / complete at all
+
+
+def test_ensure_libtv_url_falls_back_to_default_name_when_no_extension():
+    fake = UploadFake()
+    lt = LibTVClient(
+        token="t", webid="w", sync_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"b"
+    )
+    lt.ensure_libtv_url("url", "https://host/path/noext?sig=1", None, "reference.mp4")
+    init_body = next(c[2] for c in fake.calls if c[1].endswith("/init/4"))
+    assert init_body["path"].endswith(".mp4")  # default name's extension
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_uploads_external_url():
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t", webid="w", async_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"VID"
+    )
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+    assert out == "https://libtv-res/uploaded.png"
+    init_body = next(c[2] for c in fake.calls if str(c[1]).endswith("/init/4"))
+    assert init_body["path"].endswith(".mp4")
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_uploads_external_reference_video_in_compliance_branch():
+    fake = _FullAsyncFake(_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"VID", http_put=lambda u, d: 200)
+    vo = await llm.avideo_generation(
+        "star-video2",
+        "edit it",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "reference_videos": [_EXT_VIDEO], "modeType": "mixed2video"},
+        None,
+        client=fake,
+    )
+    assert vo.status == "completed"
+    mixed = _gen_params(fake.calls)["mixedList"]
+    # portrait image stays asset://, external video is uploaded to libtv (no raw external url)
+    assert {"url": "asset://asset-AAA", "type": "image"} in mixed
+    assert {"url": _LIBTV_UPLOADED, "type": "video"} in mixed
+    assert all("minio.internal" not in m["url"] for m in mixed)
+
+
+def test_video_generation_uploads_external_reference_image_non_compliance_model():
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+    fake = _FullSyncFake(
+        routes, get_payload=_tool_spec_payload(auto_compliance=False), upload_cdn="https://libtv-res.liblib.art/up/img.png"
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "image": "https://minio.internal/b/img.png"}, None, client=fake
+    )
+    assert vo.status == "completed"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/img.png"]  # uploaded, not the external url
+    assert "/api/community/image/verify" not in [u.split("api.liblib.tv", 1)[-1] for u, _ in fake.calls]

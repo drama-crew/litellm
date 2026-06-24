@@ -28,6 +28,11 @@ from .common import (
 THIRD_ASSET_POLL_ATTEMPTS = 30
 
 
+def _filename_from_url(url: str, default_name: str) -> str:
+    base = url.split("?", 1)[0].split("#", 1)[0].rsplit("/", 1)[-1]
+    return base if base and "." in base else default_name
+
+
 def parse_upload_url(complete_payload: Dict[str, Any]) -> str:
     data = complete_payload.get("data") or {}
     url = data.get("cdnUrl") or data.get("ossUrl") or data.get("path")
@@ -435,12 +440,15 @@ class LibTVClient:
             raise LibTVError(status_code=resp.status_code, message=f"libtv reference fetch HTTP {resp.status_code}")
         return resp.content
 
-    def _libtv_cdn_url(self, kind: str, url: str, data: Optional[bytes]) -> str:
+    def ensure_libtv_url(self, kind: str, url: str, data: Optional[bytes], default_name: str = "reference.png") -> str:
+        """Return a url libtv can fetch: a libtv-res url passes through, any other reference
+        (external presigned url or raw bytes) is uploaded into the libtv project store first.
+        libtv generation cannot reach arbitrary external presigned object-store urls."""
         if kind == "url":
             if "libtv-res.liblib.art" in url:
                 return url
-            return self.upload_media(self._fetch_bytes(url), "reference.png")
-        return self.upload_media(data or b"", url or "reference.png")
+            return self.upload_media(self._fetch_bytes(url), _filename_from_url(url, default_name))
+        return self.upload_media(data or b"", url or default_name)
 
     def resolve_compliant_image_refs(self, refs: List[tuple]) -> List[str]:
         """For an auto-compliance (portrait-capable) model: ensure each image reference
@@ -448,7 +456,7 @@ class LibTVClient:
         ``asset://<assetId>`` for images the backend issues a verified asset id for
         (portraits), or the libtv cdn url for images it exempts (no real person). Raises
         if any reference fails moderation so the caller can fall back to another provider."""
-        cdn_urls = [self._libtv_cdn_url(kind, url, data) for (kind, url, data) in refs]
+        cdn_urls = [self.ensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
         passed = parse_verify_passed(self._post("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify"))
         resolved: List[str] = []
         for cdn_url in cdn_urls:
@@ -533,15 +541,17 @@ class LibTVClient:
             raise LibTVError(status_code=400, message="libtv upload url must be http(s)")
         return httpx.put(url, content=data, timeout=self.request_timeout).status_code
 
-    async def _alibtv_cdn_url(self, kind: str, url: str, data: Optional[bytes]) -> str:
+    async def aensure_libtv_url(
+        self, kind: str, url: str, data: Optional[bytes], default_name: str = "reference.png"
+    ) -> str:
         if kind == "url":
             if "libtv-res.liblib.art" in url:
                 return url
-            return await self.aupload_media(await self._afetch_bytes(url), "reference.png")
-        return await self.aupload_media(data or b"", url or "reference.png")
+            return await self.aupload_media(await self._afetch_bytes(url), _filename_from_url(url, default_name))
+        return await self.aupload_media(data or b"", url or default_name)
 
     async def aresolve_compliant_image_refs(self, refs: List[tuple]) -> List[str]:
-        cdn_urls = [await self._alibtv_cdn_url(kind, url, data) for (kind, url, data) in refs]
+        cdn_urls = [await self.aensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
         passed = parse_verify_passed(
             await self._apost("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify")
         )
