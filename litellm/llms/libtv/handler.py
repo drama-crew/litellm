@@ -301,11 +301,12 @@ class LibTVLLM(CustomLLM):
 
         if images and _auto_compliance_enabled(spec):
             image_refs = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
+            video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "mixed2video")
             params["autoCompliance"] = 1
             params["mixedList"] = (
                 [{"url": r, "type": "image"} for r in image_refs]
-                + [{"url": url_for(r, _REF_DEFAULT_NAME["video"]), "type": "video"} for r in videos]
+                + [{"url": r, "type": "video"} for r in video_refs]
                 + [{"url": url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
             )
         else:
@@ -342,11 +343,12 @@ class LibTVLLM(CustomLLM):
 
         if images and _auto_compliance_enabled(spec):
             image_refs = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
+            video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "mixed2video")
             params["autoCompliance"] = 1
             params["mixedList"] = (
                 [{"url": r, "type": "image"} for r in image_refs]
-                + [{"url": await url_for(r, _REF_DEFAULT_NAME["video"]), "type": "video"} for r in videos]
+                + [{"url": r, "type": "video"} for r in video_refs]
                 + [{"url": await url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
             )
         else:

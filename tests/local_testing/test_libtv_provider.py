@@ -798,6 +798,88 @@ def test_compliance_exempt_image_keeps_cdn_url_not_asset():
     assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "type": "image"}]
 
 
+_LIBTV_VIDEO = "https://libtv-res.liblib.art/upload-images/uid/clip.mp4"
+
+
+def _mixed_compliance_routes():
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    return {
+        "/api/community/image/verify": {"code": 0, "data": {"list": [{"url": _LIBTV_REF, "riskLabels": risk}]}},
+        "/api/third_asset/create": [
+            {"code": 0, "data": {"uuid": "u-img"}},
+            {"code": 0, "data": {"uuid": "u-vid"}},
+        ],
+        "/api/third_asset/check": [
+            {"code": 0, "data": {"list": [{"uuid": "u-img", "assetId": "asset-IMG", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "status": 0}]}},
+        ],
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+
+
+def test_mixed2video_compliance_registers_reference_video_as_asset():
+    # A video-edit (image + reference video) on a portrait model: the reference VIDEO can
+    # itself show a real person, and the image moderation endpoint cannot score a video, so
+    # the video must reach generation as a registered asset:// id (same path as the portrait
+    # image), never as a raw cdn url, or libtv rejects the whole generation for missing
+    # compliance.
+    fake = FakeSyncClient(post_by_path=_mixed_compliance_routes(), get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "swap the lead",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF], "reference_videos": [_LIBTV_VIDEO]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "completed"
+    creates = [body for path, body in fake.calls if path == "/api/third_asset/create"]
+    assert {c["assetType"] for c in creates} == {"image", "video"}
+    assert next(c for c in creates if c["assetType"] == "video")["assetUrl"] == _LIBTV_VIDEO
+    # image moderation scores only the image; it is never asked to score the video
+    verify_bodies = [body for path, body in fake.calls if path == "/api/community/image/verify"]
+    assert verify_bodies == [{"urlList": [_LIBTV_REF]}]
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["autoCompliance"] == 1
+    assert gen_params["mixedList"] == [
+        {"url": "asset://asset-IMG", "type": "image"},
+        {"url": "asset://asset-VID", "type": "video"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mixed2video_compliance_registers_reference_video_as_asset_async():
+    fake = FakeAsyncClient(post_by_path=_mixed_compliance_routes(), get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = await llm.avideo_generation(
+        "star-video2",
+        "swap the lead",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF], "reference_videos": [_LIBTV_VIDEO]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "completed"
+    creates = [body for path, body in fake.calls if path == "/api/third_asset/create"]
+    assert next(c for c in creates if c["assetType"] == "video")["assetUrl"] == _LIBTV_VIDEO
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["mixedList"] == [
+        {"url": "asset://asset-IMG", "type": "image"},
+        {"url": "asset://asset-VID", "type": "video"},
+    ]
+
+
 # --- video usage -> resolution-tiered cost (authoritative spend line) ---------
 from litellm.llms.libtv.handler import _video_usage  # noqa: E402
 from litellm.llms.openai.cost_calculation import video_generation_cost  # noqa: E402
@@ -902,9 +984,7 @@ def _gen_params(calls):
 
 def test_ensure_libtv_url_uploads_external_url_and_keeps_extension():
     fake = UploadFake()
-    lt = LibTVClient(
-        token="t", webid="w", sync_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"VIDEOBYTES"
-    )
+    lt = LibTVClient(token="t", webid="w", sync_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"VIDEOBYTES")
     out = lt.ensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
     assert out == "https://libtv-res/uploaded.png"  # UploadFake's complete cdnUrl
     init_body = next(c[2] for c in fake.calls if c[1].endswith("/init/4"))
@@ -922,9 +1002,7 @@ def test_ensure_libtv_url_passes_through_libtv_res_url_without_upload():
 
 def test_ensure_libtv_url_falls_back_to_default_name_when_no_extension():
     fake = UploadFake()
-    lt = LibTVClient(
-        token="t", webid="w", sync_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"b"
-    )
+    lt = LibTVClient(token="t", webid="w", sync_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"b")
     lt.ensure_libtv_url("url", "https://host/path/noext?sig=1", None, "reference.mp4")
     init_body = next(c[2] for c in fake.calls if c[1].endswith("/init/4"))
     assert init_body["path"].endswith(".mp4")  # default name's extension
@@ -933,9 +1011,7 @@ def test_ensure_libtv_url_falls_back_to_default_name_when_no_extension():
 @pytest.mark.asyncio
 async def test_aensure_libtv_url_uploads_external_url():
     fake = AsyncUploadFake()
-    lt = LibTVClient(
-        token="t", webid="w", async_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"VID"
-    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, http_put=fake.put_bytes, http_get=lambda u: b"VID")
     out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
     assert out == "https://libtv-res/uploaded.png"
     init_body = next(c[2] for c in fake.calls if str(c[1]).endswith("/init/4"))
@@ -957,10 +1033,16 @@ async def test_avideo_generation_uploads_external_reference_video_in_compliance_
     )
     assert vo.status == "completed"
     mixed = _gen_params(fake.calls)["mixedList"]
-    # portrait image stays asset://, external video is uploaded to libtv (no raw external url)
+    # portrait image stays asset://; the external video is uploaded to libtv and then registered
+    # for compliance, so it reaches generation as asset:// too (never a raw external/cdn url)
     assert {"url": "asset://asset-AAA", "type": "image"} in mixed
-    assert {"url": _LIBTV_UPLOADED, "type": "video"} in mixed
+    assert {"url": "asset://asset-AAA", "type": "video"} in mixed
     assert all("minio.internal" not in m["url"] for m in mixed)
+    # the upload still happens: the video is registered as a third_asset under its libtv cdn url
+    video_create = next(
+        j for u, j in fake.calls if u.endswith("/api/third_asset/create") and j.get("assetType") == "video"
+    )
+    assert video_create["assetUrl"] == _LIBTV_UPLOADED
 
 
 def test_video_generation_uploads_external_reference_image_non_compliance_model():
@@ -976,7 +1058,9 @@ def test_video_generation_uploads_external_reference_image_non_compliance_model(
         },
     }
     fake = _FullSyncFake(
-        routes, get_payload=_tool_spec_payload(auto_compliance=False), upload_cdn="https://libtv-res.liblib.art/up/img.png"
+        routes,
+        get_payload=_tool_spec_payload(auto_compliance=False),
+        upload_cdn="https://libtv-res.liblib.art/up/img.png",
     )
     llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
     vo = llm.video_generation(

@@ -116,7 +116,7 @@ def parse_task_id(payload: Dict[str, Any]) -> str:
 
 def parse_verify_passed(payload: Dict[str, Any]) -> Dict[str, bool]:
     out: Dict[str, bool] = {}
-    for item in ((payload.get("data") or {}).get("list") or []):
+    for item in (payload.get("data") or {}).get("list") or []:
         url = item.get("url")
         if not url:
             continue
@@ -138,7 +138,7 @@ def parse_third_asset_uuid(payload: Dict[str, Any]) -> str:
 
 
 def parse_third_asset_item(payload: Dict[str, Any], asset_uuid: str) -> Optional[Dict[str, Any]]:
-    for item in ((payload.get("data") or {}).get("list") or []):
+    for item in (payload.get("data") or {}).get("list") or []:
         if item.get("uuid") == asset_uuid:
             return item
     return None
@@ -274,9 +274,7 @@ class LibTVClient:
             chunk = buffer[i * BRIDGE_PART_SIZE : (i + 1) * BRIDGE_PART_SIZE]
             put_status = self._put_bytes(part["url"], chunk)
             if put_status not in (200, 204):
-                raise LibTVError(
-                    status_code=put_status, message=f"libtv upload part {part.get('partNumber')} failed"
-                )
+                raise LibTVError(status_code=put_status, message=f"libtv upload part {part.get('partNumber')} failed")
         complete = self._check(
             self.sync_client.post(
                 url=self._bridge_url("complete"),
@@ -317,9 +315,7 @@ class LibTVClient:
             chunk = buffer[i * BRIDGE_PART_SIZE : (i + 1) * BRIDGE_PART_SIZE]
             put_status = await asyncio.to_thread(self._put_bytes, part["url"], chunk)
             if put_status not in (200, 204):
-                raise LibTVError(
-                    status_code=put_status, message=f"libtv upload part {part.get('partNumber')} failed"
-                )
+                raise LibTVError(status_code=put_status, message=f"libtv upload part {part.get('partNumber')} failed")
         complete = self._check(
             await self.async_client.post(
                 url=self._bridge_url("complete"),
@@ -450,6 +446,27 @@ class LibTVClient:
             return self.upload_media(self._fetch_bytes(url), _filename_from_url(url, default_name))
         return self.upload_media(data or b"", url or default_name)
 
+    def _register_compliant_asset(self, cdn_url: str, asset_type: str) -> str:
+        asset_uuid = parse_third_asset_uuid(
+            self._post(
+                "/api/third_asset/create",
+                {"assetUrl": cdn_url, "assetType": asset_type, "version": 1},
+                "third_asset/create",
+            )
+        )
+        for _ in range(THIRD_ASSET_POLL_ATTEMPTS):
+            ref = _asset_ref_from_item(
+                parse_third_asset_item(
+                    self._post("/api/third_asset/check", {"uuids": [asset_uuid]}, "third_asset/check"),
+                    asset_uuid,
+                ),
+                cdn_url,
+            )
+            if ref:
+                return ref
+            time.sleep(self.poll_interval)
+        return cdn_url
+
     def resolve_compliant_image_refs(self, refs: List[tuple]) -> List[str]:
         """For an auto-compliance (portrait-capable) model: ensure each image reference
         clears libtv moderation before generation. Returns one libtv reference per input:
@@ -465,27 +482,19 @@ class LibTVClient:
                     status_code=400,
                     message="libtv portrait compliance check did not pass for a reference image",
                 )
-            asset_uuid = parse_third_asset_uuid(
-                self._post(
-                    "/api/third_asset/create",
-                    {"assetUrl": cdn_url, "assetType": "image", "version": 1},
-                    "third_asset/create",
-                )
-            )
-            ref = None
-            for _ in range(THIRD_ASSET_POLL_ATTEMPTS):
-                ref = _asset_ref_from_item(
-                    parse_third_asset_item(
-                        self._post("/api/third_asset/check", {"uuids": [asset_uuid]}, "third_asset/check"),
-                        asset_uuid,
-                    ),
-                    cdn_url,
-                )
-                if ref:
-                    break
-                time.sleep(self.poll_interval)
-            resolved.append(ref or cdn_url)
+            resolved.append(self._register_compliant_asset(cdn_url, "image"))
         return resolved
+
+    def resolve_compliant_video_refs(self, refs: List[tuple]) -> List[str]:
+        """Companion to resolve_compliant_image_refs for reference videos in a mixed2video
+        edit. The image moderation endpoint cannot score a video (it reports a retry-exhausted
+        error), so a reference video that itself shows a real person never clears moderation
+        while it stays a raw cdn url and libtv rejects the whole generation. Registering it as
+        a third_asset yields the same ``asset://<assetId>`` libtv accepts for portraits."""
+        return [
+            self._register_compliant_asset(self.ensure_libtv_url(kind, url, data), "video")
+            for (kind, url, data) in refs
+        ]
 
     # ---------- async ----------
     async def _apost(self, path: str, body: Dict[str, Any], step: str) -> Dict[str, Any]:
@@ -550,6 +559,27 @@ class LibTVClient:
             return await self.aupload_media(await self._afetch_bytes(url), _filename_from_url(url, default_name))
         return await self.aupload_media(data or b"", url or default_name)
 
+    async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> str:
+        asset_uuid = parse_third_asset_uuid(
+            await self._apost(
+                "/api/third_asset/create",
+                {"assetUrl": cdn_url, "assetType": asset_type, "version": 1},
+                "third_asset/create",
+            )
+        )
+        for _ in range(THIRD_ASSET_POLL_ATTEMPTS):
+            ref = _asset_ref_from_item(
+                parse_third_asset_item(
+                    await self._apost("/api/third_asset/check", {"uuids": [asset_uuid]}, "third_asset/check"),
+                    asset_uuid,
+                ),
+                cdn_url,
+            )
+            if ref:
+                return ref
+            await asyncio.sleep(self.poll_interval)
+        return cdn_url
+
     async def aresolve_compliant_image_refs(self, refs: List[tuple]) -> List[str]:
         cdn_urls = [await self.aensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
         passed = parse_verify_passed(
@@ -562,24 +592,12 @@ class LibTVClient:
                     status_code=400,
                     message="libtv portrait compliance check did not pass for a reference image",
                 )
-            asset_uuid = parse_third_asset_uuid(
-                await self._apost(
-                    "/api/third_asset/create",
-                    {"assetUrl": cdn_url, "assetType": "image", "version": 1},
-                    "third_asset/create",
-                )
-            )
-            ref = None
-            for _ in range(THIRD_ASSET_POLL_ATTEMPTS):
-                ref = _asset_ref_from_item(
-                    parse_third_asset_item(
-                        await self._apost("/api/third_asset/check", {"uuids": [asset_uuid]}, "third_asset/check"),
-                        asset_uuid,
-                    ),
-                    cdn_url,
-                )
-                if ref:
-                    break
-                await asyncio.sleep(self.poll_interval)
-            resolved.append(ref or cdn_url)
+            resolved.append(await self._aregister_compliant_asset(cdn_url, "image"))
+        return resolved
+
+    async def aresolve_compliant_video_refs(self, refs: List[tuple]) -> List[str]:
+        resolved: List[str] = []
+        for kind, url, data in refs:
+            cdn_url = await self.aensure_libtv_url(kind, url, data)
+            resolved.append(await self._aregister_compliant_asset(cdn_url, "video"))
         return resolved
