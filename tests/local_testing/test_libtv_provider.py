@@ -118,6 +118,20 @@ def test_build_params_flat_settings_seedance():
     assert params["duration"] == 8
 
 
+def test_build_params_reads_aspect_ratio_for_ratio():
+    # The drama platform sends the chosen ratio as `aspect_ratio` (the wavespeed key);
+    # libtv must honour it as `ratio` so a portrait source isn't forced to the 16:9
+    # default. An explicit `ratio` still wins; `aspect_ratio` beats size-derived.
+    params = build_generation_params("a cat", {"aspect_ratio": "9:16"}, _SEEDANCE_SPEC, "mixed2video")
+    assert params["ratio"] == "9:16"
+    params2 = build_generation_params(
+        "a cat", {"aspect_ratio": "9:16", "size": "1280x720"}, _SEEDANCE_SPEC, "mixed2video"
+    )
+    assert params2["ratio"] == "9:16"  # aspect_ratio beats size-derived 16:9
+    params3 = build_generation_params("a cat", {"ratio": "1:1", "aspect_ratio": "9:16"}, _SEEDANCE_SPEC, "mixed2video")
+    assert params3["ratio"] == "1:1"  # explicit ratio still wins
+
+
 def test_build_params_filters_to_mode_keys_and_fills_defaults():
     # Wan text2video declares only ratio/resolution/duration; enableSound must NOT appear
     params = build_generation_params("a cat", {"enableSound": "off"}, _WAN_SPEC, "text2video")

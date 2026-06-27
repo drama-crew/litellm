@@ -87,9 +87,10 @@ def build_generation_params(
     props = spec.get("properties") or {}
     size = op.get("size")
 
+    ratio = op.get("ratio") or op.get("aspect_ratio") or size_to_ratio(size)
     candidates: Dict[str, Any] = {
-        "ratio": op.get("ratio") or size_to_ratio(size),
-        "ratio_auto": op.get("ratio") or size_to_ratio(size),
+        "ratio": ratio,
+        "ratio_auto": ratio,
         "resolution": op.get("resolution") or _resolution_from_size(size),
         "resolution_480": op.get("resolution") or _resolution_from_size(size),
         "duration": op.get("seconds") or op.get("duration"),
