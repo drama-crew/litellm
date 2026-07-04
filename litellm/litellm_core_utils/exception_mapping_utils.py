@@ -446,6 +446,8 @@ def exception_type(  # type: ignore  # noqa: PLR0915
                         "request was rejected as a result of the safety system"
                         in error_str.lower()
                     )
+                    or ("rejected by the safety system" in error_str.lower())
+                    or ("moderation_blocked" in error_str.lower())
                 ):
                     exception_mapping_worked = True
                     raise ContentPolicyViolationError(

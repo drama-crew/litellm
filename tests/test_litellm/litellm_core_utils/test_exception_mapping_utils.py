@@ -375,3 +375,52 @@ class TestExtractAndRaiseLitellmException:
         )
 
         assert result is None
+
+
+class TestOpenAIImageModerationMapping:
+    """The OpenAI Images API rejects disallowed prompts (e.g. a real public
+    figure) with HTTP 400, type ``image_generation_user_error`` and code
+    ``moderation_blocked``, whose message reads "Your request was rejected BY
+    the safety system". This must map to ContentPolicyViolationError so callers
+    (and the router's content_policy_fallbacks) can short-circuit instead of
+    replaying the doomed prompt across every fallback provider.
+    """
+
+    @staticmethod
+    def _openai_400(message: str):
+        import httpx
+        import openai
+
+        request = httpx.Request("POST", "http://x/v1/images/generations")
+        response = httpx.Response(400, request=request)
+        return openai.BadRequestError(
+            message=message, response=response, body={"message": message}
+        )
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Error code: 400 - {'error': {'message': 'Your request was rejected "
+            "by the safety system. If you believe this is an error, contact us and "
+            "include the request ID abc-123.', 'type': 'image_generation_user_error', "
+            "'code': 'moderation_blocked'}}",
+            "Your request was rejected by the safety system.",
+            "image_generation_user_error moderation_blocked",
+        ],
+    )
+    def test_openai_image_moderation_maps_to_content_policy(self, message):
+        with pytest.raises(litellm.ContentPolicyViolationError):
+            exception_type(
+                model="gpt-image-2",
+                original_exception=self._openai_400(message),
+                custom_llm_provider="openai",
+            )
+
+    def test_plain_openai_400_is_not_content_policy(self):
+        with pytest.raises(litellm.BadRequestError) as excinfo:
+            exception_type(
+                model="gpt-image-2",
+                original_exception=self._openai_400("Invalid 'size' parameter"),
+                custom_llm_provider="openai",
+            )
+        assert not isinstance(excinfo.value, litellm.ContentPolicyViolationError)
