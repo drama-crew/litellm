@@ -793,3 +793,41 @@ def test_wavespeed_no_reference_video_still_text_to_video() -> None:
     )
     assert url == "https://api.wavespeed.ai/api/v3/bytedance/seedance-2.0/text-to-video"
     assert "video" not in _data
+
+
+def test_wavespeed_video_status_surfaces_failure_error_and_code() -> None:
+    # WaveSpeed reports a content-moderation rejection at poll time as
+    # status=failed with a data.code + data.error (captured live: code 1200,
+    # "Content flagged as potentially sensitive"). Previously the transform
+    # dropped both, so callers saw error=null and could not tell the user why.
+    config = WaveSpeedVideoConfig()
+    video = config.transform_video_status_retrieve_response(
+        raw_response=httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "message": "success",
+                "data": {
+                    "id": "task-9",
+                    "status": "failed",
+                    "code": 1200,
+                    "error": "Content flagged as potentially sensitive. Please try different prompts or images.",
+                },
+            },
+        ),
+        logging_obj=None,
+    )
+    assert video.status == "failed"
+    assert video.error is not None
+    assert "flagged as potentially sensitive" in video.error["message"]
+    assert video.error["code"] == 1200
+
+
+def test_wavespeed_video_status_completed_has_no_error() -> None:
+    config = WaveSpeedVideoConfig()
+    video = config.transform_video_status_retrieve_response(
+        raw_response=httpx.Response(200, json={"data": {"id": "task-9", "status": "completed"}}),
+        logging_obj=None,
+    )
+    assert video.status == "completed"
+    assert video.error is None
