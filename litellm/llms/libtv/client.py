@@ -398,7 +398,7 @@ class LibTVClient:
         )
         return self._check(resp, step)
 
-    def generate(
+    def create(
         self,
         model_key: str,
         vendor: str,
@@ -420,16 +420,29 @@ class LibTVClient:
             build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
             "generation/create",
         )
-        task_id = parse_task_id(created)
+        return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+
+    def poll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
+        progress = self._post("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
+        return parse_progress(progress, task_type)
+
+    def generate(
+        self,
+        model_key: str,
+        vendor: str,
+        task_type: str,
+        params: Dict[str, Any],
+        project_name: str,
+    ) -> Dict[str, Any]:
+        created = self.create(model_key, vendor, task_type, params, project_name)
         for _ in range(self.poll_max_attempts):
-            progress = self._post("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
-            state = parse_progress(progress, task_type)
+            state = self.poll_once(created["task_id"], task_type)
             if state["status"] == 2:
-                return {"urls": state["urls"], "task_id": task_id, "project_uuid": project_uuid, "node_key": node_key}
+                return {"urls": state["urls"], **created}
             if state["status"] == 3:
                 _raise_generation_failed(state["failed_reason"])
             time.sleep(self.poll_interval)
-        raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
+        raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {created['task_id']})")
 
     def _fetch_bytes(self, url: str) -> bytes:
         # Bare httpx, not the litellm http client wrappers: the async wrapper injects
@@ -513,7 +526,7 @@ class LibTVClient:
         )
         return self._check(resp, step)
 
-    async def agenerate(
+    async def acreate(
         self,
         model_key: str,
         vendor: str,
@@ -535,16 +548,29 @@ class LibTVClient:
             build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
             "generation/create",
         )
-        task_id = parse_task_id(created)
+        return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+
+    async def apoll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
+        progress = await self._apost("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
+        return parse_progress(progress, task_type)
+
+    async def agenerate(
+        self,
+        model_key: str,
+        vendor: str,
+        task_type: str,
+        params: Dict[str, Any],
+        project_name: str,
+    ) -> Dict[str, Any]:
+        created = await self.acreate(model_key, vendor, task_type, params, project_name)
         for _ in range(self.poll_max_attempts):
-            progress = await self._apost("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
-            state = parse_progress(progress, task_type)
+            state = await self.apoll_once(created["task_id"], task_type)
             if state["status"] == 2:
-                return {"urls": state["urls"], "task_id": task_id, "project_uuid": project_uuid, "node_key": node_key}
+                return {"urls": state["urls"], **created}
             if state["status"] == 3:
                 _raise_generation_failed(state["failed_reason"])
             await asyncio.sleep(self.poll_interval)
-        raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
+        raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {created['task_id']})")
 
     async def _afetch_bytes(self, url: str) -> bytes:
         return await asyncio.to_thread(self._fetch_bytes, url)

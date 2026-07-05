@@ -17,15 +17,20 @@ LIBTV_PROVIDER = "libtv"
 
 _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
 
-from litellm.exceptions import ContentPolicyViolationError
-
 from .client import LibTVClient
-from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
+from .common import LibTVError, resolve_libtv_credentials
 from .transform import _resolution_from_size, build_generation_params
 
+# libtv progress status -> OpenAI-style video status. Non-terminal codes keep the
+# client polling; the app treats completed as done and failed as a terminal error.
+_LIBTV_STATUS = {0: "queued", 1: "in_progress", 2: "completed", 3: "failed"}
 
-def _as_content_policy(exc: LibTVContentPolicyError, model: str) -> ContentPolicyViolationError:
-    return ContentPolicyViolationError(message=exc.message, model=model, llm_provider=LIBTV_PROVIDER)
+
+def _decode_task_id(video_id: str) -> str:
+    task_id = (decode_video_id_with_provider(video_id) or {}).get("video_id") or ""
+    if not task_id:
+        raise LibTVError(status_code=400, message="libtv video id does not carry a task id")
+    return task_id
 
 
 def _project_name(model: str) -> str:
@@ -147,27 +152,37 @@ class LibTVLLM(CustomLLM):
             http_put=self._http_put,
         )
 
-    def _build_video_object(self, model: str, result: dict, optional_params: Optional[dict] = None) -> VideoObject:
-        urls = result.get("urls") or []
-        url = urls[0] if urls else ""
-        # Encode the result url + provider into the video id so the proxy routes
-        # subsequent /v1/videos/{id} status and /content calls back to libtv.
-        video_id = encode_video_id_with_provider(url, LIBTV_PROVIDER) if url else result.get("task_id", "")
-        vo = VideoObject(id=video_id, object="video", status="completed", model=model)
-        vo.usage = _video_usage(optional_params or {})
-        vo._hidden_params = {
-            "libtv_video_urls": urls,
-            "url": url or None,
-            "project_uuid": result.get("project_uuid"),
-        }
+    def _build_video_object(self, model: str, created: dict, optional_params: Optional[dict] = None) -> VideoObject:
+        op = optional_params or {}
+        # Encode the libtv task id + this deployment's status model into the video
+        # id so the proxy routes subsequent /v1/videos/{id} status and /content
+        # calls back to the SAME libtv account (its token+webid).
+        video_id = encode_video_id_with_provider(created["task_id"], LIBTV_PROVIDER, op.get("libtv_status_model"))
+        vo = VideoObject(id=video_id, object="video", status="queued", model=model)
+        vo.usage = _video_usage(op)
+        vo._hidden_params = {"project_uuid": created.get("project_uuid")}
         return vo
 
-    @staticmethod
-    def _decode_result_url(video_id: str) -> str:
-        url = (decode_video_id_with_provider(video_id) or {}).get("video_id") or ""
-        if not url.startswith("http"):
-            raise LibTVError(status_code=400, message="libtv video id does not carry a result url")
-        return url
+    def _video_status(self, video_id: str, state: dict) -> VideoObject:
+        status = _LIBTV_STATUS.get(state.get("status"), "in_progress")
+        vo = VideoObject(id=video_id, object="video", status=status)
+        if status == "completed":
+            urls = state.get("urls") or []
+            vo._hidden_params = {"url": urls[0] if urls else None, "libtv_video_urls": urls}
+        elif status == "failed":
+            vo.error = {"message": state.get("failed_reason") or "libtv generation failed"}
+        return vo
+
+    def _download(self, http, state: dict) -> bytes:
+        if state.get("status") != 2:
+            raise LibTVError(status_code=409, message="libtv video still processing")
+        urls = state.get("urls") or []
+        if not urls:
+            raise LibTVError(status_code=502, message="libtv video completed without a result url")
+        resp = http.get(url=urls[0])
+        if resp.status_code != 200:
+            raise LibTVError(status_code=resp.status_code, message="libtv video content download failed")
+        return resp.content
 
     def video_status(
         self,
@@ -179,10 +194,8 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[HTTPHandler] = None,
     ) -> VideoObject:
-        url = self._decode_result_url(video_id)
-        vo = VideoObject(id=video_id, object="video", status="completed")
-        vo._hidden_params = {"url": url, "libtv_video_urls": [url]}
-        return vo
+        lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
+        return self._video_status(video_id, lt.poll_once(_decode_task_id(video_id), "video"))
 
     async def avideo_status(
         self,
@@ -194,7 +207,8 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[AsyncHTTPHandler] = None,
     ) -> VideoObject:
-        return self.video_status(video_id, api_key, api_base, optional_params, logging_obj, timeout, None)
+        lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
+        return self._video_status(video_id, await lt.apoll_once(_decode_task_id(video_id), "video"))
 
     def video_content(
         self,
@@ -206,12 +220,9 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[HTTPHandler] = None,
     ) -> bytes:
-        url = self._decode_result_url(video_id)
         http = client or HTTPHandler()
-        resp = http.get(url=url)
-        if resp.status_code != 200:
-            raise LibTVError(status_code=resp.status_code, message="libtv video content download failed")
-        return resp.content
+        lt = self._make_client(api_key, optional_params, sync_client=http)
+        return self._download(http, lt.poll_once(_decode_task_id(video_id), "video"))
 
     async def avideo_content(
         self,
@@ -223,9 +234,15 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[AsyncHTTPHandler] = None,
     ) -> bytes:
-        url = self._decode_result_url(video_id)
         http = client or AsyncHTTPHandler()
-        resp = await http.get(url=url)
+        lt = self._make_client(api_key, optional_params, async_client=http)
+        state = await lt.apoll_once(_decode_task_id(video_id), "video")
+        if state.get("status") != 2:
+            raise LibTVError(status_code=409, message="libtv video still processing")
+        urls = state.get("urls") or []
+        if not urls:
+            raise LibTVError(status_code=502, message="libtv video completed without a result url")
+        resp = await http.get(url=urls[0])
         if resp.status_code != 200:
             raise LibTVError(status_code=resp.status_code, message="libtv video content download failed")
         return resp.content
@@ -325,11 +342,8 @@ class LibTVLLM(CustomLLM):
                 [url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
-        try:
-            result = lt.generate(model, spec["vendor"], "video", params, _project_name(model))
-        except LibTVContentPolicyError as e:
-            raise _as_content_policy(e, model) from e
-        return self._build_video_object(model, result, optional_params)
+        created = lt.create(model, spec["vendor"], "video", params, _project_name(model))
+        return self._build_video_object(model, created, optional_params)
 
     async def avideo_generation(
         self,
@@ -370,8 +384,5 @@ class LibTVLLM(CustomLLM):
                 [await url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
-        try:
-            result = await lt.agenerate(model, spec["vendor"], "video", params, _project_name(model))
-        except LibTVContentPolicyError as e:
-            raise _as_content_policy(e, model) from e
-        return self._build_video_object(model, result, optional_params)
+        created = await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
+        return self._build_video_object(model, created, optional_params)
