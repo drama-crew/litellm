@@ -244,6 +244,8 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         task_id = self._task_id(payload)
         status = self._status(self._raw_status(payload))
         video = VideoObject(id=task_id, object="video", status=status)
+        if status == "failed":
+            video.error = self._error(payload)
         if custom_llm_provider and video.id:
             video.id = encode_video_id_with_provider(video.id, custom_llm_provider, None)
         return video
@@ -497,6 +499,18 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
     def _raw_status(payload: Dict[str, Any]) -> str:
         data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         return str(payload.get("status") or data.get("status") or "queued")
+
+    @staticmethod
+    def _error(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        message = data.get("error") or data.get("message") or payload.get("error")
+        if not message:
+            return None
+        error: Dict[str, Any] = {"message": str(message)}
+        code = data.get("code")
+        if code is not None:
+            error["code"] = code
+        return error
 
     @staticmethod
     def _extract_output_url(payload: Dict[str, Any]) -> str:
