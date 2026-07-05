@@ -17,9 +17,15 @@ LIBTV_PROVIDER = "libtv"
 
 _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
 
+from litellm.exceptions import ContentPolicyViolationError
+
 from .client import LibTVClient
-from .common import LibTVError, resolve_libtv_credentials
+from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
 from .transform import _resolution_from_size, build_generation_params
+
+
+def _as_content_policy(exc: LibTVContentPolicyError, model: str) -> ContentPolicyViolationError:
+    return ContentPolicyViolationError(message=exc.message, model=model, llm_provider=LIBTV_PROVIDER)
 
 
 def _project_name(model: str) -> str:
@@ -319,7 +325,10 @@ class LibTVLLM(CustomLLM):
                 [url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
-        result = lt.generate(model, spec["vendor"], "video", params, _project_name(model))
+        try:
+            result = lt.generate(model, spec["vendor"], "video", params, _project_name(model))
+        except LibTVContentPolicyError as e:
+            raise _as_content_policy(e, model) from e
         return self._build_video_object(model, result, optional_params)
 
     async def avideo_generation(
@@ -361,5 +370,8 @@ class LibTVLLM(CustomLLM):
                 [await url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
-        result = await lt.agenerate(model, spec["vendor"], "video", params, _project_name(model))
+        try:
+            result = await lt.agenerate(model, spec["vendor"], "video", params, _project_name(model))
+        except LibTVContentPolicyError as e:
+            raise _as_content_policy(e, model) from e
         return self._build_video_object(model, result, optional_params)
