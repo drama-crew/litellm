@@ -22,6 +22,50 @@ class LibTVError(Exception):
         super().__init__(message)
 
 
+class LibTVContentPolicyError(LibTVError):
+    """A generation rejected by libtv content moderation (real public figure,
+    copyright, other restricted content). Distinct from transient/capacity/billing
+    failures so the caller can surface it as a content-policy rejection that must
+    NOT be retried or routed to another provider."""
+
+    def __init__(self, message: str):
+        super().__init__(status_code=400, message=message)
+
+
+_COMPLIANCE_REASON_TOKENS = (
+    "版权",
+    "侵权",
+    "违规",
+    "违禁",
+    "敏感",
+    "审核",
+    "涉黄",
+    "涉政",
+    "色情",
+    "血腥",
+    "未成年",
+    "请调整描述或素材",
+    "copyright",
+    "infring",
+    "nsfw",
+    "moderation",
+    "content policy",
+)
+
+
+def is_compliance_failure(reason: Optional[str]) -> bool:
+    """Whether a libtv failedReason denotes a content-moderation rejection.
+
+    Poll-time failures only carry a free-text ``failedReason`` (no structured
+    code), so classification is a conservative positive whitelist: only clear
+    compliance wording matches. Capacity ("算力不足"), billing ("积分不足"),
+    network faults and unknown reasons return False and stay retryable/fallback-able."""
+    if not reason:
+        return False
+    text = reason.lower()
+    return any(token in text for token in _COMPLIANCE_REASON_TOKENS)
+
+
 def resolve_libtv_credentials(token: Optional[str] = None, webid: Optional[str] = None) -> tuple:
     resolved_token = token or os.getenv("LIBTV_TOKEN") or os.getenv("LIBTV_CLI_USERTOKEN")
     resolved_webid = webid or os.getenv("LIBTV_WEBID") or os.getenv("LIBTV_CLI_WEBID")

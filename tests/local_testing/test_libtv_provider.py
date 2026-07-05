@@ -1084,3 +1084,116 @@ def test_video_generation_uploads_external_reference_image_non_compliance_model(
     gen_params = _gen_params(fake.calls)
     assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/img.png"]  # uploaded, not the external url
     assert "/api/community/image/verify" not in [u.split("api.liblib.tv", 1)[-1] for u, _ in fake.calls]
+
+
+# --- libtv compliance classification: content rejections must fast-fail (no fallback) ---
+
+from litellm.llms.libtv.common import (  # noqa: E402
+    LibTVContentPolicyError,
+    is_compliance_failure,
+)
+
+_CAPTURED_COMPLIANCE_REASON = (
+    "生成视频可能涉及版权限制，积分将会在2小时内返还，请调整描述或素材后重试"
+)
+
+
+def test_is_compliance_failure_matches_captured_copyright_reason():
+    assert is_compliance_failure(_CAPTURED_COMPLIANCE_REASON) is True
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["版权", "涉黄内容", "内容审核未通过", "疑似侵权", "copyright detected", "nsfw content"],
+)
+def test_is_compliance_failure_true_for_content_terms(reason):
+    assert is_compliance_failure(reason) is True
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["算力不足", "积分不足", "余额不足，请充值", "网络超时", "generation failed", "", None],
+)
+def test_is_compliance_failure_false_for_capacity_billing_network(reason):
+    assert is_compliance_failure(reason) is False
+
+
+def _failed_routes(reason):
+    return {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t"}},
+        "/api/task/generation/progress": [
+            {"code": 0, "data": {"progresses": [{"status": 3, "failedReason": reason}]}}
+        ],
+    }
+
+
+def test_generate_raises_content_policy_error_on_compliance_reason():
+    lt = LibTVClient(
+        token="t", webid="w",
+        sync_client=FakeSyncClient(post_by_path=_failed_routes(_CAPTURED_COMPLIANCE_REASON)),
+        poll_interval=0,
+    )
+    with pytest.raises(LibTVContentPolicyError):
+        lt.generate("m", "v", "video", {"prompt": "x"}, "n")
+
+
+def test_generate_capacity_failure_is_plain_error_not_content_policy():
+    lt = LibTVClient(
+        token="t", webid="w",
+        sync_client=FakeSyncClient(post_by_path=_failed_routes("算力不足")),
+        poll_interval=0,
+    )
+    with pytest.raises(LibTVError) as ei:
+        lt.generate("m", "v", "video", {"prompt": "x"}, "n")
+    assert not isinstance(ei.value, LibTVContentPolicyError)
+
+
+def _video_failed_routes(reason):
+    return {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": [
+            {"code": 0, "data": {"progresses": [{"status": 3, "failedReason": reason}]}}
+        ],
+    }
+
+
+def test_video_generation_maps_compliance_to_content_policy_violation():
+    import litellm
+
+    fake = FakeSyncClient(
+        post_by_path=_video_failed_routes(_CAPTURED_COMPLIANCE_REASON),
+        get_payload=_tool_spec_payload(auto_compliance=False),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    with pytest.raises(litellm.ContentPolicyViolationError):
+        llm.video_generation("star-video2", "王力宏 sings", "tok", None, {"webid": "w"}, None, client=fake)
+
+
+def test_video_generation_capacity_failure_not_content_policy():
+    import litellm
+
+    fake = FakeSyncClient(
+        post_by_path=_video_failed_routes("算力不足"),
+        get_payload=_tool_spec_payload(auto_compliance=False),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    with pytest.raises(Exception) as ei:
+        llm.video_generation("star-video2", "a fox", "tok", None, {"webid": "w"}, None, client=fake)
+    assert not isinstance(ei.value, litellm.ContentPolicyViolationError)
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_maps_compliance_to_content_policy_violation():
+    import litellm
+
+    fake = FakeAsyncClient(
+        post_by_path=_video_failed_routes(_CAPTURED_COMPLIANCE_REASON),
+        get_payload=_tool_spec_payload(auto_compliance=False),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    with pytest.raises(litellm.ContentPolicyViolationError):
+        await llm.avideo_generation("star-video2", "王力宏 sings", "tok", None, {"webid": "w"}, None, client=fake)

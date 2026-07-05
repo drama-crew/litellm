@@ -18,11 +18,20 @@ from .common import (
     NODE_ACTION,
     NODE_DEFAULT_NAME,
     NODE_TYPE_BACKEND,
+    LibTVContentPolicyError,
     LibTVError,
     build_bridge_headers,
     build_libtv_headers,
     build_upload_path,
+    is_compliance_failure,
 )
+
+
+def _raise_generation_failed(failed_reason: Optional[str]) -> None:
+    message = f"libtv generation failed: {failed_reason}"
+    if is_compliance_failure(failed_reason):
+        raise LibTVContentPolicyError(message=message)
+    raise LibTVError(status_code=502, message=message)
 
 
 THIRD_ASSET_POLL_ATTEMPTS = 30
@@ -418,7 +427,7 @@ class LibTVClient:
             if state["status"] == 2:
                 return {"urls": state["urls"], "task_id": task_id, "project_uuid": project_uuid, "node_key": node_key}
             if state["status"] == 3:
-                raise LibTVError(status_code=502, message=f"libtv generation failed: {state['failed_reason']}")
+                _raise_generation_failed(state["failed_reason"])
             time.sleep(self.poll_interval)
         raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
 
@@ -533,7 +542,7 @@ class LibTVClient:
             if state["status"] == 2:
                 return {"urls": state["urls"], "task_id": task_id, "project_uuid": project_uuid, "node_key": node_key}
             if state["status"] == 3:
-                raise LibTVError(status_code=502, message=f"libtv generation failed: {state['failed_reason']}")
+                _raise_generation_failed(state["failed_reason"])
             await asyncio.sleep(self.poll_interval)
         raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
 
