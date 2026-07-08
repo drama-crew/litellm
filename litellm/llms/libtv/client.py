@@ -185,17 +185,49 @@ def _extract_urls(task_result: Dict[str, Any], kind: str) -> List[str]:
     return collect(task_result.get("images"))
 
 
-def parse_progress(payload: Dict[str, Any], kind: str) -> Dict[str, Any]:
+_UNKNOWN_TASK_REASON_MARKER = "任务数据异常"
+
+
+def _match_progress(progresses: List[Dict[str, Any]], task_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if task_id is not None:
+        tagged = [p for p in progresses if p.get("taskId") is not None or p.get("task_id") is not None]
+        if tagged:
+            for item in tagged:
+                if str(item.get("taskId") or item.get("task_id")) == str(task_id):
+                    return item
+            return None
+    return progresses[0] if progresses else None
+
+
+def _is_unknown_task(item: Dict[str, Any], status: Optional[int]) -> bool:
+    # libtv returns this shape for a taskId it cannot find yet (the window right
+    # after generation/create, before the task is visible upstream): status 3 with
+    # failedReason carrying the unknown-task marker, no startTimeMs/endTimeMs and
+    # progressPercent 0. Treated as not-yet-terminal so the poll loop keeps going
+    # instead of failing a task that hasn't even started. Any substantive
+    # failedReason (e.g. a compliance rejection before the task starts) stays
+    # terminal regardless of timing fields.
+    if status != 3:
+        return False
+    reason = item.get("failedReason") or ""
+    if _UNKNOWN_TASK_REASON_MARKER in reason:
+        return True
+    return not reason and item.get("startTimeMs") is None and item.get("progressPercent") in (0, None)
+
+
+def parse_progress(payload: Dict[str, Any], kind: str, task_id: Optional[str] = None) -> Dict[str, Any]:
     data = payload.get("data") or {}
     progresses = data.get("progresses") or []
-    if not progresses:
+    last = _match_progress(progresses, task_id)
+    if not last:
         return {"status": None, "urls": [], "failed_reason": None}
-    last = progresses[0] or {}
     raw_status = last.get("status")
     try:
         status = int(raw_status)
     except (TypeError, ValueError):
         status = None
+    if _is_unknown_task(last, status):
+        return {"status": None, "urls": [], "failed_reason": None}
     urls: List[str] = []
     if status == 2:
         raw = last.get("taskResult")
@@ -424,7 +456,7 @@ class LibTVClient:
 
     def poll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
         progress = self._post("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
-        return parse_progress(progress, task_type)
+        return parse_progress(progress, task_type, task_id)
 
     def generate(
         self,
@@ -552,7 +584,7 @@ class LibTVClient:
 
     async def apoll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
         progress = await self._apost("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
-        return parse_progress(progress, task_type)
+        return parse_progress(progress, task_type, task_id)
 
     async def agenerate(
         self,

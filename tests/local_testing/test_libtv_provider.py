@@ -360,6 +360,8 @@ def _progress_route(status, url=None, reason=None):
         prog["taskResult"] = json.dumps({"videos": [{"videoUrl": url}]})
     if reason is not None:
         prog["failedReason"] = reason
+        prog["startTimeMs"] = 1700000000000
+        prog["progressPercent"] = 100
     return {"/api/task/generation/progress": {"code": 0, "data": {"progresses": [prog]}}}
 
 
@@ -480,7 +482,9 @@ def test_parse_progress_video_falls_back_to_images():
 
 
 def test_parse_progress_failed():
-    payload = {"data": {"progresses": [{"status": 3, "failedReason": "blocked"}]}}
+    payload = {
+        "data": {"progresses": [{"status": 3, "failedReason": "blocked", "startTimeMs": 1700000000000}]}
+    }
     state = parse_progress(payload, "video")
     assert state["status"] == 3
     assert state["failed_reason"] == "blocked"
@@ -489,6 +493,165 @@ def test_parse_progress_failed():
 def test_parse_progress_loading_has_no_urls():
     payload = {"data": {"progresses": [{"status": 1}]}}
     assert parse_progress(payload, "video") == {"status": 1, "urls": [], "failed_reason": None}
+
+
+# --- progress poll racing generation/create: libtv returns a "task data abnormal" -----
+# status 3 for a taskId it cannot find yet (the window right after create, before the
+# task is visible upstream), with no startTimeMs/endTimeMs and progressPercent 0. This
+# must not be read as a real failure or the whole generation gets killed while the
+# upstream task is actually still running.
+
+_UNKNOWN_TASK_REASON = "任务数据异常，请重新发起任务"
+
+
+def _unknown_task_progress(task_id):
+    return {
+        "taskId": task_id,
+        "status": 3,
+        "failedReason": _UNKNOWN_TASK_REASON,
+        "progressPercent": 0,
+        "power": 0,
+    }
+
+
+@pytest.mark.parametrize("kind", ["video", "image"])
+def test_parse_progress_unknown_task_signature_is_not_terminal(kind):
+    payload = {"data": {"progresses": [_unknown_task_progress("task-9")]}}
+    assert parse_progress(payload, kind, task_id="task-9") == {
+        "status": None,
+        "urls": [],
+        "failed_reason": None,
+    }
+
+
+def test_parse_progress_ignores_entry_for_a_different_task_id():
+    payload = {
+        "data": {
+            "progresses": [
+                {
+                    "taskId": "other-task",
+                    "status": 2,
+                    "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/wrong.mp4"}]}),
+                },
+                {"taskId": "task-9", "status": 1},
+            ]
+        }
+    }
+    state = parse_progress(payload, "video", task_id="task-9")
+    assert state == {"status": 1, "urls": [], "failed_reason": None}
+
+
+def test_parse_progress_real_failure_with_timing_stays_failed():
+    payload = {
+        "data": {
+            "progresses": [
+                {
+                    "taskId": "task-9",
+                    "status": 3,
+                    "failedReason": "视频生成失败，请重试",
+                    "startTimeMs": 1700000000000,
+                    "endTimeMs": 1700000010000,
+                    "progressPercent": 100,
+                }
+            ]
+        }
+    }
+    state = parse_progress(payload, "video", task_id="task-9")
+    assert state["status"] == 3
+    assert state["failed_reason"] == "视频生成失败，请重试"
+
+
+def test_parse_progress_real_failure_without_timing_stays_failed():
+    # a task rejected before it starts (e.g. compliance) has no startTimeMs and
+    # progressPercent 0, but its substantive failedReason must keep it terminal
+    payload = {
+        "data": {
+            "progresses": [
+                {
+                    "taskId": "task-9",
+                    "status": 3,
+                    "failedReason": "生成视频可能涉及版权限制",
+                    "progressPercent": 0,
+                }
+            ]
+        }
+    }
+    state = parse_progress(payload, "video", task_id="task-9")
+    assert state["status"] == 3
+    assert state["failed_reason"] == "生成视频可能涉及版权限制"
+
+
+def test_generate_compliance_rejection_without_timing_short_circuits():
+    from litellm.llms.libtv.common import LibTVContentPolicyError
+
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "t"}},
+            "/api/task/generation/progress": {
+                "code": 0,
+                "data": {
+                    "progresses": [
+                        {
+                            "taskId": "t",
+                            "status": 3,
+                            "failedReason": "生成视频可能涉及版权限制",
+                            "progressPercent": 0,
+                        }
+                    ]
+                },
+            },
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", sync_client=client, poll_interval=0)
+    with pytest.raises(LibTVContentPolicyError):
+        lt.generate("m", "v", "video", {"prompt": "x"}, "n")
+    assert [c[0] for c in client.calls].count("/api/task/generation/progress") == 1
+
+
+def test_generate_survives_unknown_task_polls_then_completes():
+    task_id = "task-race"
+    unknown = {"code": 0, "data": {"progresses": [_unknown_task_progress(task_id)]}}
+    done = {
+        "code": 0,
+        "data": {
+            "progresses": [
+                {
+                    "taskId": task_id,
+                    "status": 2,
+                    "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/done.mp4"}]}),
+                }
+            ]
+        },
+    }
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": task_id}},
+            "/api/task/generation/progress": [unknown, unknown, done],
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", sync_client=client, poll_interval=0)
+    result = lt.generate("m", "v", "video", {"prompt": "x"}, "n")
+    assert result["urls"] == ["https://x/done.mp4"]
+    assert [c[0] for c in client.calls].count("/api/task/generation/progress") == 3
+
+
+def test_video_status_maps_unknown_task_signature_to_in_progress():
+    task_id = "task-race"
+    vid = LibTVLLM()._build_video_object("m", {"task_id": task_id}).id
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/task/generation/progress": {
+                "code": 0,
+                "data": {"progresses": [_unknown_task_progress(task_id)]},
+            }
+        }
+    )
+    status = LibTVLLM().video_status(vid, "tok", None, {"webid": "w"}, None, client=client)
+    assert status.status == "in_progress"
 
 
 def test_generate_orchestrates_full_sequence():
@@ -541,7 +704,14 @@ def test_generate_raises_on_failed_status():
             "/api/canvas/nodes/batch": {"code": 0, "data": {}},
             "/api/task/generation/create": {"code": 0, "data": {"taskId": "t"}},
             "/api/task/generation/progress": [
-                {"code": 0, "data": {"progresses": [{"status": 3, "failedReason": "nope"}]}}
+                {
+                    "code": 0,
+                    "data": {
+                        "progresses": [
+                            {"status": 3, "failedReason": "nope", "startTimeMs": 1700000000000}
+                        ]
+                    },
+                }
             ],
         }
     )
@@ -1159,7 +1329,14 @@ def _failed_routes(reason):
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
         "/api/task/generation/create": {"code": 0, "data": {"taskId": "t"}},
         "/api/task/generation/progress": [
-            {"code": 0, "data": {"progresses": [{"status": 3, "failedReason": reason}]}}
+            {
+                "code": 0,
+                "data": {
+                    "progresses": [
+                        {"status": 3, "failedReason": reason, "startTimeMs": 1700000000000}
+                    ]
+                },
+            }
         ],
     }
 
@@ -1273,7 +1450,18 @@ def test_poll_once_single_progress_call_maps_state():
             {"status": 2, "urls": ["https://x/v.mp4"], "failed_reason": None},
         ),
         (
-            {"code": 0, "data": {"progresses": [{"status": 3, "failedReason": "生成视频可能涉及版权限制"}]}},
+            {
+                "code": 0,
+                "data": {
+                    "progresses": [
+                        {
+                            "status": 3,
+                            "failedReason": "生成视频可能涉及版权限制",
+                            "startTimeMs": 1700000000000,
+                        }
+                    ]
+                },
+            },
             {"status": 3, "urls": [], "failed_reason": "生成视频可能涉及版权限制"},
         ),
     ]:
