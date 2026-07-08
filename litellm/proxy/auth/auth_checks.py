@@ -3025,6 +3025,23 @@ def _can_object_call_model(
         if _model:
             potential_models.append(_model)
 
+    # A server-side fallback target declared in router fallbacks is implicitly
+    # callable by any key allowed to call the declaring model group: the CREATE
+    # call already reached the fallback deployment via router fallbacks without a
+    # per-key check, so RETRIEVE (which re-authenticates the model decoded from a
+    # managed resource id, e.g. video_id) must stay symmetric or polling 403s.
+    if llm_router is not None:
+        for fallback_mapping in getattr(llm_router, "fallbacks", None) or []:
+            if not isinstance(fallback_mapping, dict):
+                continue
+            for declaring_group, fallback_targets in fallback_mapping.items():
+                if (
+                    isinstance(fallback_targets, list)
+                    and model in fallback_targets
+                    and declaring_group not in potential_models
+                ):
+                    potential_models.append(declaring_group)
+
     ## check model access for alias + underlying model - allow if either is in allowed models
     for m in potential_models:
         if _check_model_access_helper(
