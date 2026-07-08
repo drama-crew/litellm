@@ -181,7 +181,7 @@ async def test_can_key_call_model_server_side_fallback_target(
                 "model": "wavespeed/seedance-2.0-fast-fallback",
                 "api_key": "test-api-key",
             },
-            "model_info": {"id": "seedance-fallback2"},
+            "model_info": {"id": "seedance-fallback2", "hidden": True},
         },
     ]
     router = litellm.Router(
@@ -199,6 +199,49 @@ async def test_can_key_call_model_server_side_fallback_target(
     else:
         with pytest.raises(Exception):
             await can_key_call_model(**args)
+
+
+@pytest.mark.asyncio
+async def test_can_key_call_model_public_fallback_target_not_implicitly_allowed():
+    """
+    Unlike internal fallback deployments (hidden), a *public* model group that is
+    merely listed as a fallback target (e.g. `deepseek-v4-pro` as a fallback for
+    `gpt-4.1-mini`) must NOT be implicitly callable by a key that is only
+    authorized for the declaring group. Only the per-key model access check
+    should decide access for non-hidden deployments.
+    """
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    llm_model_list = [
+        {
+            "model_name": "gpt-4.1-mini",
+            "litellm_params": {
+                "model": "openai/gpt-4.1-mini",
+                "api_key": "test-api-key",
+            },
+            "model_info": {"id": "gpt-4.1-mini-primary"},
+        },
+        {
+            "model_name": "deepseek-v4-pro",
+            "litellm_params": {
+                "model": "deepseek/deepseek-v4-pro",
+                "api_key": "test-api-key",
+            },
+            "model_info": {"id": "deepseek-v4-pro-public"},
+        },
+    ]
+    router = litellm.Router(
+        model_list=llm_model_list,
+        fallbacks=[{"gpt-4.1-mini": ["deepseek-v4-pro"]}],
+    )
+    args = {
+        "model": "deepseek-v4-pro",
+        "llm_model_list": llm_model_list,
+        "valid_token": UserAPIKeyAuth(models=["gpt-4.1-mini"]),
+        "llm_router": router,
+    }
+    with pytest.raises(Exception):
+        await can_key_call_model(**args)
 
 
 @pytest.mark.parametrize(
