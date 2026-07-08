@@ -1236,10 +1236,10 @@ def test_video_generation_capacity_failure_propagates_for_fallback():
 async def test_avideo_generation_returns_queued_without_polling():
     fake = FakeAsyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
     vo = await LibTVLLM(poll_interval=0).avideo_generation(
-        "star-video2", "a fox", "tok", None, {"webid": "w", "libtv_status_model": "_fallback_libtv2/seedance-2.0"}, None, client=fake
+        "star-video2", "a fox", "tok", None, {"webid": "w", "libtv_status_model": "_fallback2/seedance-2.0"}, None, client=fake
     )
     assert vo.status == "queued"
-    assert decode_video_id_with_provider(vo.id)["model_id"] == "_fallback_libtv2/seedance-2.0"
+    assert decode_video_id_with_provider(vo.id)["model_id"] == "_fallback2/seedance-2.0"
     assert "/api/task/generation/progress" not in [c[0] for c in fake.calls]
 
 

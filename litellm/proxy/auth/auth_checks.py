@@ -2973,6 +2973,24 @@ def _check_model_access_helper(
     return True
 
 
+def _is_hidden_fallback_deployment(model: str, llm_router: Router) -> bool:
+    """
+    Returns True only if `model` resolves to at least one router deployment and
+    every matching deployment is marked `model_info.hidden: True` (internal-only
+    fallback deployments, e.g. `_fallback2/seedance-2.0-fast`).
+
+    Public model groups are never hidden, so this defensively returns False when
+    no deployment is found for `model` at all.
+    """
+    deployments = llm_router.get_model_list(model_name=model)
+    if not deployments:
+        return False
+    return all(
+        (deployment.get("model_info") or {}).get("hidden") is True
+        for deployment in deployments
+    )
+
+
 def _can_object_call_model(
     model: Union[str, List[str]],
     llm_router: Optional[Router],
@@ -3024,6 +3042,29 @@ def _can_object_call_model(
         _model = llm_router._get_model_from_alias(model)
         if _model:
             potential_models.append(_model)
+
+    # A server-side fallback target declared in router fallbacks is implicitly
+    # callable by any key allowed to call the declaring model group: the CREATE
+    # call already reached the fallback deployment via router fallbacks without a
+    # per-key check, so RETRIEVE (which re-authenticates the model decoded from a
+    # managed resource id, e.g. video_id) must stay symmetric or polling 403s.
+    #
+    # This must only apply to *internal* fallback deployments (model_info.hidden
+    # == True on every matching deployment) - e.g. `_fallback2/seedance-2.0-fast`.
+    # Public model groups that merely happen to be listed as a fallback target
+    # (e.g. `deepseek-v4-pro`, `glm-5.2`) must still go through the normal
+    # per-key model access check.
+    if llm_router is not None and _is_hidden_fallback_deployment(model, llm_router):
+        for fallback_mapping in getattr(llm_router, "fallbacks", None) or []:
+            if not isinstance(fallback_mapping, dict):
+                continue
+            for declaring_group, fallback_targets in fallback_mapping.items():
+                if (
+                    isinstance(fallback_targets, list)
+                    and model in fallback_targets
+                    and declaring_group not in potential_models
+                ):
+                    potential_models.append(declaring_group)
 
     ## check model access for alias + underlying model - allow if either is in allowed models
     for m in potential_models:

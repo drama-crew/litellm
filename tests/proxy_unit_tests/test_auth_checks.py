@@ -145,6 +145,106 @@ async def test_can_key_call_model(model, expect_to_work):
 
 
 @pytest.mark.parametrize(
+    "key_models, model, expect_to_work",
+    [
+        (["seedance-2.0-fast"], "_fallback2/seedance-2.0-fast", True),
+        (["seedance-2.0-fast"], "seedance-2.0-fast", True),
+        (["gpt-4o"], "_fallback2/seedance-2.0-fast", False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_can_key_call_model_server_side_fallback_target(
+    key_models, model, expect_to_work
+):
+    """
+    A server-side fallback target declared in router fallbacks (e.g.
+    `_fallback2/seedance-2.0-fast`) must be implicitly callable by any key
+    allowed to call the group that declares it as a fallback (`seedance-2.0-fast`),
+    since the CREATE call already reached that deployment via router fallbacks
+    without a per-key check. RETRIEVE re-authenticates against the model
+    decoded from a managed resource id and must stay symmetric with CREATE.
+    """
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    llm_model_list = [
+        {
+            "model_name": "seedance-2.0-fast",
+            "litellm_params": {
+                "model": "wavespeed/seedance-2.0-fast",
+                "api_key": "test-api-key",
+            },
+            "model_info": {"id": "seedance-primary"},
+        },
+        {
+            "model_name": "_fallback2/seedance-2.0-fast",
+            "litellm_params": {
+                "model": "wavespeed/seedance-2.0-fast-fallback",
+                "api_key": "test-api-key",
+            },
+            "model_info": {"id": "seedance-fallback2", "hidden": True},
+        },
+    ]
+    router = litellm.Router(
+        model_list=llm_model_list,
+        fallbacks=[{"seedance-2.0-fast": ["_fallback2/seedance-2.0-fast"]}],
+    )
+    args = {
+        "model": model,
+        "llm_model_list": llm_model_list,
+        "valid_token": UserAPIKeyAuth(models=key_models),
+        "llm_router": router,
+    }
+    if expect_to_work:
+        await can_key_call_model(**args)
+    else:
+        with pytest.raises(Exception):
+            await can_key_call_model(**args)
+
+
+@pytest.mark.asyncio
+async def test_can_key_call_model_public_fallback_target_not_implicitly_allowed():
+    """
+    Unlike internal fallback deployments (hidden), a *public* model group that is
+    merely listed as a fallback target (e.g. `deepseek-v4-pro` as a fallback for
+    `gpt-4.1-mini`) must NOT be implicitly callable by a key that is only
+    authorized for the declaring group. Only the per-key model access check
+    should decide access for non-hidden deployments.
+    """
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    llm_model_list = [
+        {
+            "model_name": "gpt-4.1-mini",
+            "litellm_params": {
+                "model": "openai/gpt-4.1-mini",
+                "api_key": "test-api-key",
+            },
+            "model_info": {"id": "gpt-4.1-mini-primary"},
+        },
+        {
+            "model_name": "deepseek-v4-pro",
+            "litellm_params": {
+                "model": "deepseek/deepseek-v4-pro",
+                "api_key": "test-api-key",
+            },
+            "model_info": {"id": "deepseek-v4-pro-public"},
+        },
+    ]
+    router = litellm.Router(
+        model_list=llm_model_list,
+        fallbacks=[{"gpt-4.1-mini": ["deepseek-v4-pro"]}],
+    )
+    args = {
+        "model": "deepseek-v4-pro",
+        "llm_model_list": llm_model_list,
+        "valid_token": UserAPIKeyAuth(models=["gpt-4.1-mini"]),
+        "llm_router": router,
+    }
+    with pytest.raises(Exception):
+        await can_key_call_model(**args)
+
+
+@pytest.mark.parametrize(
     "model, expect_to_work",
     [("openai/gpt-4o", False), ("openai/gpt-4o-mini", True)],
 )
