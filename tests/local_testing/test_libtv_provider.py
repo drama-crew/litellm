@@ -614,6 +614,162 @@ def test_count_list_property_does_not_crash():
     assert params["count"] == 1
 
 
+# Real metadata for kling-video-o3 ("可灵 3.0"), captured live from the libtv catalog.
+# Kept as the full payload (not just properties/config) so the fixture matches what
+# resolve_model_spec actually stores for this model.
+_KLING_VIDEO_O3_SPEC = {
+    "modelKey": "kling-video-o3",
+    "modelName": "可灵 3.0",
+    "modelVendor": "Kling",
+    "baseType": 66,
+    "properties": {
+        "count": [1],
+        "magic": True,
+        "prompt": {"maxLength": 2000, "originalField": "prompt"},
+        "lens": {"displayName": " 镜头", "maxCount": 1},
+        "duration": {
+            "description": "",
+            "displayName": "时长",
+            "min": 5,
+            "max": 15,
+            "step": 1,
+            "default": 5,
+            "component": "slider",
+            "originalField": "duration",
+        },
+        "ratio_auto": {
+            "displayName": "比例",
+            "enum": [{"value": " ", "displayName": "智能模式"}, "16:9", "1:1", "9:16"],
+            "default": " ",
+            "component": "singleButton",
+            "originalField": "ratio",
+        },
+        "quality": {
+            "description": "",
+            "displayName": "生成品质",
+            "enum": [
+                {"value": "low", "displayName": "标准"},
+                {"value": "high", "displayName": "高品质"},
+                {"value": "4k", "displayName": "4K"},
+            ],
+            "default": "low",
+            "component": "singleButton",
+            "originalField": "quality",
+        },
+        "enableSound": {
+            "description": "",
+            "displayName": "生成音频",
+            "tips": "为生成的视频添加音频内容",
+            "enum": [{"value": "on", "displayName": "开启"}, {"value": "off", "displayName": "关闭"}],
+            "default": "on",
+            "originalField": "enableSound",
+            "component": "singleButton",
+        },
+        "modeType": {
+            "description": "模态类型",
+            "originalField": "modeType",
+            "items": {"frames2video": [2, 2], "audio2video": [0, 0], "singleImage2video": [1, 1]},
+        },
+        "subjects": {
+            "displayName": "主体",
+            "items": {"singleImage2video": {"maxCount": 3}, "frames2video": {"maxCount": 3}},
+        },
+        "smartStoryboard": {
+            "displayName": "智能分镜",
+            "component": "switch",
+            "default": False,
+            "originalField": "multi_shot",
+            "barOnly": True,
+        },
+    },
+    "config": {
+        "settings": {
+            "text2video": ["ratio_auto", "quality", "duration", "enableSound", "smartStoryboard"],
+            "frames2video": ["quality", "duration", "enableSound"],
+            "singleImage2video": ["quality", "duration", "enableSound", "smartStoryboard"],
+        }
+    },
+    "rules": [
+        {"require": ["prompt", "media"], "mode": "any"},
+        {"require": ["prompt"], "forModeTypes": ["text2video"]},
+    ],
+    "generateTypes": {"text": 90, "image": 90, "checkpointId": 22522069},
+}
+
+
+def test_build_params_kling_video_o3_text2video_defaults():
+    # No ratio/quality/duration/enableSound supplied: every setting must fall back to
+    # its schema default. `ratio_auto`'s default is a single space (libtv's "smart
+    # mode" sentinel) because `_coerce_to_enum` only runs when a value is present, so
+    # the unset case skips straight to `prop.get("default")` = " ". Studio never lets
+    # a user pick this value directly, so it only ever surfaces via this default path.
+    params = build_generation_params("a cat", {}, _KLING_VIDEO_O3_SPEC, "text2video")
+    assert params["ratio_auto"] == " "
+    assert params["quality"] == "low"
+    assert params["duration"] == 5
+    assert params["enableSound"] == "on"
+    # smartStoryboard has no entry in `candidates`, so the key can never receive a
+    # user-supplied value -- it always resolves to the schema default regardless of
+    # what optional_params contains. Documented below in
+    # test_build_params_kling_video_o3_smart_storyboard_ignores_user_value.
+    assert params["smartStoryboard"] is False
+
+
+def test_build_params_kling_video_o3_text2video_explicit_values():
+    params = build_generation_params(
+        "a cat",
+        {"ratio": "9:16", "quality": "high", "duration": 8, "enableSound": "off"},
+        _KLING_VIDEO_O3_SPEC,
+        "text2video",
+    )
+    # The key written into params is the schema key itself (`ratio_auto`), not its
+    # `originalField` ("ratio") -- build_generation_params never reads originalField.
+    assert params["ratio_auto"] == "9:16"
+    assert "ratio" not in params
+    assert params["quality"] == "high"
+    assert params["duration"] == 8
+    assert isinstance(params["duration"], int)
+    assert params["enableSound"] == "off"
+
+
+def test_build_params_kling_video_o3_smart_storyboard_ignores_user_value():
+    # Known limitation: `candidates` has no "smartStoryboard" mapping, so
+    # `candidates.get("smartStoryboard")` is always None and the code falls through to
+    # the schema default no matter what the caller passes. Passing True here still
+    # yields the schema default (False) -- this proves users cannot currently turn on
+    # 智能分镜 (smart storyboard) via optional_params.
+    params = build_generation_params(
+        "a cat", {"smartStoryboard": True}, _KLING_VIDEO_O3_SPEC, "text2video"
+    )
+    assert params["smartStoryboard"] is False
+
+
+def test_build_params_kling_video_o3_frames2video_excludes_ratio():
+    params = build_generation_params("a cat", {}, _KLING_VIDEO_O3_SPEC, "frames2video")
+    assert "ratio_auto" not in params
+    assert "smartStoryboard" not in params
+    assert params["quality"] == "low"
+    assert params["duration"] == 5
+    assert params["enableSound"] == "on"
+
+
+def test_build_params_kling_video_o3_single_image2video_excludes_ratio():
+    params = build_generation_params("a cat", {"quality": "4k"}, _KLING_VIDEO_O3_SPEC, "singleImage2video")
+    assert "ratio_auto" not in params
+    assert params["quality"] == "4k"
+    assert params["duration"] == 5
+    assert params["enableSound"] == "on"
+    assert params["smartStoryboard"] is False
+
+
+def test_build_params_kling_video_o3_count_is_forced_to_one():
+    # properties.count is `[1]` (a bare list, not a {"default": ...} dict), so
+    # count_default takes the `isinstance(count_prop, dict)` else-branch and is
+    # hard-coded to 1 regardless of the list's contents.
+    params = build_generation_params("a cat", {}, _KLING_VIDEO_O3_SPEC, "text2video")
+    assert params["count"] == 1
+
+
 def test_resolve_credentials_requires_both(monkeypatch):
     for key in ("LIBTV_TOKEN", "LIBTV_CLI_USERTOKEN", "LIBTV_WEBID", "LIBTV_CLI_WEBID"):
         monkeypatch.delenv(key, raising=False)
