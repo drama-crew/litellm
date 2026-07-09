@@ -16,9 +16,11 @@ from litellm.llms.libtv.handler import (
     LibTVLLM,
     _collect_reference_groups,
     _default_video_mode,
+    _infer_image_mode,
     _infer_video_mode,
     _reference_payload,
 )
+from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.utils import decode_video_id_with_provider
 from litellm.llms.libtv.transform import build_generation_params, size_to_ratio
 
@@ -39,6 +41,57 @@ _WAN_SPEC = {
         "resolution": {"default": "720p", "enum": [{"value": "480P"}, {"value": "720P"}]},
         "duration": {"default": 5},
     },
+}
+
+# Real tool_spec metadata for nebula-ultra ("全能图片模型V2", libtv's disguised name for
+# Nano Banana Pro). Flat settings list (no per-mode buckets) with count as a bare enum
+# list rather than a dict, and modeType.items only advertising image2image.
+_NEBULA_ULTRA_SPEC = {
+    "modelKey": "nebula-ultra",
+    "modelName": "全能图片模型V2",
+    "modelVendor": "nebula",
+    "vendor": "nebula",
+    "baseType": 40,
+    "properties": {
+        "enableSlash": True,
+        "cameraControl": True,
+        "magic": True,
+        "focus": True,
+        "mention": True,
+        "count": [1, 2, 4],
+        "template": {"displayName": "风格", "maxCount": 1},
+        "prompt": {"description": "", "placeholder": "", "maxLength": 0},
+        "quality": {
+            "displayName": "分辨率",
+            "enum": ["1K", "2K", "4K"],
+            "default": "2K",
+            "component": "singleButton",
+            "originalField": "quality",
+        },
+        "ratio": {
+            "displayName": "比例",
+            "enum": [
+                {"value": "auto", "displayName": "自适应"},
+                "1:1",
+                "9:16",
+                "16:9",
+                "3:4",
+                "4:3",
+                "3:2",
+                "2:3",
+                "4:5",
+                "5:4",
+                "21:9",
+            ],
+            "default": "16:9",
+            "component": "singleButton",
+            "originalField": "ratio",
+        },
+        "searchable": {"displayName": "联网搜索", "default": 0, "component": "switch", "originalField": "searchable"},
+        "modeType": {"description": "模态类型", "items": {"image2image": [0, 7]}},
+    },
+    "config": {"settings": ["quality", "ratio"], "advancedSettings": ["searchable"]},
+    "rules": [{"require": ["prompt", "media"], "mode": "any"}, {"require": ["prompt"]}],
 }
 
 
@@ -152,6 +205,65 @@ def test_build_params_unknown_mode_has_empty_settings():
     params = build_generation_params("x", {}, _WAN_SPEC, "image2video")
     assert "ratio" not in params and "resolution" not in params and "duration" not in params
     assert params["imageList"] == [] and params["textList"] == []
+
+
+def test_build_params_nebula_ultra_coerces_lowercase_clarity_and_derives_ratio_from_size():
+    # drama backend sends lowercase clarity tokens + a size, no explicit ratio.
+    params = build_generation_params("a cat", {"quality": "2k", "size": "2560x1440"}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert params["quality"] == "2K"
+    assert params["ratio"] == "16:9"
+
+
+@pytest.mark.parametrize("lower,upper", [("1k", "1K"), ("2k", "2K"), ("4k", "4K")])
+def test_build_params_nebula_ultra_quality_case_insensitive(lower, upper):
+    params = build_generation_params("x", {"quality": lower}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert params["quality"] == upper
+
+
+def test_build_params_nebula_ultra_explicit_aspect_ratio_wins_over_size():
+    params = build_generation_params(
+        "x", {"aspect_ratio": "9:16", "size": "2560x1440"}, _NEBULA_ULTRA_SPEC, "text2image"
+    )
+    assert params["ratio"] == "9:16"
+
+
+def test_build_params_nebula_ultra_defaults_quality_when_absent():
+    params = build_generation_params("x", {}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert params["quality"] == "2K"
+    assert params["ratio"] == "16:9"
+
+
+def test_build_params_nebula_ultra_count_from_n_or_count_kw():
+    assert build_generation_params("x", {"n": 2}, _NEBULA_ULTRA_SPEC, "text2image")["count"] == 2
+    assert build_generation_params("x", {"count": 4}, _NEBULA_ULTRA_SPEC, "text2image")["count"] == 4
+
+
+def test_build_params_nebula_ultra_count_bare_list_default_does_not_crash():
+    # the "count" property is a bare enum list ([1, 2, 4]), not a dict with a "default"
+    # key; build_generation_params must fall back to 1 instead of raising.
+    params = build_generation_params("x", {}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert params["count"] == 1
+
+
+def test_build_params_nebula_ultra_searchable_advanced_setting_not_sent_unless_explicit():
+    params = build_generation_params("x", {}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert "searchable" not in params
+    params_explicit = build_generation_params(
+        "x", {"advancedSettings": {"searchable": 1}}, _NEBULA_ULTRA_SPEC, "text2image"
+    )
+    assert params_explicit["searchable"] == 1
+
+
+def test_build_params_nebula_ultra_image2image_still_applies_quality_and_ratio():
+    params = build_generation_params("x", {"quality": "4k", "aspect_ratio": "1:1"}, _NEBULA_ULTRA_SPEC, "image2image")
+    assert params["modeType"] == "image2image"
+    assert params["quality"] == "4K"
+    assert params["ratio"] == "1:1"
+
+
+def test_infer_image_mode():
+    assert _infer_image_mode([]) == "text2image"
+    assert _infer_image_mode(["ref.png"]) == "image2image"
 
 
 def test_build_node_batch_body_video_carries_model_and_params():
@@ -1268,6 +1380,139 @@ def test_video_generation_uploads_external_reference_image_non_compliance_model(
     gen_params = _gen_params(fake.calls)
     assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/img.png"]  # uploaded, not the external url
     assert "/api/community/image/verify" not in [u.split("api.liblib.tv", 1)[-1] for u, _ in fake.calls]
+
+
+def _nebula_ultra_tool_spec_payload():
+    meta = {
+        "modelKey": "nebula-ultra",
+        "modelVendor": "nebula",
+        "properties": _NEBULA_ULTRA_SPEC["properties"],
+        "config": _NEBULA_ULTRA_SPEC["config"],
+    }
+    return {"data": {"tools": [{"type": "image", "metadata": json.dumps(meta)}]}}
+
+
+_NEBULA_IMAGE_ROUTES = {
+    "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+    "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+    "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    "/api/task/generation/progress": {
+        "code": 0,
+        "data": {
+            "progresses": [{"status": 2, "taskResult": json.dumps({"images": [{"imageUrl": "https://x/o.png"}]})}]
+        },
+    },
+}
+
+
+def test_image_generation_text_only_stays_text2image_and_omits_imagelist():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    llm.image_generation(
+        "nebula-ultra", "a cat", "tok", None, ImageResponse(), {"webid": "w", "quality": "2k"}, None, client=fake
+    )
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "text2image"
+    assert gen_params["imageList"] == []
+    assert gen_params["quality"] == "2K"
+
+
+def test_image_generation_with_reference_infers_image2image_and_uploads():
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "restyle it",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "reference_images": ["https://minio.internal/b/ref.png"]},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "image2image"
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]  # uploaded, not the external url
+
+
+def test_image_generation_explicit_mode_type_wins_over_inference():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "modeType": "text2image", "reference_images": [_LIBTV_REF]},
+        None,
+        client=fake,
+    )
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "text2image"
+
+
+@pytest.mark.asyncio
+async def test_aimage_generation_with_reference_infers_image2image_and_uploads():
+    fake = _FullAsyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = await llm.aimage_generation(
+        "nebula-ultra",
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "reference_images": ["https://minio.internal/b/ref.png"]},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "image2image"
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
+
+
+def test_image_generation_routes_to_custom_provider():
+    import litellm
+    from litellm.llms.custom_llm import CustomLLM
+
+    captured = {}
+
+    class StubLLM(CustomLLM):
+        def image_generation(
+            self,
+            model,
+            prompt,
+            api_key,
+            api_base,
+            model_response,
+            optional_params,
+            logging_obj,
+            timeout=None,
+            client=None,
+        ):
+            captured["model"] = model
+            captured["prompt"] = prompt
+            model_response.data = [ImageObject(url="https://x/y.png")]
+            return model_response
+
+    litellm.custom_provider_map = [{"provider": "libtvstub", "custom_handler": StubLLM()}]
+    try:
+        out = litellm.image_generation(model="libtvstub/nebula-ultra", prompt="a fox")
+        assert out.data[0]["url"] == "https://x/y.png"
+        assert captured["model"] == "nebula-ultra"
+        assert captured["prompt"] == "a fox"
+    finally:
+        litellm.custom_provider_map = []
 
 
 # --- libtv compliance classification: content rejections must fast-fail (no fallback) ---

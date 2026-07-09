@@ -113,6 +113,10 @@ def _infer_video_mode(optional_params: dict, images: list, videos: list, audios:
     return _default_video_mode(images, videos, audios)
 
 
+def _infer_image_mode(images: list) -> str:
+    return "image2image" if images else "text2image"
+
+
 def _auto_compliance_enabled(spec: dict) -> bool:
     # Portrait-capable models (e.g. star-video2) reject raw reference-image URLs that
     # contain a real person; the upstream verify flow must run and convert each image
@@ -264,7 +268,20 @@ class LibTVLLM(CustomLLM):
     ) -> ImageResponse:
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
-        params = build_generation_params(prompt, optional_params, spec, _resolve_mode(optional_params, "text2image"))
+        images, _, _ = _collect_reference_groups(optional_params)
+
+        def url_for(ref):
+            p = _reference_payload(ref)
+            return lt.ensure_libtv_url(p[0], p[1], p[2], _REF_DEFAULT_NAME["image"])
+
+        mode = _resolve_mode(optional_params, _infer_image_mode(images))
+        params = build_generation_params(prompt, optional_params, spec, mode)
+        if images:
+            if _auto_compliance_enabled(spec):
+                params["autoCompliance"] = 1
+                params["imageList"] = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
+            else:
+                params["imageList"] = [url_for(r) for r in images]
         result = lt.generate(model, spec["vendor"], "image", params, _project_name(model))
         return self._fill_image_response(model_response, result)
 
@@ -282,7 +299,20 @@ class LibTVLLM(CustomLLM):
     ) -> ImageResponse:
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
-        params = build_generation_params(prompt, optional_params, spec, _resolve_mode(optional_params, "text2image"))
+        images, _, _ = _collect_reference_groups(optional_params)
+
+        async def url_for(ref):
+            p = _reference_payload(ref)
+            return await lt.aensure_libtv_url(p[0], p[1], p[2], _REF_DEFAULT_NAME["image"])
+
+        mode = _resolve_mode(optional_params, _infer_image_mode(images))
+        params = build_generation_params(prompt, optional_params, spec, mode)
+        if images:
+            if _auto_compliance_enabled(spec):
+                params["autoCompliance"] = 1
+                params["imageList"] = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
+            else:
+                params["imageList"] = [await url_for(r) for r in images]
         result = await lt.agenerate(model, spec["vendor"], "image", params, _project_name(model))
         return self._fill_image_response(model_response, result)
 
