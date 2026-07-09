@@ -133,8 +133,19 @@ def _wants_frames2video(optional_params: dict, spec: dict) -> bool:
     # instead of a 400.
     if not optional_params.get("last_image"):
         return False
+    # An explicit modeType override always wins; only frames2video (or no override)
+    # takes this branch, so the mode and the payload shape never disagree.
+    if _resolve_mode(optional_params, "frames2video") != "frames2video":
+        return False
     mode_items = ((spec.get("properties") or {}).get("modeType") or {}).get("items")
     return isinstance(mode_items, dict) and "frames2video" in mode_items
+
+
+def _frame_payloads(optional_params: dict) -> list:
+    # [first, last] in order; image may be absent (libtv frames2video accepts 1-2
+    # frames, and the non-compliance branch already sends a single-image imageList).
+    payloads = [_reference_payload(optional_params.get("image")), _reference_payload(optional_params.get("last_image"))]
+    return [p for p in payloads if p is not None]
 
 
 class LibTVLLM(CustomLLM):
@@ -335,12 +346,9 @@ class LibTVLLM(CustomLLM):
             return lt.ensure_libtv_url(p[0], p[1], p[2], default_name)
 
         if images and _auto_compliance_enabled(spec) and _wants_frames2video(optional_params, spec):
-            frame_refs = lt.resolve_compliant_image_refs(
-                [_reference_payload(optional_params.get("image")), _reference_payload(optional_params.get("last_image"))]
-            )
+            frame_refs = lt.resolve_compliant_image_refs(_frame_payloads(optional_params))
             video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
-            mode = _resolve_mode(optional_params, "frames2video")
-            params = build_generation_params(prompt, optional_params, spec, mode)
+            params = build_generation_params(prompt, optional_params, spec, "frames2video")
             params["autoCompliance"] = 1
             params["imageList"] = frame_refs
             if video_refs:
@@ -390,12 +398,9 @@ class LibTVLLM(CustomLLM):
             return await lt.aensure_libtv_url(p[0], p[1], p[2], default_name)
 
         if images and _auto_compliance_enabled(spec) and _wants_frames2video(optional_params, spec):
-            frame_refs = await lt.aresolve_compliant_image_refs(
-                [_reference_payload(optional_params.get("image")), _reference_payload(optional_params.get("last_image"))]
-            )
+            frame_refs = await lt.aresolve_compliant_image_refs(_frame_payloads(optional_params))
             video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
-            mode = _resolve_mode(optional_params, "frames2video")
-            params = build_generation_params(prompt, optional_params, spec, mode)
+            params = build_generation_params(prompt, optional_params, spec, "frames2video")
             params["autoCompliance"] = 1
             params["imageList"] = frame_refs
             if video_refs:

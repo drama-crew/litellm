@@ -1236,6 +1236,50 @@ def test_non_compliance_frames2video_keeps_first_last_imagelist_order():
     assert gen_params["imageList"] == [_LIBTV_REF, _LIBTV_LAST]
 
 
+def test_explicit_mixed2video_override_wins_over_last_image():
+    fake = FakeSyncClient(
+        post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=True)
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_REF, "modeType": "mixed2video"},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert "mixedList" in gen_params
+    assert gen_params.get("imageList") in ([], None)
+
+
+def test_frames2video_compliance_last_image_only_single_frame():
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    routes = _frames2video_compliance_routes()
+    routes["/api/community/image/verify"] = {
+        "code": 0,
+        "data": {"list": [{"url": _LIBTV_LAST, "riskLabels": risk}]},
+    }
+    routes["/api/third_asset/create"] = {"code": 0, "data": {"uuid": "u-last"}}
+    routes["/api/third_asset/check"] = {
+        "code": 0,
+        "data": {"list": [{"uuid": "u-last", "assetId": "asset-LAST", "status": 1}]},
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "last_image": _LIBTV_LAST}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["imageList"] == ["asset://asset-LAST"]
+
+
 # --- video usage -> resolution-tiered cost (authoritative spend line) ---------
 from litellm.llms.libtv.handler import _video_usage  # noqa: E402
 from litellm.llms.openai.cost_calculation import video_generation_cost  # noqa: E402
