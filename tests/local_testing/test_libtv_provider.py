@@ -16,6 +16,7 @@ from litellm.llms.libtv.handler import (
     LibTVLLM,
     _collect_reference_groups,
     _default_video_mode,
+    _image_clarity_response_cost,
     _infer_image_mode,
     _infer_video_mode,
     _reference_payload,
@@ -1618,6 +1619,179 @@ async def test_aimage_edit_uploads_reference_and_infers_image2image():
     assert gen_params["modeType"] == "image2image"
     assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
     assert gen_params["quality"] == "4K"
+
+
+# --- clarity-tiered image cost accrual (nano-banana-pro / libtv nebula-ultra) -------
+# litellm's internally-accrued team spend is our authoritative wallet ledger, but the
+# libtv handler never told litellm what an image actually cost, so spend always fell
+# through to the flat config price regardless of the 1K/2K vs 4K clarity actually
+# billed upstream. Deployment config now declares per-tier unit prices as
+# litellm_params keys (output_cost_per_image_1k/_2k/_4k, mirroring how libtv video
+# deployments declare output_cost_per_second_<resolution>); the router spreads
+# litellm_params into image_generation()'s kwargs, and any key litellm doesn't
+# recognize as a first-class param lands in optional_params for custom providers,
+# which is how these tests set them up.
+
+_NANO_BANANA_TIER_PRICES = {
+    "output_cost_per_image_1k": 0.134,
+    "output_cost_per_image_2k": 0.134,
+    "output_cost_per_image_4k": 0.24,
+}
+
+_NEBULA_IMAGE_ROUTES_TWO_IMAGES = {
+    **_NEBULA_IMAGE_ROUTES,
+    "/api/task/generation/progress": {
+        "code": 0,
+        "data": {
+            "progresses": [
+                {
+                    "status": 2,
+                    "taskResult": json.dumps(
+                        {"images": [{"imageUrl": "https://x/o1.png"}, {"imageUrl": "https://x/o2.png"}]}
+                    ),
+                }
+            ]
+        },
+    },
+}
+
+
+def test_image_clarity_response_cost_multiplies_tier_price_by_count():
+    optional_params = {"output_cost_per_image_4k": 0.24}
+    assert _image_clarity_response_cost(optional_params, "4K", 1) == pytest.approx(0.24)
+    assert _image_clarity_response_cost(optional_params, "4K", 3) == pytest.approx(0.72)
+
+
+def test_image_clarity_response_cost_none_when_quality_or_tier_missing():
+    assert _image_clarity_response_cost({"output_cost_per_image_4k": 0.24}, None, 1) is None
+    assert _image_clarity_response_cost({"output_cost_per_image_4k": 0.24}, "2K", 1) is None
+    assert _image_clarity_response_cost({}, "4K", 1) is None
+    assert _image_clarity_response_cost({"output_cost_per_image_4k": 0.24}, "4K", 0) is None
+
+
+def test_image_generation_clarity_tier_cost_4k():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "quality": "4k", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.24)
+
+
+def test_image_generation_clarity_tier_cost_2k():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "quality": "2k", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.134)
+
+
+def test_image_generation_clarity_tier_cost_defaults_when_quality_absent():
+    # nebula-ultra's spec defaults quality to "2K" when the caller doesn't set it;
+    # the accrued cost must follow the same default tier actually sent upstream.
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.134)
+
+
+def test_image_generation_clarity_tier_cost_scales_with_count():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES_TWO_IMAGES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "quality": "4k", "n": 2, **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert len(vo.data) == 2
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.48)
+
+
+def test_image_generation_no_tier_keys_leaves_response_cost_unset():
+    # Other libtv image models (no output_cost_per_image_<tier> config) must be
+    # byte-identical to pre-fix behavior: no hidden response_cost override, so
+    # litellm's normal default_image_cost_calculator + flat config price applies.
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra", "a cat", "tok", None, ImageResponse(), {"webid": "w", "quality": "2k"}, None, client=fake
+    )
+    assert "response_cost" not in vo._hidden_params
+
+
+def test_image_edit_clarity_tier_cost_parity():
+    # image_edit is the real transport for nano-banana-pro reference requests (see
+    # comment above test_image_edit_single_reference_uploads_and_carries_quality);
+    # cost accrual must work identically on that path.
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.image_edit(
+        "nebula-ultra",
+        [_REF_TUPLE],
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "quality": "4k", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.24)
+
+
+@pytest.mark.asyncio
+async def test_aimage_edit_clarity_tier_cost_parity():
+    fake = _FullAsyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = await llm.aimage_edit(
+        "nebula-ultra",
+        [_REF_TUPLE],
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "quality": "2k", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.134)
 
 
 def test_libtv_overrides_base_class_image_edit():

@@ -49,6 +49,33 @@ def _resolve_mode(optional_params: dict, default_mode: str) -> str:
     return optional_params.get("modeType") or optional_params.get("mode_type") or default_mode
 
 
+def _image_clarity_response_cost(optional_params: dict, quality: Optional[str], image_count: int) -> Optional[float]:
+    """Authoritative accrued spend for clarity-tiered libtv image models (e.g. nano-banana-pro).
+
+    Deployment config declares per-tier unit prices as litellm_params keys
+    (``output_cost_per_image_1k``/``_2k``/``_4k``), mirroring how libtv video
+    deployments declare ``output_cost_per_second_<resolution>`` in model_info.
+    Router deployments spread litellm_params into image_generation()'s kwargs;
+    any key litellm doesn't recognize as a first-class param is merged into
+    optional_params for custom providers (see
+    add_provider_specific_params_to_optional_params in litellm/utils.py),
+    which is how these tier prices reach this handler. When a model's spec has
+    no "quality" setting (and thus build_generation_params never sets
+    ``quality``) or the deployment declares no tier keys, this returns None
+    and callers must leave litellm's normal cost-calculator matrix in charge.
+    """
+    if not quality or image_count <= 0:
+        return None
+    tier_key = f"output_cost_per_image_{quality.strip().lower()}"
+    unit_price = optional_params.get(tier_key)
+    if unit_price is None:
+        return None
+    try:
+        return float(unit_price) * image_count
+    except (TypeError, ValueError):
+        return None
+
+
 def _reference_payload(ref: Any) -> Optional[Tuple[str, str, Optional[bytes]]]:
     """Normalize a litellm input_reference into ('url', url, None) or ('bytes', filename, data)."""
     if ref is None:
@@ -249,9 +276,21 @@ class LibTVLLM(CustomLLM):
                 + [{"url": u, "type": "audio"} for u in aud_urls]
             )
 
-    def _fill_image_response(self, model_response: ImageResponse, result: dict) -> ImageResponse:
-        model_response.data = [ImageObject(url=u) for u in (result.get("urls") or [])]
-        model_response._hidden_params = {"project_uuid": result.get("project_uuid")}
+    def _fill_image_response(
+        self,
+        model_response: ImageResponse,
+        result: dict,
+        optional_params: Optional[dict] = None,
+        quality: Optional[str] = None,
+    ) -> ImageResponse:
+        urls = result.get("urls") or []
+        model_response.data = [ImageObject(url=u) for u in urls]
+        hidden_params: dict = {"project_uuid": result.get("project_uuid")}
+        if optional_params is not None:
+            response_cost = _image_clarity_response_cost(optional_params, quality, len(urls))
+            if response_cost is not None:
+                hidden_params["response_cost"] = response_cost
+        model_response._hidden_params = hidden_params
         return model_response
 
     def _resolved_image_params(
@@ -301,7 +340,7 @@ class LibTVLLM(CustomLLM):
         images, _, _ = _collect_reference_groups(optional_params)
         params = self._resolved_image_params(lt, prompt, spec, images, optional_params)
         result = lt.generate(model, spec["vendor"], "image", params, _project_name(model))
-        return self._fill_image_response(model_response, result)
+        return self._fill_image_response(model_response, result, optional_params, params.get("quality"))
 
     async def aimage_generation(
         self,
@@ -320,7 +359,7 @@ class LibTVLLM(CustomLLM):
         images, _, _ = _collect_reference_groups(optional_params)
         params = await self._aresolved_image_params(lt, prompt, spec, images, optional_params)
         result = await lt.agenerate(model, spec["vendor"], "image", params, _project_name(model))
-        return self._fill_image_response(model_response, result)
+        return self._fill_image_response(model_response, result, optional_params, params.get("quality"))
 
     def image_edit(
         self,
@@ -345,7 +384,7 @@ class LibTVLLM(CustomLLM):
         images = _as_list(image)
         params = self._resolved_image_params(lt, prompt or "", spec, images, optional_params)
         result = lt.generate(model, spec["vendor"], "image", params, _project_name(model))
-        return self._fill_image_response(model_response, result)
+        return self._fill_image_response(model_response, result, optional_params, params.get("quality"))
 
     async def aimage_edit(
         self,
@@ -365,7 +404,7 @@ class LibTVLLM(CustomLLM):
         images = _as_list(image)
         params = await self._aresolved_image_params(lt, prompt or "", spec, images, optional_params)
         result = await lt.agenerate(model, spec["vendor"], "image", params, _project_name(model))
-        return self._fill_image_response(model_response, result)
+        return self._fill_image_response(model_response, result, optional_params, params.get("quality"))
 
     def video_generation(
         self,
