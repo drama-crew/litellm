@@ -1509,6 +1509,45 @@ def test_video_generation_uploads_external_reference_image_non_compliance_model(
     assert "/api/community/image/verify" not in [u.split("api.liblib.tv", 1)[-1] for u, _ in fake.calls]
 
 
+def test_video_generation_kling_omni_explicit_mixed2video_with_images_only_no_video_required():
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+    fake = _FullSyncFake(
+        routes,
+        get_payload=_tool_spec_payload(model_key="kling-v3-omni", auto_compliance=False),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "kling-v3-omni",
+        "a dragon flying",
+        "tok",
+        None,
+        {
+            "webid": "w",
+            "reference_images": [_LIBTV_REF, "https://libtv-res.liblib.art/upload-images/uid/def.png"],
+            "modeType": "mixed2video",
+        },
+        None,
+        client=fake,
+    )
+    assert vo.status == "completed"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [
+        {"url": _LIBTV_REF, "type": "image"},
+        {"url": "https://libtv-res.liblib.art/upload-images/uid/def.png", "type": "image"},
+    ]
+
+
 def _nebula_ultra_tool_spec_payload():
     meta = {
         "modelKey": "nebula-ultra",
