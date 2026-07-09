@@ -68,6 +68,22 @@ def _coerce_to_enum(value: Any, prop: Dict[str, Any]) -> Any:
     return None
 
 
+_MODE_ALIASES = {
+    "image2video": "singleImage2video",
+    "video2video": "mixed2video",
+}
+
+
+def _canonicalize_mode(mode: str, spec: Dict[str, Any]) -> str:
+    cfg_settings = (spec.get("config") or {}).get("settings")
+    if not isinstance(cfg_settings, dict) or mode in cfg_settings:
+        return mode
+    alias = _MODE_ALIASES.get(mode)
+    if alias and alias in cfg_settings:
+        return alias
+    return mode
+
+
 def _allowed_setting_keys(spec: Dict[str, Any], mode: str) -> List[str]:
     cfg_settings = (spec.get("config") or {}).get("settings")
     if isinstance(cfg_settings, dict):
@@ -86,8 +102,12 @@ def build_generation_params(
     op = dict(optional_params or {})
     props = spec.get("properties") or {}
     size = op.get("size")
+    mode = _canonicalize_mode(mode, spec)
 
     ratio = op.get("ratio") or op.get("aspect_ratio") or size_to_ratio(size)
+    enable_sound = op.get("enableSound")
+    if enable_sound is None and op.get("generate_audio") is not None:
+        enable_sound = "on" if op.get("generate_audio") else "off"
     candidates: Dict[str, Any] = {
         "ratio": ratio,
         "ratio_auto": ratio,
@@ -96,7 +116,7 @@ def build_generation_params(
         "duration": op.get("seconds") or op.get("duration"),
         "quality": op.get("quality"),
         "quality_high": op.get("quality"),
-        "enableSound": op.get("enableSound"),
+        "enableSound": enable_sound,
         "smartStoryboard": op.get("smartStoryboard"),
     }
 

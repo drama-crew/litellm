@@ -758,6 +758,67 @@ def test_build_params_kling_video_o3_single_image2video_excludes_ratio():
     assert params["smartStoryboard"] is False
 
 
+def test_build_params_kling_video_o3_canonicalizes_generic_image2video_mode():
+    # litellm's own mode-inference layer (_infer_video_mode) returns the generic
+    # "image2video" for a single reference image, but kling's schema buckets its
+    # settings under "singleImage2video". Without canonicalization the settings
+    # lookup misses entirely and every setting (quality/duration/enableSound/
+    # smartStoryboard) silently drops out of the request.
+    params = build_generation_params("a cat", {}, _KLING_VIDEO_O3_SPEC, "image2video")
+    assert params["quality"] == "low"
+    assert params["duration"] == 5
+    assert params["enableSound"] == "on"
+    assert params["smartStoryboard"] is False
+
+
+def test_build_params_canonicalizes_generic_video2video_mode_to_mixed2video():
+    # A vendor schema that buckets its combined image+video settings under
+    # "mixed2video" (litellm's handler produces "video2video" for that case).
+    spec = {
+        "config": {"settings": {"mixed2video": ["ratio", "duration"]}},
+        "properties": {"ratio": {"default": "16:9"}, "duration": {"default": 5}},
+    }
+    params = build_generation_params("a cat", {}, spec, "video2video")
+    assert params["ratio"] == "16:9"
+    assert params["duration"] == 5
+
+
+def test_build_params_flat_settings_seedance_unaffected_by_mode_canonicalization():
+    # seedance's config.settings is a flat list, so _allowed_setting_keys returns
+    # before ever consulting the mode alias table; canonicalization must be a no-op.
+    params = build_generation_params("a cat", {"seconds": "8"}, _SEEDANCE_SPEC, "image2video")
+    assert params["modeType"] == "image2video"
+    assert params["ratio"] == "16:9"
+    assert params["resolution"] == "720p"
+    assert params["duration"] == 8
+
+
+def test_build_params_kling_video_o3_generate_audio_false_maps_to_enablesound_off():
+    params = build_generation_params(
+        "a cat", {"generate_audio": False}, _KLING_VIDEO_O3_SPEC, "text2video"
+    )
+    assert params["enableSound"] == "off"
+
+
+def test_build_params_kling_video_o3_generate_audio_true_maps_to_enablesound_on():
+    params = build_generation_params(
+        "a cat", {"generate_audio": True}, _KLING_VIDEO_O3_SPEC, "text2video"
+    )
+    assert params["enableSound"] == "on"
+
+
+def test_build_params_kling_video_o3_explicit_enablesound_wins_over_generate_audio():
+    params = build_generation_params(
+        "a cat", {"enableSound": "off", "generate_audio": True}, _KLING_VIDEO_O3_SPEC, "text2video"
+    )
+    assert params["enableSound"] == "off"
+
+
+def test_build_params_kling_video_o3_neither_audio_key_falls_back_to_schema_default():
+    params = build_generation_params("a cat", {}, _KLING_VIDEO_O3_SPEC, "text2video")
+    assert params["enableSound"] == "on"
+
+
 def test_build_params_kling_video_o3_count_is_forced_to_one():
     # properties.count is `[1]` (a bare list, not a {"default": ...} dict), so
     # count_default takes the `isinstance(count_prop, dict)` else-branch and is
