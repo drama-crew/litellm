@@ -93,6 +93,35 @@ def _allowed_setting_keys(spec: Dict[str, Any], mode: str) -> List[str]:
     return []
 
 
+def _candidate_value(
+    key: str,
+    ratio: Optional[str],
+    resolution: Optional[str],
+    duration: Any,
+    quality: Any,
+    enable_sound: Optional[str],
+    smart_storyboard: Any,
+) -> Any:
+    # Vendor schemas bucket the same logical setting under several key spellings
+    # per mode (e.g. kling's quality/quality_high/quality_4k, duration/duration_10,
+    # ratio/ratio_auto). Matching by prefix means a new bucket spelling picks up its
+    # value automatically instead of silently dropping out until someone adds a new
+    # literal entry to a lookup table.
+    if key == "enableSound":
+        return enable_sound
+    if key == "smartStoryboard":
+        return smart_storyboard
+    if key.startswith("ratio"):
+        return ratio
+    if key.startswith("resolution"):
+        return resolution
+    if key.startswith("duration"):
+        return duration
+    if key.startswith("quality"):
+        return quality
+    return None
+
+
 def build_generation_params(
     prompt: str,
     optional_params: Dict[str, Any],
@@ -105,25 +134,18 @@ def build_generation_params(
     mode = _canonicalize_mode(mode, spec)
 
     ratio = op.get("ratio") or op.get("aspect_ratio") or size_to_ratio(size)
+    resolution = op.get("resolution") or _resolution_from_size(size)
+    duration = op.get("seconds") or op.get("duration")
+    quality = op.get("quality")
     enable_sound = op.get("enableSound")
     if enable_sound is None and op.get("generate_audio") is not None:
         enable_sound = "on" if op.get("generate_audio") else "off"
-    candidates: Dict[str, Any] = {
-        "ratio": ratio,
-        "ratio_auto": ratio,
-        "resolution": op.get("resolution") or _resolution_from_size(size),
-        "resolution_480": op.get("resolution") or _resolution_from_size(size),
-        "duration": op.get("seconds") or op.get("duration"),
-        "quality": op.get("quality"),
-        "quality_high": op.get("quality"),
-        "enableSound": enable_sound,
-        "smartStoryboard": op.get("smartStoryboard"),
-    }
+    smart_storyboard = op.get("smartStoryboard")
 
     settings: Dict[str, Any] = {}
     for key in _allowed_setting_keys(spec, mode):
         prop = props.get(key) or {}
-        val = candidates.get(key)
+        val = _candidate_value(key, ratio, resolution, duration, quality, enable_sound, smart_storyboard)
         if key.startswith("duration") and val is not None:
             try:
                 val = int(val)
