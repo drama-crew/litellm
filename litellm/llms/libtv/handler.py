@@ -125,6 +125,18 @@ def _auto_compliance_enabled(spec: dict) -> bool:
     return bool(((spec.get("properties") or {}).get("autoCompliance") or {}).get("enable"))
 
 
+def _wants_frames2video(optional_params: dict, spec: dict) -> bool:
+    # A first/last-frame request (image + last_image) must not be flattened into
+    # mixed2video reference-image soup: that loses the first/last ordering entirely.
+    # Only take the frames2video path when the model schema actually advertises support
+    # for it, so unsupported models keep getting the existing mixed2video behavior
+    # instead of a 400.
+    if not optional_params.get("last_image"):
+        return False
+    mode_items = ((spec.get("properties") or {}).get("modeType") or {}).get("items")
+    return isinstance(mode_items, dict) and "frames2video" in mode_items
+
+
 class LibTVLLM(CustomLLM):
     def __init__(self, poll_interval: float = 3.0, poll_max_attempts: int = 200, http_get=None, http_put=None):
         super().__init__()
@@ -322,7 +334,20 @@ class LibTVLLM(CustomLLM):
             p = _reference_payload(ref)
             return lt.ensure_libtv_url(p[0], p[1], p[2], default_name)
 
-        if images and _auto_compliance_enabled(spec):
+        if images and _auto_compliance_enabled(spec) and _wants_frames2video(optional_params, spec):
+            frame_refs = lt.resolve_compliant_image_refs(
+                [_reference_payload(optional_params.get("image")), _reference_payload(optional_params.get("last_image"))]
+            )
+            video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
+            mode = _resolve_mode(optional_params, "frames2video")
+            params = build_generation_params(prompt, optional_params, spec, mode)
+            params["autoCompliance"] = 1
+            params["imageList"] = frame_refs
+            if video_refs:
+                params["videoList"] = video_refs
+            if audios:
+                params["audioList"] = [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
+        elif images and _auto_compliance_enabled(spec):
             image_refs = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
             video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "mixed2video")
@@ -364,7 +389,20 @@ class LibTVLLM(CustomLLM):
             p = _reference_payload(ref)
             return await lt.aensure_libtv_url(p[0], p[1], p[2], default_name)
 
-        if images and _auto_compliance_enabled(spec):
+        if images and _auto_compliance_enabled(spec) and _wants_frames2video(optional_params, spec):
+            frame_refs = await lt.aresolve_compliant_image_refs(
+                [_reference_payload(optional_params.get("image")), _reference_payload(optional_params.get("last_image"))]
+            )
+            video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
+            mode = _resolve_mode(optional_params, "frames2video")
+            params = build_generation_params(prompt, optional_params, spec, mode)
+            params["autoCompliance"] = 1
+            params["imageList"] = frame_refs
+            if video_refs:
+                params["videoList"] = video_refs
+            if audios:
+                params["audioList"] = [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
+        elif images and _auto_compliance_enabled(spec):
             image_refs = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
             video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "mixed2video")

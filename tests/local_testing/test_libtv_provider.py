@@ -895,7 +895,7 @@ def test_resolve_model_spec_indexes_tool_spec():
         lt.resolve_model_spec("does-not-exist")
 
 
-def _tool_spec_payload(model_key="star-video2", auto_compliance=True):
+def _tool_spec_payload(model_key="star-video2", auto_compliance=True, frames2video=False):
     props = {
         "ratio": {"default": "9:16", "enum": ["16:9", "9:16"]},
         "resolution": {"default": "720p", "enum": [{"value": "720p"}]},
@@ -904,6 +904,8 @@ def _tool_spec_payload(model_key="star-video2", auto_compliance=True):
     }
     if auto_compliance:
         props["autoCompliance"] = {"enable": True, "default": 1}
+    if frames2video:
+        props["modeType"] = {"items": {"frames2video": [1, 2], "mixed2video": []}}
     meta = {
         "modelKey": model_key,
         "modelVendor": model_key,
@@ -1097,6 +1099,141 @@ async def test_mixed2video_compliance_registers_reference_video_as_asset_async()
         {"url": "asset://asset-IMG", "type": "image"},
         {"url": "asset://asset-VID", "type": "video"},
     ]
+
+
+_LIBTV_LAST = "https://libtv-res.liblib.art/upload-images/uid/last.png"
+
+
+def _frames2video_compliance_routes():
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    return {
+        "/api/community/image/verify": {
+            "code": 0,
+            "data": {"list": [{"url": _LIBTV_REF, "riskLabels": risk}, {"url": _LIBTV_LAST, "riskLabels": risk}]},
+        },
+        "/api/third_asset/create": [
+            {"code": 0, "data": {"uuid": "u-first"}},
+            {"code": 0, "data": {"uuid": "u-last"}},
+        ],
+        "/api/third_asset/check": [
+            {"code": 0, "data": {"list": [{"uuid": "u-first", "assetId": "asset-FIRST", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-last", "assetId": "asset-LAST", "status": 1}]}},
+        ],
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+
+
+def test_frames2video_compliance_keeps_first_last_order_and_mode():
+    fake = FakeSyncClient(
+        post_by_path=_frames2video_compliance_routes(),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["autoCompliance"] == 1
+    assert gen_params["imageList"] == ["asset://asset-FIRST", "asset://asset-LAST"]
+    assert "mixedList" not in gen_params
+
+
+def test_reference_images_only_still_uses_mixed2video():
+    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=True))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}]
+
+
+def test_frames2video_falls_back_to_mixed2video_when_spec_lacks_mode():
+    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=False))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_REF},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert "mixedList" in gen_params
+    assert "imageList" not in gen_params or gen_params["imageList"] == []
+
+
+@pytest.mark.asyncio
+async def test_frames2video_compliance_async_keeps_first_last_order():
+    fake = FakeAsyncClient(
+        post_by_path=_frames2video_compliance_routes(),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = await llm.avideo_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["imageList"] == ["asset://asset-FIRST", "asset://asset-LAST"]
+
+
+def test_non_compliance_frames2video_keeps_first_last_imagelist_order():
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(auto_compliance=False, frames2video=True))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["imageList"] == [_LIBTV_REF, _LIBTV_LAST]
 
 
 # --- video usage -> resolution-tiered cost (authoritative spend line) ---------
