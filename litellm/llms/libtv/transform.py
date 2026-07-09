@@ -97,6 +97,7 @@ def build_generation_params(
         "quality": op.get("quality"),
         "quality_high": op.get("quality"),
         "enableSound": op.get("enableSound"),
+        "smartStoryboard": op.get("smartStoryboard"),
     }
 
     settings: Dict[str, Any] = {}

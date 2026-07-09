@@ -708,10 +708,6 @@ def test_build_params_kling_video_o3_text2video_defaults():
     assert params["quality"] == "low"
     assert params["duration"] == 5
     assert params["enableSound"] == "on"
-    # smartStoryboard has no entry in `candidates`, so the key can never receive a
-    # user-supplied value -- it always resolves to the schema default regardless of
-    # what optional_params contains. Documented below in
-    # test_build_params_kling_video_o3_smart_storyboard_ignores_user_value.
     assert params["smartStoryboard"] is False
 
 
@@ -732,14 +728,14 @@ def test_build_params_kling_video_o3_text2video_explicit_values():
     assert params["enableSound"] == "off"
 
 
-def test_build_params_kling_video_o3_smart_storyboard_ignores_user_value():
-    # Known limitation: `candidates` has no "smartStoryboard" mapping, so
-    # `candidates.get("smartStoryboard")` is always None and the code falls through to
-    # the schema default no matter what the caller passes. Passing True here still
-    # yields the schema default (False) -- this proves users cannot currently turn on
-    # 智能分镜 (smart storyboard) via optional_params.
+def test_build_params_kling_video_o3_smart_storyboard_honors_user_value():
     params = build_generation_params(
         "a cat", {"smartStoryboard": True}, _KLING_VIDEO_O3_SPEC, "text2video"
+    )
+    assert params["smartStoryboard"] is True
+
+    params = build_generation_params(
+        "a cat", {"smartStoryboard": False}, _KLING_VIDEO_O3_SPEC, "text2video"
     )
     assert params["smartStoryboard"] is False
 
