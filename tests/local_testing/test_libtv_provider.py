@@ -911,6 +911,132 @@ def test_build_params_kling_omni_count_is_forced_to_one():
     assert params["count"] == 1
 
 
+_HAPPY_HORSE_11_SPEC = {
+    "modelKey": "happy-horse-1.1",
+    "modelName": "Happy Horse 1.1",
+    "modelVendor": "happy-horse",
+    "baseType": 27,
+    "properties": {
+        "strikethroughPrice": {"active": True},
+        "magic": False,
+        "mention": True,
+        "count": [1],
+        "prompt": {"maxLength": 0},
+        "ratio": {
+            "displayName": "比例",
+            "enum": ["16:9", "9:16", "1:1", "4:3", "3:4"],
+            "default": "16:9",
+            "component": "singleButton",
+            "originalField": "ratio",
+        },
+        "resolution": {
+            "displayName": "清晰度",
+            "enum": ["720P", "1080P"],
+            "default": "720P",
+            "component": "singleButton",
+            "originalField": "resolution",
+        },
+        "duration": {
+            "min": 3,
+            "max": 15,
+            "step": 1,
+            "default": 5,
+            "originalField": "duration",
+            "component": "slider",
+        },
+        "modeType": {
+            "originalField": "modeType",
+            "items": {
+                "frames2video": [1, 1],
+                "videoEdit2video": [1, 5],
+                "image2video": [1, 9],
+            },
+            "videoEdit2videoConfig": {"videoMax": 1, "imageMaxWithVideo": 5},
+        },
+    },
+    "config": {
+        "settings": {
+            "text2video": ["ratio", "resolution", "duration"],
+            "frames2video": ["resolution", "duration"],
+            "image2video": ["ratio", "resolution", "duration"],
+            "videoEdit2video": ["resolution"],
+        }
+    },
+    "rules": [{"require": ["prompt", "media"], "mode": "any"}],
+}
+
+
+def test_build_params_happy_horse_text2video_coerces_lowercase_resolution():
+    params = build_generation_params(
+        "a horse", {"resolution": "720p", "aspect_ratio": "9:16", "seconds": 8}, _HAPPY_HORSE_11_SPEC, "text2video"
+    )
+    assert params["resolution"] == "720P"
+    assert params["ratio"] == "9:16"
+    assert params["duration"] == 8
+    assert isinstance(params["duration"], int)
+
+
+def test_build_params_happy_horse_image2video_is_native_bucket_not_aliased():
+    # happy-horse buckets its own "image2video" settings natively -- unlike omni it
+    # has no "singleImage2video" key, so canonicalization must leave the mode alone
+    # (exact-key-wins) instead of aliasing it away to a bucket that doesn't exist.
+    params = build_generation_params("a horse", {"quality": "high"}, _HAPPY_HORSE_11_SPEC, "image2video")
+    assert params["modeType"] == "image2video"
+    assert params["ratio"] == "16:9"
+    assert params["resolution"] == "720P"
+    assert params["duration"] == 5
+
+
+def test_build_params_happy_horse_explicit_mixed2video_canonicalizes_to_videoedit2video():
+    # happy-horse has no "mixed2video" bucket at all -- only "videoEdit2video" -- so
+    # the drama backend's explicit build_generation_params(..., "mixed2video") call
+    # for 视频编辑 must fall back to the bucket that actually exists.
+    params = build_generation_params(
+        "a horse", {"aspect_ratio": "1:1", "resolution": "1080p", "seconds": 6}, _HAPPY_HORSE_11_SPEC, "mixed2video"
+    )
+    assert params["modeType"] == "videoEdit2video"
+    assert params["resolution"] == "1080P"
+    assert "ratio" not in params
+    assert "duration" not in params
+
+
+def test_build_params_happy_horse_generic_video2video_canonicalizes_to_videoedit2video():
+    params = build_generation_params("a horse", {"resolution": "1080p"}, _HAPPY_HORSE_11_SPEC, "video2video")
+    assert params["modeType"] == "videoEdit2video"
+    assert params["resolution"] == "1080P"
+
+
+def test_build_params_kling_omni_mixed2video_exact_match_still_wins_over_alias_chain():
+    # regression guard: omni has BOTH "mixed2video" and "videoEdit2video" buckets, so
+    # extending the alias chain for happy-horse must not make omni's explicit
+    # mixed2video calls fall through to videoEdit2video.
+    params = build_generation_params("a cat", {"seconds": 6, "quality": "high"}, _KLING_V3_OMNI_SPEC, "mixed2video")
+    assert params["modeType"] == "mixed2video"
+    assert params["duration"] == 6
+    assert params["quality_4k"] == "high"
+    assert "duration_10" not in params
+    assert "quality" not in params
+
+
+def test_build_params_happy_horse_frames2video_single_image():
+    params = build_generation_params(
+        "a horse", {"resolution": "720p", "seconds": 4}, _HAPPY_HORSE_11_SPEC, "frames2video"
+    )
+    assert params["modeType"] == "frames2video"
+    assert params["resolution"] == "720P"
+    assert params["duration"] == 4
+    assert "ratio" not in params
+
+
+def test_build_params_happy_horse_generate_audio_ignored_no_enablesound_key():
+    # no enableSound property or settings entry exists anywhere in happy-horse's
+    # spec, so generate_audio must be silently ignored rather than raising or
+    # injecting a key the vendor schema doesn't recognize.
+    params = build_generation_params("a horse", {"generate_audio": True}, _HAPPY_HORSE_11_SPEC, "text2video")
+    assert "enableSound" not in params
+    assert params["ratio"] == "16:9"
+
+
 def test_resolve_credentials_requires_both(monkeypatch):
     for key in ("LIBTV_TOKEN", "LIBTV_CLI_USERTOKEN", "LIBTV_WEBID", "LIBTV_CLI_WEBID"):
         monkeypatch.delenv(key, raising=False)

@@ -69,8 +69,9 @@ def _coerce_to_enum(value: Any, prop: Dict[str, Any]) -> Any:
 
 
 _MODE_ALIASES = {
-    "image2video": "singleImage2video",
-    "video2video": "mixed2video",
+    "image2video": ["singleImage2video"],
+    "video2video": ["mixed2video", "videoEdit2video"],
+    "mixed2video": ["videoEdit2video"],
 }
 
 
@@ -78,9 +79,9 @@ def _canonicalize_mode(mode: str, spec: Dict[str, Any]) -> str:
     cfg_settings = (spec.get("config") or {}).get("settings")
     if not isinstance(cfg_settings, dict) or mode in cfg_settings:
         return mode
-    alias = _MODE_ALIASES.get(mode)
-    if alias and alias in cfg_settings:
-        return alias
+    for alias in _MODE_ALIASES.get(mode, []):
+        if alias in cfg_settings:
+            return alias
     return mode
 
 
