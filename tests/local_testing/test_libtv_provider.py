@@ -16,9 +16,12 @@ from litellm.llms.libtv.handler import (
     LibTVLLM,
     _collect_reference_groups,
     _default_video_mode,
+    _image_clarity_response_cost,
+    _infer_image_mode,
     _infer_video_mode,
     _reference_payload,
 )
+from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.utils import decode_video_id_with_provider
 from litellm.llms.libtv.transform import build_generation_params, size_to_ratio
 
@@ -39,6 +42,57 @@ _WAN_SPEC = {
         "resolution": {"default": "720p", "enum": [{"value": "480P"}, {"value": "720P"}]},
         "duration": {"default": 5},
     },
+}
+
+# Real tool_spec metadata for nebula-ultra ("全能图片模型V2", libtv's disguised name for
+# Nano Banana Pro). Flat settings list (no per-mode buckets) with count as a bare enum
+# list rather than a dict, and modeType.items only advertising image2image.
+_NEBULA_ULTRA_SPEC = {
+    "modelKey": "nebula-ultra",
+    "modelName": "全能图片模型V2",
+    "modelVendor": "nebula",
+    "vendor": "nebula",
+    "baseType": 40,
+    "properties": {
+        "enableSlash": True,
+        "cameraControl": True,
+        "magic": True,
+        "focus": True,
+        "mention": True,
+        "count": [1, 2, 4],
+        "template": {"displayName": "风格", "maxCount": 1},
+        "prompt": {"description": "", "placeholder": "", "maxLength": 0},
+        "quality": {
+            "displayName": "分辨率",
+            "enum": ["1K", "2K", "4K"],
+            "default": "2K",
+            "component": "singleButton",
+            "originalField": "quality",
+        },
+        "ratio": {
+            "displayName": "比例",
+            "enum": [
+                {"value": "auto", "displayName": "自适应"},
+                "1:1",
+                "9:16",
+                "16:9",
+                "3:4",
+                "4:3",
+                "3:2",
+                "2:3",
+                "4:5",
+                "5:4",
+                "21:9",
+            ],
+            "default": "16:9",
+            "component": "singleButton",
+            "originalField": "ratio",
+        },
+        "searchable": {"displayName": "联网搜索", "default": 0, "component": "switch", "originalField": "searchable"},
+        "modeType": {"description": "模态类型", "items": {"image2image": [0, 7]}},
+    },
+    "config": {"settings": ["quality", "ratio"], "advancedSettings": ["searchable"]},
+    "rules": [{"require": ["prompt", "media"], "mode": "any"}, {"require": ["prompt"]}],
 }
 
 
@@ -152,6 +206,65 @@ def test_build_params_unknown_mode_has_empty_settings():
     params = build_generation_params("x", {}, _WAN_SPEC, "image2video")
     assert "ratio" not in params and "resolution" not in params and "duration" not in params
     assert params["imageList"] == [] and params["textList"] == []
+
+
+def test_build_params_nebula_ultra_coerces_lowercase_clarity_and_derives_ratio_from_size():
+    # drama backend sends lowercase clarity tokens + a size, no explicit ratio.
+    params = build_generation_params("a cat", {"quality": "2k", "size": "2560x1440"}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert params["quality"] == "2K"
+    assert params["ratio"] == "16:9"
+
+
+@pytest.mark.parametrize("lower,upper", [("1k", "1K"), ("2k", "2K"), ("4k", "4K")])
+def test_build_params_nebula_ultra_quality_case_insensitive(lower, upper):
+    params = build_generation_params("x", {"quality": lower}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert params["quality"] == upper
+
+
+def test_build_params_nebula_ultra_explicit_aspect_ratio_wins_over_size():
+    params = build_generation_params(
+        "x", {"aspect_ratio": "9:16", "size": "2560x1440"}, _NEBULA_ULTRA_SPEC, "text2image"
+    )
+    assert params["ratio"] == "9:16"
+
+
+def test_build_params_nebula_ultra_defaults_quality_when_absent():
+    params = build_generation_params("x", {}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert params["quality"] == "2K"
+    assert params["ratio"] == "16:9"
+
+
+def test_build_params_nebula_ultra_count_from_n_or_count_kw():
+    assert build_generation_params("x", {"n": 2}, _NEBULA_ULTRA_SPEC, "text2image")["count"] == 2
+    assert build_generation_params("x", {"count": 4}, _NEBULA_ULTRA_SPEC, "text2image")["count"] == 4
+
+
+def test_build_params_nebula_ultra_count_bare_list_default_does_not_crash():
+    # the "count" property is a bare enum list ([1, 2, 4]), not a dict with a "default"
+    # key; build_generation_params must fall back to 1 instead of raising.
+    params = build_generation_params("x", {}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert params["count"] == 1
+
+
+def test_build_params_nebula_ultra_searchable_advanced_setting_not_sent_unless_explicit():
+    params = build_generation_params("x", {}, _NEBULA_ULTRA_SPEC, "text2image")
+    assert "searchable" not in params
+    params_explicit = build_generation_params(
+        "x", {"advancedSettings": {"searchable": 1}}, _NEBULA_ULTRA_SPEC, "text2image"
+    )
+    assert params_explicit["searchable"] == 1
+
+
+def test_build_params_nebula_ultra_image2image_still_applies_quality_and_ratio():
+    params = build_generation_params("x", {"quality": "4k", "aspect_ratio": "1:1"}, _NEBULA_ULTRA_SPEC, "image2image")
+    assert params["modeType"] == "image2image"
+    assert params["quality"] == "4K"
+    assert params["ratio"] == "1:1"
+
+
+def test_infer_image_mode():
+    assert _infer_image_mode([]) == "text2image"
+    assert _infer_image_mode(["ref.png"]) == "image2image"
 
 
 def test_build_node_batch_body_video_carries_model_and_params():
@@ -819,6 +932,316 @@ def test_count_list_property_does_not_crash():
     assert params["count"] == 1
 
 
+# Real metadata for kling-v3-omni ("可灵 3.0 Omni"), the model actually shipping on
+# the drama platform (kling-video-o3 was superseded before launch). Kept as the full
+# payload (not just properties/config) so the fixture matches what resolve_model_spec
+# actually stores for this model.
+_KLING_V3_OMNI_SPEC = {
+    "modelKey": "kling-v3-omni",
+    "modelName": "可灵 3.0 Omni",
+    "modelVendor": "Kling",
+    "properties": {
+        "count": [1],
+        "magic": True,
+        "mention": True,
+        "prompt": {"maxLength": 2000, "originalField": "prompt"},
+        "ratio": {"enum": ["16:9", "1:1", "9:16"], "default": "16:9", "originalField": "ratio"},
+        "ratio_auto": {
+            "enum": [{"value": " ", "displayName": "智能模式"}, "16:9", "1:1", "9:16"],
+            "default": " ",
+            "originalField": "ratio",
+        },
+        "duration": {"min": 3, "max": 15, "default": 5, "originalField": "duration"},
+        "duration_10": {"min": 3, "max": 10, "default": 5, "originalField": "duration"},
+        "quality": {
+            "enum": [{"value": "low", "displayName": "标准"}, {"value": "high", "displayName": "高品质"}],
+            "default": "low",
+            "originalField": "quality",
+        },
+        "quality_4k": {
+            "enum": [
+                {"value": "low", "displayName": "标准"},
+                {"value": "high", "displayName": "高品质"},
+                {"value": "4k", "displayName": "4K"},
+            ],
+            "default": "low",
+            "originalField": "quality",
+        },
+        "enableSound": {
+            "enum": [{"value": "on", "displayName": "开启"}, {"value": "off", "displayName": "关闭"}],
+            "default": "on",
+            "originalField": "enableSound",
+        },
+        "modeType": {
+            "originalField": "modeType",
+            "items": {
+                "mixed2video": [1, 7],
+                "frames2video": [1, 2],
+                "videoEdit2video": [1, 5],
+                "audio2video": [0, 0],
+                "singleImage2video": [1, 1],
+            },
+        },
+        "smartStoryboard": {
+            "displayName": "智能分镜",
+            "component": "switch",
+            "default": False,
+            "originalField": "multi_shot",
+        },
+    },
+    "config": {
+        "settings": {
+            "text2video": ["ratio", "enableSound", "duration", "quality_4k", "smartStoryboard"],
+            "frames2video": ["ratio_auto", "enableSound", "duration", "quality_4k"],
+            "singleImage2video": ["ratio", "enableSound", "duration", "quality_4k", "smartStoryboard"],
+            "videoEdit2video": ["ratio_auto", "duration_10", "quality", "enableSound"],
+            "mixed2video": ["ratio", "duration", "quality_4k", "enableSound", "smartStoryboard"],
+        }
+    },
+    "rules": [{"require": ["prompt", "media"], "mode": "any"}, {"require": ["prompt"]}],
+}
+
+
+def test_build_params_kling_omni_text2video_defaults():
+    params = build_generation_params("a cat", {}, _KLING_V3_OMNI_SPEC, "text2video")
+    assert params["ratio"] == "16:9"
+    assert params["quality_4k"] == "low"
+    assert params["duration"] == 5
+    assert params["enableSound"] == "on"
+    assert params["smartStoryboard"] is False
+
+
+def test_build_params_kling_omni_text2video_explicit_values():
+    # quality_4k is the settings key omni buckets text2video quality under; without
+    # prefix-matching on "quality*" this key falls out of the old exact-key
+    # candidates dict and the requested quality is silently dropped to the default.
+    params = build_generation_params(
+        "a cat",
+        {"aspect_ratio": "9:16", "quality": "high", "seconds": 8, "generate_audio": False},
+        _KLING_V3_OMNI_SPEC,
+        "text2video",
+    )
+    assert params["ratio"] == "9:16"
+    assert params["quality_4k"] == "high"
+    assert params["duration"] == 8
+    assert isinstance(params["duration"], int)
+    assert params["enableSound"] == "off"
+    assert params["smartStoryboard"] is False
+
+
+def test_build_params_kling_omni_canonicalizes_generic_image2video_mode():
+    # litellm's own mode-inference layer (_infer_video_mode) returns the generic
+    # "image2video" for a single reference image, but omni's schema buckets its
+    # settings under "singleImage2video".
+    params = build_generation_params("a cat", {"quality": "high"}, _KLING_V3_OMNI_SPEC, "image2video")
+    assert params["quality_4k"] == "high"
+    assert params["duration"] == 5
+    assert params["enableSound"] == "on"
+    assert params["smartStoryboard"] is False
+
+
+def test_build_params_kling_omni_canonicalizes_generic_video2video_mode_to_mixed2video():
+    params = build_generation_params(
+        "a cat", {"aspect_ratio": "1:1", "quality": "high", "seconds": 6}, _KLING_V3_OMNI_SPEC, "video2video"
+    )
+    assert params["modeType"] == "mixed2video"
+    assert params["ratio"] == "1:1"
+    assert params["quality_4k"] == "high"
+    assert params["duration"] == 6
+
+
+def test_build_params_kling_omni_video_edit_uses_duration_10_and_quality():
+    # videoEdit2video is the one omni bucket no generic mode aliases to; callers must
+    # pass it explicitly. It uses duration_10 (max 10s, still int-coerced by the
+    # existing key.startswith("duration") branch) and the low/high-only "quality"
+    # key -- a requested "4k" isn't a valid option there and coerces to the default.
+    params = build_generation_params("a cat", {"seconds": 8, "quality": "4k"}, _KLING_V3_OMNI_SPEC, "videoEdit2video")
+    assert params["duration_10"] == 8
+    assert isinstance(params["duration_10"], int)
+    assert params["quality"] == "low"
+    assert "quality_4k" not in params
+    assert "duration" not in params
+
+
+def test_build_params_kling_omni_frames2video_uses_ratio_auto_and_drops_storyboard():
+    params = build_generation_params(
+        "a cat", {"aspect_ratio": "9:16", "quality": "high"}, _KLING_V3_OMNI_SPEC, "frames2video"
+    )
+    assert params["ratio_auto"] == "9:16"
+    assert "ratio" not in params
+    assert params["quality_4k"] == "high"
+    assert "smartStoryboard" not in params
+
+
+def test_build_params_flat_settings_seedance_unaffected_by_mode_canonicalization():
+    # seedance's config.settings is a flat list, so _allowed_setting_keys returns
+    # before ever consulting the mode alias table; canonicalization must be a no-op.
+    params = build_generation_params("a cat", {"seconds": "8"}, _SEEDANCE_SPEC, "image2video")
+    assert params["modeType"] == "image2video"
+    assert params["ratio"] == "16:9"
+    assert params["resolution"] == "720p"
+    assert params["duration"] == 8
+
+
+def test_build_params_kling_omni_generate_audio_false_maps_to_enablesound_off():
+    params = build_generation_params("a cat", {"generate_audio": False}, _KLING_V3_OMNI_SPEC, "text2video")
+    assert params["enableSound"] == "off"
+
+
+def test_build_params_kling_omni_generate_audio_true_maps_to_enablesound_on():
+    params = build_generation_params("a cat", {"generate_audio": True}, _KLING_V3_OMNI_SPEC, "text2video")
+    assert params["enableSound"] == "on"
+
+
+def test_build_params_kling_omni_explicit_enablesound_wins_over_generate_audio():
+    params = build_generation_params(
+        "a cat", {"enableSound": "off", "generate_audio": True}, _KLING_V3_OMNI_SPEC, "text2video"
+    )
+    assert params["enableSound"] == "off"
+
+
+def test_build_params_kling_omni_smart_storyboard_honors_user_value():
+    params = build_generation_params("a cat", {"smartStoryboard": True}, _KLING_V3_OMNI_SPEC, "text2video")
+    assert params["smartStoryboard"] is True
+
+    params = build_generation_params("a cat", {"smartStoryboard": False}, _KLING_V3_OMNI_SPEC, "text2video")
+    assert params["smartStoryboard"] is False
+
+
+def test_build_params_kling_omni_count_is_forced_to_one():
+    # properties.count is `[1]` (a bare list, not a {"default": ...} dict), so
+    # count_default takes the `isinstance(count_prop, dict)` else-branch and is
+    # hard-coded to 1 regardless of the list's contents.
+    params = build_generation_params("a cat", {}, _KLING_V3_OMNI_SPEC, "text2video")
+    assert params["count"] == 1
+
+
+_HAPPY_HORSE_11_SPEC = {
+    "modelKey": "happy-horse-1.1",
+    "modelName": "Happy Horse 1.1",
+    "modelVendor": "happy-horse",
+    "baseType": 27,
+    "properties": {
+        "strikethroughPrice": {"active": True},
+        "magic": False,
+        "mention": True,
+        "count": [1],
+        "prompt": {"maxLength": 0},
+        "ratio": {
+            "displayName": "比例",
+            "enum": ["16:9", "9:16", "1:1", "4:3", "3:4"],
+            "default": "16:9",
+            "component": "singleButton",
+            "originalField": "ratio",
+        },
+        "resolution": {
+            "displayName": "清晰度",
+            "enum": ["720P", "1080P"],
+            "default": "720P",
+            "component": "singleButton",
+            "originalField": "resolution",
+        },
+        "duration": {
+            "min": 3,
+            "max": 15,
+            "step": 1,
+            "default": 5,
+            "originalField": "duration",
+            "component": "slider",
+        },
+        "modeType": {
+            "originalField": "modeType",
+            "items": {
+                "frames2video": [1, 1],
+                "videoEdit2video": [1, 5],
+                "image2video": [1, 9],
+            },
+            "videoEdit2videoConfig": {"videoMax": 1, "imageMaxWithVideo": 5},
+        },
+    },
+    "config": {
+        "settings": {
+            "text2video": ["ratio", "resolution", "duration"],
+            "frames2video": ["resolution", "duration"],
+            "image2video": ["ratio", "resolution", "duration"],
+            "videoEdit2video": ["resolution"],
+        }
+    },
+    "rules": [{"require": ["prompt", "media"], "mode": "any"}],
+}
+
+
+def test_build_params_happy_horse_text2video_coerces_lowercase_resolution():
+    params = build_generation_params(
+        "a horse", {"resolution": "720p", "aspect_ratio": "9:16", "seconds": 8}, _HAPPY_HORSE_11_SPEC, "text2video"
+    )
+    assert params["resolution"] == "720P"
+    assert params["ratio"] == "9:16"
+    assert params["duration"] == 8
+    assert isinstance(params["duration"], int)
+
+
+def test_build_params_happy_horse_image2video_is_native_bucket_not_aliased():
+    # happy-horse buckets its own "image2video" settings natively -- unlike omni it
+    # has no "singleImage2video" key, so canonicalization must leave the mode alone
+    # (exact-key-wins) instead of aliasing it away to a bucket that doesn't exist.
+    params = build_generation_params("a horse", {"quality": "high"}, _HAPPY_HORSE_11_SPEC, "image2video")
+    assert params["modeType"] == "image2video"
+    assert params["ratio"] == "16:9"
+    assert params["resolution"] == "720P"
+    assert params["duration"] == 5
+
+
+def test_build_params_happy_horse_explicit_mixed2video_canonicalizes_to_videoedit2video():
+    # happy-horse has no "mixed2video" bucket at all -- only "videoEdit2video" -- so
+    # the drama backend's explicit build_generation_params(..., "mixed2video") call
+    # for 视频编辑 must fall back to the bucket that actually exists.
+    params = build_generation_params(
+        "a horse", {"aspect_ratio": "1:1", "resolution": "1080p", "seconds": 6}, _HAPPY_HORSE_11_SPEC, "mixed2video"
+    )
+    assert params["modeType"] == "videoEdit2video"
+    assert params["resolution"] == "1080P"
+    assert "ratio" not in params
+    assert "duration" not in params
+
+
+def test_build_params_happy_horse_generic_video2video_canonicalizes_to_videoedit2video():
+    params = build_generation_params("a horse", {"resolution": "1080p"}, _HAPPY_HORSE_11_SPEC, "video2video")
+    assert params["modeType"] == "videoEdit2video"
+    assert params["resolution"] == "1080P"
+
+
+def test_build_params_kling_omni_mixed2video_exact_match_still_wins_over_alias_chain():
+    # regression guard: omni has BOTH "mixed2video" and "videoEdit2video" buckets, so
+    # extending the alias chain for happy-horse must not make omni's explicit
+    # mixed2video calls fall through to videoEdit2video.
+    params = build_generation_params("a cat", {"seconds": 6, "quality": "high"}, _KLING_V3_OMNI_SPEC, "mixed2video")
+    assert params["modeType"] == "mixed2video"
+    assert params["duration"] == 6
+    assert params["quality_4k"] == "high"
+    assert "duration_10" not in params
+    assert "quality" not in params
+
+
+def test_build_params_happy_horse_frames2video_single_image():
+    params = build_generation_params(
+        "a horse", {"resolution": "720p", "seconds": 4}, _HAPPY_HORSE_11_SPEC, "frames2video"
+    )
+    assert params["modeType"] == "frames2video"
+    assert params["resolution"] == "720P"
+    assert params["duration"] == 4
+    assert "ratio" not in params
+
+
+def test_build_params_happy_horse_generate_audio_ignored_no_enablesound_key():
+    # no enableSound property or settings entry exists anywhere in happy-horse's
+    # spec, so generate_audio must be silently ignored rather than raising or
+    # injecting a key the vendor schema doesn't recognize.
+    params = build_generation_params("a horse", {"generate_audio": True}, _HAPPY_HORSE_11_SPEC, "text2video")
+    assert "enableSound" not in params
+    assert params["ratio"] == "16:9"
+
+
 def test_resolve_credentials_requires_both(monkeypatch):
     for key in ("LIBTV_TOKEN", "LIBTV_CLI_USERTOKEN", "LIBTV_WEBID", "LIBTV_CLI_WEBID"):
         monkeypatch.delenv(key, raising=False)
@@ -1472,6 +1895,554 @@ def test_video_generation_uploads_external_reference_image_non_compliance_model(
     assert "/api/community/image/verify" not in [u.split("api.liblib.tv", 1)[-1] for u, _ in fake.calls]
 
 
+def test_video_generation_kling_omni_explicit_mixed2video_with_images_only_no_video_required():
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    }
+    fake = _FullSyncFake(
+        routes,
+        get_payload=_tool_spec_payload(model_key="kling-v3-omni", auto_compliance=False),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "kling-v3-omni",
+        "a dragon flying",
+        "tok",
+        None,
+        {
+            "webid": "w",
+            "reference_images": [_LIBTV_REF, "https://libtv-res.liblib.art/upload-images/uid/def.png"],
+            "modeType": "mixed2video",
+        },
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [
+        {"url": _LIBTV_REF, "type": "image"},
+        {"url": "https://libtv-res.liblib.art/upload-images/uid/def.png", "type": "image"},
+    ]
+
+
+def _nebula_ultra_tool_spec_payload():
+    meta = {
+        "modelKey": "nebula-ultra",
+        "modelVendor": "nebula",
+        "properties": _NEBULA_ULTRA_SPEC["properties"],
+        "config": _NEBULA_ULTRA_SPEC["config"],
+    }
+    return {"data": {"tools": [{"type": "image", "metadata": json.dumps(meta)}]}}
+
+
+_NEBULA_IMAGE_ROUTES = {
+    "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+    "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+    "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    "/api/task/generation/progress": {
+        "code": 0,
+        "data": {
+            "progresses": [{"status": 2, "taskResult": json.dumps({"images": [{"imageUrl": "https://x/o.png"}]})}]
+        },
+    },
+}
+
+
+def test_image_generation_text_only_stays_text2image_and_omits_imagelist():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    llm.image_generation(
+        "nebula-ultra", "a cat", "tok", None, ImageResponse(), {"webid": "w", "quality": "2k"}, None, client=fake
+    )
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "text2image"
+    assert gen_params["imageList"] == []
+    assert gen_params["quality"] == "2K"
+
+
+def test_image_generation_with_reference_infers_image2image_and_uploads():
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "restyle it",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "reference_images": ["https://minio.internal/b/ref.png"]},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "image2image"
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]  # uploaded, not the external url
+
+
+def test_image_generation_explicit_mode_type_wins_over_inference():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "modeType": "text2image", "reference_images": [_LIBTV_REF]},
+        None,
+        client=fake,
+    )
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "text2image"
+
+
+@pytest.mark.asyncio
+async def test_aimage_generation_with_reference_infers_image2image_and_uploads():
+    fake = _FullAsyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = await llm.aimage_generation(
+        "nebula-ultra",
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "reference_images": ["https://minio.internal/b/ref.png"]},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "image2image"
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
+
+
+def test_image_generation_routes_to_custom_provider():
+    import litellm
+    from litellm.llms.custom_llm import CustomLLM
+
+    captured = {}
+
+    class StubLLM(CustomLLM):
+        def image_generation(
+            self,
+            model,
+            prompt,
+            api_key,
+            api_base,
+            model_response,
+            optional_params,
+            logging_obj,
+            timeout=None,
+            client=None,
+        ):
+            captured["model"] = model
+            captured["prompt"] = prompt
+            model_response.data = [ImageObject(url="https://x/y.png")]
+            return model_response
+
+    litellm.custom_provider_map = [{"provider": "libtvstub", "custom_handler": StubLLM()}]
+    try:
+        out = litellm.image_generation(model="libtvstub/nebula-ultra", prompt="a fox")
+        assert out.data[0]["url"] == "https://x/y.png"
+        assert captured["model"] == "nebula-ultra"
+        assert captured["prompt"] == "a fox"
+    finally:
+        litellm.custom_provider_map = []
+
+
+# --- image_edit: the real transport for nano-banana-pro (nebula-ultra) reference
+# requests. The drama backend and drama-cli both send reference images as multipart
+# POST /v1/images/edits (files under "image"), never optional_params["reference_images"]
+# on a JSON /v1/images/generations body, so image_edit/aimage_edit on LibTVLLM must
+# work standalone from image_generation/aimage_generation. ---
+
+_REF_TUPLE = ("reference_0.png", b"IMGBYTES", "image/png")
+
+
+def test_image_edit_single_reference_uploads_and_carries_quality():
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.image_edit(
+        "nebula-ultra",
+        [_REF_TUPLE],
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "quality": "2k"},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "image2image"
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
+    assert gen_params["quality"] == "2K"
+
+
+def test_image_edit_single_file_not_wrapped_in_list_still_uploads():
+    # litellm always normalizes `image` to a list before calling the custom
+    # handler, but a direct/older caller might still pass a bare file; image_edit
+    # must accept both shapes the way _as_list already does elsewhere.
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.image_edit(
+        "nebula-ultra", _REF_TUPLE, "restyle it", ImageResponse(), "tok", None, {"webid": "w"}, None, client=fake
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    assert _gen_params(fake.calls)["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
+
+
+def test_image_edit_multiple_references_uploads_all():
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    refs = [
+        ("reference_0.png", b"A", "image/png"),
+        ("reference_1.png", b"B", "image/png"),
+        ("reference_2.png", b"C", "image/png"),
+    ]
+    llm.image_edit("nebula-ultra", refs, "restyle it", ImageResponse(), "tok", None, {"webid": "w"}, None, client=fake)
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"] * 3
+
+
+def test_image_edit_without_reference_stays_text2image():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    llm.image_edit(
+        "nebula-ultra", [], "a cat from scratch", ImageResponse(), "tok", None, {"webid": "w"}, None, client=fake
+    )
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "text2image"
+    assert gen_params["imageList"] == []
+
+
+@pytest.mark.asyncio
+async def test_aimage_edit_uploads_reference_and_infers_image2image():
+    fake = _FullAsyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = await llm.aimage_edit(
+        "nebula-ultra",
+        [_REF_TUPLE],
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "quality": "4k"},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "image2image"
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
+    assert gen_params["quality"] == "4K"
+
+
+# --- clarity-tiered image cost accrual (nano-banana-pro / libtv nebula-ultra) -------
+# litellm's internally-accrued team spend is our authoritative wallet ledger, but the
+# libtv handler never told litellm what an image actually cost, so spend always fell
+# through to the flat config price regardless of the 1K/2K vs 4K clarity actually
+# billed upstream. Deployment config now declares per-tier unit prices as
+# litellm_params keys (output_cost_per_image_1k/_2k/_4k, mirroring how libtv video
+# deployments declare output_cost_per_second_<resolution>); the router spreads
+# litellm_params into image_generation()'s kwargs, and any key litellm doesn't
+# recognize as a first-class param lands in optional_params for custom providers,
+# which is how these tests set them up.
+
+_NANO_BANANA_TIER_PRICES = {
+    "output_cost_per_image_1k": 0.134,
+    "output_cost_per_image_2k": 0.134,
+    "output_cost_per_image_4k": 0.24,
+}
+
+_NEBULA_IMAGE_ROUTES_TWO_IMAGES = {
+    **_NEBULA_IMAGE_ROUTES,
+    "/api/task/generation/progress": {
+        "code": 0,
+        "data": {
+            "progresses": [
+                {
+                    "status": 2,
+                    "taskResult": json.dumps(
+                        {"images": [{"imageUrl": "https://x/o1.png"}, {"imageUrl": "https://x/o2.png"}]}
+                    ),
+                }
+            ]
+        },
+    },
+}
+
+
+def test_image_clarity_response_cost_multiplies_tier_price_by_count():
+    optional_params = {"output_cost_per_image_4k": 0.24}
+    assert _image_clarity_response_cost(optional_params, "4K", 1) == pytest.approx(0.24)
+    assert _image_clarity_response_cost(optional_params, "4K", 3) == pytest.approx(0.72)
+
+
+def test_image_clarity_response_cost_none_when_quality_or_tier_missing():
+    assert _image_clarity_response_cost({"output_cost_per_image_4k": 0.24}, None, 1) is None
+    assert _image_clarity_response_cost({"output_cost_per_image_4k": 0.24}, "2K", 1) is None
+    assert _image_clarity_response_cost({}, "4K", 1) is None
+    assert _image_clarity_response_cost({"output_cost_per_image_4k": 0.24}, "4K", 0) is None
+
+
+def test_image_generation_clarity_tier_cost_4k():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "quality": "4k", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.24)
+
+
+def test_image_generation_clarity_tier_cost_2k():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "quality": "2k", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.134)
+
+
+def test_image_generation_clarity_tier_cost_defaults_when_quality_absent():
+    # nebula-ultra's spec defaults quality to "2K" when the caller doesn't set it;
+    # the accrued cost must follow the same default tier actually sent upstream.
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.134)
+
+
+def test_image_generation_clarity_tier_cost_scales_with_count():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES_TWO_IMAGES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra",
+        "a cat",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "quality": "4k", "n": 2, **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert len(vo.data) == 2
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.48)
+
+
+def test_image_generation_no_tier_keys_leaves_response_cost_unset():
+    # Other libtv image models (no output_cost_per_image_<tier> config) must be
+    # byte-identical to pre-fix behavior: no hidden response_cost override, so
+    # litellm's normal default_image_cost_calculator + flat config price applies.
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "nebula-ultra", "a cat", "tok", None, ImageResponse(), {"webid": "w", "quality": "2k"}, None, client=fake
+    )
+    assert "response_cost" not in vo._hidden_params
+
+
+def test_image_edit_clarity_tier_cost_parity():
+    # image_edit is the real transport for nano-banana-pro reference requests (see
+    # comment above test_image_edit_single_reference_uploads_and_carries_quality);
+    # cost accrual must work identically on that path.
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.image_edit(
+        "nebula-ultra",
+        [_REF_TUPLE],
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "quality": "4k", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.24)
+
+
+@pytest.mark.asyncio
+async def test_aimage_edit_clarity_tier_cost_parity():
+    fake = _FullAsyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = await llm.aimage_edit(
+        "nebula-ultra",
+        [_REF_TUPLE],
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "quality": "2k", **_NANO_BANANA_TIER_PRICES},
+        None,
+        client=fake,
+    )
+    assert vo._hidden_params["response_cost"] == pytest.approx(0.134)
+
+
+def test_libtv_overrides_base_class_image_edit():
+    from litellm.llms.custom_llm import CustomLLM
+
+    # Without the override, image_edit/aimage_edit inherit CustomLLM's stub which
+    # unconditionally raises CustomLLMError(status_code=500, "Not implemented yet!") --
+    # exactly the guaranteed-500 this fix removes.
+    assert LibTVLLM.image_edit is not CustomLLM.image_edit
+    assert LibTVLLM.aimage_edit is not CustomLLM.aimage_edit
+
+
+def test_image_edit_routes_to_custom_provider_via_main_entry():
+    # Exercises the real litellm.images.main.image_edit dispatch for a custom
+    # provider (mirrors test_image_generation_routes_to_custom_provider), and
+    # proves the images/main.py fix: n/quality/size are bound to image_edit's
+    # named params, not **kwargs, so the custom-provider branch must fold them
+    # back into optional_params or a custom handler never sees them.
+    import litellm
+    from litellm.llms.custom_llm import CustomLLM
+
+    captured = {}
+
+    class StubLLM(CustomLLM):
+        def image_edit(
+            self,
+            model,
+            image,
+            prompt,
+            model_response,
+            api_key,
+            api_base,
+            optional_params,
+            logging_obj,
+            timeout=None,
+            client=None,
+        ):
+            captured["model"] = model
+            captured["prompt"] = prompt
+            captured["image"] = image
+            captured["optional_params"] = dict(optional_params)
+            model_response.data = [ImageObject(url="https://x/y.png")]
+            return model_response
+
+    litellm.custom_provider_map = [{"provider": "libtvstub", "custom_handler": StubLLM()}]
+    try:
+        out = litellm.image_edit(
+            model="libtvstub/nebula-ultra",
+            image=[_REF_TUPLE],
+            prompt="a fox",
+            quality="2k",
+            size="2048x2048",
+            n=1,
+        )
+        assert out.data[0]["url"] == "https://x/y.png"
+        assert captured["model"] == "nebula-ultra"
+        assert captured["prompt"] == "a fox"
+        assert captured["image"] == [_REF_TUPLE]
+        assert captured["optional_params"]["quality"] == "2k"
+        assert captured["optional_params"]["size"] == "2048x2048"
+        assert captured["optional_params"]["n"] == 1
+    finally:
+        litellm.custom_provider_map = []
+
+
+@pytest.mark.asyncio
+async def test_aimage_edit_routes_to_custom_provider_via_main_entry():
+    import litellm
+    from litellm.llms.custom_llm import CustomLLM
+
+    captured = {}
+
+    class StubLLM(CustomLLM):
+        async def aimage_edit(
+            self,
+            model,
+            image,
+            prompt,
+            model_response,
+            api_key,
+            api_base,
+            optional_params,
+            logging_obj,
+            timeout=None,
+            client=None,
+        ):
+            captured["optional_params"] = dict(optional_params)
+            model_response.data = [ImageObject(url="https://x/z.png")]
+            return model_response
+
+    litellm.custom_provider_map = [{"provider": "libtvstub", "custom_handler": StubLLM()}]
+    try:
+        out = await litellm.aimage_edit(
+            model="libtvstub/nebula-ultra",
+            image=[_REF_TUPLE],
+            prompt="a fox",
+            quality="4k",
+            size="1024x1024",
+        )
+        assert out.data[0]["url"] == "https://x/z.png"
+        assert captured["optional_params"]["quality"] == "4k"
+        assert captured["optional_params"]["size"] == "1024x1024"
+    finally:
+        litellm.custom_provider_map = []
+
+
 # --- libtv compliance classification: content rejections must fast-fail (no fallback) ---
 
 from litellm.llms.libtv.common import (  # noqa: E402
@@ -1479,9 +2450,7 @@ from litellm.llms.libtv.common import (  # noqa: E402
     is_compliance_failure,
 )
 
-_CAPTURED_COMPLIANCE_REASON = (
-    "生成视频可能涉及版权限制，积分将会在2小时内返还，请调整描述或素材后重试"
-)
+_CAPTURED_COMPLIANCE_REASON = "生成视频可能涉及版权限制，积分将会在2小时内返还，请调整描述或素材后重试"
 
 
 def test_is_compliance_failure_matches_captured_copyright_reason():
@@ -1524,7 +2493,8 @@ def _failed_routes(reason):
 
 def test_generate_raises_content_policy_error_on_compliance_reason():
     lt = LibTVClient(
-        token="t", webid="w",
+        token="t",
+        webid="w",
         sync_client=FakeSyncClient(post_by_path=_failed_routes(_CAPTURED_COMPLIANCE_REASON)),
         poll_interval=0,
     )
@@ -1534,7 +2504,8 @@ def test_generate_raises_content_policy_error_on_compliance_reason():
 
 def test_generate_capacity_failure_is_plain_error_not_content_policy():
     lt = LibTVClient(
-        token="t", webid="w",
+        token="t",
+        webid="w",
         sync_client=FakeSyncClient(post_by_path=_failed_routes("算力不足")),
         poll_interval=0,
     )
@@ -1548,9 +2519,7 @@ def _video_failed_routes(reason):
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
         "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
-        "/api/task/generation/progress": [
-            {"code": 0, "data": {"progresses": [{"status": 3, "failedReason": reason}]}}
-        ],
+        "/api/task/generation/progress": [{"code": 0, "data": {"progresses": [{"status": 3, "failedReason": reason}]}}],
     }
 
 
