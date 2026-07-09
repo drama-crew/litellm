@@ -1900,12 +1900,6 @@ def test_video_generation_kling_omni_explicit_mixed2video_with_images_only_no_vi
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
         "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
-        "/api/task/generation/progress": {
-            "code": 0,
-            "data": {
-                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
-            },
-        },
     }
     fake = _FullSyncFake(
         routes,
@@ -1925,7 +1919,7 @@ def test_video_generation_kling_omni_explicit_mixed2video_with_images_only_no_vi
         None,
         client=fake,
     )
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     gen_params = _gen_params(fake.calls)
     assert gen_params["modeType"] == "mixed2video"
     assert gen_params["mixedList"] == [
