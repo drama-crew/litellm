@@ -185,17 +185,49 @@ def _extract_urls(task_result: Dict[str, Any], kind: str) -> List[str]:
     return collect(task_result.get("images"))
 
 
-def parse_progress(payload: Dict[str, Any], kind: str) -> Dict[str, Any]:
+_UNKNOWN_TASK_REASON_MARKER = "任务数据异常"
+
+
+def _match_progress(progresses: List[Dict[str, Any]], task_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if task_id is not None:
+        tagged = [p for p in progresses if p.get("taskId") is not None or p.get("task_id") is not None]
+        if tagged:
+            for item in tagged:
+                if str(item.get("taskId") or item.get("task_id")) == str(task_id):
+                    return item
+            return None
+    return progresses[0] if progresses else None
+
+
+def _is_unknown_task(item: Dict[str, Any], status: Optional[int]) -> bool:
+    # libtv returns this shape for a taskId it cannot find yet (the window right
+    # after generation/create, before the task is visible upstream): status 3 with
+    # failedReason carrying the unknown-task marker, no startTimeMs/endTimeMs and
+    # progressPercent 0. Treated as not-yet-terminal so the poll loop keeps going
+    # instead of failing a task that hasn't even started. Any substantive
+    # failedReason (e.g. a compliance rejection before the task starts) stays
+    # terminal regardless of timing fields.
+    if status != 3:
+        return False
+    reason = item.get("failedReason") or ""
+    if _UNKNOWN_TASK_REASON_MARKER in reason:
+        return True
+    return not reason and item.get("startTimeMs") is None and item.get("progressPercent") in (0, None)
+
+
+def parse_progress(payload: Dict[str, Any], kind: str, task_id: Optional[str] = None) -> Dict[str, Any]:
     data = payload.get("data") or {}
     progresses = data.get("progresses") or []
-    if not progresses:
+    last = _match_progress(progresses, task_id)
+    if not last:
         return {"status": None, "urls": [], "failed_reason": None}
-    last = progresses[0] or {}
     raw_status = last.get("status")
     try:
         status = int(raw_status)
     except (TypeError, ValueError):
         status = None
+    if _is_unknown_task(last, status):
+        return {"status": None, "urls": [], "failed_reason": None}
     urls: List[str] = []
     if status == 2:
         raw = last.get("taskResult")
@@ -398,7 +430,7 @@ class LibTVClient:
         )
         return self._check(resp, step)
 
-    def generate(
+    def create(
         self,
         model_key: str,
         vendor: str,
@@ -420,16 +452,29 @@ class LibTVClient:
             build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
             "generation/create",
         )
-        task_id = parse_task_id(created)
+        return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+
+    def poll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
+        progress = self._post("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
+        return parse_progress(progress, task_type, task_id)
+
+    def generate(
+        self,
+        model_key: str,
+        vendor: str,
+        task_type: str,
+        params: Dict[str, Any],
+        project_name: str,
+    ) -> Dict[str, Any]:
+        created = self.create(model_key, vendor, task_type, params, project_name)
         for _ in range(self.poll_max_attempts):
-            progress = self._post("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
-            state = parse_progress(progress, task_type)
+            state = self.poll_once(created["task_id"], task_type)
             if state["status"] == 2:
-                return {"urls": state["urls"], "task_id": task_id, "project_uuid": project_uuid, "node_key": node_key}
+                return {"urls": state["urls"], **created}
             if state["status"] == 3:
                 _raise_generation_failed(state["failed_reason"])
             time.sleep(self.poll_interval)
-        raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
+        raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {created['task_id']})")
 
     def _fetch_bytes(self, url: str) -> bytes:
         # Bare httpx, not the litellm http client wrappers: the async wrapper injects
@@ -513,7 +558,7 @@ class LibTVClient:
         )
         return self._check(resp, step)
 
-    async def agenerate(
+    async def acreate(
         self,
         model_key: str,
         vendor: str,
@@ -535,16 +580,29 @@ class LibTVClient:
             build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
             "generation/create",
         )
-        task_id = parse_task_id(created)
+        return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+
+    async def apoll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
+        progress = await self._apost("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
+        return parse_progress(progress, task_type, task_id)
+
+    async def agenerate(
+        self,
+        model_key: str,
+        vendor: str,
+        task_type: str,
+        params: Dict[str, Any],
+        project_name: str,
+    ) -> Dict[str, Any]:
+        created = await self.acreate(model_key, vendor, task_type, params, project_name)
         for _ in range(self.poll_max_attempts):
-            progress = await self._apost("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
-            state = parse_progress(progress, task_type)
+            state = await self.apoll_once(created["task_id"], task_type)
             if state["status"] == 2:
-                return {"urls": state["urls"], "task_id": task_id, "project_uuid": project_uuid, "node_key": node_key}
+                return {"urls": state["urls"], **created}
             if state["status"] == 3:
                 _raise_generation_failed(state["failed_reason"])
             await asyncio.sleep(self.poll_interval)
-        raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {task_id})")
+        raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {created['task_id']})")
 
     async def _afetch_bytes(self, url: str) -> bytes:
         return await asyncio.to_thread(self._fetch_bytes, url)

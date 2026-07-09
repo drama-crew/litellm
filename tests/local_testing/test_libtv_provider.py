@@ -454,45 +454,82 @@ def test_infer_video_mode_frames_when_last_image():
     assert _infer_video_mode({}, [], [], ["x"]) == "audio2video"
 
 
-def test_build_video_object_encodes_url_into_id():
+def test_build_video_object_encodes_task_id_and_status_model_queued():
     llm = LibTVLLM()
-    vo = llm._build_video_object("star-video2", {"urls": ["https://libtv-res/x.mp4"], "task_id": "t1"})
-    assert vo.status == "completed"
+    vo = llm._build_video_object(
+        "star-video2", {"task_id": "task-9", "project_uuid": "p"}, {"libtv_status_model": "seedance-2.0"}
+    )
+    assert vo.status == "queued"  # async submit: not done yet
     decoded = decode_video_id_with_provider(vo.id)
     assert decoded["custom_llm_provider"] == LIBTV_PROVIDER
-    assert decoded["video_id"] == "https://libtv-res/x.mp4"
-    assert vo._hidden_params["url"] == "https://libtv-res/x.mp4"
+    assert decoded["video_id"] == "task-9"  # the libtv task id, not a url
+    # model_id routes /v1/videos/{id} status/content back to THIS account's deployment
+    assert decoded["model_id"] == "seedance-2.0"
 
 
-def test_video_status_returns_completed_with_url():
-    llm = LibTVLLM()
-    vid = llm._build_video_object("m", {"urls": ["https://libtv-res/v.mp4"]}).id
-    status = llm.video_status(vid, None, None, {}, None)
+def _progress_route(status, url=None, reason=None):
+    prog = {"status": status}
+    if url is not None:
+        prog["taskResult"] = json.dumps({"videos": [{"videoUrl": url}]})
+    if reason is not None:
+        prog["failedReason"] = reason
+        prog["startTimeMs"] = 1700000000000
+        prog["progressPercent"] = 100
+    return {"/api/task/generation/progress": {"code": 0, "data": {"progresses": [prog]}}}
+
+
+def test_video_status_polls_and_maps_completed():
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeSyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    status = LibTVLLM().video_status(vid, "tok", None, {"webid": "w"}, None, client=client)
     assert status.status == "completed"
     assert status._hidden_params["url"] == "https://libtv-res/v.mp4"
+    assert [c[0] for c in client.calls] == ["/api/task/generation/progress"]
 
 
-def test_video_content_downloads_decoded_url():
-    llm = LibTVLLM()
-    vid = llm._build_video_object("m", {"urls": ["https://libtv-res/v.mp4"]}).id
+def test_video_status_maps_failed_with_reason():
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeSyncClient(post_by_path=_progress_route(3, reason="生成视频可能涉及版权限制"))
+    status = LibTVLLM().video_status(vid, "tok", None, {"webid": "w"}, None, client=client)
+    assert status.status == "failed"
+    assert status.error["message"] == "生成视频可能涉及版权限制"
 
-    class _DLClient:
-        def __init__(self):
-            self.got = None
 
-        def get(self, url):
-            self.got = url
+def test_video_status_maps_in_progress():
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeSyncClient(post_by_path=_progress_route(1))
+    assert LibTVLLM().video_status(vid, "tok", None, {"webid": "w"}, None, client=client).status == "in_progress"
 
-            class _R:
-                status_code = 200
-                content = b"MP4BYTES"
 
-            return _R()
+class _DownloadResp:
+    status_code = 200
+    content = b"MP4BYTES"
 
-    dl = _DLClient()
-    data = llm.video_content(vid, None, None, {}, None, client=dl)
+
+class _PollAndDownloadClient(FakeSyncClient):
+    def __init__(self, status, url=None):
+        super().__init__(post_by_path=_progress_route(status, url=url))
+        self.got = None
+
+    def get(self, url, headers=None, timeout=None, params=None):
+        self.got = url
+        return _DownloadResp()
+
+
+def test_video_content_polls_then_downloads():
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    c = _PollAndDownloadClient(2, url="https://libtv-res/v.mp4")
+    data = LibTVLLM().video_content(vid, "tok", None, {"webid": "w"}, None, client=c)
     assert data == b"MP4BYTES"
-    assert dl.got == "https://libtv-res/v.mp4"
+    assert c.got == "https://libtv-res/v.mp4"
+    assert any(call[0] == "/api/task/generation/progress" for call in c.calls)
+
+
+def test_video_content_raises_while_still_processing():
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    c = _PollAndDownloadClient(1)
+    with pytest.raises(LibTVError):
+        LibTVLLM().video_content(vid, "tok", None, {"webid": "w"}, None, client=c)
 
 
 def test_video_status_rejects_non_libtv_id():
@@ -558,7 +595,9 @@ def test_parse_progress_video_falls_back_to_images():
 
 
 def test_parse_progress_failed():
-    payload = {"data": {"progresses": [{"status": 3, "failedReason": "blocked"}]}}
+    payload = {
+        "data": {"progresses": [{"status": 3, "failedReason": "blocked", "startTimeMs": 1700000000000}]}
+    }
     state = parse_progress(payload, "video")
     assert state["status"] == 3
     assert state["failed_reason"] == "blocked"
@@ -567,6 +606,165 @@ def test_parse_progress_failed():
 def test_parse_progress_loading_has_no_urls():
     payload = {"data": {"progresses": [{"status": 1}]}}
     assert parse_progress(payload, "video") == {"status": 1, "urls": [], "failed_reason": None}
+
+
+# --- progress poll racing generation/create: libtv returns a "task data abnormal" -----
+# status 3 for a taskId it cannot find yet (the window right after create, before the
+# task is visible upstream), with no startTimeMs/endTimeMs and progressPercent 0. This
+# must not be read as a real failure or the whole generation gets killed while the
+# upstream task is actually still running.
+
+_UNKNOWN_TASK_REASON = "任务数据异常，请重新发起任务"
+
+
+def _unknown_task_progress(task_id):
+    return {
+        "taskId": task_id,
+        "status": 3,
+        "failedReason": _UNKNOWN_TASK_REASON,
+        "progressPercent": 0,
+        "power": 0,
+    }
+
+
+@pytest.mark.parametrize("kind", ["video", "image"])
+def test_parse_progress_unknown_task_signature_is_not_terminal(kind):
+    payload = {"data": {"progresses": [_unknown_task_progress("task-9")]}}
+    assert parse_progress(payload, kind, task_id="task-9") == {
+        "status": None,
+        "urls": [],
+        "failed_reason": None,
+    }
+
+
+def test_parse_progress_ignores_entry_for_a_different_task_id():
+    payload = {
+        "data": {
+            "progresses": [
+                {
+                    "taskId": "other-task",
+                    "status": 2,
+                    "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/wrong.mp4"}]}),
+                },
+                {"taskId": "task-9", "status": 1},
+            ]
+        }
+    }
+    state = parse_progress(payload, "video", task_id="task-9")
+    assert state == {"status": 1, "urls": [], "failed_reason": None}
+
+
+def test_parse_progress_real_failure_with_timing_stays_failed():
+    payload = {
+        "data": {
+            "progresses": [
+                {
+                    "taskId": "task-9",
+                    "status": 3,
+                    "failedReason": "视频生成失败，请重试",
+                    "startTimeMs": 1700000000000,
+                    "endTimeMs": 1700000010000,
+                    "progressPercent": 100,
+                }
+            ]
+        }
+    }
+    state = parse_progress(payload, "video", task_id="task-9")
+    assert state["status"] == 3
+    assert state["failed_reason"] == "视频生成失败，请重试"
+
+
+def test_parse_progress_real_failure_without_timing_stays_failed():
+    # a task rejected before it starts (e.g. compliance) has no startTimeMs and
+    # progressPercent 0, but its substantive failedReason must keep it terminal
+    payload = {
+        "data": {
+            "progresses": [
+                {
+                    "taskId": "task-9",
+                    "status": 3,
+                    "failedReason": "生成视频可能涉及版权限制",
+                    "progressPercent": 0,
+                }
+            ]
+        }
+    }
+    state = parse_progress(payload, "video", task_id="task-9")
+    assert state["status"] == 3
+    assert state["failed_reason"] == "生成视频可能涉及版权限制"
+
+
+def test_generate_compliance_rejection_without_timing_short_circuits():
+    from litellm.llms.libtv.common import LibTVContentPolicyError
+
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "t"}},
+            "/api/task/generation/progress": {
+                "code": 0,
+                "data": {
+                    "progresses": [
+                        {
+                            "taskId": "t",
+                            "status": 3,
+                            "failedReason": "生成视频可能涉及版权限制",
+                            "progressPercent": 0,
+                        }
+                    ]
+                },
+            },
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", sync_client=client, poll_interval=0)
+    with pytest.raises(LibTVContentPolicyError):
+        lt.generate("m", "v", "video", {"prompt": "x"}, "n")
+    assert [c[0] for c in client.calls].count("/api/task/generation/progress") == 1
+
+
+def test_generate_survives_unknown_task_polls_then_completes():
+    task_id = "task-race"
+    unknown = {"code": 0, "data": {"progresses": [_unknown_task_progress(task_id)]}}
+    done = {
+        "code": 0,
+        "data": {
+            "progresses": [
+                {
+                    "taskId": task_id,
+                    "status": 2,
+                    "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/done.mp4"}]}),
+                }
+            ]
+        },
+    }
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": task_id}},
+            "/api/task/generation/progress": [unknown, unknown, done],
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", sync_client=client, poll_interval=0)
+    result = lt.generate("m", "v", "video", {"prompt": "x"}, "n")
+    assert result["urls"] == ["https://x/done.mp4"]
+    assert [c[0] for c in client.calls].count("/api/task/generation/progress") == 3
+
+
+def test_video_status_maps_unknown_task_signature_to_in_progress():
+    task_id = "task-race"
+    vid = LibTVLLM()._build_video_object("m", {"task_id": task_id}).id
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/task/generation/progress": {
+                "code": 0,
+                "data": {"progresses": [_unknown_task_progress(task_id)]},
+            }
+        }
+    )
+    status = LibTVLLM().video_status(vid, "tok", None, {"webid": "w"}, None, client=client)
+    assert status.status == "in_progress"
 
 
 def test_generate_orchestrates_full_sequence():
@@ -619,7 +817,14 @@ def test_generate_raises_on_failed_status():
             "/api/canvas/nodes/batch": {"code": 0, "data": {}},
             "/api/task/generation/create": {"code": 0, "data": {"taskId": "t"}},
             "/api/task/generation/progress": [
-                {"code": 0, "data": {"progresses": [{"status": 3, "failedReason": "nope"}]}}
+                {
+                    "code": 0,
+                    "data": {
+                        "progresses": [
+                            {"status": 3, "failedReason": "nope", "startTimeMs": 1700000000000}
+                        ]
+                    },
+                }
             ],
         }
     )
@@ -1113,7 +1318,7 @@ def test_resolve_model_spec_indexes_tool_spec():
         lt.resolve_model_spec("does-not-exist")
 
 
-def _tool_spec_payload(model_key="star-video2", auto_compliance=True):
+def _tool_spec_payload(model_key="star-video2", auto_compliance=True, frames2video=False):
     props = {
         "ratio": {"default": "9:16", "enum": ["16:9", "9:16"]},
         "resolution": {"default": "720p", "enum": [{"value": "720p"}]},
@@ -1122,6 +1327,8 @@ def _tool_spec_payload(model_key="star-video2", auto_compliance=True):
     }
     if auto_compliance:
         props["autoCompliance"] = {"enable": True, "default": 1}
+    if frames2video:
+        props["modeType"] = {"items": {"frames2video": [1, 2], "mixed2video": []}}
     meta = {
         "modelKey": model_key,
         "modelVendor": model_key,
@@ -1158,7 +1365,7 @@ def test_portrait_compliance_converts_image_to_asset_and_sets_flag():
     vo = llm.video_generation(
         "star-video2", "subtle motion", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
     )
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     paths = [c[0] for c in fake.calls]
     assert "/api/community/image/verify" in paths
     assert "/api/third_asset/create" in paths
@@ -1198,7 +1405,7 @@ def test_non_compliance_model_keeps_raw_imagelist_no_verify():
     fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(auto_compliance=False))
     llm = LibTVLLM(poll_interval=0)
     vo = llm.video_generation("star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake)
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     paths = [c[0] for c in fake.calls]
     assert "/api/community/image/verify" not in paths
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
@@ -1213,7 +1420,7 @@ async def test_portrait_compliance_async_happy_path():
     vo = await llm.avideo_generation(
         "star-video2", "subtle motion", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
     )
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["autoCompliance"] == 1
     assert gen_params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}]
@@ -1230,7 +1437,7 @@ def test_compliance_exempt_image_keeps_cdn_url_not_asset():
     fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload())
     llm = LibTVLLM(poll_interval=0)
     vo = llm.video_generation("star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake)
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "type": "image"}]
 
@@ -1279,7 +1486,7 @@ def test_mixed2video_compliance_registers_reference_video_as_asset():
         None,
         client=fake,
     )
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     creates = [body for path, body in fake.calls if path == "/api/third_asset/create"]
     assert {c["assetType"] for c in creates} == {"image", "video"}
     assert next(c for c in creates if c["assetType"] == "video")["assetUrl"] == _LIBTV_VIDEO
@@ -1307,7 +1514,7 @@ async def test_mixed2video_compliance_registers_reference_video_as_asset_async()
         None,
         client=fake,
     )
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     creates = [body for path, body in fake.calls if path == "/api/third_asset/create"]
     assert next(c for c in creates if c["assetType"] == "video")["assetUrl"] == _LIBTV_VIDEO
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
@@ -1315,6 +1522,185 @@ async def test_mixed2video_compliance_registers_reference_video_as_asset_async()
         {"url": "asset://asset-IMG", "type": "image"},
         {"url": "asset://asset-VID", "type": "video"},
     ]
+
+
+_LIBTV_LAST = "https://libtv-res.liblib.art/upload-images/uid/last.png"
+
+
+def _frames2video_compliance_routes():
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    return {
+        "/api/community/image/verify": {
+            "code": 0,
+            "data": {"list": [{"url": _LIBTV_REF, "riskLabels": risk}, {"url": _LIBTV_LAST, "riskLabels": risk}]},
+        },
+        "/api/third_asset/create": [
+            {"code": 0, "data": {"uuid": "u-first"}},
+            {"code": 0, "data": {"uuid": "u-last"}},
+        ],
+        "/api/third_asset/check": [
+            {"code": 0, "data": {"list": [{"uuid": "u-first", "assetId": "asset-FIRST", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-last", "assetId": "asset-LAST", "status": 1}]}},
+        ],
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+
+
+def test_frames2video_compliance_keeps_first_last_order_and_mode():
+    fake = FakeSyncClient(
+        post_by_path=_frames2video_compliance_routes(),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["autoCompliance"] == 1
+    assert gen_params["imageList"] == ["asset://asset-FIRST", "asset://asset-LAST"]
+    assert "mixedList" not in gen_params
+
+
+def test_reference_images_only_still_uses_mixed2video():
+    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=True))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}]
+
+
+def test_frames2video_falls_back_to_mixed2video_when_spec_lacks_mode():
+    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=False))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_REF},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert "mixedList" in gen_params
+    assert "imageList" not in gen_params or gen_params["imageList"] == []
+
+
+@pytest.mark.asyncio
+async def test_frames2video_compliance_async_keeps_first_last_order():
+    fake = FakeAsyncClient(
+        post_by_path=_frames2video_compliance_routes(),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = await llm.avideo_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["imageList"] == ["asset://asset-FIRST", "asset://asset-LAST"]
+
+
+def test_non_compliance_frames2video_keeps_first_last_imagelist_order():
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(auto_compliance=False, frames2video=True))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["imageList"] == [_LIBTV_REF, _LIBTV_LAST]
+
+
+def test_explicit_mixed2video_override_wins_over_last_image():
+    fake = FakeSyncClient(
+        post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=True)
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_REF, "modeType": "mixed2video"},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert "mixedList" in gen_params
+    assert gen_params.get("imageList") in ([], None)
+
+
+def test_frames2video_compliance_last_image_only_single_frame():
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    routes = _frames2video_compliance_routes()
+    routes["/api/community/image/verify"] = {
+        "code": 0,
+        "data": {"list": [{"url": _LIBTV_LAST, "riskLabels": risk}]},
+    }
+    routes["/api/third_asset/create"] = {"code": 0, "data": {"uuid": "u-last"}}
+    routes["/api/third_asset/check"] = {
+        "code": 0,
+        "data": {"list": [{"uuid": "u-last", "assetId": "asset-LAST", "status": 1}]},
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "last_image": _LIBTV_LAST}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["imageList"] == ["asset://asset-LAST"]
 
 
 # --- video usage -> resolution-tiered cost (authoritative spend line) ---------
@@ -1339,7 +1725,7 @@ def test_video_usage_carries_duration_and_resolution():
 def test_build_video_object_populates_usage():
     vo = LibTVLLM()._build_video_object(
         "seedance-2.0",
-        {"urls": ["http://x/v.mp4"]},
+        {"task_id": "task-1"},
         {"resolution": "1080p", "seconds": 8},
     )
     assert vo.usage == {"duration_seconds": 8.0, "video_resolution": "1080p"}
@@ -1468,7 +1854,7 @@ async def test_avideo_generation_uploads_external_reference_video_in_compliance_
         None,
         client=fake,
     )
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     mixed = _gen_params(fake.calls)["mixedList"]
     # portrait image stays asset://; the external video is uploaded to libtv and then registered
     # for compliance, so it reaches generation as asset:// too (never a raw external/cdn url)
@@ -1503,7 +1889,7 @@ def test_video_generation_uploads_external_reference_image_non_compliance_model(
     vo = llm.video_generation(
         "star-video2", "x", "tok", None, {"webid": "w", "image": "https://minio.internal/b/img.png"}, None, client=fake
     )
-    assert vo.status == "completed"
+    assert vo.status == "queued"
     gen_params = _gen_params(fake.calls)
     assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/img.png"]  # uploaded, not the external url
     assert "/api/community/image/verify" not in [u.split("api.liblib.tv", 1)[-1] for u, _ in fake.calls]
@@ -2098,7 +2484,16 @@ def _failed_routes(reason):
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
         "/api/task/generation/create": {"code": 0, "data": {"taskId": "t"}},
-        "/api/task/generation/progress": [{"code": 0, "data": {"progresses": [{"status": 3, "failedReason": reason}]}}],
+        "/api/task/generation/progress": [
+            {
+                "code": 0,
+                "data": {
+                    "progresses": [
+                        {"status": 3, "failedReason": reason, "startTimeMs": 1700000000000}
+                    ]
+                },
+            }
+        ],
     }
 
 
@@ -2134,39 +2529,114 @@ def _video_failed_routes(reason):
     }
 
 
-def test_video_generation_maps_compliance_to_content_policy_violation():
+def _submit_routes():
+    return {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-1"}},
+    }
+
+
+def test_video_generation_returns_queued_without_polling():
+    fake = FakeSyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "a fox", "tok", None, {"webid": "w", "libtv_status_model": "seedance-2.0"}, None, client=fake
+    )
+    assert vo.status == "queued"  # async: submit does NOT block on the render
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "task-1"
+    assert decode_video_id_with_provider(vo.id)["model_id"] == "seedance-2.0"
+    assert "/api/task/generation/progress" not in [c[0] for c in fake.calls]
+
+
+def test_video_generation_capacity_failure_propagates_for_fallback():
+    # 算力不足 at CREATE stays a retryable 5xx LibTVError so the router falls over
+    # to the next libtv account / wavespeed (NOT a content-policy short-circuit).
     import litellm
 
-    fake = FakeSyncClient(
-        post_by_path=_video_failed_routes(_CAPTURED_COMPLIANCE_REASON),
-        get_payload=_tool_spec_payload(auto_compliance=False),
-    )
-    llm = LibTVLLM(poll_interval=0)
-    with pytest.raises(litellm.ContentPolicyViolationError):
-        llm.video_generation("star-video2", "王力宏 sings", "tok", None, {"webid": "w"}, None, client=fake)
-
-
-def test_video_generation_capacity_failure_not_content_policy():
-    import litellm
-
-    fake = FakeSyncClient(
-        post_by_path=_video_failed_routes("算力不足"),
-        get_payload=_tool_spec_payload(auto_compliance=False),
-    )
-    llm = LibTVLLM(poll_interval=0)
-    with pytest.raises(Exception) as ei:
-        llm.video_generation("star-video2", "a fox", "tok", None, {"webid": "w"}, None, client=fake)
+    routes = _submit_routes()
+    routes["/api/task/generation/create"] = {"code": 1200000136, "data": None, "msg": "算力不足"}
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(auto_compliance=False))
+    with pytest.raises(LibTVError) as ei:
+        LibTVLLM(poll_interval=0).video_generation(
+            "star-video2", "a fox", "tok", None, {"webid": "w"}, None, client=fake
+        )
     assert not isinstance(ei.value, litellm.ContentPolicyViolationError)
+    assert ei.value.status_code == 502
 
 
 @pytest.mark.asyncio
-async def test_avideo_generation_maps_compliance_to_content_policy_violation():
-    import litellm
-
-    fake = FakeAsyncClient(
-        post_by_path=_video_failed_routes(_CAPTURED_COMPLIANCE_REASON),
-        get_payload=_tool_spec_payload(auto_compliance=False),
+async def test_avideo_generation_returns_queued_without_polling():
+    fake = FakeAsyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+    vo = await LibTVLLM(poll_interval=0).avideo_generation(
+        "star-video2", "a fox", "tok", None, {"webid": "w", "libtv_status_model": "_fallback2/seedance-2.0"}, None, client=fake
     )
-    llm = LibTVLLM(poll_interval=0)
-    with pytest.raises(litellm.ContentPolicyViolationError):
-        await llm.avideo_generation("star-video2", "王力宏 sings", "tok", None, {"webid": "w"}, None, client=fake)
+    assert vo.status == "queued"
+    assert decode_video_id_with_provider(vo.id)["model_id"] == "_fallback2/seedance-2.0"
+    assert "/api/task/generation/progress" not in [c[0] for c in fake.calls]
+
+
+# --- async video: client split into create (no poll) + poll_once (single tick) ---
+
+def test_create_does_not_poll_and_returns_task_id():
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p9", "teamId": 7}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-async-1"}},
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", sync_client=client, poll_interval=0)
+    out = lt.create("star-video2-fast", "star-video2-fast", "video", {"prompt": "x"}, "proj")
+    assert out == {"task_id": "task-async-1", "project_uuid": "p9", "node_key": out["node_key"]}
+    paths = [c[0] for c in client.calls]
+    assert paths == [
+        "/api/canvas/project/create",
+        "/api/canvas/nodes/batch",
+        "/api/task/generation/create",
+    ]
+    assert "/api/task/generation/progress" not in paths  # create MUST NOT poll
+
+
+def test_poll_once_single_progress_call_maps_state():
+    for raw, expect in [
+        ({"code": 0, "data": {"progresses": [{"status": 1}]}}, {"status": 1, "urls": [], "failed_reason": None}),
+        (
+            {"code": 0, "data": {"progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/v.mp4"}]})}]}},
+            {"status": 2, "urls": ["https://x/v.mp4"], "failed_reason": None},
+        ),
+        (
+            {
+                "code": 0,
+                "data": {
+                    "progresses": [
+                        {
+                            "status": 3,
+                            "failedReason": "生成视频可能涉及版权限制",
+                            "startTimeMs": 1700000000000,
+                        }
+                    ]
+                },
+            },
+            {"status": 3, "urls": [], "failed_reason": "生成视频可能涉及版权限制"},
+        ),
+    ]:
+        client = FakeSyncClient(post_by_path={"/api/task/generation/progress": raw})
+        lt = LibTVClient(token="t", webid="w", sync_client=client, poll_interval=0)
+        assert lt.poll_once("task-async-1", "video") == expect
+        assert [c[0] for c in client.calls] == ["/api/task/generation/progress"]
+
+
+@pytest.mark.asyncio
+async def test_acreate_does_not_poll():
+    client = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p9"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-async-2"}},
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=client, poll_interval=0)
+    out = await lt.acreate("star-video2-fast", "star-video2-fast", "video", {"prompt": "x"}, "proj")
+    assert out["task_id"] == "task-async-2"
+    assert "/api/task/generation/progress" not in [c[0] for c in client.calls]
