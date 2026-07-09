@@ -254,6 +254,36 @@ class LibTVLLM(CustomLLM):
         model_response._hidden_params = {"project_uuid": result.get("project_uuid")}
         return model_response
 
+    def _resolved_image_params(
+        self, lt: LibTVClient, prompt: str, spec: dict, images: list, optional_params: dict
+    ) -> dict:
+        mode = _resolve_mode(optional_params, _infer_image_mode(images))
+        params = build_generation_params(prompt, optional_params, spec, mode)
+        if images:
+            if _auto_compliance_enabled(spec):
+                params["autoCompliance"] = 1
+                params["imageList"] = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
+            else:
+                params["imageList"] = [
+                    lt.ensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["image"]) for r in images
+                ]
+        return params
+
+    async def _aresolved_image_params(
+        self, lt: LibTVClient, prompt: str, spec: dict, images: list, optional_params: dict
+    ) -> dict:
+        mode = _resolve_mode(optional_params, _infer_image_mode(images))
+        params = build_generation_params(prompt, optional_params, spec, mode)
+        if images:
+            if _auto_compliance_enabled(spec):
+                params["autoCompliance"] = 1
+                params["imageList"] = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
+            else:
+                params["imageList"] = [
+                    await lt.aensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["image"]) for r in images
+                ]
+        return params
+
     def image_generation(
         self,
         model: str,
@@ -269,19 +299,7 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
         images, _, _ = _collect_reference_groups(optional_params)
-
-        def url_for(ref):
-            p = _reference_payload(ref)
-            return lt.ensure_libtv_url(p[0], p[1], p[2], _REF_DEFAULT_NAME["image"])
-
-        mode = _resolve_mode(optional_params, _infer_image_mode(images))
-        params = build_generation_params(prompt, optional_params, spec, mode)
-        if images:
-            if _auto_compliance_enabled(spec):
-                params["autoCompliance"] = 1
-                params["imageList"] = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
-            else:
-                params["imageList"] = [url_for(r) for r in images]
+        params = self._resolved_image_params(lt, prompt, spec, images, optional_params)
         result = lt.generate(model, spec["vendor"], "image", params, _project_name(model))
         return self._fill_image_response(model_response, result)
 
@@ -300,19 +318,52 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
         images, _, _ = _collect_reference_groups(optional_params)
+        params = await self._aresolved_image_params(lt, prompt, spec, images, optional_params)
+        result = await lt.agenerate(model, spec["vendor"], "image", params, _project_name(model))
+        return self._fill_image_response(model_response, result)
 
-        async def url_for(ref):
-            p = _reference_payload(ref)
-            return await lt.aensure_libtv_url(p[0], p[1], p[2], _REF_DEFAULT_NAME["image"])
+    def image_edit(
+        self,
+        model: str,
+        image: Any,
+        prompt: Optional[str],
+        model_response: ImageResponse,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[HTTPHandler] = None,
+    ) -> ImageResponse:
+        # litellm's OpenAI-shaped /v1/images/edits routes here with the uploaded
+        # reference file(s) as `image` (single file or list) rather than
+        # optional_params["reference_images"]/["image"] the way image_generation's
+        # JSON-body callers do; the reference upload/compliance flow is identical
+        # from here on, just fed a differently-shaped reference list.
+        lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
+        spec = lt.resolve_model_spec(model)
+        images = _as_list(image)
+        params = self._resolved_image_params(lt, prompt or "", spec, images, optional_params)
+        result = lt.generate(model, spec["vendor"], "image", params, _project_name(model))
+        return self._fill_image_response(model_response, result)
 
-        mode = _resolve_mode(optional_params, _infer_image_mode(images))
-        params = build_generation_params(prompt, optional_params, spec, mode)
-        if images:
-            if _auto_compliance_enabled(spec):
-                params["autoCompliance"] = 1
-                params["imageList"] = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
-            else:
-                params["imageList"] = [await url_for(r) for r in images]
+    async def aimage_edit(
+        self,
+        model: str,
+        image: Any,
+        prompt: Optional[str],
+        model_response: ImageResponse,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        client: Optional[AsyncHTTPHandler] = None,
+    ) -> ImageResponse:
+        lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
+        spec = await lt.aresolve_model_spec(model)
+        images = _as_list(image)
+        params = await self._aresolved_image_params(lt, prompt or "", spec, images, optional_params)
         result = await lt.agenerate(model, spec["vendor"], "image", params, _project_name(model))
         return self._fill_image_response(model_response, result)
 

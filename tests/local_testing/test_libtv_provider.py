@@ -1515,6 +1515,215 @@ def test_image_generation_routes_to_custom_provider():
         litellm.custom_provider_map = []
 
 
+# --- image_edit: the real transport for nano-banana-pro (nebula-ultra) reference
+# requests. The drama backend and drama-cli both send reference images as multipart
+# POST /v1/images/edits (files under "image"), never optional_params["reference_images"]
+# on a JSON /v1/images/generations body, so image_edit/aimage_edit on LibTVLLM must
+# work standalone from image_generation/aimage_generation. ---
+
+_REF_TUPLE = ("reference_0.png", b"IMGBYTES", "image/png")
+
+
+def test_image_edit_single_reference_uploads_and_carries_quality():
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.image_edit(
+        "nebula-ultra",
+        [_REF_TUPLE],
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "quality": "2k"},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "image2image"
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
+    assert gen_params["quality"] == "2K"
+
+
+def test_image_edit_single_file_not_wrapped_in_list_still_uploads():
+    # litellm always normalizes `image` to a list before calling the custom
+    # handler, but a direct/older caller might still pass a bare file; image_edit
+    # must accept both shapes the way _as_list already does elsewhere.
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = llm.image_edit(
+        "nebula-ultra", _REF_TUPLE, "restyle it", ImageResponse(), "tok", None, {"webid": "w"}, None, client=fake
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    assert _gen_params(fake.calls)["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
+
+
+def test_image_edit_multiple_references_uploads_all():
+    fake = _FullSyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    refs = [
+        ("reference_0.png", b"A", "image/png"),
+        ("reference_1.png", b"B", "image/png"),
+        ("reference_2.png", b"C", "image/png"),
+    ]
+    llm.image_edit("nebula-ultra", refs, "restyle it", ImageResponse(), "tok", None, {"webid": "w"}, None, client=fake)
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"] * 3
+
+
+def test_image_edit_without_reference_stays_text2image():
+    fake = _FullSyncFake(_NEBULA_IMAGE_ROUTES, get_payload=_nebula_ultra_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    llm.image_edit(
+        "nebula-ultra", [], "a cat from scratch", ImageResponse(), "tok", None, {"webid": "w"}, None, client=fake
+    )
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "text2image"
+    assert gen_params["imageList"] == []
+
+
+@pytest.mark.asyncio
+async def test_aimage_edit_uploads_reference_and_infers_image2image():
+    fake = _FullAsyncFake(
+        _NEBULA_IMAGE_ROUTES,
+        get_payload=_nebula_ultra_tool_spec_payload(),
+        upload_cdn="https://libtv-res.liblib.art/up/ref.png",
+    )
+    llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"IMG", http_put=lambda u, d: 200)
+    vo = await llm.aimage_edit(
+        "nebula-ultra",
+        [_REF_TUPLE],
+        "restyle it",
+        ImageResponse(),
+        "tok",
+        None,
+        {"webid": "w", "quality": "4k"},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "image2image"
+    assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]
+    assert gen_params["quality"] == "4K"
+
+
+def test_libtv_overrides_base_class_image_edit():
+    from litellm.llms.custom_llm import CustomLLM
+
+    # Without the override, image_edit/aimage_edit inherit CustomLLM's stub which
+    # unconditionally raises CustomLLMError(status_code=500, "Not implemented yet!") --
+    # exactly the guaranteed-500 this fix removes.
+    assert LibTVLLM.image_edit is not CustomLLM.image_edit
+    assert LibTVLLM.aimage_edit is not CustomLLM.aimage_edit
+
+
+def test_image_edit_routes_to_custom_provider_via_main_entry():
+    # Exercises the real litellm.images.main.image_edit dispatch for a custom
+    # provider (mirrors test_image_generation_routes_to_custom_provider), and
+    # proves the images/main.py fix: n/quality/size are bound to image_edit's
+    # named params, not **kwargs, so the custom-provider branch must fold them
+    # back into optional_params or a custom handler never sees them.
+    import litellm
+    from litellm.llms.custom_llm import CustomLLM
+
+    captured = {}
+
+    class StubLLM(CustomLLM):
+        def image_edit(
+            self,
+            model,
+            image,
+            prompt,
+            model_response,
+            api_key,
+            api_base,
+            optional_params,
+            logging_obj,
+            timeout=None,
+            client=None,
+        ):
+            captured["model"] = model
+            captured["prompt"] = prompt
+            captured["image"] = image
+            captured["optional_params"] = dict(optional_params)
+            model_response.data = [ImageObject(url="https://x/y.png")]
+            return model_response
+
+    litellm.custom_provider_map = [{"provider": "libtvstub", "custom_handler": StubLLM()}]
+    try:
+        out = litellm.image_edit(
+            model="libtvstub/nebula-ultra",
+            image=[_REF_TUPLE],
+            prompt="a fox",
+            quality="2k",
+            size="2048x2048",
+            n=1,
+        )
+        assert out.data[0]["url"] == "https://x/y.png"
+        assert captured["model"] == "nebula-ultra"
+        assert captured["prompt"] == "a fox"
+        assert captured["image"] == [_REF_TUPLE]
+        assert captured["optional_params"]["quality"] == "2k"
+        assert captured["optional_params"]["size"] == "2048x2048"
+        assert captured["optional_params"]["n"] == 1
+    finally:
+        litellm.custom_provider_map = []
+
+
+@pytest.mark.asyncio
+async def test_aimage_edit_routes_to_custom_provider_via_main_entry():
+    import litellm
+    from litellm.llms.custom_llm import CustomLLM
+
+    captured = {}
+
+    class StubLLM(CustomLLM):
+        async def aimage_edit(
+            self,
+            model,
+            image,
+            prompt,
+            model_response,
+            api_key,
+            api_base,
+            optional_params,
+            logging_obj,
+            timeout=None,
+            client=None,
+        ):
+            captured["optional_params"] = dict(optional_params)
+            model_response.data = [ImageObject(url="https://x/z.png")]
+            return model_response
+
+    litellm.custom_provider_map = [{"provider": "libtvstub", "custom_handler": StubLLM()}]
+    try:
+        out = await litellm.aimage_edit(
+            model="libtvstub/nebula-ultra",
+            image=[_REF_TUPLE],
+            prompt="a fox",
+            quality="4k",
+            size="1024x1024",
+        )
+        assert out.data[0]["url"] == "https://x/z.png"
+        assert captured["optional_params"]["quality"] == "4k"
+        assert captured["optional_params"]["size"] == "1024x1024"
+    finally:
+        litellm.custom_provider_map = []
+
+
 # --- libtv compliance classification: content rejections must fast-fail (no fallback) ---
 
 from litellm.llms.libtv.common import (  # noqa: E402

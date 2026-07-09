@@ -828,6 +828,27 @@ def image_edit(  # noqa: PLR0915
 
             model_response = ImageResponse()
 
+            # `n`/`quality`/`size`/`response_format`/`user`/`mask` are bound to
+            # this function's named parameters, so they never land in **kwargs.
+            # Fold them back in (image_generation does the same via
+            # get_optional_params_image_gen) so a custom provider actually sees
+            # the request shape callers send, e.g. quality+size on /v1/images/edits.
+            custom_optional_params: Dict[str, Any] = {
+                **{
+                    k: v
+                    for k, v in {
+                        "n": n,
+                        "quality": quality,
+                        "response_format": response_format,
+                        "size": size,
+                        "user": user,
+                        "mask": mask,
+                    }.items()
+                    if v is not None
+                },
+                **kwargs,
+            }
+
             if _is_async:
                 async_custom_client: Optional[AsyncHTTPHandler] = None
                 if kwargs.get("client") is not None and isinstance(
@@ -842,7 +863,7 @@ def image_edit(  # noqa: PLR0915
                     model_response=model_response,
                     api_key=kwargs.get("api_key"),
                     api_base=kwargs.get("api_base"),
-                    optional_params=kwargs,
+                    optional_params=custom_optional_params,
                     logging_obj=litellm_logging_obj,
                     timeout=timeout,
                     client=async_custom_client,
@@ -861,7 +882,7 @@ def image_edit(  # noqa: PLR0915
                     model_response=model_response,
                     api_key=kwargs.get("api_key"),
                     api_base=kwargs.get("api_base"),
-                    optional_params=kwargs,
+                    optional_params=custom_optional_params,
                     logging_obj=litellm_logging_obj,
                     timeout=timeout,
                     client=custom_client,
