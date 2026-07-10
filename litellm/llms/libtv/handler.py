@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 from functools import wraps
@@ -28,8 +29,25 @@ from litellm.types.videos.utils import (
 )
 
 LIBTV_PROVIDER = "libtv"
+logger = logging.getLogger(__name__)
 
 _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
+
+# Keep in sync with the keys _collect_reference_groups reads: the guard below must
+# recognize exactly the keys that can contribute a reference, native libtv or
+# wavespeed-shaped, so it neither misses a caller's reference intent nor false-alarms
+# on a plain text2video request that never mentioned references at all.
+_REFERENCE_KEYS = (
+    "input_reference",
+    "image_references",
+    "reference_images",
+    "image",
+    "last_image",
+    "video_references",
+    "reference_videos",
+    "audio_references",
+    "reference_audios",
+)
 
 from .client import LibTVClient
 from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
@@ -203,6 +221,41 @@ def _collect_reference_groups(optional_params: dict) -> Tuple[list, list, list]:
     videos = _as_list(optional_params.get("video_references")) + _as_list(optional_params.get("reference_videos"))
     audios = _as_list(optional_params.get("audio_references")) + _as_list(optional_params.get("reference_audios"))
     return images, videos, audios
+
+
+def _guard_reference_intent(model: str, optional_params: dict, images: list, videos: list, audios: list) -> None:
+    # A caller that sends any reference key is declaring reference intent. If every
+    # key we recognize resolves to nothing, silently falling through to the
+    # text2video branch would burn provider quota generating the wrong content
+    # (production incident: reference_images present but collected empty -> silent
+    # text2video). Fail loud instead of degrading.
+    if images or videos or audios:
+        return
+    present_keys = [key for key in _REFERENCE_KEYS if key in optional_params]
+    if not present_keys:
+        return
+    raise LibTVError(
+        status_code=400,
+        message=(
+            f"libtv video_generation model={model}: reference keys present ({', '.join(present_keys)}) "
+            "but resolved to no references; refusing to degrade to text2video"
+        ),
+    )
+
+
+def _log_reference_collection(
+    model: str, optional_params: dict, images: list, videos: list, audios: list, branch: str
+) -> None:
+    key_presence = " ".join(f"{key}_present={key in optional_params}" for key in _REFERENCE_KEYS)
+    logger.info(
+        "libtv reference_collection model=%s %s images=%d videos=%d audios=%d branch=%s",
+        model,
+        key_presence,
+        len(images),
+        len(videos),
+        len(audios),
+        branch,
+    )
 
 
 def _default_video_mode(images: list, videos: list, audios: list) -> str:
@@ -557,12 +610,23 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
         images, videos, audios = _collect_reference_groups(optional_params)
+        _guard_reference_intent(model, optional_params, images, videos, audios)
+        auto_compliance = _auto_compliance_enabled(spec)
+        wants_frames = bool(images) and auto_compliance and _wants_frames2video(optional_params, spec)
+        _log_reference_collection(
+            model,
+            optional_params,
+            images,
+            videos,
+            audios,
+            branch="frames2video" if wants_frames else ("mixed2video" if images and auto_compliance else "else-mode"),
+        )
 
         def url_for(ref, default_name):
             p = _reference_payload(ref)
             return lt.ensure_libtv_url(p[0], p[1], p[2], default_name)
 
-        if images and _auto_compliance_enabled(spec) and _wants_frames2video(optional_params, spec):
+        if wants_frames:
             frame_refs = lt.resolve_compliant_image_refs(_frame_payloads(optional_params))
             video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "frames2video")
@@ -572,7 +636,7 @@ class LibTVLLM(CustomLLM):
                 params["videoList"] = video_refs
             if audios:
                 params["audioList"] = [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
-        elif images and _auto_compliance_enabled(spec):
+        elif images and auto_compliance:
             image_refs = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
             video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "mixed2video")
@@ -610,12 +674,23 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
         images, videos, audios = _collect_reference_groups(optional_params)
+        _guard_reference_intent(model, optional_params, images, videos, audios)
+        auto_compliance = _auto_compliance_enabled(spec)
+        wants_frames = bool(images) and auto_compliance and _wants_frames2video(optional_params, spec)
+        _log_reference_collection(
+            model,
+            optional_params,
+            images,
+            videos,
+            audios,
+            branch="frames2video" if wants_frames else ("mixed2video" if images and auto_compliance else "else-mode"),
+        )
 
         async def url_for(ref, default_name):
             p = _reference_payload(ref)
             return await lt.aensure_libtv_url(p[0], p[1], p[2], default_name)
 
-        if images and _auto_compliance_enabled(spec) and _wants_frames2video(optional_params, spec):
+        if wants_frames:
             frame_refs = await lt.aresolve_compliant_image_refs(_frame_payloads(optional_params))
             video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "frames2video")
@@ -625,7 +700,7 @@ class LibTVLLM(CustomLLM):
                 params["videoList"] = video_refs
             if audios:
                 params["audioList"] = [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
-        elif images and _auto_compliance_enabled(spec):
+        elif images and auto_compliance:
             image_refs = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
             video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "mixed2video")
