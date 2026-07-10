@@ -1731,10 +1731,7 @@ def test_frames2video_compliance_keeps_first_last_order_and_mode():
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "frames2video"
     assert gen_params["autoCompliance"] == 1
-    assert gen_params["imageList"] == [
-        {"url": _LIBTV_REF, "assetId": "asset-FIRST", "mediaType": "image"},
-        {"url": _LIBTV_LAST, "assetId": "asset-LAST", "mediaType": "image"},
-    ]
+    assert gen_params["imageList"] == ["asset://asset-FIRST", "asset://asset-LAST"]
     assert "mixedList" not in gen_params
 
 
@@ -1798,10 +1795,7 @@ async def test_frames2video_compliance_async_keeps_first_last_order():
     assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "frames2video"
-    assert gen_params["imageList"] == [
-        {"url": _LIBTV_REF, "assetId": "asset-FIRST", "mediaType": "image"},
-        {"url": _LIBTV_LAST, "assetId": "asset-LAST", "mediaType": "image"},
-    ]
+    assert gen_params["imageList"] == ["asset://asset-FIRST", "asset://asset-LAST"]
 
 
 def test_non_compliance_frames2video_keeps_first_last_imagelist_order():
@@ -1879,7 +1873,58 @@ def test_frames2video_compliance_last_image_only_single_frame():
     assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "frames2video"
-    assert gen_params["imageList"] == [{"url": _LIBTV_LAST, "assetId": "asset-LAST", "mediaType": "image"}]
+    assert gen_params["imageList"] == ["asset://asset-LAST"]
+
+
+def test_frames2video_compliance_exempt_frame_and_reference_video_use_asset_strings():
+    # frames2video's own vendor contract wants imageList/videoList as "asset://<id>"
+    # strings, never the {url, assetId} object shape mixed2video uses: verified against
+    # production, an object-shaped imageList fails star-video2-fast frames2video
+    # generation outright. An exempt frame (assetId None, non-portrait) keeps falling
+    # back to the raw cdn url string, same as before compliance existed.
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    routes = {
+        "/api/community/image/verify": {
+            "code": 0,
+            "data": {"list": [{"url": _LIBTV_REF, "riskLabels": risk}, {"url": _LIBTV_LAST, "riskLabels": risk}]},
+        },
+        "/api/third_asset/create": [
+            {"code": 0, "data": {"uuid": "u-first"}},
+            {"code": 0, "data": {"uuid": "u-last"}},
+            {"code": 0, "data": {"uuid": "u-vid"}},
+        ],
+        "/api/third_asset/check": [
+            {"code": 0, "data": {"list": [{"uuid": "u-first", "assetId": "asset-FIRST", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-last", "assetId": None, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "status": 0}]}},
+        ],
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST, "reference_videos": [_LIBTV_VIDEO]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "frames2video"
+    assert gen_params["imageList"] == ["asset://asset-FIRST", _LIBTV_LAST]
+    assert gen_params["videoList"] == ["asset://asset-VID"]
+    assert "mixedList" not in gen_params
 
 
 # --- video usage -> resolution-tiered cost (authoritative spend line) ---------
