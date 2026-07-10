@@ -137,6 +137,48 @@ async def test_delegated_transfer_falls_back_to_direct_on_timeout():
 
 
 @pytest.mark.asyncio
+async def test_delegated_transfer_late_grace_picks_up_worker_result_after_done_cas():
+    redis = _make_redis()
+    await _mark_worker_alive(redis)
+
+    fallback_calls = []
+
+    async def fallback_fetch(url):
+        fallback_calls.append(url)
+        return b"DIRECT"
+
+    fallback = DirectTransfer(fetch=fallback_fetch, put=await _async_put(200, "direct-etag"), part_size=100)
+    strategy = DelegatedTransfer(redis=redis, wait_timeout=0.2, late_grace_timeout=2.0, fallback=fallback)
+
+    async def slow_worker():
+        # Claim + finish the CAS before the requester's first BRPOP expires, but only
+        # push the result afterwards: the requester's cancel CAS must fail (status is
+        # already done) and the late-grace second BRPOP must pick the result up.
+        for _ in range(50):
+            entries = await redis.xrange("worker:tasks:media_transfer")
+            if entries:
+                break
+            await asyncio.sleep(0.01)
+        _, fields = entries[0]
+        payload = json.loads(fields["payload"])
+        task_id = payload["task_id"]
+        assert await cas_status(redis, task_id, {"queued"}, "claimed")
+        assert await cas_status(redis, task_id, {"claimed"}, "done")
+        await asyncio.sleep(0.4)  # past the requester's first BRPOP window
+        await redis.lpush(
+            result_key(task_id),
+            json.dumps({"ok": True, "result": {"etags": [{"n": 1, "etag": "late-but-committed"}]}}),
+        )
+
+    worker_task = asyncio.create_task(slow_worker())
+    etags = await strategy.transfer("https://source/x", 100, [{"n": 1, "url": "https://oss/1"}])
+    await worker_task
+
+    assert etags == [{"n": 1, "etag": "late-but-committed"}]
+    assert fallback_calls == []  # the committed worker result was used, not a direct re-upload
+
+
+@pytest.mark.asyncio
 async def test_delegated_transfer_no_active_worker_goes_direct_immediately():
     redis = _make_redis()  # no heartbeat registered
 
@@ -281,6 +323,57 @@ def test_build_transfer_strategy_below_min_bytes_stays_direct(monkeypatch):
     assert isinstance(strategy, DirectTransfer)
 
 
+# ---------------- size-aware wait timeout ----------------
+
+
+def test_wait_timeout_small_file_floors_at_60(monkeypatch):
+    from litellm.llms.libtv.transfer import resolve_wait_timeout
+
+    monkeypatch.delenv("MEDIA_TRANSFER_WAIT_TIMEOUT", raising=False)
+    assert resolve_wait_timeout(2 * 1024 * 1024) == 60.0  # 2MiB: formula gives 2s, floor wins
+
+
+def test_wait_timeout_large_file_scales_with_size(monkeypatch):
+    from litellm.llms.libtv.transfer import resolve_wait_timeout
+
+    monkeypatch.delenv("MEDIA_TRANSFER_WAIT_TIMEOUT", raising=False)
+    # 200MiB at the assumed 0.5MiB/s direct rate, halved: 200MiB / 0.5MiB * 0.5 = 200s
+    assert resolve_wait_timeout(200 * 1024 * 1024) == 200.0
+
+
+def test_wait_timeout_capped_at_300(monkeypatch):
+    from litellm.llms.libtv.transfer import resolve_wait_timeout
+
+    monkeypatch.delenv("MEDIA_TRANSFER_WAIT_TIMEOUT", raising=False)
+    assert resolve_wait_timeout(1024 * 1024 * 1024) == 300.0  # 1GiB: formula gives 1024s, cap wins
+
+
+def test_wait_timeout_env_override_wins(monkeypatch):
+    from litellm.llms.libtv.transfer import resolve_wait_timeout
+
+    monkeypatch.setenv("MEDIA_TRANSFER_WAIT_TIMEOUT", "42")
+    assert resolve_wait_timeout(1024 * 1024 * 1024) == 42.0
+
+
+def test_build_transfer_strategy_wait_timeout_is_size_aware(monkeypatch):
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    monkeypatch.delenv("MEDIA_TRANSFER_WAIT_TIMEOUT", raising=False)
+    strategy = build_transfer_strategy(size=200 * 1024 * 1024, redis_client=_make_redis())
+    assert isinstance(strategy, DelegatedTransfer)
+    assert strategy.wait_timeout == 200.0
+
+
+@pytest.mark.asyncio
+async def test_cas_status_matches_claimed_with_owner_suffix():
+    # enterprise workers may store the claim as "claimed:{worker_id}"; the cancel
+    # CAS must still treat it as a claimed state it can revoke.
+    redis = _make_redis()
+    task_id = "owner-suffix-task"
+    await redis.set(status_key(task_id), "claimed:worker-7")
+    assert await cas_status(redis, task_id, {"queued", "claimed"}, "cancelled") is True
+    assert await redis.get(status_key(task_id)) == "cancelled"
+
+
 # ---------------- production redis wiring ----------------
 
 
@@ -288,8 +381,7 @@ def test_build_transfer_strategy_below_min_bytes_stays_direct(monkeypatch):
 def reset_transfer_redis(monkeypatch):
     import litellm.llms.libtv.transfer as transfer_mod
 
-    monkeypatch.setattr(transfer_mod, "_redis_singleton", None)
-    monkeypatch.setattr(transfer_mod, "_redis_singleton_url", None)
+    monkeypatch.setattr(transfer_mod, "_redis_clients", {})
     return transfer_mod
 
 
@@ -306,7 +398,49 @@ def test_get_transfer_redis_builds_and_reuses_client(monkeypatch, reset_transfer
     monkeypatch.setenv("MEDIA_TRANSFER_REDIS_URL", "redis://127.0.0.1:6399/0")
     client = get_transfer_redis()
     assert client is not None
-    assert get_transfer_redis() is client  # process-wide singleton, reused
+    assert get_transfer_redis() is client  # reused within the same event-loop context
+
+
+def test_get_transfer_redis_separate_client_per_event_loop(monkeypatch, reset_transfer_redis):
+    from litellm.llms.libtv.transfer import get_transfer_redis
+
+    monkeypatch.setenv("MEDIA_TRANSFER_REDIS_URL", "redis://127.0.0.1:6399/0")
+
+    async def grab():
+        return get_transfer_redis()
+
+    loop1 = asyncio.new_event_loop()
+    loop2 = asyncio.new_event_loop()
+    try:
+        c1 = loop1.run_until_complete(grab())
+        c1_again = loop1.run_until_complete(grab())
+        c2 = loop2.run_until_complete(grab())
+    finally:
+        loop1.close()
+        loop2.close()
+
+    assert c1 is c1_again  # cached per loop
+    assert c1 is not c2  # a redis.asyncio client must never cross event loops
+
+
+@pytest.mark.asyncio
+async def test_delegated_transfer_runtime_error_falls_back_without_raising():
+    class WrongLoopRedis:
+        async def zcount(self, *a, **k):
+            raise RuntimeError("Task got Future attached to a different loop")
+
+    fallback_calls = []
+
+    async def fallback_fetch(url):
+        fallback_calls.append(url)
+        return b"X"
+
+    fallback = DirectTransfer(fetch=fallback_fetch, put=await _async_put(200, "direct-etag"), part_size=100)
+    strategy = DelegatedTransfer(redis=WrongLoopRedis(), wait_timeout=5, fallback=fallback)
+
+    etags = await strategy.transfer("https://source/x", 100, [{"n": 1, "url": "https://oss/1"}])
+    assert fallback_calls == ["https://source/x"]
+    assert etags == [{"n": 1, "etag": "direct-etag"}]
 
 
 def test_build_transfer_strategy_uses_env_redis_when_not_injected(monkeypatch, reset_transfer_redis):

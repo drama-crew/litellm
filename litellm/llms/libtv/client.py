@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import time
 import uuid
@@ -37,6 +38,35 @@ def _raise_generation_failed(failed_reason: Optional[str]) -> None:
 
 
 THIRD_ASSET_POLL_ATTEMPTS = 30
+
+logger = logging.getLogger(__name__)
+
+
+def probe_size_via_ranged_get(url: str, timeout: float, client: Optional[httpx.Client] = None) -> int:
+    """Object size of a presigned GET url without downloading it. A HEAD request
+    would 403 (the HTTP verb is part of the presigned string-to-sign), so issue the
+    signed GET with ``Range: bytes=0-0`` and read the total from Content-Range (206),
+    falling back to Content-Length when the store ignores Range (200). The response
+    body is never consumed."""
+    owned = client is None
+    client = client or httpx.Client(follow_redirects=True, timeout=timeout)
+    try:
+        with client.stream("GET", url, headers={"Range": "bytes=0-0"}) as resp:
+            if resp.status_code == 206:
+                total = resp.headers.get("content-range", "").rsplit("/", 1)[-1]
+                if total.isdigit():
+                    return int(total)
+            if resp.status_code == 200:
+                content_length = resp.headers.get("content-length")
+                if content_length is not None:
+                    return int(content_length)
+            raise LibTVError(
+                status_code=resp.status_code if resp.status_code >= 400 else 502,
+                message=f"libtv reference size probe failed: HTTP {resp.status_code}",
+            )
+    finally:
+        if owned:
+            client.close()
 
 
 def _filename_from_url(url: str, default_name: str) -> str:
@@ -258,7 +288,7 @@ class LibTVClient:
         request_timeout: float = 60.0,
         http_get=None,
         http_put=None,
-        http_head=None,
+        http_size_probe=None,
         redis_client: Optional[Any] = None,
     ):
         self.token = token
@@ -274,7 +304,7 @@ class LibTVClient:
         # path). Injectable for tests.
         self._http_get = http_get
         self._http_put = http_put
-        self._http_head = http_head
+        self._http_size_probe = http_size_probe
         # Async redis client for the delegated media-transfer strategy (see transfer.py).
         # None disables delegation regardless of MEDIA_TRANSFER_MODE.
         self._redis_client = redis_client
@@ -615,23 +645,17 @@ class LibTVClient:
     async def _afetch_bytes(self, url: str) -> bytes:
         return await asyncio.to_thread(self._fetch_bytes, url)
 
-    def _head_size(self, url: str) -> int:
+    def _probe_size(self, url: str) -> int:
         # Same bare-httpx rationale as _fetch_bytes/_put_bytes: a presigned object-store
         # url must not pick up the litellm http wrapper's default headers.
-        if self._http_head is not None:
-            return self._http_head(url)
+        if self._http_size_probe is not None:
+            return self._http_size_probe(url)
         if not (url.startswith("http://") or url.startswith("https://")):
             raise LibTVError(status_code=400, message="libtv reference url must be http(s)")
-        resp = httpx.head(url, follow_redirects=True, timeout=self.request_timeout)
-        if resp.status_code != 200:
-            raise LibTVError(status_code=resp.status_code, message=f"libtv reference head HTTP {resp.status_code}")
-        content_length = resp.headers.get("content-length")
-        if content_length is None:
-            raise LibTVError(status_code=502, message="libtv reference head missing content-length")
-        return int(content_length)
+        return probe_size_via_ranged_get(url, timeout=self.request_timeout)
 
-    async def _ahead_size(self, url: str) -> int:
-        return await asyncio.to_thread(self._head_size, url)
+    async def _aprobe_size(self, url: str) -> int:
+        return await asyncio.to_thread(self._probe_size, url)
 
     async def _aput_bytes(self, url: str, data: bytes) -> Tuple[int, str]:
         status = await asyncio.to_thread(self._put_bytes, url, data)
@@ -655,19 +679,26 @@ class LibTVClient:
                 return url
             filename = _filename_from_url(url, default_name)
             if os.getenv("MEDIA_TRANSFER_MODE", "direct").lower() == "delegated":
-                return await self._aupload_via_transfer(url, filename)
+                try:
+                    size = await self._aprobe_size(url)
+                except (LibTVError, httpx.HTTPError, ValueError) as e:
+                    # Size probe failed (403 store, chunked source without a length,
+                    # network fault): the delegated path needs the size up front, the
+                    # legacy fetch+upload path does not.
+                    logger.warning("libtv media size probe failed, using direct upload: %s", e)
+                    return await self.aupload_media(await self._afetch_bytes(url), filename)
+                return await self._aupload_via_transfer(url, filename, size)
             return await self.aupload_media(await self._afetch_bytes(url), filename)
         return await self.aupload_media(data or b"", url or default_name)
 
-    async def _aupload_via_transfer(self, source_url: str, filename: str) -> str:
-        """Delegated-mode counterpart to aupload_media: HEAD the source for its size,
-        open a bridge multipart upload, hand the byte transfer off to a
+    async def _aupload_via_transfer(self, source_url: str, filename: str, size: int) -> str:
+        """Delegated-mode counterpart to aupload_media: open a bridge multipart upload
+        for the probed source size, hand the byte transfer off to a
         MediaTransferStrategy (a Redis-coordinated worker when one is available, or
         an in-process fetch+PUT fallback), then close out the bridge upload. Unlike
         aupload_media, this never buffers the source bytes in this process itself --
         that only happens inside the chosen strategy."""
         user_uuid = await self.aresolve_user_uuid()
-        size = await self._ahead_size(source_url)
         path = build_upload_path(user_uuid, hashlib.sha1(source_url.encode()).hexdigest(), filename)
         init = self._check(
             await self.async_client.post(

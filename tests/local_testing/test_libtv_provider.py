@@ -1857,7 +1857,7 @@ async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monk
     fake = AsyncUploadFake()
     head_calls = []
 
-    def http_head(url):
+    def http_size_probe(url):
         head_calls.append(url)
         return 11  # source size in bytes
 
@@ -1867,7 +1867,7 @@ async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monk
         async_client=fake,
         http_get=lambda u: b"VIDEOBYTES!",
         http_put=fake.put_bytes,
-        http_head=http_head,
+        http_size_probe=http_size_probe,
         redis_client=redis,
     )
 
@@ -1899,6 +1899,73 @@ async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monk
     assert init_body["fileSize"] == 11
 
 
+def _ranged_get_transport(status_code, headers):
+    import httpx
+
+    def handler(request):
+        assert request.method == "GET"
+        assert request.headers.get("range") == "bytes=0-0"
+        response = httpx.Response(status_code, content=b"" if status_code == 403 else b"\x00")
+        response.headers = httpx.Headers(headers)  # exactly these headers, no implied Content-Length
+        return response
+
+    return httpx.MockTransport(handler)
+
+
+def test_probe_size_via_ranged_get_reads_content_range():
+    import httpx
+
+    from litellm.llms.libtv.client import probe_size_via_ranged_get
+
+    client = httpx.Client(transport=_ranged_get_transport(206, {"Content-Range": "bytes 0-0/52428800"}))
+    assert probe_size_via_ranged_get("https://oss/presigned?sig=1", timeout=5, client=client) == 52428800
+
+
+def test_probe_size_via_ranged_get_falls_back_to_content_length_on_200():
+    import httpx
+
+    from litellm.llms.libtv.client import probe_size_via_ranged_get
+
+    client = httpx.Client(transport=_ranged_get_transport(200, {"Content-Length": "1"}))
+    assert probe_size_via_ranged_get("https://oss/presigned?sig=1", timeout=5, client=client) == 1
+
+
+def test_probe_size_via_ranged_get_raises_on_403_and_missing_length():
+    import httpx
+
+    from litellm.llms.libtv.client import probe_size_via_ranged_get
+
+    client = httpx.Client(transport=_ranged_get_transport(403, {}))
+    with pytest.raises(LibTVError):
+        probe_size_via_ranged_get("https://oss/presigned?sig=1", timeout=5, client=client)
+
+    chunked = httpx.Client(transport=_ranged_get_transport(200, {"Transfer-Encoding": "chunked"}))
+    with pytest.raises(LibTVError):
+        probe_size_via_ranged_get("https://oss/presigned?sig=1", timeout=5, client=chunked)
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_delegated_mode_probe_failure_falls_back_to_legacy_upload(monkeypatch):
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+
+    def failing_probe(url):
+        raise LibTVError(status_code=403, message="probe 403")
+
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VID",
+        http_put=fake.put_bytes,
+        http_size_probe=failing_probe,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+    assert out == "https://libtv-res/uploaded.png"
+    assert ("PUT", "https://oss/put/1", 3, None) in fake.calls  # legacy fetch+upload ran in-process
+
+
 @pytest.mark.asyncio
 async def test_aensure_libtv_url_delegated_mode_falls_back_to_direct_without_worker(monkeypatch):
     pytest.importorskip("fakeredis")
@@ -1914,7 +1981,7 @@ async def test_aensure_libtv_url_delegated_mode_falls_back_to_direct_without_wor
         async_client=fake,
         http_get=lambda u: b"VID",
         http_put=fake.put_bytes,
-        http_head=lambda u: 3,
+        http_size_probe=lambda u: 3,
         redis_client=redis,
     )
 

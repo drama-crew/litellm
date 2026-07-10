@@ -22,7 +22,12 @@ STATUS_TTL_SECONDS = 24 * 3600
 RESULT_TTL_SECONDS = 3600
 DEFAULT_MIN_BYTES = 2 * 1024 * 1024
 DEFAULT_WAIT_TIMEOUT = 60.0
+MAX_WAIT_TIMEOUT = 300.0
+# Assumed direct-upload rate on the constrained egress; the delegated wait is half
+# the projected direct duration so falling back still beats never delegating.
+ASSUMED_DIRECT_RATE_BYTES_PER_S = 0.5 * 1024 * 1024
 DEFAULT_LATE_GRACE_TIMEOUT = 2.0
+WARN_INTERVAL_SECONDS = 300.0
 # A worker's heartbeat key/zset entry is refreshed every ~15s; anything older than
 # 2x that interval is treated as dead so a stalled worker doesn't win task claims.
 WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
@@ -30,22 +35,41 @@ WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
 
 logger = logging.getLogger(__name__)
 
-_redis_singleton: Optional[Any] = None
-_redis_singleton_url: Optional[str] = None
-_warned_redis_unavailable = False
+_redis_clients: dict = {}  # (event loop, url) -> redis.asyncio client
+_last_unavailable_warn_ts = 0.0
+
+
+def _warn_unavailable(message: str, exc_info: bool = False) -> None:
+    global _last_unavailable_warn_ts
+    now = time.time()
+    if now - _last_unavailable_warn_ts >= WARN_INTERVAL_SECONDS:
+        _last_unavailable_warn_ts = now
+        logger.warning(message, exc_info=exc_info)
 
 
 def get_transfer_redis() -> Optional[Any]:
-    """Process-wide lazy redis.asyncio client built from MEDIA_TRANSFER_REDIS_URL;
-    None when the env var is unset. Rebuilt if the URL changes between calls."""
-    global _redis_singleton, _redis_singleton_url
+    """Lazy redis.asyncio client built from MEDIA_TRANSFER_REDIS_URL; None when the
+    env var is unset. Cached per (event loop, url): a redis.asyncio client binds to
+    the loop it was created under, so sharing one across loops raises RuntimeError
+    and leaks connections. Entries for closed loops (and superseded urls on the
+    current loop) are evicted, closing their clients best-effort."""
     url = os.getenv("MEDIA_TRANSFER_REDIS_URL")
     if not url:
         return None
-    if _redis_singleton is None or _redis_singleton_url != url:
+    try:
+        loop: Optional[Any] = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    key = (loop, url)
+    client = _redis_clients.get(key)
+    if client is None:
         import redis.asyncio as async_redis
 
-        _redis_singleton = async_redis.from_url(
+        for stale_key in [k for k in _redis_clients if (k[0] is loop and k[1] != url) or (k[0] is not None and k[0].is_closed())]:
+            stale = _redis_clients.pop(stale_key)
+            if loop is not None and stale_key[0] is loop and not loop.is_closed():
+                loop.create_task(stale.aclose())
+        client = async_redis.from_url(
             url,
             decode_responses=True,
             socket_connect_timeout=5,
@@ -53,8 +77,15 @@ def get_transfer_redis() -> Optional[Any]:
             # a socket_timeout shorter than that would abort every delegated wait.
             health_check_interval=30,
         )
-        _redis_singleton_url = url
-    return _redis_singleton
+        _redis_clients[key] = client
+    return client
+
+
+def resolve_wait_timeout(size: int) -> float:
+    env_value = os.getenv("MEDIA_TRANSFER_WAIT_TIMEOUT")
+    if env_value:
+        return float(env_value)
+    return min(MAX_WAIT_TIMEOUT, max(DEFAULT_WAIT_TIMEOUT, size / ASSUMED_DIRECT_RATE_BYTES_PER_S * 0.5))
 
 
 def status_key(task_id: str) -> str:
@@ -126,7 +157,9 @@ class DirectTransfer:
 async def cas_status(redis: Any, task_id: str, allowed_current: set, new_value: str, ex: Optional[int] = None) -> bool:
     """Compare-and-set the status key for ``task_id``: only writes ``new_value``
     when the current value is one of ``allowed_current`` (``None`` may be a
-    member to allow transitioning from a missing key). Uses a WATCH/MULTI
+    member to allow transitioning from a missing key). A stored value is matched
+    by its base token before any ``:`` suffix, so an owner-tagged claim such as
+    ``claimed:{worker_id}`` still counts as ``claimed``. Uses a WATCH/MULTI
     transaction rather than server-side Lua so it works against any Redis-
     compatible server (including fakeredis without the optional lupa/Lua
     scripting extra)."""
@@ -134,8 +167,9 @@ async def cas_status(redis: Any, task_id: str, allowed_current: set, new_value: 
     async with redis.pipeline(transaction=True) as pipe:
         try:
             await pipe.watch(key)
-            current = await redis.get(key)
-            if current not in allowed_current:
+            current = await pipe.get(key)  # immediate mode while watching
+            base = current.split(":", 1)[0] if isinstance(current, str) else current
+            if base not in allowed_current:
                 await pipe.unwatch()
                 return False
             pipe.multi()
@@ -185,22 +219,28 @@ class DelegatedTransfer:
         return json.loads(body)
 
     async def transfer(self, source_url: str, size: int, parts: List[PartTarget]) -> List[PartEtag]:
-        global _warned_redis_unavailable
+        task_id = str(uuid.uuid4())
         try:
-            return await self._transfer_delegated(source_url, size, parts)
-        except redis_exceptions.RedisError:
-            if not _warned_redis_unavailable:
-                _warned_redis_unavailable = True
-                logger.warning(
-                    "media transfer redis unreachable; falling back to direct transfer", exc_info=True
-                )
+            return await self._transfer_delegated(task_id, source_url, size, parts)
+        except (redis_exceptions.RedisError, RuntimeError, OSError):
+            # RuntimeError covers a redis.asyncio client used across event loops,
+            # which surfaces outside the RedisError hierarchy.
+            _warn_unavailable("media transfer redis unreachable; falling back to direct transfer", exc_info=True)
+            try:
+                # Best-effort cancel so a worker that did receive the task drops it.
+                # If the cancel itself fails, a worker may still upload the parts in
+                # parallel with the direct fallback; multipart PUTs to the same
+                # uploadId/partNumber just overwrite each other, so the double
+                # upload is harmless.
+                await self._cas_cancel(task_id)
+            except Exception:
+                pass
             return await self.fallback.transfer(source_url, size, parts)
 
-    async def _transfer_delegated(self, source_url: str, size: int, parts: List[PartTarget]) -> List[PartEtag]:
+    async def _transfer_delegated(self, task_id: str, source_url: str, size: int, parts: List[PartTarget]) -> List[PartEtag]:
         if not await self._has_active_worker():
             return await self.fallback.transfer(source_url, size, parts)
 
-        task_id = str(uuid.uuid4())
         now = time.time()
         payload = {
             "type": TASK_TYPE,
@@ -243,16 +283,12 @@ def build_transfer_strategy(
     if redis_client is None:
         redis_client = get_transfer_redis()
     if redis_client is None:
-        global _warned_redis_unavailable
-        if not _warned_redis_unavailable:
-            _warned_redis_unavailable = True
-            logger.warning(
-                "MEDIA_TRANSFER_MODE=delegated but no redis client (set MEDIA_TRANSFER_REDIS_URL); "
-                "using direct transfer"
-            )
+        _warn_unavailable(
+            "MEDIA_TRANSFER_MODE=delegated but no redis client (set MEDIA_TRANSFER_REDIS_URL); "
+            "using direct transfer"
+        )
         return direct
     min_bytes = int(os.getenv("MEDIA_TRANSFER_MIN_BYTES", str(DEFAULT_MIN_BYTES)))
     if size < min_bytes:
         return direct
-    wait_timeout = float(os.getenv("MEDIA_TRANSFER_WAIT_TIMEOUT", str(DEFAULT_WAIT_TIMEOUT)))
-    return DelegatedTransfer(redis=redis_client, fallback=direct, wait_timeout=wait_timeout)
+    return DelegatedTransfer(redis=redis_client, fallback=direct, wait_timeout=resolve_wait_timeout(size))
