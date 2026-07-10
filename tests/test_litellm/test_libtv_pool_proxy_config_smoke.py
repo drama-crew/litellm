@@ -46,6 +46,7 @@ PUBLIC_MODELS = (
     "happy-horse-1.1",
 )
 MASTER_KEY = "sk-libtv-pool-smoke-test"
+BLOCKED_PUBLIC_MODEL = "seedance-2.0-blocked-test"
 
 _MODEL_KEY_BY_PUBLIC_NAME = {
     "nano-banana-pro": "nebula-ultra",
@@ -98,6 +99,21 @@ def _pool_config_yaml() -> str:
       hidden: true
 """
         )
+
+    model_entries.append(
+        f"""
+  - model_name: {BLOCKED_PUBLIC_MODEL}
+    litellm_params:
+      model: libtv/{_MODEL_KEY_BY_PUBLIC_NAME["seedance-2.0"]}
+      libtv_require_explicit_credentials: true
+      api_key: os.environ/LIBTV_TOKEN_1
+      webid: os.environ/LIBTV_WEBID_1
+      num_retries: 0
+    model_info:
+      id: {BLOCKED_PUBLIC_MODEL}-account-1
+      blocked: true
+"""
+    )
 
     aliases = "\n".join(
         f'      {public_name}: "{public_name}-account-1"' for public_name in PUBLIC_MODELS
@@ -326,3 +342,15 @@ class TestModelListingHidesAccountSlotsAndHiddenFallbacks:
         model_ids = {entry["id"] for entry in response.json()["data"]}
         assert "_fallback/seedance-2.0" not in model_ids
         assert "_fallback/seedance-2.0-fast" not in model_ids
+
+    def test_v1_models_never_leaks_a_fully_blocked_admin_paused_model(self, pool_proxy):
+        # Regression test: a merge conflict resolution once discarded
+        # `blocked_names` (paused-by-admin models) from the hidden-names set
+        # used to filter `/v1/models`, so an admin-paused model would
+        # reappear in the public listing even though every deployment behind
+        # it has `model_info.blocked=True`.
+        _proxy_server_module, client, _transport = pool_proxy
+        response = client.get("/v1/models", headers=_auth_headers())
+        assert response.status_code == 200, response.text
+        model_ids = {entry["id"] for entry in response.json()["data"]}
+        assert BLOCKED_PUBLIC_MODEL not in model_ids

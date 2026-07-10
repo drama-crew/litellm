@@ -8241,7 +8241,6 @@ async def model_list(
     # Models flagged model_info.hidden=true (fallback peers / provider-specific
     # channels) back a public model_name but must not surface on their own; this
     # keeps the public listing free of provider-revealing deployment names.
-    hidden_names: set = set()
     if llm_router is not None:
         for _dep in getattr(llm_router, "model_list", None) or []:
             _mi = (
@@ -8262,7 +8261,6 @@ async def model_list(
                 )
                 if _nm:
                     hidden_names.add(_nm)
-    blocked_names = set(blocked_names) | hidden_names
 
     # If scope=expand and user has admin privileges, return all proxy models
     if should_expand_scope:
