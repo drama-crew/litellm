@@ -1404,7 +1404,20 @@ def _resolve_model_id_with_router(model_id: Optional[str], llm_router: Optional[
     if model_id is None or llm_router is None:
         return model_id
     try:
-        return llm_router.resolve_model_name_from_model_id(model_id) or model_id
+        resolved_model = llm_router.resolve_model_name_from_model_id(model_id) or model_id
+        # `resolve_model_name_from_model_id` returns the input unchanged when it
+        # matches a deployment ID (its Strategy 1) - that's the correct value for
+        # sticky routing (video_endpoints.py needs the exact deployment), but auth
+        # candidates must never be a raw deployment ID: per-key allowlists only
+        # ever contain the public model_name, so an unresolved deployment ID here
+        # would always fail can_key_call_model(). Look up the deployment's public
+        # model_name for auth purposes only, without touching the router method.
+        if resolved_model == model_id and llm_router.has_model_id(model_id):
+            deployment = llm_router.get_deployment(model_id=model_id)
+            deployment_model_name = getattr(deployment, "model_name", None)
+            if deployment_model_name:
+                return deployment_model_name
+        return resolved_model
     except Exception as e:
         verbose_proxy_logger.debug("Unable to resolve model_id from managed resource ID: %s", str(e))
         return model_id

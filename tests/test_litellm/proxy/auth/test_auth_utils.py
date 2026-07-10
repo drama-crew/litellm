@@ -530,6 +530,168 @@ def test_get_model_from_request_resolves_character_id_model_with_router():
     )
 
 
+def _libtv_pool_router():
+    from litellm import Router
+
+    return Router(
+        model_list=[
+            {
+                "model_name": "seedance-2.0-fast",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "one"},
+                "model_info": {"id": "libtv-seedance-2-fast-account-1", "mode": "video_generation"},
+            },
+            {
+                "model_name": "seedance-2.0-fast",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "two"},
+                "model_info": {"id": "libtv-seedance-2-fast-account-2", "mode": "video_generation"},
+            },
+            {
+                "model_name": "seedance-2.0",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "three"},
+                "model_info": {"id": "seedance-2.0-deployment", "mode": "video_generation"},
+            },
+        ],
+    )
+
+
+def test_get_model_from_request_resolves_video_id_deployment_id_to_public_model_name():
+    """Regression test: video_id encoding a per-account deployment ID (sticky
+    routing across a libtv pool) must resolve to the deployment's public
+    model_name for auth purposes - not the raw deployment ID, which never
+    appears in a virtual key's allowlist and would always 403.
+    """
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    video_id = encode_video_id_with_provider(
+        video_id="provider-video-id",
+        provider="libtv",
+        model_id="libtv-seedance-2-fast-account-1",
+    )
+    router = _libtv_pool_router()
+
+    model = get_model_from_request(
+        request_data={"video_id": video_id},
+        route="/v1/videos/{video_id}",
+        llm_router=router,
+    )
+
+    assert model == "seedance-2.0-fast"
+
+
+def test_get_model_from_request_resolves_character_id_deployment_id_to_public_model_name():
+    from litellm.types.videos.utils import encode_character_id_with_provider
+
+    character_id = encode_character_id_with_provider(
+        character_id="provider-character-id",
+        provider="libtv",
+        model_id="libtv-seedance-2-fast-account-2",
+    )
+    router = _libtv_pool_router()
+
+    model = get_model_from_request(
+        request_data={"character_id": character_id},
+        route="/v1/videos/characters/{character_id}",
+        llm_router=router,
+    )
+
+    assert model == "seedance-2.0-fast"
+
+
+def test_get_model_from_request_video_id_legacy_public_model_name_still_resolves():
+    """video_id's carrying an already-public model name (pre-pool aliases, e.g.
+    ``seedance-2.0``) must keep resolving to that same public name.
+    """
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    video_id = encode_video_id_with_provider(
+        video_id="provider-video-id",
+        provider="libtv",
+        model_id="seedance-2.0",
+    )
+    router = _libtv_pool_router()
+
+    model = get_model_from_request(
+        request_data={"video_id": video_id},
+        route="/v1/videos/{video_id}",
+        llm_router=router,
+    )
+
+    assert model == "seedance-2.0"
+
+
+def test_get_model_from_request_video_id_deployment_id_passes_key_allowlist_check():
+    """End-to-end of the auth candidate through can_key_call_model(): a virtual
+    key whose allowlist only contains the public model name must be allowed to
+    poll a video_id that was encoded with the underlying deployment ID.
+    """
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    video_id = encode_video_id_with_provider(
+        video_id="provider-video-id",
+        provider="libtv",
+        model_id="libtv-seedance-2-fast-account-1",
+    )
+    router = _libtv_pool_router()
+
+    model = get_model_from_request(
+        request_data={"video_id": video_id},
+        route="/v1/videos/{video_id}",
+        llm_router=router,
+    )
+
+    valid_token = UserAPIKeyAuth(models=["seedance-2.0", "seedance-2.0-fast"])
+
+    import asyncio
+
+    assert (
+        asyncio.run(
+            can_key_call_model(
+                model=model,
+                llm_model_list=None,
+                valid_token=valid_token,
+                llm_router=router,
+            )
+        )
+        is True
+    )
+
+
+def test_get_model_from_request_video_id_deployment_id_still_blocked_when_not_allowed():
+    """Sanity check that the fix doesn't accidentally bypass allowlists: a key
+    without the pool's public model name must still be rejected.
+    """
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    video_id = encode_video_id_with_provider(
+        video_id="provider-video-id",
+        provider="libtv",
+        model_id="libtv-seedance-2-fast-account-1",
+    )
+    router = _libtv_pool_router()
+
+    model = get_model_from_request(
+        request_data={"video_id": video_id},
+        route="/v1/videos/{video_id}",
+        llm_router=router,
+    )
+
+    valid_token = UserAPIKeyAuth(models=["some-other-model"])
+
+    import asyncio
+
+    with pytest.raises(Exception):
+        asyncio.run(
+            can_key_call_model(
+                model=model,
+                llm_model_list=None,
+                valid_token=valid_token,
+                llm_router=router,
+            )
+        )
+
+
 def test_get_model_from_request_only_runs_media_decoders_for_matching_fields():
     with (
         patch(
