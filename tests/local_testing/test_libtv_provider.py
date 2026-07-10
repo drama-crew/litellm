@@ -1842,6 +1842,88 @@ async def test_aensure_libtv_url_uploads_external_url():
 
 
 @pytest.mark.asyncio
+async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monkeypatch):
+    fakeredis = pytest.importorskip("fakeredis")
+    from fakeredis import aioredis as fakeredis_aioredis
+
+    from litellm.llms.libtv.transfer import WORKERS_ZSET
+
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    monkeypatch.setenv("MEDIA_TRANSFER_MIN_BYTES", "1")  # exercise delegation despite the tiny fixture payload
+
+    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
+    await redis.zadd(WORKERS_ZSET, {"w1": __import__("time").time()})
+
+    fake = AsyncUploadFake()
+    head_calls = []
+
+    def http_head(url):
+        head_calls.append(url)
+        return 11  # source size in bytes
+
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VIDEOBYTES!",
+        http_put=fake.put_bytes,
+        http_head=http_head,
+        redis_client=redis,
+    )
+
+    async def fake_worker():
+        for _ in range(50):
+            entries = await redis.xrange("media:transfer:tasks")
+            if entries:
+                break
+            await __import__("asyncio").sleep(0.02)
+        import json as _json
+
+        _, fields = entries[0]
+        payload = _json.loads(fields["payload"])
+        task_id = payload["task_id"]
+        assert payload["source"]["size"] == 11
+        await redis.lpush(
+            f"media:transfer:result:{task_id}",
+            _json.dumps({"ok": True, "etags": [{"n": 1, "etag": "worker-etag"}]}),
+        )
+
+    worker_task = __import__("asyncio").create_task(fake_worker())
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+    await worker_task
+
+    assert out == "https://libtv-res/uploaded.png"
+    assert head_calls == [_EXT_VIDEO]
+    assert not any(c[0] == "PUT" for c in fake.calls)  # bytes went to the worker, not this process
+    init_body = next(c[2] for c in fake.calls if str(c[1]).endswith("/init/4"))
+    assert init_body["fileSize"] == 11
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_delegated_mode_falls_back_to_direct_without_worker(monkeypatch):
+    pytest.importorskip("fakeredis")
+    from fakeredis import aioredis as fakeredis_aioredis
+
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)  # no heartbeat registered
+
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VID",
+        http_put=fake.put_bytes,
+        http_head=lambda u: 3,
+        redis_client=redis,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+    assert out == "https://libtv-res/uploaded.png"
+    assert ("PUT", "https://oss/put/1", 3, None) in fake.calls  # DirectTransfer fallback ran in-process
+
+
+@pytest.mark.asyncio
 async def test_avideo_generation_uploads_external_reference_video_in_compliance_branch():
     fake = _FullAsyncFake(_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload())
     llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"VID", http_put=lambda u, d: 200)

@@ -1,9 +1,10 @@
 import asyncio
 import hashlib
 import json
+import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -25,6 +26,7 @@ from .common import (
     build_upload_path,
     is_compliance_failure,
 )
+from .transfer import PartTarget, build_transfer_strategy
 
 
 def _raise_generation_failed(failed_reason: Optional[str]) -> None:
@@ -256,6 +258,8 @@ class LibTVClient:
         request_timeout: float = 60.0,
         http_get=None,
         http_put=None,
+        http_head=None,
+        redis_client: Optional[Any] = None,
     ):
         self.token = token
         self.webid = webid
@@ -265,11 +269,15 @@ class LibTVClient:
         self.poll_interval = poll_interval
         self.poll_max_attempts = poll_max_attempts
         self.request_timeout = request_timeout
-        # Presigned object-store GET/PUT seams; default to bare httpx so the verbatim url
-        # reaches the store (the litellm http client breaks the signature on the async
+        # Presigned object-store GET/PUT/HEAD seams; default to bare httpx so the verbatim
+        # url reaches the store (the litellm http client breaks the signature on the async
         # path). Injectable for tests.
         self._http_get = http_get
         self._http_put = http_put
+        self._http_head = http_head
+        # Async redis client for the delegated media-transfer strategy (see transfer.py).
+        # None disables delegation regardless of MEDIA_TRANSFER_MODE.
+        self._redis_client = redis_client
         self._tool_spec_cache: Optional[Dict[str, Dict[str, Any]]] = None
         self._user_uuid: Optional[str] = None
 
@@ -607,6 +615,28 @@ class LibTVClient:
     async def _afetch_bytes(self, url: str) -> bytes:
         return await asyncio.to_thread(self._fetch_bytes, url)
 
+    def _head_size(self, url: str) -> int:
+        # Same bare-httpx rationale as _fetch_bytes/_put_bytes: a presigned object-store
+        # url must not pick up the litellm http wrapper's default headers.
+        if self._http_head is not None:
+            return self._http_head(url)
+        if not (url.startswith("http://") or url.startswith("https://")):
+            raise LibTVError(status_code=400, message="libtv reference url must be http(s)")
+        resp = httpx.head(url, follow_redirects=True, timeout=self.request_timeout)
+        if resp.status_code != 200:
+            raise LibTVError(status_code=resp.status_code, message=f"libtv reference head HTTP {resp.status_code}")
+        content_length = resp.headers.get("content-length")
+        if content_length is None:
+            raise LibTVError(status_code=502, message="libtv reference head missing content-length")
+        return int(content_length)
+
+    async def _ahead_size(self, url: str) -> int:
+        return await asyncio.to_thread(self._head_size, url)
+
+    async def _aput_bytes(self, url: str, data: bytes) -> Tuple[int, str]:
+        status = await asyncio.to_thread(self._put_bytes, url, data)
+        return status, ""
+
     def _put_bytes(self, url: str, data: bytes) -> int:
         # See _fetch_bytes: the presigned PUT must carry no extra headers (raw body
         # only) or the object store rejects the signature, so use bare httpx with
@@ -623,8 +653,52 @@ class LibTVClient:
         if kind == "url":
             if "libtv-res.liblib.art" in url:
                 return url
-            return await self.aupload_media(await self._afetch_bytes(url), _filename_from_url(url, default_name))
+            filename = _filename_from_url(url, default_name)
+            if os.getenv("MEDIA_TRANSFER_MODE", "direct").lower() == "delegated":
+                return await self._aupload_via_transfer(url, filename)
+            return await self.aupload_media(await self._afetch_bytes(url), filename)
         return await self.aupload_media(data or b"", url or default_name)
+
+    async def _aupload_via_transfer(self, source_url: str, filename: str) -> str:
+        """Delegated-mode counterpart to aupload_media: HEAD the source for its size,
+        open a bridge multipart upload, hand the byte transfer off to a
+        MediaTransferStrategy (a Redis-coordinated worker when one is available, or
+        an in-process fetch+PUT fallback), then close out the bridge upload. Unlike
+        aupload_media, this never buffers the source bytes in this process itself --
+        that only happens inside the chosen strategy."""
+        user_uuid = await self.aresolve_user_uuid()
+        size = await self._ahead_size(source_url)
+        path = build_upload_path(user_uuid, hashlib.sha1(source_url.encode()).hexdigest(), filename)
+        init = self._check(
+            await self.async_client.post(
+                url=self._bridge_url("init"),
+                json={"path": path, "fileSize": size, "partSize": BRIDGE_PART_SIZE},
+                headers=build_bridge_headers(self.token),
+                timeout=self.request_timeout,
+            ),
+            "upload/init",
+        )
+        data = init.get("data") or {}
+        parts: List[PartTarget] = [
+            {"n": part.get("partNumber"), "url": part["url"]} for part in data.get("parts") or []
+        ]
+        strategy = build_transfer_strategy(
+            size=size,
+            redis_client=self._redis_client,
+            fetch=self._afetch_bytes,
+            put=self._aput_bytes,
+        )
+        await strategy.transfer(source_url, size, parts)
+        complete = self._check(
+            await self.async_client.post(
+                url=self._bridge_url("complete"),
+                json={"path": path, "uploadId": data.get("uploadId")},
+                headers=build_bridge_headers(self.token),
+                timeout=self.request_timeout,
+            ),
+            "upload/complete",
+        )
+        return parse_upload_url(complete)
 
     async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> str:
         asset_uuid = parse_third_asset_uuid(
