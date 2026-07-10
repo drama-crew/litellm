@@ -303,6 +303,16 @@ def _wants_frames2video(optional_params: dict, spec: dict) -> bool:
     return isinstance(mode_items, dict) and "frames2video" in mode_items
 
 
+def _asset_ref_to_string(ref: dict) -> str:
+    # frames2video's imageList/videoList vendor contract wants "asset://<id>" strings,
+    # not the {url, assetId} objects mixed2video's mixedList/imageList expect: verified
+    # in production, an object-shaped imageList fails generation outright on
+    # star-video2-fast frames2video. assetId is None for exempt refs (no real person
+    # detected), which keeps the pre-compliance behavior of sending the raw cdn url.
+    asset_id = ref.get("assetId")
+    return f"asset://{asset_id}" if asset_id else ref["url"]
+
+
 def _frame_payloads(optional_params: dict) -> list:
     # [first, last] in order; image may be absent (libtv frames2video accepts 1-2
     # frames, and the non-compliance branch already sends a single-image imageList).
@@ -638,9 +648,9 @@ class LibTVLLM(CustomLLM):
             video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "frames2video")
             params["autoCompliance"] = 1
-            params["imageList"] = [{**ref, "mediaType": "image"} for ref in frame_refs]
+            params["imageList"] = [_asset_ref_to_string(ref) for ref in frame_refs]
             if video_refs:
-                params["videoList"] = [{**ref, "mediaType": "video"} for ref in video_refs]
+                params["videoList"] = [_asset_ref_to_string(ref) for ref in video_refs]
             if audios:
                 params["audioList"] = [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
         elif images and auto_compliance:
@@ -704,9 +714,9 @@ class LibTVLLM(CustomLLM):
             video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "frames2video")
             params["autoCompliance"] = 1
-            params["imageList"] = [{**ref, "mediaType": "image"} for ref in frame_refs]
+            params["imageList"] = [_asset_ref_to_string(ref) for ref in frame_refs]
             if video_refs:
-                params["videoList"] = [{**ref, "mediaType": "video"} for ref in video_refs]
+                params["videoList"] = [_asset_ref_to_string(ref) for ref in video_refs]
             if audios:
                 params["audioList"] = [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
         elif images and auto_compliance:
