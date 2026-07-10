@@ -10,8 +10,13 @@ import redis.exceptions as redis_exceptions
 
 from .common import BRIDGE_PART_SIZE, LibTVError
 
-TASKS_STREAM = "media:transfer:tasks"
-WORKERS_ZSET = "media:transfer:workers"
+# Generic worker-task protocol namespace (workers are general task executors;
+# media transfer is one task type). Keep all key names here for cross-repo reference.
+TASK_TYPE = "media_transfer"
+TASKS_STREAM = f"worker:tasks:{TASK_TYPE}"
+WORKERS_ZSET = f"worker:alive:{TASK_TYPE}"
+STATUS_KEY_PREFIX = "worker:task:status:"
+RESULT_KEY_PREFIX = "worker:task:result:"
 STATUS_TTL_SECONDS = 24 * 3600
 RESULT_TTL_SECONDS = 3600
 DEFAULT_MIN_BYTES = 2 * 1024 * 1024
@@ -23,11 +28,11 @@ WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
 
 
 def status_key(task_id: str) -> str:
-    return f"media:transfer:status:{task_id}"
+    return f"{STATUS_KEY_PREFIX}{task_id}"
 
 
 def result_key(task_id: str) -> str:
-    return f"media:transfer:result:{task_id}"
+    return f"{RESULT_KEY_PREFIX}{task_id}"
 
 
 class PartTarget(TypedDict):
@@ -156,6 +161,7 @@ class DelegatedTransfer:
         task_id = str(uuid.uuid4())
         now = time.time()
         payload = {
+            "type": TASK_TYPE,
             "task_id": task_id,
             "source": {"url": source_url, "size": size},
             "target": {"kind": "presigned_parts", "parts": parts, "part_size": BRIDGE_PART_SIZE},
@@ -175,7 +181,8 @@ class DelegatedTransfer:
                 )
 
         if result is not None and result.get("ok"):
-            return [{"n": e["n"], "etag": e.get("etag", "")} for e in result.get("etags", [])]
+            inner = result.get("result") or {}
+            return [{"n": e["n"], "etag": e.get("etag", "")} for e in inner.get("etags", [])]
         return await self.fallback.transfer(source_url, size, parts)
 
 

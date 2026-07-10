@@ -1846,7 +1846,7 @@ async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monk
     fakeredis = pytest.importorskip("fakeredis")
     from fakeredis import aioredis as fakeredis_aioredis
 
-    from litellm.llms.libtv.transfer import WORKERS_ZSET
+    from litellm.llms.libtv.transfer import WORKERS_ZSET, result_key
 
     monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
     monkeypatch.setenv("MEDIA_TRANSFER_MIN_BYTES", "1")  # exercise delegation despite the tiny fixture payload
@@ -1873,7 +1873,7 @@ async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monk
 
     async def fake_worker():
         for _ in range(50):
-            entries = await redis.xrange("media:transfer:tasks")
+            entries = await redis.xrange("worker:tasks:media_transfer")
             if entries:
                 break
             await __import__("asyncio").sleep(0.02)
@@ -1884,8 +1884,8 @@ async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monk
         task_id = payload["task_id"]
         assert payload["source"]["size"] == 11
         await redis.lpush(
-            f"media:transfer:result:{task_id}",
-            _json.dumps({"ok": True, "etags": [{"n": 1, "etag": "worker-etag"}]}),
+            result_key(task_id),
+            _json.dumps({"ok": True, "result": {"etags": [{"n": 1, "etag": "worker-etag"}]}}),
         )
 
     worker_task = __import__("asyncio").create_task(fake_worker())

@@ -94,17 +94,18 @@ async def test_delegated_transfer_completes_normally():
     async def fake_worker():
         # Wait for the task to land on the stream, then act like a worker completing it.
         for _ in range(50):
-            entries = await redis.xrange("media:transfer:tasks")
+            entries = await redis.xrange("worker:tasks:media_transfer")
             if entries:
                 break
             await asyncio.sleep(0.05)
         _, fields = entries[0]
         payload = json.loads(fields["payload"])
+        assert payload["type"] == "media_transfer"
         task_id = payload["task_id"]
         await redis.set(status_key(task_id), "done")
         await redis.lpush(
             result_key(task_id),
-            json.dumps({"ok": True, "etags": [{"n": 1, "etag": "worker-etag"}], "bytes": payload["source"]["size"]}),
+            json.dumps({"ok": True, "result": {"etags": [{"n": 1, "etag": "worker-etag"}], "bytes": payload["source"]["size"]}}),
         )
 
     worker_task = asyncio.create_task(fake_worker())
@@ -154,7 +155,7 @@ async def test_delegated_transfer_no_active_worker_goes_direct_immediately():
 
     assert fallback_calls == ["https://source/x"]
     assert elapsed < 1  # no XADD/BRPOP wait incurred
-    entries = await redis.xrange("media:transfer:tasks")
+    entries = await redis.xrange("worker:tasks:media_transfer")
     assert entries == []  # never enqueued a task nobody would claim
 
 
@@ -173,7 +174,7 @@ async def test_delegated_transfer_ignores_late_worker_result_after_cancel():
     # inspecting the status keys fakeredis now holds; simulate the worker waking up
     # after the deadline and trying to CAS claimed/queued -> done, which must fail
     # because the requester already cancelled it.
-    keys = [k async for k in redis.scan_iter("media:transfer:status:*")]
+    keys = [k async for k in redis.scan_iter("worker:task:status:*")]
     assert len(keys) == 1
     task_id = keys[0].split(":")[-1]
     assert await redis.get(status_key(task_id)) == "cancelled"
@@ -182,7 +183,7 @@ async def test_delegated_transfer_ignores_late_worker_result_after_cancel():
     assert claimed_to_done is False  # late worker CAS is rejected; must not overwrite cancelled
 
     # Even if the late worker ignores the CAS result and pushes anyway, nothing reads it.
-    await redis.lpush(result_key(task_id), json.dumps({"ok": True, "etags": [{"n": 1, "etag": "late"}]}))
+    await redis.lpush(result_key(task_id), json.dumps({"ok": True, "result": {"etags": [{"n": 1, "etag": "late"}]}}))
     assert etags == [{"n": 1, "etag": "direct-etag"}]  # already returned before the late push
 
 
@@ -234,7 +235,7 @@ async def test_delegated_transfer_worker_reported_failure_falls_back_to_direct()
 
     async def failing_worker():
         for _ in range(50):
-            entries = await redis.xrange("media:transfer:tasks")
+            entries = await redis.xrange("worker:tasks:media_transfer")
             if entries:
                 break
             await asyncio.sleep(0.02)
