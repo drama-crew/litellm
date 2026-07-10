@@ -1981,6 +1981,155 @@ async def test_aensure_libtv_url_uploads_external_url():
 
 
 @pytest.mark.asyncio
+async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monkeypatch):
+    fakeredis = pytest.importorskip("fakeredis")
+    from fakeredis import aioredis as fakeredis_aioredis
+
+    from litellm.llms.libtv.transfer import WORKERS_ZSET, result_key
+
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    monkeypatch.setenv("MEDIA_TRANSFER_MIN_BYTES", "1")  # exercise delegation despite the tiny fixture payload
+
+    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
+    await redis.zadd(WORKERS_ZSET, {"w1": __import__("time").time()})
+
+    fake = AsyncUploadFake()
+    head_calls = []
+
+    def http_size_probe(url):
+        head_calls.append(url)
+        return 11  # source size in bytes
+
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VIDEOBYTES!",
+        http_put=fake.put_bytes,
+        http_size_probe=http_size_probe,
+        redis_client=redis,
+    )
+
+    async def fake_worker():
+        for _ in range(50):
+            entries = await redis.xrange("worker:tasks:media_transfer")
+            if entries:
+                break
+            await __import__("asyncio").sleep(0.02)
+        import json as _json
+
+        _, fields = entries[0]
+        payload = _json.loads(fields["payload"])
+        task_id = payload["task_id"]
+        assert payload["source"]["size"] == 11
+        await redis.lpush(
+            result_key(task_id),
+            _json.dumps({"ok": True, "result": {"etags": [{"n": 1, "etag": "worker-etag"}]}}),
+        )
+
+    worker_task = __import__("asyncio").create_task(fake_worker())
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+    await worker_task
+
+    assert out == "https://libtv-res/uploaded.png"
+    assert head_calls == [_EXT_VIDEO]
+    assert not any(c[0] == "PUT" for c in fake.calls)  # bytes went to the worker, not this process
+    init_body = next(c[2] for c in fake.calls if str(c[1]).endswith("/init/4"))
+    assert init_body["fileSize"] == 11
+
+
+def _ranged_get_transport(status_code, headers):
+    import httpx
+
+    def handler(request):
+        assert request.method == "GET"
+        assert request.headers.get("range") == "bytes=0-0"
+        response = httpx.Response(status_code, content=b"" if status_code == 403 else b"\x00")
+        response.headers = httpx.Headers(headers)  # exactly these headers, no implied Content-Length
+        return response
+
+    return httpx.MockTransport(handler)
+
+
+def test_probe_size_via_ranged_get_reads_content_range():
+    import httpx
+
+    from litellm.llms.libtv.client import probe_size_via_ranged_get
+
+    client = httpx.Client(transport=_ranged_get_transport(206, {"Content-Range": "bytes 0-0/52428800"}))
+    assert probe_size_via_ranged_get("https://oss/presigned?sig=1", timeout=5, client=client) == 52428800
+
+
+def test_probe_size_via_ranged_get_falls_back_to_content_length_on_200():
+    import httpx
+
+    from litellm.llms.libtv.client import probe_size_via_ranged_get
+
+    client = httpx.Client(transport=_ranged_get_transport(200, {"Content-Length": "1"}))
+    assert probe_size_via_ranged_get("https://oss/presigned?sig=1", timeout=5, client=client) == 1
+
+
+def test_probe_size_via_ranged_get_raises_on_403_and_missing_length():
+    import httpx
+
+    from litellm.llms.libtv.client import probe_size_via_ranged_get
+
+    client = httpx.Client(transport=_ranged_get_transport(403, {}))
+    with pytest.raises(LibTVError):
+        probe_size_via_ranged_get("https://oss/presigned?sig=1", timeout=5, client=client)
+
+    chunked = httpx.Client(transport=_ranged_get_transport(200, {"Transfer-Encoding": "chunked"}))
+    with pytest.raises(LibTVError):
+        probe_size_via_ranged_get("https://oss/presigned?sig=1", timeout=5, client=chunked)
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_delegated_mode_probe_failure_falls_back_to_legacy_upload(monkeypatch):
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+
+    def failing_probe(url):
+        raise LibTVError(status_code=403, message="probe 403")
+
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VID",
+        http_put=fake.put_bytes,
+        http_size_probe=failing_probe,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+    assert out == "https://libtv-res/uploaded.png"
+    assert ("PUT", "https://oss/put/1", 3, None) in fake.calls  # legacy fetch+upload ran in-process
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_delegated_mode_falls_back_to_direct_without_worker(monkeypatch):
+    pytest.importorskip("fakeredis")
+    from fakeredis import aioredis as fakeredis_aioredis
+
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)  # no heartbeat registered
+
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VID",
+        http_put=fake.put_bytes,
+        http_size_probe=lambda u: 3,
+        redis_client=redis,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+    assert out == "https://libtv-res/uploaded.png"
+    assert ("PUT", "https://oss/put/1", 3, None) in fake.calls  # DirectTransfer fallback ran in-process
+
+
+@pytest.mark.asyncio
 async def test_avideo_generation_uploads_external_reference_video_in_compliance_branch():
     fake = _FullAsyncFake(_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload())
     llm = LibTVLLM(poll_interval=0, http_get=lambda u: b"VID", http_put=lambda u, d: 200)
