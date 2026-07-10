@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import litellm
 from litellm import Router
 from litellm.utils import _get_excluded_filtered_deployments
 
@@ -92,7 +93,9 @@ def test_set_failed_deployment_id_on_exception():
             }
         ],
     )
-    exc = Exception("fail")
+    exc = litellm.RateLimitError(
+        message="fail", model="test-model", llm_provider="test"
+    )
     dep = _make_dep("dep-a")
     router._set_failed_deployment_id_on_exception(exc, dep)
     assert getattr(exc, "failed_deployment_id", None) == "dep-a"
@@ -158,7 +161,9 @@ async def test_maybe_run_weighted_failover_persists_excluded_ids_to_kwargs(monke
 
     monkeypatch.setattr("litellm.router.run_async_fallback", _stub_run_async_fallback)
 
-    exc = Exception("fail")
+    exc = litellm.RateLimitError(
+        message="fail", model="test-model", llm_provider="test"
+    )
     exc.failed_deployment_id = "A"
     kwargs: dict = {"metadata": {}}
     await router._maybe_run_weighted_failover(
@@ -615,7 +620,9 @@ async def test_maybe_run_weighted_failover_skips_when_remaining_all_in_cooldown(
     )
 
     # A just failed; B and C are both in cooldown.
-    exc = Exception("A down")
+    exc = litellm.RateLimitError(
+        message="A down", model="test-model", llm_provider="test"
+    )
     exc.failed_deployment_id = "A"
 
     run_async_fallback_called = False
@@ -679,7 +686,9 @@ async def test_maybe_run_weighted_failover_proceeds_when_one_healthy_remains(
     )
 
     # A just failed; B is in cooldown; C is healthy.
-    exc = Exception("A down")
+    exc = litellm.RateLimitError(
+        message="A down", model="test-model", llm_provider="test"
+    )
     exc.failed_deployment_id = "A"
 
     run_async_fallback_called = False
