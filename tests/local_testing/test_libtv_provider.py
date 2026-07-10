@@ -2860,6 +2860,73 @@ async def test_avideo_generation_returns_queued_without_polling():
     assert "/api/task/generation/progress" not in [c[0] for c in fake.calls]
 
 
+# --- reference-intent guard: reference keys present but resolved empty must fail loud,
+# never silently degrade to text2video (production incident regression) ---
+
+
+def test_video_generation_rejects_reference_key_present_but_empty():
+    fake = FakeSyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+    with pytest.raises(BadRequestError) as ei:
+        LibTVLLM(poll_interval=0).video_generation(
+            "star-video2", "a fox", "tok", None, {"webid": "w", "reference_images": []}, None, client=fake
+        )
+    assert "reference keys present" in str(ei.value)
+    assert "/api/task/generation/create" not in [c[0] for c in fake.calls]
+
+
+def test_video_generation_rejects_reference_key_present_but_none():
+    fake = FakeSyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+    with pytest.raises(BadRequestError):
+        LibTVLLM(poll_interval=0).video_generation(
+            "star-video2", "a fox", "tok", None, {"webid": "w", "image": None}, None, client=fake
+        )
+    assert "/api/task/generation/create" not in [c[0] for c in fake.calls]
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_rejects_reference_key_present_but_empty():
+    fake = FakeAsyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+    with pytest.raises(BadRequestError) as ei:
+        await LibTVLLM(poll_interval=0).avideo_generation(
+            "star-video2", "a fox", "tok", None, {"webid": "w", "reference_videos": []}, None, client=fake
+        )
+    assert "reference keys present" in str(ei.value)
+    assert "/api/task/generation/create" not in [c[0] for c in fake.calls]
+
+
+def test_video_generation_no_reference_keys_stays_text2video():
+    # No reference keys at all is an ordinary text2video request; the guard must not
+    # touch it.
+    fake = FakeSyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+    vo = LibTVLLM(poll_interval=0).video_generation(
+        "star-video2", "a fox", "tok", None, {"webid": "w"}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert not gen_params.get("imageList") and not gen_params.get("videoList") and not gen_params.get("audioList")
+
+
+def test_video_generation_with_real_reference_unaffected_by_guard():
+    fake = FakeSyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+    vo = LibTVLLM(poll_interval=0).video_generation(
+        "star-video2", "a fox", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["imageList"] == [_LIBTV_REF]
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_with_real_reference_unaffected_by_guard():
+    fake = FakeAsyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+    vo = await LibTVLLM(poll_interval=0).avideo_generation(
+        "star-video2", "a fox", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["imageList"] == [_LIBTV_REF]
+
+
 # --- async video: client split into create (no poll) + poll_once (single tick) ---
 
 
