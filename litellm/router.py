@@ -6235,6 +6235,8 @@ class Router:
 
                     if litellm.expose_router_debug_in_errors:
                         e.message += "\n{}".format(error_message)
+
+                    raise original_exception
             if fallbacks is not None and model_group is not None:
                 verbose_router_logger.debug(f"inside model fallbacks: {mask_sensitive_structure(fallbacks)}")
                 (

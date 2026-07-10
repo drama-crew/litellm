@@ -30,6 +30,7 @@ PUBLIC_MODELS = (
 class PoolHarness:
     def __init__(self):
         self.failures = {}
+        self.calls = []
         model_list = []
         for model in PUBLIC_MODELS:
             for slot, weight in (("account-1", 1), ("account-2", 0)):
@@ -85,10 +86,15 @@ class PoolHarness:
         async def fake_provider(**kwargs):
             slot = kwargs["api_key"]
             deployment_id = kwargs["model_info"]["id"]
+            self.calls.append(slot)
             failure = self.failures.get((model, slot))
             if failure:
                 if failure == 401:
                     error = litellm.AuthenticationError(message="expired", model=model, llm_provider="fake")
+                elif failure == "content_policy":
+                    error = litellm.ContentPolicyViolationError(
+                        message="policy violation", model=model, llm_provider="fake"
+                    )
                 else:
                     error = litellm.RateLimitError(message="capacity", model=model, llm_provider="fake")
                 self.router.deployment_callback_on_failure(
@@ -222,6 +228,20 @@ def test_http_seedance_reaches_wavespeed_only_after_both_accounts_fail():
         status, result = request_json(base, "/v1/generate", {"model": "seedance-2.0-fast"})
         assert status == 200
         assert result["slot"] == "wavespeed"
+
+
+def test_http_content_policy_violation_never_reaches_wavespeed():
+    harness = PoolHarness()
+    with http_proxy(harness) as base:
+        request_json(
+            base,
+            "/control",
+            {"model": "seedance-2.0-fast", "slot": "account-1", "status": "content_policy"},
+        )
+        status, result = request_json(base, "/v1/generate", {"model": "seedance-2.0-fast"})
+        assert status == 400
+        assert "policy violation" in result["error"]
+        assert harness.calls == ["account-1"]
 
 
 def test_http_non_seedance_has_no_external_fallback():
