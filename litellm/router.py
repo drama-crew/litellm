@@ -328,6 +328,7 @@ class Router:
         health_check_staleness_threshold: Optional[int] = None,
         health_check_ignore_transient_errors: bool = False,
         enable_weighted_failover: bool = False,
+        video_id_model_aliases: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> None:
         """
         Initialize the Router class with the given parameters for caching, reliability, and routing strategy.
@@ -521,6 +522,7 @@ class Router:
         self.disable_cooldowns = disable_cooldowns
         self.enable_health_check_routing = enable_health_check_routing
         self.enable_weighted_failover = enable_weighted_failover
+        self.video_id_model_aliases = video_id_model_aliases or {}
         self.health_check_ignore_transient_errors = health_check_ignore_transient_errors
         _staleness = health_check_staleness_threshold or (
             DEFAULT_HEALTH_CHECK_INTERVAL * DEFAULT_HEALTH_CHECK_STALENESS_MULTIPLIER
@@ -4436,6 +4438,9 @@ class Router:
             verbose_router_logger.info(
                 f"ageneric_api_call_with_fallbacks(model={model})\033[31m Exception {str(e)}\033[0m"
             )
+            if "deployment" in locals():
+                self._set_deployment_num_retries_on_exception(e, deployment)
+                self._set_failed_deployment_id_on_exception(e, deployment)
             if model is not None:
                 self.fail_calls[model] += 1
             raise e
@@ -5917,6 +5922,35 @@ class Router:
 
     #### [END] ASSISTANTS API ####
 
+    @staticmethod
+    def _is_failover_eligible_exception(exception: Exception) -> bool:
+        """Return whether replaying the request on another deployment is safe."""
+        if isinstance(
+            exception,
+            (
+                litellm.BadRequestError,
+                litellm.ContentPolicyViolationError,
+                litellm.ContextWindowExceededError,
+            ),
+        ):
+            return False
+        if isinstance(
+            exception,
+            (
+                litellm.AuthenticationError,
+                litellm.PermissionDeniedError,
+                litellm.RateLimitError,
+                litellm.Timeout,
+                litellm.APIConnectionError,
+                litellm.InternalServerError,
+                litellm.ServiceUnavailableError,
+                litellm.BadGatewayError,
+            ),
+        ):
+            return True
+        status_code = getattr(exception, "status_code", None)
+        return status_code in (401, 403, 408, 429) or (isinstance(status_code, int) and status_code >= 500)
+
     async def _maybe_run_weighted_failover(
         self,
         exception: Exception,
@@ -5929,6 +5963,9 @@ class Router:
         """Same-model-group retry after a failed deployment; returns None if not applicable."""
         strategy, _ = self._get_routing_context(original_model_group)
         if strategy != "simple-shuffle":
+            return None
+
+        if not self._is_failover_eligible_exception(exception):
             return None
 
         failed_id: Optional[str] = getattr(exception, "failed_deployment_id", None)
@@ -6015,6 +6052,13 @@ class Router:
 
         if disable_fallbacks is True or original_model_group is None:
             raise e
+
+        dedicated_fallback_error = isinstance(
+            e,
+            (litellm.ContextWindowExceededError, litellm.ContentPolicyViolationError),
+        )
+        if not dedicated_fallback_error and not self._is_failover_eligible_exception(e):
+            raise original_exception
 
         input_kwargs = {
             "litellm_router": self,
@@ -9231,6 +9275,17 @@ class Router:
         # No match found
         return None
 
+    def resolve_video_model_id_alias(self, provider: Optional[str], model_id: Optional[str]) -> Optional[str]:
+        """Resolve a legacy video model id to an exact deployment id.
+
+        This is intentionally separate from normal model aliases so it is only
+        used after decoding status/content video ids and cannot affect creates.
+        """
+        if not provider or not model_id:
+            return model_id
+        provider_aliases = self.video_id_model_aliases.get(provider) or {}
+        return provider_aliases.get(model_id, model_id)
+
     def map_team_model(self, team_model_name: Optional[str], team_id: str) -> Optional[str]:
         """
         Check if team_model_name resolves to team-specific deployments.
@@ -9671,6 +9726,7 @@ class Router:
             "retry_policy",
             "model_group_alias",
             "enable_weighted_failover",
+            "video_id_model_aliases",
         ]
 
         for var in vars_to_include:
@@ -9707,6 +9763,7 @@ class Router:
             "model_group_retry_policy",
             "model_group_alias",
             "enable_weighted_failover",
+            "video_id_model_aliases",
         ]
 
         _int_settings = [

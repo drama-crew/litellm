@@ -1,11 +1,25 @@
 import os
 import time
+from functools import wraps
+from inspect import iscoroutinefunction
 from typing import Any, Optional, Tuple, Union
 
 import httpx
 
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM
+from litellm.exceptions import (
+    APIError,
+    AuthenticationError,
+    BadGatewayError,
+    BadRequestError,
+    ContentPolicyViolationError,
+    InternalServerError,
+    PermissionDeniedError,
+    RateLimitError,
+    ServiceUnavailableError,
+    Timeout,
+)
 from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import (
@@ -18,12 +32,75 @@ LIBTV_PROVIDER = "libtv"
 _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
 
 from .client import LibTVClient
-from .common import LibTVError, resolve_libtv_credentials
+from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
 from .transform import _resolution_from_size, build_generation_params
 
 # libtv progress status -> OpenAI-style video status. Non-terminal codes keep the
 # client polling; the app treats completed as done and failed as a terminal error.
 _LIBTV_STATUS = {0: "queued", 1: "in_progress", 2: "completed", 3: "failed"}
+
+
+def _raise_normalized_libtv_error(error: LibTVError, model: str) -> None:
+    """Convert provider errors once, at the shared custom-provider boundary."""
+    response = httpx.Response(
+        status_code=error.status_code,
+        headers=error.headers,
+        request=httpx.Request("POST", "https://api.liblib.tv"),
+    )
+    common = {"message": error.message, "model": model, "llm_provider": LIBTV_PROVIDER}
+    if isinstance(error, LibTVContentPolicyError):
+        raise ContentPolicyViolationError(**common, response=response) from error
+    if error.status_code == 400:
+        raise BadRequestError(**common, response=response) from error
+    if error.status_code == 401:
+        raise AuthenticationError(**common, response=response) from error
+    if error.status_code == 403:
+        raise PermissionDeniedError(**common, response=response) from error
+    if error.status_code in (408, 504):
+        raise Timeout(
+            **common,
+            headers=error.headers,
+            exception_status_code=error.status_code,
+        ) from error
+    if error.status_code == 429:
+        raise RateLimitError(**common, response=response) from error
+    if error.status_code == 502:
+        raise BadGatewayError(**common, response=response) from error
+    if error.status_code == 503:
+        raise ServiceUnavailableError(**common, response=response) from error
+    if error.status_code >= 500:
+        raise InternalServerError(**common, response=response) from error
+    raise APIError(status_code=error.status_code, **common) from error
+
+
+def normalize_libtv_errors(func):
+    """Decorator shared by image/video sync+async custom-provider methods."""
+
+    def _model(args, kwargs) -> str:
+        value = kwargs.get("model") or kwargs.get("video_id")
+        if value is None and len(args) > 1:
+            value = args[1]
+        return str(value or "libtv")
+
+    if iscoroutinefunction(func):
+
+        @wraps(func)
+        async def _async(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except LibTVError as error:
+                _raise_normalized_libtv_error(error, _model(args, kwargs))
+
+        return _async
+
+    @wraps(func)
+    def _sync(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except LibTVError as error:
+            _raise_normalized_libtv_error(error, _model(args, kwargs))
+
+    return _sync
 
 
 def _decode_task_id(video_id: str) -> str:
@@ -194,7 +271,12 @@ class LibTVLLM(CustomLLM):
         sync_client: Optional[HTTPHandler] = None,
         async_client: Optional[AsyncHTTPHandler] = None,
     ) -> LibTVClient:
-        token, webid = resolve_libtv_credentials(token=api_key, webid=optional_params.get("webid"))
+        require_explicit = optional_params.get("libtv_require_explicit_credentials") is True
+        token = api_key if api_key is not None or not require_explicit else ""
+        webid = optional_params.get("webid")
+        if require_explicit and webid is None:
+            webid = ""
+        token, webid = resolve_libtv_credentials(token=token, webid=webid)
         return LibTVClient(
             token=token,
             webid=webid,
@@ -211,7 +293,13 @@ class LibTVLLM(CustomLLM):
         # Encode the libtv task id + this deployment's status model into the video
         # id so the proxy routes subsequent /v1/videos/{id} status and /content
         # calls back to the SAME libtv account (its token+webid).
-        video_id = encode_video_id_with_provider(created["task_id"], LIBTV_PROVIDER, op.get("libtv_status_model"))
+        model_info = op.get("model_info") or {}
+        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+        video_id = encode_video_id_with_provider(
+            created["task_id"],
+            LIBTV_PROVIDER,
+            deployment_id or op.get("libtv_status_model"),
+        )
         vo = VideoObject(id=video_id, object="video", status="queued", model=model)
         vo.usage = _video_usage(op)
         vo._hidden_params = {"project_uuid": created.get("project_uuid")}
@@ -238,6 +326,7 @@ class LibTVLLM(CustomLLM):
             raise LibTVError(status_code=resp.status_code, message="libtv video content download failed")
         return resp.content
 
+    @normalize_libtv_errors
     def video_status(
         self,
         video_id: str,
@@ -251,6 +340,7 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         return self._video_status(video_id, lt.poll_once(_decode_task_id(video_id), "video"))
 
+    @normalize_libtv_errors
     async def avideo_status(
         self,
         video_id: str,
@@ -264,6 +354,7 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         return self._video_status(video_id, await lt.apoll_once(_decode_task_id(video_id), "video"))
 
+    @normalize_libtv_errors
     def video_content(
         self,
         video_id: str,
@@ -278,6 +369,7 @@ class LibTVLLM(CustomLLM):
         lt = self._make_client(api_key, optional_params, sync_client=http)
         return self._download(http, lt.poll_once(_decode_task_id(video_id), "video"))
 
+    @normalize_libtv_errors
     async def avideo_content(
         self,
         video_id: str,
@@ -363,6 +455,7 @@ class LibTVLLM(CustomLLM):
                 ]
         return params
 
+    @normalize_libtv_errors
     def image_generation(
         self,
         model: str,
@@ -382,6 +475,7 @@ class LibTVLLM(CustomLLM):
         result = lt.generate(model, spec["vendor"], "image", params, _project_name(model))
         return self._fill_image_response(model_response, result, optional_params, params.get("quality"))
 
+    @normalize_libtv_errors
     async def aimage_generation(
         self,
         model: str,
@@ -401,6 +495,7 @@ class LibTVLLM(CustomLLM):
         result = await lt.agenerate(model, spec["vendor"], "image", params, _project_name(model))
         return self._fill_image_response(model_response, result, optional_params, params.get("quality"))
 
+    @normalize_libtv_errors
     def image_edit(
         self,
         model: str,
@@ -426,6 +521,7 @@ class LibTVLLM(CustomLLM):
         result = lt.generate(model, spec["vendor"], "image", params, _project_name(model))
         return self._fill_image_response(model_response, result, optional_params, params.get("quality"))
 
+    @normalize_libtv_errors
     async def aimage_edit(
         self,
         model: str,
@@ -446,6 +542,7 @@ class LibTVLLM(CustomLLM):
         result = await lt.agenerate(model, spec["vendor"], "image", params, _project_name(model))
         return self._fill_image_response(model_response, result, optional_params, params.get("quality"))
 
+    @normalize_libtv_errors
     def video_generation(
         self,
         model: str,
@@ -498,6 +595,7 @@ class LibTVLLM(CustomLLM):
         created = lt.create(model, spec["vendor"], "video", params, _project_name(model))
         return self._build_video_object(model, created, optional_params)
 
+    @normalize_libtv_errors
     async def avideo_generation(
         self,
         model: str,
