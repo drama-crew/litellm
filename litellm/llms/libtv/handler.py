@@ -281,8 +281,9 @@ def _infer_image_mode(images: list) -> str:
 
 def _auto_compliance_enabled(spec: dict) -> bool:
     # Portrait-capable models (e.g. star-video2) reject raw reference-image URLs that
-    # contain a real person; the upstream verify flow must run and convert each image
-    # to an ``asset://`` id before generation. The model schema advertises this.
+    # contain a real person; the upstream verify flow must run and register each image
+    # as a compliant asset (real cdn url + assetId) before generation. The model schema
+    # advertises this.
     return bool(((spec.get("properties") or {}).get("autoCompliance") or {}).get("enable"))
 
 
@@ -486,7 +487,10 @@ class LibTVLLM(CustomLLM):
         if images:
             if _auto_compliance_enabled(spec):
                 params["autoCompliance"] = 1
-                params["imageList"] = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
+                params["imageList"] = [
+                    {**ref, "mediaType": "image"}
+                    for ref in lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
+                ]
             else:
                 params["imageList"] = [
                     lt.ensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["image"]) for r in images
@@ -501,7 +505,10 @@ class LibTVLLM(CustomLLM):
         if images:
             if _auto_compliance_enabled(spec):
                 params["autoCompliance"] = 1
-                params["imageList"] = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
+                params["imageList"] = [
+                    {**ref, "mediaType": "image"}
+                    for ref in await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
+                ]
             else:
                 params["imageList"] = [
                     await lt.aensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["image"]) for r in images
@@ -631,9 +638,9 @@ class LibTVLLM(CustomLLM):
             video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "frames2video")
             params["autoCompliance"] = 1
-            params["imageList"] = frame_refs
+            params["imageList"] = [{**ref, "mediaType": "image"} for ref in frame_refs]
             if video_refs:
-                params["videoList"] = video_refs
+                params["videoList"] = [{**ref, "mediaType": "video"} for ref in video_refs]
             if audios:
                 params["audioList"] = [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
         elif images and auto_compliance:
@@ -641,11 +648,13 @@ class LibTVLLM(CustomLLM):
             video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "mixed2video")
             params["autoCompliance"] = 1
+            image_entries = [{**ref, "mediaType": "image"} for ref in image_refs]
             params["mixedList"] = (
-                [{"url": r, "type": "image"} for r in image_refs]
-                + [{"url": r, "type": "video"} for r in video_refs]
-                + [{"url": url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
+                image_entries
+                + [{**ref, "mediaType": "video"} for ref in video_refs]
+                + [{"url": url_for(r, _REF_DEFAULT_NAME["audio"]), "mediaType": "audio"} for r in audios]
             )
+            params["imageList"] = image_entries
         else:
             mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
             params = build_generation_params(prompt, optional_params, spec, mode)
@@ -695,9 +704,9 @@ class LibTVLLM(CustomLLM):
             video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "frames2video")
             params["autoCompliance"] = 1
-            params["imageList"] = frame_refs
+            params["imageList"] = [{**ref, "mediaType": "image"} for ref in frame_refs]
             if video_refs:
-                params["videoList"] = video_refs
+                params["videoList"] = [{**ref, "mediaType": "video"} for ref in video_refs]
             if audios:
                 params["audioList"] = [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
         elif images and auto_compliance:
@@ -705,11 +714,13 @@ class LibTVLLM(CustomLLM):
             video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
             params = build_generation_params(prompt, optional_params, spec, "mixed2video")
             params["autoCompliance"] = 1
+            image_entries = [{**ref, "mediaType": "image"} for ref in image_refs]
             params["mixedList"] = (
-                [{"url": r, "type": "image"} for r in image_refs]
-                + [{"url": r, "type": "video"} for r in video_refs]
-                + [{"url": await url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
+                image_entries
+                + [{**ref, "mediaType": "video"} for ref in video_refs]
+                + [{"url": await url_for(r, _REF_DEFAULT_NAME["audio"]), "mediaType": "audio"} for r in audios]
             )
+            params["imageList"] = image_entries
         else:
             mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
             params = build_generation_params(prompt, optional_params, spec, mode)

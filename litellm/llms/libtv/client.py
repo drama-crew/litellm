@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 
 import httpx
 
@@ -185,16 +185,27 @@ def parse_third_asset_item(payload: Dict[str, Any], asset_uuid: str) -> Optional
     return None
 
 
-def _asset_ref_from_item(item: Optional[Dict[str, Any]], cdn_url: str) -> Optional[str]:
-    # asset://<id> once the backend issues a verified asset id (portrait); the libtv cdn
-    # url once the asset reaches a terminal state without one (non-portrait, exempt); None
-    # while the check is still pending so the caller keeps polling.
+class CompliantAssetRef(TypedDict):
+    """libtv's own reference contract for a compliance-checked asset: the real cdn url
+    the vendor can fetch plus the verified asset id (moderation credential) as an
+    independent field. The vendor rejects url values that are anything other than a
+    real, fetchable cdn url (e.g. an ``asset://<id>`` pseudo-url), so the asset id must
+    never be folded into the url itself."""
+
+    url: str
+    assetId: Optional[str]
+
+
+def _asset_ref_from_item(item: Optional[Dict[str, Any]], cdn_url: str) -> Optional[CompliantAssetRef]:
+    # A verified asset id once the backend issues one (portrait); assetId=None once the
+    # asset reaches a terminal state without one (non-portrait, exempt); None while the
+    # check is still pending so the caller keeps polling.
     if not item:
         return None
     if item.get("assetId"):
-        return f"asset://{item['assetId']}"
+        return {"url": cdn_url, "assetId": str(item["assetId"])}
     if item.get("status") == 1:
-        return cdn_url
+        return {"url": cdn_url, "assetId": None}
     return None
 
 
@@ -543,7 +554,7 @@ class LibTVClient:
             return self.upload_media(self._fetch_bytes(url), _filename_from_url(url, default_name))
         return self.upload_media(data or b"", url or default_name)
 
-    def _register_compliant_asset(self, cdn_url: str, asset_type: str) -> str:
+    def _register_compliant_asset(self, cdn_url: str, asset_type: str) -> CompliantAssetRef:
         asset_uuid = parse_third_asset_uuid(
             self._post(
                 "/api/third_asset/create",
@@ -562,17 +573,19 @@ class LibTVClient:
             if ref:
                 return ref
             time.sleep(self.poll_interval)
-        return cdn_url
+        return {"url": cdn_url, "assetId": None}
 
-    def resolve_compliant_image_refs(self, refs: List[tuple]) -> List[str]:
+    def resolve_compliant_image_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
         """For an auto-compliance (portrait-capable) model: ensure each image reference
         clears libtv moderation before generation. Returns one libtv reference per input:
-        ``asset://<assetId>`` for images the backend issues a verified asset id for
-        (portraits), or the libtv cdn url for images it exempts (no real person). Raises
-        if any reference fails moderation so the caller can fall back to another provider."""
+        ``{"url": <real cdn url>, "assetId": <verified id>}`` for images the backend issues
+        a verified asset id for (portraits), or ``assetId: None`` for images it exempts (no
+        real person) -- url is always the real fetchable libtv cdn url, per the vendor's
+        contract, never an ``asset://`` pseudo-url. Raises if any reference fails moderation
+        so the caller can fall back to another provider."""
         cdn_urls = [self.ensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
         passed = parse_verify_passed(self._post("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify"))
-        resolved: List[str] = []
+        resolved: List[CompliantAssetRef] = []
         for cdn_url in cdn_urls:
             if not passed.get(cdn_url):
                 raise LibTVError(
@@ -582,12 +595,12 @@ class LibTVClient:
             resolved.append(self._register_compliant_asset(cdn_url, "image"))
         return resolved
 
-    def resolve_compliant_video_refs(self, refs: List[tuple]) -> List[str]:
+    def resolve_compliant_video_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
         """Companion to resolve_compliant_image_refs for reference videos in a mixed2video
         edit. The image moderation endpoint cannot score a video (it reports a retry-exhausted
         error), so a reference video that itself shows a real person never clears moderation
         while it stays a raw cdn url and libtv rejects the whole generation. Registering it as
-        a third_asset yields the same ``asset://<assetId>`` libtv accepts for portraits."""
+        a third_asset yields the same verified asset id libtv accepts for portraits."""
         return [
             self._register_compliant_asset(self.ensure_libtv_url(kind, url, data), "video")
             for (kind, url, data) in refs
@@ -736,7 +749,7 @@ class LibTVClient:
         )
         return parse_upload_url(complete)
 
-    async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> str:
+    async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> CompliantAssetRef:
         asset_uuid = parse_third_asset_uuid(
             await self._apost(
                 "/api/third_asset/create",
@@ -755,14 +768,14 @@ class LibTVClient:
             if ref:
                 return ref
             await asyncio.sleep(self.poll_interval)
-        return cdn_url
+        return {"url": cdn_url, "assetId": None}
 
-    async def aresolve_compliant_image_refs(self, refs: List[tuple]) -> List[str]:
+    async def aresolve_compliant_image_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
         cdn_urls = [await self.aensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
         passed = parse_verify_passed(
             await self._apost("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify")
         )
-        resolved: List[str] = []
+        resolved: List[CompliantAssetRef] = []
         for cdn_url in cdn_urls:
             if not passed.get(cdn_url):
                 raise LibTVError(
@@ -772,8 +785,8 @@ class LibTVClient:
             resolved.append(await self._aregister_compliant_asset(cdn_url, "image"))
         return resolved
 
-    async def aresolve_compliant_video_refs(self, refs: List[tuple]) -> List[str]:
-        resolved: List[str] = []
+    async def aresolve_compliant_video_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
+        resolved: List[CompliantAssetRef] = []
         for kind, url, data in refs:
             cdn_url = await self.aensure_libtv_url(kind, url, data)
             resolved.append(await self._aregister_compliant_asset(cdn_url, "video"))

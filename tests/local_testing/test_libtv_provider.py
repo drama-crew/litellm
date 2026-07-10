@@ -1508,11 +1508,30 @@ def test_portrait_compliance_converts_image_to_asset_and_sets_flag():
     # verify request carries urlList (the field the upstream actually reads)
     verify_body = next(body for path, body in fake.calls if path == "/api/community/image/verify")
     assert verify_body == {"urlList": [_LIBTV_REF]}
-    # generation body routes the image as asset:// via mixedList, NOT raw imageList
+    # generation body routes the image as a real cdn url + assetId (the vendor rejects
+    # asset://<id> pseudo-urls), duplicated into imageList alongside mixedList
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["autoCompliance"] == 1
-    assert gen_params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}]
-    assert gen_params.get("imageList") in ([], None)
+    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"}]
+    assert gen_params["imageList"] == [{"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"}]
+
+
+def test_compliant_refs_send_vendor_contract_shape_not_asset_pseudo_url():
+    # Regression for the libtv vendor contract: mixedList/imageList entries for a
+    # compliance-checked reference must be {"url": <real http(s) cdn url>, "assetId": <id>,
+    # "mediaType": ...}, never {"url": "asset://<id>", ...}. libtv rejects generation for a
+    # real-person portrait reference whose url is not a fetchable http(s) url, even though
+    # the moderation credential (assetId) is present elsewhere in the entry.
+    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    llm.video_generation(
+        "star-video2", "subtle motion", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    for entry in gen_params["mixedList"] + gen_params["imageList"]:
+        assert entry["url"].startswith(("http://", "https://"))
+        assert not entry["url"].startswith("asset://")
+        assert entry["assetId"] == "asset-AAA"
 
 
 def test_portrait_compliance_blocks_generation_when_verify_fails():
@@ -1558,12 +1577,13 @@ async def test_portrait_compliance_async_happy_path():
     assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["autoCompliance"] == 1
-    assert gen_params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}]
+    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"}]
 
 
 def test_compliance_exempt_image_keeps_cdn_url_not_asset():
     # verify passes but the asset reaches a terminal state with no assetId (non-portrait
-    # exempt): the reference must fall back to the raw libtv cdn url, not asset://.
+    # exempt): the reference must fall back to the raw libtv cdn url with assetId None,
+    # never a fabricated asset id.
     routes = _compliance_routes(verify_passed=True)
     routes["/api/third_asset/check"] = {
         "code": 0,
@@ -1574,7 +1594,7 @@ def test_compliance_exempt_image_keeps_cdn_url_not_asset():
     vo = llm.video_generation("star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake)
     assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
-    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "type": "image"}]
+    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "assetId": None, "mediaType": "image"}]
 
 
 _LIBTV_VIDEO = "https://libtv-res.liblib.art/upload-images/uid/clip.mp4"
@@ -1631,9 +1651,12 @@ def test_mixed2video_compliance_registers_reference_video_as_asset():
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["autoCompliance"] == 1
     assert gen_params["mixedList"] == [
-        {"url": "asset://asset-IMG", "type": "image"},
-        {"url": "asset://asset-VID", "type": "video"},
+        {"url": _LIBTV_REF, "assetId": "asset-IMG", "mediaType": "image"},
+        {"url": _LIBTV_VIDEO, "assetId": "asset-VID", "mediaType": "video"},
     ]
+    # the compliant image is duplicated into imageList; the video is not
+    assert gen_params["imageList"] == [{"url": _LIBTV_REF, "assetId": "asset-IMG", "mediaType": "image"}]
+    assert gen_params["videoList"] == []
 
 
 @pytest.mark.asyncio
@@ -1654,8 +1677,8 @@ async def test_mixed2video_compliance_registers_reference_video_as_asset_async()
     assert next(c for c in creates if c["assetType"] == "video")["assetUrl"] == _LIBTV_VIDEO
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["mixedList"] == [
-        {"url": "asset://asset-IMG", "type": "image"},
-        {"url": "asset://asset-VID", "type": "video"},
+        {"url": _LIBTV_REF, "assetId": "asset-IMG", "mediaType": "image"},
+        {"url": _LIBTV_VIDEO, "assetId": "asset-VID", "mediaType": "video"},
     ]
 
 
@@ -1708,7 +1731,10 @@ def test_frames2video_compliance_keeps_first_last_order_and_mode():
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "frames2video"
     assert gen_params["autoCompliance"] == 1
-    assert gen_params["imageList"] == ["asset://asset-FIRST", "asset://asset-LAST"]
+    assert gen_params["imageList"] == [
+        {"url": _LIBTV_REF, "assetId": "asset-FIRST", "mediaType": "image"},
+        {"url": _LIBTV_LAST, "assetId": "asset-LAST", "mediaType": "image"},
+    ]
     assert "mixedList" not in gen_params
 
 
@@ -1723,7 +1749,7 @@ def test_reference_images_only_still_uses_mixed2video():
     assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "mixed2video"
-    assert gen_params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}]
+    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"}]
 
 
 def test_frames2video_falls_back_to_mixed2video_when_spec_lacks_mode():
@@ -1744,7 +1770,13 @@ def test_frames2video_falls_back_to_mixed2video_when_spec_lacks_mode():
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "mixed2video"
     assert "mixedList" in gen_params
-    assert "imageList" not in gen_params or gen_params["imageList"] == []
+    # mixed2video duplicates the compliant image entries into imageList; image and
+    # last_image both fold into the images group here (frames2video's dedicated
+    # first/last handling does not apply once the spec lacks the mode)
+    assert gen_params["imageList"] == [
+        {"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"},
+        {"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -1766,7 +1798,10 @@ async def test_frames2video_compliance_async_keeps_first_last_order():
     assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "frames2video"
-    assert gen_params["imageList"] == ["asset://asset-FIRST", "asset://asset-LAST"]
+    assert gen_params["imageList"] == [
+        {"url": _LIBTV_REF, "assetId": "asset-FIRST", "mediaType": "image"},
+        {"url": _LIBTV_LAST, "assetId": "asset-LAST", "mediaType": "image"},
+    ]
 
 
 def test_non_compliance_frames2video_keeps_first_last_imagelist_order():
@@ -1816,7 +1851,12 @@ def test_explicit_mixed2video_override_wins_over_last_image():
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "mixed2video"
     assert "mixedList" in gen_params
-    assert gen_params.get("imageList") in ([], None)
+    # image and last_image both fold into the images group once mixed2video is in
+    # effect (frames2video's dedicated first/last handling does not apply)
+    assert gen_params["imageList"] == [
+        {"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"},
+        {"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"},
+    ]
 
 
 def test_frames2video_compliance_last_image_only_single_frame():
@@ -1839,7 +1879,7 @@ def test_frames2video_compliance_last_image_only_single_frame():
     assert vo.status == "queued"
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "frames2video"
-    assert gen_params["imageList"] == ["asset://asset-LAST"]
+    assert gen_params["imageList"] == [{"url": _LIBTV_LAST, "assetId": "asset-LAST", "mediaType": "image"}]
 
 
 # --- video usage -> resolution-tiered cost (authoritative spend line) ---------
@@ -2144,10 +2184,11 @@ async def test_avideo_generation_uploads_external_reference_video_in_compliance_
     )
     assert vo.status == "queued"
     mixed = _gen_params(fake.calls)["mixedList"]
-    # portrait image stays asset://; the external video is uploaded to libtv and then registered
-    # for compliance, so it reaches generation as asset:// too (never a raw external/cdn url)
-    assert {"url": "asset://asset-AAA", "type": "image"} in mixed
-    assert {"url": "asset://asset-AAA", "type": "video"} in mixed
+    # portrait image carries its real cdn url + assetId; the external video is uploaded to
+    # libtv first and then registered for compliance, so it too reaches generation as a real
+    # libtv cdn url + assetId (never a raw external url, never an asset:// pseudo-url)
+    assert {"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"} in mixed
+    assert {"url": _LIBTV_UPLOADED, "assetId": "asset-AAA", "mediaType": "video"} in mixed
     assert all("minio.internal" not in m["url"] for m in mixed)
     # the upload still happens: the video is registered as a third_asset under its libtv cdn url
     video_create = next(
@@ -2272,6 +2313,35 @@ def test_image_generation_with_reference_infers_image2image_and_uploads():
     gen_params = _gen_params(fake.calls)
     assert gen_params["modeType"] == "image2image"
     assert gen_params["imageList"] == ["https://libtv-res.liblib.art/up/ref.png"]  # uploaded, not the external url
+
+
+def test_image_generation_portrait_compliance_sends_vendor_contract_shape():
+    # image_generation shares resolve_compliant_image_refs with video_generation: its
+    # portrait-compliance imageList must carry the same {url, assetId} vendor contract,
+    # not an asset:// pseudo-url.
+    routes = _compliance_routes(verify_passed=True)
+    routes["/api/task/generation/progress"] = {
+        "code": 0,
+        "data": {
+            "progresses": [{"status": 2, "taskResult": json.dumps({"images": [{"imageUrl": "https://x/o.png"}]})}]
+        },
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.image_generation(
+        "star-video2",
+        "portrait edit",
+        "tok",
+        None,
+        ImageResponse(),
+        {"webid": "w", "reference_images": [_LIBTV_REF]},
+        None,
+        client=fake,
+    )
+    assert vo.data[0].url == "https://x/o.png"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["autoCompliance"] == 1
+    assert gen_params["imageList"] == [{"url": _LIBTV_REF, "assetId": "asset-AAA", "mediaType": "image"}]
 
 
 def test_image_generation_explicit_mode_type_wins_over_inference():
