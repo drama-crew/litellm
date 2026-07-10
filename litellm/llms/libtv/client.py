@@ -448,15 +448,20 @@ class LibTVClient:
         return self._lookup(self._tool_spec_cache, model_key)
 
     def _check(self, response: Any, step: str) -> Dict[str, Any]:
+        headers = dict(getattr(response, "headers", {}) or {})
         if response.status_code != 200:
             raise LibTVError(
                 status_code=response.status_code,
                 message=f"libtv {step} HTTP {response.status_code}: {response.text[:300]}",
+                headers=headers,
             )
         payload = response.json()
         if payload.get("code") not in (0, None):
+            status_code = 429 if payload.get("code") == 1200000136 else 502
             raise LibTVError(
-                status_code=502, message=f"libtv {step} code={payload.get('code')} msg={payload.get('msg')}"
+                status_code=status_code,
+                message=f"libtv {step} code={payload.get('code')} msg={payload.get('msg')}",
+                headers=headers,
             )
         return payload
 

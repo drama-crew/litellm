@@ -2,7 +2,7 @@
 
 "use client";
 import { useKeys } from "@/app/(dashboard)/hooks/keys/useKeys";
-import { formatNumberWithCommas } from "@/utils/dataUtils";
+import { DateCell, IdCell, MoneyCell } from "@/components/shared/table_cells";
 import { ChevronDownIcon, ChevronRightIcon, ChevronUpIcon, SwitchVerticalIcon } from "@heroicons/react/outline";
 import {
   ColumnDef,
@@ -12,18 +12,7 @@ import {
   SortingState,
   useReactTable,
 } from "@tanstack/react-table";
-import {
-  Badge,
-  Button,
-  Icon,
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeaderCell,
-  TableRow,
-  Text,
-} from "@tremor/react";
+import { Badge, Icon, Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow, Text } from "@tremor/react";
 import { InfoCircleOutlined } from "@ant-design/icons";
 import { Popover, Skeleton, Tooltip, Typography } from "antd";
 import DefaultProxyAdminTag from "../common_components/DefaultProxyAdminTag";
@@ -50,9 +39,7 @@ interface TeamVirtualKeysTableProps {
 export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVirtualKeysTableProps) {
   const { accessToken } = useAuthorized();
   const [selectedKey, setSelectedKey] = useState<KeyResponse | null>(null);
-  const [sorting, setSorting] = useState<SortingState>([
-    { id: "created_at", desc: true },
-  ]);
+  const [sorting, setSorting] = useState<SortingState>([{ id: "created_at", desc: true }]);
   const [tablePagination, setTablePagination] = useState<PaginationState>({
     pageIndex: 0,
     pageSize: 50,
@@ -173,9 +160,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
           const { organizationIds } = teamFilterOptions;
           if (!organizationIds.length) return [];
           const lower = searchText.toLowerCase();
-          const filtered = lower
-            ? organizationIds.filter((id) => id.toLowerCase().includes(lower))
-            : organizationIds;
+          const filtered = lower ? organizationIds.filter((id) => id.toLowerCase().includes(lower)) : organizationIds;
           return filtered.map((id) => ({ label: id, value: id }));
         },
       },
@@ -186,9 +171,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         searchFn: async (searchText: string) => {
           const { keyAliases } = teamFilterOptions;
           const lower = searchText.toLowerCase();
-          const filtered = lower
-            ? keyAliases.filter((alias) => alias.toLowerCase().includes(lower))
-            : keyAliases;
+          const filtered = lower ? keyAliases.filter((alias) => alias.toLowerCase().includes(lower)) : keyAliases;
           return filtered.map((alias) => ({ label: alias, value: alias }));
         },
       },
@@ -200,10 +183,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
           const { userIds } = teamFilterOptions;
           const lower = searchText.toLowerCase();
           const filtered = lower
-            ? userIds.filter(
-                (u) =>
-                  u.id.toLowerCase().includes(lower) || u.email.toLowerCase().includes(lower),
-              )
+            ? userIds.filter((u) => u.id.toLowerCase().includes(lower) || u.email.toLowerCase().includes(lower))
             : userIds;
           return filtered.map((u) => ({
             label: u.email ? `${u.id} (${u.email})` : u.id,
@@ -223,23 +203,9 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         header: "Key ID",
         size: 100,
         enableSorting: true,
-        cell: (info) => {
-          const value = info.getValue() as string;
-          const width = info.cell.column.getSize();
-          return (
-            <Tooltip title={value}>
-              <Button
-                size="xs"
-                variant="light"
-                className="font-mono text-blue-500 bg-blue-50 hover:bg-blue-100 text-xs font-normal px-2 py-0.5 text-left overflow-hidden truncate block"
-                style={{ maxWidth: width, overflow: "hidden" }}
-                onClick={() => setSelectedKey(info.row.original)}
-              >
-                {value ?? "-"}
-              </Button>
-            </Tooltip>
-          );
-        },
+        cell: (info) => (
+          <IdCell value={info.getValue() as string | null} onClick={() => setSelectedKey(info.row.original)} />
+        ),
       },
       {
         id: "key_alias",
@@ -252,10 +218,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
           const width = info.cell.column.getSize();
           return (
             <Tooltip title={value}>
-              <span
-                className="font-mono text-xs truncate block"
-                style={{ maxWidth: width, overflow: "hidden" }}
-              >
+              <span className="font-mono text-xs truncate block" style={{ maxWidth: width, overflow: "hidden" }}>
                 {value ?? "-"}
               </span>
             </Tooltip>
@@ -290,10 +253,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
           const width = info.cell.column.getSize();
           return (
             <Tooltip title={value}>
-              <span
-                className="font-mono text-xs truncate block"
-                style={{ maxWidth: width, overflow: "hidden" }}
-              >
+              <span className="font-mono text-xs truncate block" style={{ maxWidth: width, overflow: "hidden" }}>
                 {value ?? "-"}
               </span>
             </Tooltip>
@@ -312,10 +272,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
           const width = info.cell.column.getSize();
           return (
             <Tooltip title={displayValue}>
-              <span
-                className="font-mono text-xs truncate block"
-                style={{ maxWidth: width, overflow: "hidden" }}
-              >
+              <span className="font-mono text-xs truncate block" style={{ maxWidth: width, overflow: "hidden" }}>
                 {displayValue ?? "-"}
               </span>
             </Tooltip>
@@ -328,10 +285,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         header: "Created At",
         size: 120,
         enableSorting: true,
-        cell: (info) => {
-          const value = info.getValue();
-          return value ? new Date(value as string).toLocaleDateString() : "-";
-        },
+        cell: (info) => <DateCell value={info.getValue() as string | null} precision="date" />,
       },
       {
         id: "created_by",
@@ -359,11 +313,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
                 <div key={label} className="flex flex-col min-w-0">
                   <span className="text-gray-400">{label}</span>
                   {value ? (
-                    <Typography.Text
-                      className="font-mono text-xs"
-                      ellipsis={{ tooltip: value }}
-                      copyable
-                    >
+                    <Typography.Text className="font-mono text-xs" ellipsis={{ tooltip: value }} copyable>
                       {value}
                     </Typography.Text>
                   ) : (
@@ -402,10 +352,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         header: "Updated At",
         size: 120,
         enableSorting: true,
-        cell: (info) => {
-          const value = info.getValue();
-          return value ? new Date(value as string).toLocaleDateString() : "Never";
-        },
+        cell: (info) => <DateCell value={info.getValue() as string | null} precision="date" fallback="Never" />,
       },
       {
         id: "last_active",
@@ -423,16 +370,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         ),
         size: 130,
         enableSorting: false,
-        cell: (info) => {
-          const value = info.getValue();
-          if (!value) return "Unknown";
-          const date = new Date(value as string);
-          return (
-            <Tooltip title={date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "long" })}>
-              <span>{date.toLocaleDateString()}</span>
-            </Tooltip>
-          );
-        },
+        cell: (info) => <DateCell value={info.getValue() as string | null} precision="date" fallback="Unknown" />,
       },
       {
         id: "expires",
@@ -440,10 +378,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         header: "Expires",
         size: 120,
         enableSorting: false,
-        cell: (info) => {
-          const value = info.getValue();
-          return value ? new Date(value as string).toLocaleDateString() : "Never";
-        },
+        cell: (info) => <DateCell value={info.getValue() as string | null} precision="date" fallback="Never" />,
       },
       {
         id: "spend",
@@ -451,7 +386,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         header: "Spend (USD)",
         size: 100,
         enableSorting: true,
-        cell: (info) => formatNumberWithCommas(info.getValue() as number, 4),
+        cell: (info) => <MoneyCell value={info.getValue() as number | null} decimals={4} />,
       },
       {
         id: "max_budget",
@@ -459,11 +394,9 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         header: "Budget (USD)",
         size: 110,
         enableSorting: true,
-        cell: (info) => {
-          const maxBudget = info.getValue() as number | null;
-          if (maxBudget === null) return "Unlimited";
-          return `$${formatNumberWithCommas(maxBudget)}`;
-        },
+        cell: (info) => (
+          <MoneyCell value={info.getValue() as number | null} decimals={0} emptyText="Unlimited" showZero />
+        ),
       },
       {
         id: "budget_reset_at",
@@ -471,10 +404,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
         header: "Budget Reset",
         size: 130,
         enableSorting: false,
-        cell: (info) => {
-          const value = info.getValue();
-          return value ? new Date(value as string).toLocaleString() : "Never";
-        },
+        cell: (info) => <DateCell value={info.getValue() as string | null} fallback="Never" />,
       },
       {
         id: "models",
@@ -583,8 +513,7 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
 
   const handleSortingChange = useCallback(
     (updaterOrValue: React.SetStateAction<SortingState>) => {
-      const newSorting =
-        typeof updaterOrValue === "function" ? updaterOrValue(sorting) : updaterOrValue;
+      const newSorting = typeof updaterOrValue === "function" ? updaterOrValue(sorting) : updaterOrValue;
       setSorting(newSorting);
       if (newSorting?.length > 0) {
         const sortState = newSorting[0];
@@ -694,23 +623,15 @@ export function TeamVirtualKeysTable({ teamId, teamAlias, organization }: TeamVi
                               cursor: header.column.getCanSort() ? "pointer" : "default",
                             }}
                             onMouseEnter={() => {
-                              const resizer = document.querySelector(
-                                `[data-header-id="${header.id}"] .resizer`,
-                              );
+                              const resizer = document.querySelector(`[data-header-id="${header.id}"] .resizer`);
                               if (resizer) (resizer as HTMLElement).style.opacity = "0.5";
                             }}
                             onMouseLeave={() => {
-                              const resizer = document.querySelector(
-                                `[data-header-id="${header.id}"] .resizer`,
-                              );
+                              const resizer = document.querySelector(`[data-header-id="${header.id}"] .resizer`);
                               if (resizer && !header.column.getIsResizing())
                                 (resizer as HTMLElement).style.opacity = "0";
                             }}
-                            onClick={
-                              header.column.getCanSort()
-                                ? header.column.getToggleSortingHandler()
-                                : undefined
-                            }
+                            onClick={header.column.getCanSort() ? header.column.getToggleSortingHandler() : undefined}
                           >
                             <div className="flex items-center justify-between gap-2">
                               <div className="flex items-center">

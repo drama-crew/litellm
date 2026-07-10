@@ -1,3 +1,4 @@
+import { MoneyCell } from "@/components/shared/table_cells";
 import { formatNumberWithCommas } from "@/utils/dataUtils";
 import { InfoCircleOutlined } from "@ant-design/icons";
 import {
@@ -109,13 +110,11 @@ const SpendByProvider: React.FC<SpendByProviderProps> = ({ loading, isDateChangi
                         <span>{provider.provider}</span>
                       </div>
                     </TableCell>
-                    <TableCell>${formatNumberWithCommas(provider.spend, 2)}</TableCell>
-                    <TableCell className="text-green-600">
-                      {provider.successful_requests.toLocaleString()}
+                    <TableCell>
+                      <MoneyCell value={provider.spend} decimals={2} />
                     </TableCell>
-                    <TableCell className="text-red-600">
-                      {provider.failed_requests.toLocaleString()}
-                    </TableCell>
+                    <TableCell className="text-green-600">{provider.successful_requests.toLocaleString()}</TableCell>
+                    <TableCell className="text-red-600">{provider.failed_requests.toLocaleString()}</TableCell>
                     <TableCell>{provider.tokens.toLocaleString()}</TableCell>
                   </TableRow>
                 ))}

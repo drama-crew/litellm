@@ -10,6 +10,7 @@ import {
   SortingState,
   useReactTable,
 } from "@tanstack/react-table";
+import { DateCell } from "@/components/shared/table_cells";
 import { Policy } from "./types";
 
 /** One row per policy name; primaryPolicy is used for display and for Edit (FlowBuilder loads all versions) */
@@ -59,12 +60,6 @@ const PolicyTable: React.FC<PolicyTableProps> = ({
 
   const rows = useMemo(() => groupPoliciesByName(policies), [policies]);
 
-  const formatDate = (dateString?: string) => {
-    if (!dateString) return "-";
-    const date = new Date(dateString);
-    return date.toLocaleString();
-  };
-
   const columns: ColumnDef<PolicyRow>[] = [
     {
       header: "Name",
@@ -73,7 +68,9 @@ const PolicyTable: React.FC<PolicyTableProps> = ({
         const { primaryPolicy, versionCount } = row.original;
         return (
           <div className="flex items-center gap-2">
-            <Tooltip title={`${primaryPolicy.policy_name || "-"}${versionCount > 1 ? ` (${versionCount} versions)` : ""}`}>
+            <Tooltip
+              title={`${primaryPolicy.policy_name || "-"}${versionCount > 1 ? ` (${versionCount} versions)` : ""}`}
+            >
               <Button
                 size="xs"
                 variant="light"
@@ -99,9 +96,7 @@ const PolicyTable: React.FC<PolicyTableProps> = ({
         const policy = row.original.primaryPolicy;
         return (
           <Tooltip title={policy.description}>
-            <span className="text-xs truncate max-w-[200px] block">
-              {policy.description || "-"}
-            </span>
+            <span className="text-xs truncate max-w-[200px] block">{policy.description || "-"}</span>
           </Tooltip>
         );
       },
@@ -184,7 +179,7 @@ const PolicyTable: React.FC<PolicyTableProps> = ({
         }
         return (
           <Tooltip title={typeof modelCondition === "string" ? modelCondition : JSON.stringify(modelCondition)}>
-            <code className="text-xs bg-gray-100 px-1 py-0.5 rounded">
+            <code className="text-xs bg-gray-100 px-1 py-0.5 rounded-sm">
               {typeof modelCondition === "string"
                 ? modelCondition.length > 20
                   ? modelCondition.slice(0, 20) + "..."
@@ -199,14 +194,7 @@ const PolicyTable: React.FC<PolicyTableProps> = ({
       header: "Created At",
       id: "created_at",
       accessorFn: (row) => row.primaryPolicy.created_at ?? "",
-      cell: ({ row }) => {
-        const policy = row.original.primaryPolicy;
-        return (
-          <Tooltip title={policy.created_at}>
-            <span className="text-xs">{formatDate(policy.created_at)}</span>
-          </Tooltip>
-        );
-      },
+      cell: ({ row }) => <DateCell value={row.original.primaryPolicy.created_at} />,
     },
     {
       id: "actions",
@@ -231,8 +219,7 @@ const PolicyTable: React.FC<PolicyTableProps> = ({
                     icon={TrashIcon}
                     size="sm"
                     onClick={() =>
-                      policy.policy_id &&
-                      onDeleteClick(policy.policy_id, policy.policy_name || "Unnamed Policy")
+                      policy.policy_id && onDeleteClick(policy.policy_id, policy.policy_name || "Unnamed Policy")
                     }
                     className="cursor-pointer hover:text-red-500"
                   />

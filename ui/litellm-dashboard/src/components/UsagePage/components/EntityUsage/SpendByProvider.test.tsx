@@ -1,19 +1,15 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import SpendByProvider from "./SpendByProvider";
 
 vi.mock("../../../shared/chart_loader", () => ({
   ChartLoader: ({ isDateChanging }: { isDateChanging: boolean }) => (
-    <div data-testid="chart-loader">
-      {isDateChanging ? "Processing date selection..." : "Loading chart data..."}
-    </div>
+    <div data-testid="chart-loader">{isDateChanging ? "Processing date selection..." : "Loading chart data..."}</div>
   ),
 }));
 
 vi.mock("../../../molecules/models/ProviderLogo", () => ({
-  ProviderLogo: ({ provider }: { provider: string }) => (
-    <div data-testid={`provider-logo-${provider}`}>{provider}</div>
-  ),
+  ProviderLogo: ({ provider }: { provider: string }) => <div data-testid={`provider-logo-${provider}`}>{provider}</div>,
 }));
 
 describe("SpendByProvider", () => {
@@ -202,6 +198,14 @@ describe("SpendByProvider", () => {
     ];
     render(<SpendByProvider loading={false} isDateChanging={false} providerSpend={providerSpendWithLargeTokens} />);
     expect(screen.getByText("1,234,567")).toBeInTheDocument();
+  });
+
+  it("should render zero spend as a dash when Show Zero Spend is on", () => {
+    render(<SpendByProvider loading={false} isDateChanging={false} providerSpend={mockProviderSpend} />);
+    fireEvent.click(screen.getAllByRole("switch")[0]);
+    expect(screen.getAllByText("google").length).toBeGreaterThan(0);
+    expect(screen.getByText("-")).toBeInTheDocument();
+    expect(screen.queryByText("$0.00")).not.toBeInTheDocument();
   });
 
   it("should filter data correctly when both toggles are off", () => {
