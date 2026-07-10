@@ -2,6 +2,16 @@ import json
 
 import pytest
 
+from litellm.exceptions import (
+    APIConnectionError,
+    APIError,
+    AuthenticationError,
+    BadGatewayError,
+    BadRequestError,
+    RateLimitError,
+    Timeout,
+)
+
 from litellm.llms.libtv.client import (
     LibTVClient,
     build_generation_body,
@@ -10,7 +20,12 @@ from litellm.llms.libtv.client import (
     parse_task_id,
     parse_upload_url,
 )
-from litellm.llms.libtv.common import LibTVError, build_libtv_headers, build_upload_path
+from litellm.llms.libtv.common import (
+    LibTVError,
+    build_libtv_headers,
+    build_upload_path,
+    resolve_libtv_credentials,
+)
 from litellm.llms.libtv.handler import (
     LIBTV_PROVIDER,
     LibTVLLM,
@@ -19,6 +34,7 @@ from litellm.llms.libtv.handler import (
     _image_clarity_response_cost,
     _infer_image_mode,
     _infer_video_mode,
+    _raise_normalized_libtv_error,
     _reference_payload,
 )
 from litellm.types.utils import ImageObject, ImageResponse
@@ -97,10 +113,11 @@ _NEBULA_ULTRA_SPEC = {
 
 
 class FakeResponse:
-    def __init__(self, payload, status_code=200):
+    def __init__(self, payload, status_code=200, headers=None):
         self._payload = payload
         self.status_code = status_code
         self.text = json.dumps(payload)
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -152,6 +169,129 @@ def test_headers_carry_token_and_webid():
     assert h["webid"] == "wid"
     assert h["x-language"] == "zh"
     assert h["X-from-client"] == "cli"
+
+
+def test_explicit_empty_credentials_fail_closed(monkeypatch):
+    monkeypatch.setenv("LIBTV_TOKEN", "global-token")
+    monkeypatch.setenv("LIBTV_WEBID", "global-webid")
+    with pytest.raises(LibTVError) as exc:
+        resolve_libtv_credentials(token="", webid="")
+    assert exc.value.status_code == 401
+    assert resolve_libtv_credentials(None, None) == ("global-token", "global-webid")
+
+
+def test_pool_deployment_missing_explicit_slot_never_borrows_global_account(monkeypatch):
+    monkeypatch.setenv("LIBTV_TOKEN", "global-token")
+    monkeypatch.setenv("LIBTV_WEBID", "global-webid")
+    with pytest.raises(AuthenticationError):
+        LibTVLLM().video_generation(
+            model="star-video2",
+            prompt="x",
+            api_key=None,
+            api_base=None,
+            optional_params={"libtv_require_explicit_credentials": True},
+            logging_obj=None,
+        )
+
+
+def test_capacity_business_code_maps_to_429():
+    client = LibTVClient("token", "webid")
+    with pytest.raises(LibTVError) as exc:
+        client._check(FakeResponse({"code": 1200000136, "msg": "capacity"}), "create")
+    assert exc.value.status_code == 429
+    assert "1200000136" in str(exc.value)
+
+
+def test_unknown_business_code_remains_bad_gateway():
+    client = LibTVClient("token", "webid")
+    with pytest.raises(LibTVError) as exc:
+        client._check(FakeResponse({"code": 999, "msg": "unknown"}), "create")
+    assert exc.value.status_code == 502
+
+
+def test_http_retry_after_is_preserved_and_normalized():
+    client = LibTVClient("token", "webid")
+    with pytest.raises(LibTVError) as exc:
+        client._check(
+            FakeResponse({}, status_code=429, headers={"Retry-After": "17"}),
+            "create",
+        )
+    assert exc.value.headers["Retry-After"] == "17"
+
+    with pytest.raises(RateLimitError) as normalized:
+        _raise_normalized_libtv_error(
+            LibTVError(429, "capacity", headers={"Retry-After": "17"}),
+            "star-video2",
+        )
+    assert normalized.value.response.headers["retry-after"] == "17"
+
+
+def test_video_and_image_public_boundaries_normalize_empty_credentials(monkeypatch):
+    monkeypatch.setenv("LIBTV_TOKEN", "must-not-be-used")
+    monkeypatch.setenv("LIBTV_WEBID", "must-not-be-used")
+    handler = LibTVLLM()
+    with pytest.raises(AuthenticationError):
+        handler.video_generation(
+            model="star-video2",
+            prompt="x",
+            api_key="",
+            api_base=None,
+            optional_params={"webid": ""},
+            logging_obj=None,
+        )
+    with pytest.raises(AuthenticationError):
+        handler.image_generation(
+            model="nebula-ultra",
+            prompt="x",
+            api_key="",
+            api_base=None,
+            model_response=ImageResponse(),
+            optional_params={"webid": ""},
+            logging_obj=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_async_image_boundary_normalizes_empty_credentials(monkeypatch):
+    monkeypatch.setenv("LIBTV_TOKEN", "must-not-be-used")
+    monkeypatch.setenv("LIBTV_WEBID", "must-not-be-used")
+    with pytest.raises(AuthenticationError):
+        await LibTVLLM().aimage_generation(
+            model="nebula-ultra",
+            prompt="x",
+            api_key="",
+            api_base=None,
+            model_response=ImageResponse(),
+            optional_params={"webid": ""},
+            logging_obj=None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "expected_type"),
+    [
+        (LibTVError(504, "timeout"), Timeout),
+        (LibTVError(502, "bad gateway"), BadGatewayError),
+    ],
+)
+def test_provider_failures_never_normalize_as_connection_errors(provider_error, expected_type):
+    with pytest.raises(expected_type) as exc:
+        _raise_normalized_libtv_error(provider_error, "star-video2")
+    assert not isinstance(exc.value, APIConnectionError)
+
+
+def test_video_id_prefers_exact_deployment_id():
+    handler = LibTVLLM()
+    video = handler._build_video_object(
+        "star-video2",
+        {"task_id": "task-1", "project_uuid": "project-1"},
+        {
+            "model_info": {"id": "libtv-seedance-2-standard-account-2"},
+            "libtv_status_model": "legacy-name",
+        },
+    )
+    decoded = decode_video_id_with_provider(video.id)
+    assert decoded["model_id"] == "libtv-seedance-2-standard-account-2"
 
 
 def test_size_to_ratio():
@@ -528,12 +668,13 @@ def test_video_content_polls_then_downloads():
 def test_video_content_raises_while_still_processing():
     vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
     c = _PollAndDownloadClient(1)
-    with pytest.raises(LibTVError):
+    with pytest.raises(APIError) as exc:
         LibTVLLM().video_content(vid, "tok", None, {"webid": "w"}, None, client=c)
+    assert exc.value.status_code == 409
 
 
 def test_video_status_rejects_non_libtv_id():
-    with pytest.raises(LibTVError):
+    with pytest.raises(AuthenticationError):
         LibTVLLM().video_status("plain-id", None, None, {}, None)
 
 
@@ -595,9 +736,7 @@ def test_parse_progress_video_falls_back_to_images():
 
 
 def test_parse_progress_failed():
-    payload = {
-        "data": {"progresses": [{"status": 3, "failedReason": "blocked", "startTimeMs": 1700000000000}]}
-    }
+    payload = {"data": {"progresses": [{"status": 3, "failedReason": "blocked", "startTimeMs": 1700000000000}]}}
     state = parse_progress(payload, "video")
     assert state["status"] == 3
     assert state["failed_reason"] == "blocked"
@@ -819,11 +958,7 @@ def test_generate_raises_on_failed_status():
             "/api/task/generation/progress": [
                 {
                     "code": 0,
-                    "data": {
-                        "progresses": [
-                            {"status": 3, "failedReason": "nope", "startTimeMs": 1700000000000}
-                        ]
-                    },
+                    "data": {"progresses": [{"status": 3, "failedReason": "nope", "startTimeMs": 1700000000000}]},
                 }
             ],
         }
@@ -1383,7 +1518,7 @@ def test_portrait_compliance_converts_image_to_asset_and_sets_flag():
 def test_portrait_compliance_blocks_generation_when_verify_fails():
     fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=False), get_payload=_tool_spec_payload())
     llm = LibTVLLM(poll_interval=0)
-    with pytest.raises(LibTVError):
+    with pytest.raises(BadRequestError):
         llm.video_generation("star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake)
     paths = [c[0] for c in fake.calls]
     assert "/api/community/image/verify" in paths
@@ -1578,7 +1713,9 @@ def test_frames2video_compliance_keeps_first_last_order_and_mode():
 
 
 def test_reference_images_only_still_uses_mixed2video():
-    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=True))
+    fake = FakeSyncClient(
+        post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=True)
+    )
     llm = LibTVLLM(poll_interval=0)
     vo = llm.video_generation(
         "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
@@ -1590,7 +1727,9 @@ def test_reference_images_only_still_uses_mixed2video():
 
 
 def test_frames2video_falls_back_to_mixed2video_when_spec_lacks_mode():
-    fake = FakeSyncClient(post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=False))
+    fake = FakeSyncClient(
+        post_by_path=_compliance_routes(verify_passed=True), get_payload=_tool_spec_payload(frames2video=False)
+    )
     llm = LibTVLLM(poll_interval=0)
     vo = llm.video_generation(
         "star-video2",
@@ -2481,11 +2620,7 @@ def _failed_routes(reason):
         "/api/task/generation/progress": [
             {
                 "code": 0,
-                "data": {
-                    "progresses": [
-                        {"status": 3, "failedReason": reason, "startTimeMs": 1700000000000}
-                    ]
-                },
+                "data": {"progresses": [{"status": 3, "failedReason": reason, "startTimeMs": 1700000000000}]},
             }
         ],
     }
@@ -2544,26 +2679,32 @@ def test_video_generation_returns_queued_without_polling():
 
 
 def test_video_generation_capacity_failure_propagates_for_fallback():
-    # 算力不足 at CREATE stays a retryable 5xx LibTVError so the router falls over
-    # to the next libtv account / wavespeed (NOT a content-policy short-circuit).
+    # 算力不足 at CREATE is a retryable 429 so the router cools this deployment
+    # and falls over to the next libtv account / WaveSpeed.
     import litellm
 
     routes = _submit_routes()
     routes["/api/task/generation/create"] = {"code": 1200000136, "data": None, "msg": "算力不足"}
     fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(auto_compliance=False))
-    with pytest.raises(LibTVError) as ei:
+    with pytest.raises(RateLimitError) as ei:
         LibTVLLM(poll_interval=0).video_generation(
             "star-video2", "a fox", "tok", None, {"webid": "w"}, None, client=fake
         )
     assert not isinstance(ei.value, litellm.ContentPolicyViolationError)
-    assert ei.value.status_code == 502
+    assert ei.value.status_code == 429
 
 
 @pytest.mark.asyncio
 async def test_avideo_generation_returns_queued_without_polling():
     fake = FakeAsyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
     vo = await LibTVLLM(poll_interval=0).avideo_generation(
-        "star-video2", "a fox", "tok", None, {"webid": "w", "libtv_status_model": "_fallback2/seedance-2.0"}, None, client=fake
+        "star-video2",
+        "a fox",
+        "tok",
+        None,
+        {"webid": "w", "libtv_status_model": "_fallback2/seedance-2.0"},
+        None,
+        client=fake,
     )
     assert vo.status == "queued"
     assert decode_video_id_with_provider(vo.id)["model_id"] == "_fallback2/seedance-2.0"
@@ -2571,6 +2712,7 @@ async def test_avideo_generation_returns_queued_without_polling():
 
 
 # --- async video: client split into create (no poll) + poll_once (single tick) ---
+
 
 def test_create_does_not_poll_and_returns_task_id():
     client = FakeSyncClient(
@@ -2596,7 +2738,14 @@ def test_poll_once_single_progress_call_maps_state():
     for raw, expect in [
         ({"code": 0, "data": {"progresses": [{"status": 1}]}}, {"status": 1, "urls": [], "failed_reason": None}),
         (
-            {"code": 0, "data": {"progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/v.mp4"}]})}]}},
+            {
+                "code": 0,
+                "data": {
+                    "progresses": [
+                        {"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/v.mp4"}]})}
+                    ]
+                },
+            },
             {"status": 2, "urls": ["https://x/v.mp4"], "failed_reason": None},
         ),
         (

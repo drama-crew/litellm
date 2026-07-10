@@ -1,6 +1,6 @@
 import os
 import uuid
-from typing import Optional
+from typing import Mapping, Optional
 
 LIBTV_API_BASE = "https://api.liblib.tv"
 LIBTV_PASSPORT_BASE = "https://passport.liblib.art"
@@ -16,9 +16,15 @@ NODE_DEFAULT_NAME = {"image": "图片节点", "video": "视频节点"}
 
 
 class LibTVError(Exception):
-    def __init__(self, status_code: int, message: str):
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        headers: Optional[Mapping[str, str]] = None,
+    ):
         self.status_code = status_code
         self.message = message
+        self.headers = dict(headers or {})
         super().__init__(message)
 
 
@@ -67,8 +73,11 @@ def is_compliance_failure(reason: Optional[str]) -> bool:
 
 
 def resolve_libtv_credentials(token: Optional[str] = None, webid: Optional[str] = None) -> tuple:
-    resolved_token = token or os.getenv("LIBTV_TOKEN") or os.getenv("LIBTV_CLI_USERTOKEN")
-    resolved_webid = webid or os.getenv("LIBTV_WEBID") or os.getenv("LIBTV_CLI_WEBID")
+    # An explicitly configured empty value is a broken deployment and must fail
+    # closed. Falling back to the process-wide account here can silently make two
+    # pool slots use the same account.
+    resolved_token = token if token is not None else os.getenv("LIBTV_TOKEN") or os.getenv("LIBTV_CLI_USERTOKEN")
+    resolved_webid = webid if webid is not None else os.getenv("LIBTV_WEBID") or os.getenv("LIBTV_CLI_WEBID")
     if not resolved_token:
         raise LibTVError(
             status_code=401,
