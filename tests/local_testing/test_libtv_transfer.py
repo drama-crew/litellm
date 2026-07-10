@@ -263,6 +263,7 @@ def test_build_transfer_strategy_defaults_to_direct(monkeypatch):
 
 def test_build_transfer_strategy_delegated_needs_redis(monkeypatch):
     monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    monkeypatch.delenv("MEDIA_TRANSFER_REDIS_URL", raising=False)
     strategy = build_transfer_strategy(size=10 * 1024 * 1024, redis_client=None)
     assert isinstance(strategy, DirectTransfer)  # no redis client injected -> can't delegate
 
@@ -278,3 +279,60 @@ def test_build_transfer_strategy_below_min_bytes_stays_direct(monkeypatch):
     monkeypatch.setenv("MEDIA_TRANSFER_MIN_BYTES", str(2 * 1024 * 1024))
     strategy = build_transfer_strategy(size=1024, redis_client=_make_redis())
     assert isinstance(strategy, DirectTransfer)
+
+
+# ---------------- production redis wiring ----------------
+
+
+@pytest.fixture
+def reset_transfer_redis(monkeypatch):
+    import litellm.llms.libtv.transfer as transfer_mod
+
+    monkeypatch.setattr(transfer_mod, "_redis_singleton", None)
+    monkeypatch.setattr(transfer_mod, "_redis_singleton_url", None)
+    return transfer_mod
+
+
+def test_get_transfer_redis_none_without_url(monkeypatch, reset_transfer_redis):
+    from litellm.llms.libtv.transfer import get_transfer_redis
+
+    monkeypatch.delenv("MEDIA_TRANSFER_REDIS_URL", raising=False)
+    assert get_transfer_redis() is None
+
+
+def test_get_transfer_redis_builds_and_reuses_client(monkeypatch, reset_transfer_redis):
+    from litellm.llms.libtv.transfer import get_transfer_redis
+
+    monkeypatch.setenv("MEDIA_TRANSFER_REDIS_URL", "redis://127.0.0.1:6399/0")
+    client = get_transfer_redis()
+    assert client is not None
+    assert get_transfer_redis() is client  # process-wide singleton, reused
+
+
+def test_build_transfer_strategy_uses_env_redis_when_not_injected(monkeypatch, reset_transfer_redis):
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    monkeypatch.setenv("MEDIA_TRANSFER_REDIS_URL", "redis://127.0.0.1:6399/0")
+    strategy = build_transfer_strategy(size=10 * 1024 * 1024)
+    assert isinstance(strategy, DelegatedTransfer)
+
+
+@pytest.mark.asyncio
+async def test_delegated_transfer_redis_unreachable_falls_back_without_raising():
+    import redis.exceptions as redis_exceptions
+
+    class DeadRedis:
+        async def zcount(self, *a, **k):
+            raise redis_exceptions.ConnectionError("connection refused")
+
+    fallback_calls = []
+
+    async def fallback_fetch(url):
+        fallback_calls.append(url)
+        return b"X"
+
+    fallback = DirectTransfer(fetch=fallback_fetch, put=await _async_put(200, "direct-etag"), part_size=100)
+    strategy = DelegatedTransfer(redis=DeadRedis(), wait_timeout=5, fallback=fallback)
+
+    etags = await strategy.transfer("https://source/x", 100, [{"n": 1, "url": "https://oss/1"}])
+    assert fallback_calls == ["https://source/x"]
+    assert etags == [{"n": 1, "etag": "direct-etag"}]

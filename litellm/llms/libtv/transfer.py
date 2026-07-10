@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -25,6 +26,35 @@ DEFAULT_LATE_GRACE_TIMEOUT = 2.0
 # A worker's heartbeat key/zset entry is refreshed every ~15s; anything older than
 # 2x that interval is treated as dead so a stalled worker doesn't win task claims.
 WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
+
+
+logger = logging.getLogger(__name__)
+
+_redis_singleton: Optional[Any] = None
+_redis_singleton_url: Optional[str] = None
+_warned_redis_unavailable = False
+
+
+def get_transfer_redis() -> Optional[Any]:
+    """Process-wide lazy redis.asyncio client built from MEDIA_TRANSFER_REDIS_URL;
+    None when the env var is unset. Rebuilt if the URL changes between calls."""
+    global _redis_singleton, _redis_singleton_url
+    url = os.getenv("MEDIA_TRANSFER_REDIS_URL")
+    if not url:
+        return None
+    if _redis_singleton is None or _redis_singleton_url != url:
+        import redis.asyncio as async_redis
+
+        _redis_singleton = async_redis.from_url(
+            url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            # No read timeout: BRPOP legitimately blocks up to wait_timeout (minutes);
+            # a socket_timeout shorter than that would abort every delegated wait.
+            health_check_interval=30,
+        )
+        _redis_singleton_url = url
+    return _redis_singleton
 
 
 def status_key(task_id: str) -> str:
@@ -155,6 +185,18 @@ class DelegatedTransfer:
         return json.loads(body)
 
     async def transfer(self, source_url: str, size: int, parts: List[PartTarget]) -> List[PartEtag]:
+        global _warned_redis_unavailable
+        try:
+            return await self._transfer_delegated(source_url, size, parts)
+        except redis_exceptions.RedisError:
+            if not _warned_redis_unavailable:
+                _warned_redis_unavailable = True
+                logger.warning(
+                    "media transfer redis unreachable; falling back to direct transfer", exc_info=True
+                )
+            return await self.fallback.transfer(source_url, size, parts)
+
+    async def _transfer_delegated(self, source_url: str, size: int, parts: List[PartTarget]) -> List[PartEtag]:
         if not await self._has_active_worker():
             return await self.fallback.transfer(source_url, size, parts)
 
@@ -196,7 +238,18 @@ def build_transfer_strategy(
 ) -> MediaTransferStrategy:
     direct = fallback or DirectTransfer(fetch=fetch, put=put)
     mode = os.getenv("MEDIA_TRANSFER_MODE", "direct").lower()
-    if mode != "delegated" or redis_client is None:
+    if mode != "delegated":
+        return direct
+    if redis_client is None:
+        redis_client = get_transfer_redis()
+    if redis_client is None:
+        global _warned_redis_unavailable
+        if not _warned_redis_unavailable:
+            _warned_redis_unavailable = True
+            logger.warning(
+                "MEDIA_TRANSFER_MODE=delegated but no redis client (set MEDIA_TRANSFER_REDIS_URL); "
+                "using direct transfer"
+            )
         return direct
     min_bytes = int(os.getenv("MEDIA_TRANSFER_MIN_BYTES", str(DEFAULT_MIN_BYTES)))
     if size < min_bytes:
