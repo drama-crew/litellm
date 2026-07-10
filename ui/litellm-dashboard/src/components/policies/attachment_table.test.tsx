@@ -11,10 +11,18 @@ vi.mock("./impact_popover", () => ({
 }));
 
 vi.mock("@heroicons/react/outline", () => ({
-  TrashIcon: function TrashIcon() { return null; },
-  SwitchVerticalIcon: function SwitchVerticalIcon() { return null; },
-  ChevronUpIcon: function ChevronUpIcon() { return null; },
-  ChevronDownIcon: function ChevronDownIcon() { return null; },
+  TrashIcon: function TrashIcon() {
+    return null;
+  },
+  SwitchVerticalIcon: function SwitchVerticalIcon() {
+    return null;
+  },
+  ChevronUpIcon: function ChevronUpIcon() {
+    return null;
+  },
+  ChevronDownIcon: function ChevronDownIcon() {
+    return null;
+  },
 }));
 
 vi.mock("@tremor/react", async (importOriginal) => {
@@ -22,11 +30,18 @@ vi.mock("@tremor/react", async (importOriginal) => {
   return {
     ...actual,
     Button: React.forwardRef<HTMLButtonElement, any>(({ children, ...props }, ref) =>
-      React.createElement("button", { ...props, ref }, children)
+      React.createElement("button", { ...props, ref }, children),
     ),
-    Tooltip: ({ children }: { children?: React.ReactNode }) =>
-      React.createElement(React.Fragment, null, children),
-    Switch: ({ checked, onChange, className }: { checked?: boolean; onChange?: (v: boolean) => void; className?: string }) =>
+    Tooltip: ({ children }: { children?: React.ReactNode }) => React.createElement(React.Fragment, null, children),
+    Switch: ({
+      checked,
+      onChange,
+      className,
+    }: {
+      checked?: boolean;
+      onChange?: (v: boolean) => void;
+      className?: string;
+    }) =>
       React.createElement("input", {
         type: "checkbox",
         role: "switch",
@@ -35,7 +50,11 @@ vi.mock("@tremor/react", async (importOriginal) => {
         className,
       }),
     Icon: ({ icon: IconComp, onClick, className }: any) =>
-      React.createElement("button", { type: "button", onClick, className }, IconComp?.displayName ?? IconComp?.name ?? "icon"),
+      React.createElement(
+        "button",
+        { type: "button", onClick, className },
+        IconComp?.displayName ?? IconComp?.name ?? "icon",
+      ),
   };
 });
 
@@ -121,10 +140,13 @@ describe("AttachmentTable", () => {
     expect(screen.queryByRole("button", { name: /TrashIcon/i })).not.toBeInTheDocument();
   });
 
-  it("should show a truncated attachment ID in the table", () => {
+  it("should show the attachment ID as truncated plain mono text", () => {
     const attachment = makeAttachment({ attachment_id: "att-abcdef1234567" });
     renderWithProviders(<AttachmentTable {...defaultProps} attachments={[attachment]} />);
-    expect(screen.getByText("att-abc...")).toBeInTheDocument();
+    const idElement = screen.getByText("att-abcdef1234567");
+    expect(idElement.className).toContain("font-mono");
+    expect(idElement.className).toContain("truncate");
+    expect(idElement.className).not.toContain("bg-blue-50");
   });
 
   it("should render model tags when the attachment has models", () => {

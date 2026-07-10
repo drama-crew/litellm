@@ -157,7 +157,6 @@ def _custom_video_content(
         client=sync_client,
     )
 
-
 ##### Video Generation #######################
 @client
 async def avideo_generation(
