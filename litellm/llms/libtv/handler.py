@@ -314,6 +314,11 @@ def _image2video_eligible(optional_params: dict, spec: dict, images: list, video
     if not (isinstance(bounds, (list, tuple)) and len(bounds) == 2):
         return False
     lo, hi = bounds
+    if not (isinstance(lo, int) and isinstance(hi, int)):
+        return False
+    cfg_settings = (spec.get("config") or {}).get("settings")
+    if isinstance(cfg_settings, dict) and "image2video" not in cfg_settings:
+        return False
     return lo <= len(images) <= hi
 
 
