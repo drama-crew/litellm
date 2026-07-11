@@ -32,6 +32,24 @@ from litellm.types.videos.utils import (
 LIBTV_PROVIDER = "libtv"
 logger = logging.getLogger(__name__)
 
+# A pooled keep-alive connection can be closed by the peer during the long
+# fresh_asset_retry_wait sleep; reusing it fails the very first http call of the
+# retried create instantly, before any request reaches the server. One immediate
+# re-attempt dials a fresh connection and is enough to recover.
+_CONNECT_PHASE_FAILURES: Tuple[type, ...] = (
+    Timeout,
+    httpx.ConnectTimeout,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+)
+# litellm.Timeout above also wraps genuine mid-request read timeouts (AsyncHTTPHandler
+# collapses every httpx.TimeoutException into it), and create's last http call submits
+# a paid task: re-dialing after a read timeout could double-bill a task the server
+# already accepted. Only an attempt that failed near-instantly (a stale connection
+# dies in ~1ms; a real read timeout waited out its full multi-second budget) is safe
+# to re-dial.
+_STALE_CONNECT_WINDOW_SECONDS = 2.0
+
 _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
 
 # Keep in sync with the keys _collect_reference_groups reads: the guard below must
@@ -433,8 +451,19 @@ class LibTVLLM(CustomLLM):
             if state is None or not _is_fresh_asset_aging_failure(state):
                 return created
             time.sleep(self.fresh_asset_retry_wait)
-            created = lt.create(model, vendor, "video", params, project_name)
+            created = self._create_after_wait(lt, model, vendor, params, project_name)
         return created
+
+    def _create_after_wait(
+        self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str, monotonic=time.monotonic
+    ) -> dict:
+        start = monotonic()
+        try:
+            return lt.create(model, vendor, "video", params, project_name)
+        except _CONNECT_PHASE_FAILURES:
+            if monotonic() - start >= _STALE_CONNECT_WINDOW_SECONDS:
+                raise
+            return lt.create(model, vendor, "video", params, project_name)
 
     async def _acreate_with_fresh_asset_retry(
         self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str
@@ -445,8 +474,19 @@ class LibTVLLM(CustomLLM):
             if state is None or not _is_fresh_asset_aging_failure(state):
                 return created
             await asyncio.sleep(self.fresh_asset_retry_wait)
-            created = await lt.acreate(model, vendor, "video", params, project_name)
+            created = await self._acreate_after_wait(lt, model, vendor, params, project_name)
         return created
+
+    async def _acreate_after_wait(
+        self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str, monotonic=time.monotonic
+    ) -> dict:
+        start = monotonic()
+        try:
+            return await lt.acreate(model, vendor, "video", params, project_name)
+        except _CONNECT_PHASE_FAILURES:
+            if monotonic() - start >= _STALE_CONNECT_WINDOW_SECONDS:
+                raise
+            return await lt.acreate(model, vendor, "video", params, project_name)
 
     def _guard_poll_sync(self, lt: LibTVClient, task_id: str) -> Optional[dict]:
         for _ in range(self.fresh_asset_guard_polls):

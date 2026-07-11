@@ -31,6 +31,11 @@ WARN_INTERVAL_SECONDS = 300.0
 # A worker's heartbeat key/zset entry is refreshed every ~15s; anything older than
 # 2x that interval is treated as dead so a stalled worker doesn't win task claims.
 WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
+# httpx's 5s default read/write timeout leaves no margin on the bandwidth-constrained
+# egress DirectTransfer runs on (a 5.4MB part at ~0.5MiB/s takes ~11s); the caller
+# already enforces the overall budget, so per-operation timeouts only need to catch
+# genuine stalls.
+DIRECT_TRANSFER_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=120.0, pool=10.0)
 
 
 logger = logging.getLogger(__name__)
@@ -115,7 +120,7 @@ PutFn = Callable[[str, bytes], Awaitable[Tuple[int, str]]]
 
 
 async def _default_fetch(url: str) -> bytes:
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DIRECT_TRANSFER_TIMEOUT) as client:
         resp = await client.get(url, follow_redirects=True)
     if resp.status_code != 200:
         raise LibTVError(status_code=resp.status_code, message=f"libtv reference fetch HTTP {resp.status_code}")
@@ -123,7 +128,7 @@ async def _default_fetch(url: str) -> bytes:
 
 
 async def _default_put(url: str, data: bytes) -> Tuple[int, str]:
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=DIRECT_TRANSFER_TIMEOUT) as client:
         resp = await client.put(url, content=data)
     return resp.status_code, resp.headers.get("etag", "")
 

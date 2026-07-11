@@ -74,6 +74,44 @@ async def test_direct_transfer_raises_on_put_failure():
         await strategy.transfer("https://source/x", 5, [{"n": 1, "url": "https://oss/1"}])
 
 
+@pytest.mark.asyncio
+async def test_default_fetch_and_put_use_generous_transfer_timeout(monkeypatch):
+    import httpx
+
+    import litellm.llms.libtv.transfer as transfer_mod
+
+    assert transfer_mod.DIRECT_TRANSFER_TIMEOUT.connect == 10.0
+    assert transfer_mod.DIRECT_TRANSFER_TIMEOUT.read == 120.0
+    assert transfer_mod.DIRECT_TRANSFER_TIMEOUT.write == 120.0
+    assert transfer_mod.DIRECT_TRANSFER_TIMEOUT.pool == 10.0
+
+    captured = []
+
+    class CapturingClient:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, follow_redirects=False):
+            return httpx.Response(200, content=b"OK")
+
+        async def put(self, url, content=None):
+            return httpx.Response(200, headers={"etag": "e1"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", CapturingClient)
+
+    assert await transfer_mod._default_fetch("https://source/x") == b"OK"
+    assert await transfer_mod._default_put("https://oss/1", b"data") == (200, "e1")
+
+    assert len(captured) == 2
+    assert all(kwargs.get("timeout") is transfer_mod.DIRECT_TRANSFER_TIMEOUT for kwargs in captured)
+
+
 # ---------------- DelegatedTransfer ----------------
 
 

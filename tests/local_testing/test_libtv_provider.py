@@ -136,7 +136,10 @@ class FakeSyncClient:
         path = self._path(url)
         self.calls.append((path, json))
         queue = self.post_by_path[path]
-        return FakeResponse(queue.pop(0) if isinstance(queue, list) else queue)
+        item = queue.pop(0) if isinstance(queue, list) else queue
+        if isinstance(item, BaseException):
+            raise item
+        return FakeResponse(item)
 
     def get(self, url, headers=None, timeout=None, params=None):
         self.calls.append((self._path(url), None))
@@ -156,7 +159,10 @@ class FakeAsyncClient:
         path = self._path(url)
         self.calls.append((path, json))
         queue = self.post_by_path[path]
-        return FakeResponse(queue.pop(0) if isinstance(queue, list) else queue)
+        item = queue.pop(0) if isinstance(queue, list) else queue
+        if isinstance(item, BaseException):
+            raise item
+        return FakeResponse(item)
 
     async def get(self, url, headers=None, params=None):
         self.calls.append((self._path(url), None))
@@ -2357,6 +2363,124 @@ async def test_image2video_fresh_asset_fast_fail_retries_create_async():
     assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
 
 
+def test_frames2video_retry_create_recovers_from_stale_connection_instant_timeout():
+    import httpx
+
+    routes = _fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING])
+    routes["/api/canvas/project/create"] = [
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        httpx.ConnectTimeout("stale pooled connection"),
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+    ]
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    vo = _frames2video_call(_fresh_retry_llm(), fake)
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+@pytest.mark.asyncio
+async def test_frames2video_aretry_create_recovers_from_stale_connection_instant_timeout():
+    import httpx
+
+    routes = _fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING])
+    routes["/api/canvas/project/create"] = [
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        httpx.ConnectTimeout("stale pooled connection"),
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+    ]
+    fake = FakeAsyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    vo = await _fresh_retry_llm().avideo_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+def test_frames2video_retry_create_gives_up_after_two_consecutive_connect_failures():
+    import httpx
+
+    routes = _fresh_retry_routes(["t1"], [_AGING_FAIL])
+    routes["/api/canvas/project/create"] = [
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        httpx.ConnectTimeout("stale pooled connection"),
+        httpx.ConnectTimeout("dead again"),
+    ]
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    with pytest.raises(httpx.ConnectTimeout):
+        _frames2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1  # only the pre-retry create ever reached generation/create
+
+
+class _RetryFakeLT:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def _next(self):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def create(self, model, vendor, task_type, params, project_name):
+        return self._next()
+
+    async def acreate(self, model, vendor, task_type, params, project_name):
+        return self._next()
+
+
+def test_create_after_wait_non_connect_error_propagates_without_redial():
+    lt = _RetryFakeLT([LibTVError(status_code=400, message="bad request")])
+    with pytest.raises(LibTVError):
+        LibTVLLM()._create_after_wait(lt, "m", "v", {}, "p")
+    assert lt.calls == 1
+
+
+def test_create_after_wait_slow_timeout_is_not_redialed():
+    lt = _RetryFakeLT([Timeout("read timed out", "m", "libtv")])
+    ticks = iter([0.0, 60.0])
+    with pytest.raises(Timeout):
+        LibTVLLM()._create_after_wait(lt, "m", "v", {}, "p", monotonic=lambda: next(ticks))
+    assert lt.calls == 1
+
+
+def test_create_after_wait_instant_timeout_redials_once():
+    lt = _RetryFakeLT([Timeout("connect timed out", "m", "libtv"), {"task_id": "t2"}])
+    ticks = iter([0.0, 0.001])
+    created = LibTVLLM()._create_after_wait(lt, "m", "v", {}, "p", monotonic=lambda: next(ticks))
+    assert created == {"task_id": "t2"}
+    assert lt.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_acreate_after_wait_slow_timeout_is_not_redialed():
+    lt = _RetryFakeLT([Timeout("read timed out", "m", "libtv")])
+    ticks = iter([0.0, 60.0])
+    with pytest.raises(Timeout):
+        await LibTVLLM()._acreate_after_wait(lt, "m", "v", {}, "p", monotonic=lambda: next(ticks))
+    assert lt.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_acreate_after_wait_non_connect_error_propagates_without_redial():
+    lt = _RetryFakeLT([LibTVError(status_code=400, message="bad request")])
+    with pytest.raises(LibTVError):
+        await LibTVLLM()._acreate_after_wait(lt, "m", "v", {}, "p")
+    assert lt.calls == 1
+
+
 def test_mixed2video_submit_does_not_guard_poll():
     routes = _compliance_routes(verify_passed=True)
     routes["/api/task/generation/progress"] = [_AGING_FAIL]
@@ -2562,6 +2686,67 @@ async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monk
     assert not any(c[0] == "PUT" for c in fake.calls)  # bytes went to the worker, not this process
     init_body = next(c[2] for c in fake.calls if str(c[1]).endswith("/init/4"))
     assert init_body["fileSize"] == 11
+
+
+@pytest.mark.asyncio
+async def test_aupload_via_transfer_path_stable_across_presign_query_strings(monkeypatch):
+    pytest.importorskip("fakeredis")
+    from fakeredis import aioredis as fakeredis_aioredis
+
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)  # no heartbeat -> DirectTransfer fallback
+
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VID",
+        http_put=fake.put_bytes,
+        http_size_probe=lambda u: 3,
+        redis_client=redis,
+    )
+
+    await lt.aensure_libtv_url(
+        "url", "https://minio.internal/bucket/clip.mp4?X-Amz-Signature=abc&X-Amz-Expires=1", None, "reference.mp4"
+    )
+    await lt.aensure_libtv_url(
+        "url", "https://minio.internal/bucket/clip.mp4?X-Amz-Signature=zzz&X-Amz-Expires=999", None, "reference.mp4"
+    )
+    await lt.aensure_libtv_url(
+        "url", "https://minio.internal/bucket/clip.mp4?X-Amz-Signature=abc#t=5", None, "reference.mp4"
+    )
+
+    init_bodies = [c[2] for c in fake.calls if str(c[1]).endswith("/init/4")]
+    assert len(init_bodies) == 3
+    assert init_bodies[0]["path"] == init_bodies[1]["path"] == init_bodies[2]["path"]
+
+
+@pytest.mark.asyncio
+async def test_aupload_via_transfer_different_object_path_produces_different_upload_path(monkeypatch):
+    pytest.importorskip("fakeredis")
+    from fakeredis import aioredis as fakeredis_aioredis
+
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
+
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VID",
+        http_put=fake.put_bytes,
+        http_size_probe=lambda u: 3,
+        redis_client=redis,
+    )
+
+    await lt.aensure_libtv_url("url", "https://minio.internal/bucket/clip.mp4?sig=abc", None, "reference.mp4")
+    await lt.aensure_libtv_url("url", "https://minio.internal/bucket2/clip.mp4?sig=abc", None, "reference.mp4")
+
+    init_bodies = [c[2] for c in fake.calls if str(c[1]).endswith("/init/4")]
+    assert len(init_bodies) == 2
+    assert init_bodies[0]["path"] != init_bodies[1]["path"]
 
 
 def _ranged_get_transport(status_code, headers):
