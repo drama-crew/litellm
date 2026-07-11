@@ -1453,7 +1453,7 @@ def test_resolve_model_spec_indexes_tool_spec():
         lt.resolve_model_spec("does-not-exist")
 
 
-def _tool_spec_payload(model_key="star-video2", auto_compliance=True, frames2video=False):
+def _tool_spec_payload(model_key="star-video2", auto_compliance=True, frames2video=False, image2video=None, settings=None):
     props = {
         "ratio": {"default": "9:16", "enum": ["16:9", "9:16"]},
         "resolution": {"default": "720p", "enum": [{"value": "720p"}]},
@@ -1462,13 +1462,21 @@ def _tool_spec_payload(model_key="star-video2", auto_compliance=True, frames2vid
     }
     if auto_compliance:
         props["autoCompliance"] = {"enable": True, "default": 1}
+    mode_items = {}
     if frames2video:
-        props["modeType"] = {"items": {"frames2video": [1, 2], "mixed2video": []}}
+        mode_items["frames2video"] = [1, 2]
+        mode_items["mixed2video"] = []
+    if image2video is not None:
+        mode_items["image2video"] = image2video
+    if mode_items:
+        props["modeType"] = {"items": mode_items}
     meta = {
         "modelKey": model_key,
         "modelVendor": model_key,
         "properties": props,
-        "config": {"settings": ["ratio", "resolution", "duration", "enableSound"]},
+        "config": {
+            "settings": settings if settings is not None else ["ratio", "resolution", "duration", "enableSound"]
+        },
     }
     return {"data": {"tools": [{"type": "video", "metadata": json.dumps(meta)}]}}
 
@@ -1927,6 +1935,254 @@ def test_frames2video_compliance_exempt_frame_and_reference_video_use_asset_stri
     assert "mixedList" not in gen_params
 
 
+_LIBTV_REF_2 = "https://libtv-res.liblib.art/upload-images/uid/def.png"
+
+
+def _image2video_compliance_routes(urls, asset_ids):
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    return {
+        "/api/community/image/verify": {
+            "code": 0,
+            "data": {"list": [{"url": u, "riskLabels": risk} for u in urls]},
+        },
+        "/api/third_asset/create": [{"code": 0, "data": {"uuid": f"u{i}"}} for i in range(len(urls))],
+        "/api/third_asset/check": [
+            {"code": 0, "data": {"list": [{"uuid": f"u{i}", "assetId": asset_ids[i], "status": 1}]}}
+            for i in range(len(urls))
+        ],
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+
+
+def test_image2video_reference_images_only_uses_asset_strings_not_mixedlist():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes(
+            [_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]
+        ),
+        get_payload=_tool_spec_payload(image2video=[1, 9]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "keep the same person",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "image2video"
+    assert gen_params["autoCompliance"] == 1
+    assert gen_params["imageList"] == ["asset://asset-ONE", "asset://asset-TWO"]
+    assert "mixedList" not in gen_params
+
+
+def test_image2video_exempt_ref_keeps_raw_cdn_url_string():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], [None]),
+        get_payload=_tool_spec_payload(image2video=[1, 9]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "image2video"
+    assert gen_params["imageList"] == [_LIBTV_REF]
+
+
+def test_image2video_images_with_reference_video_falls_back_to_mixed2video():
+    fake = FakeSyncClient(post_by_path=_mixed_compliance_routes(), get_payload=_tool_spec_payload(image2video=[1, 9]))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "swap the lead",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF], "reference_videos": [_LIBTV_VIDEO]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [
+        {"url": _LIBTV_REF, "assetId": "asset-IMG", "mediaType": "image"},
+        {"url": _LIBTV_VIDEO, "assetId": "asset-VID", "mediaType": "video"},
+    ]
+
+
+def test_image2video_images_above_schema_max_falls_back_to_mixed2video():
+    urls = [f"https://libtv-res.liblib.art/upload-images/uid/img{i}.png" for i in range(10)]
+    asset_ids = [f"asset-{i}" for i in range(10)]
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    routes = {
+        "/api/community/image/verify": {
+            "code": 0,
+            "data": {"list": [{"url": u, "riskLabels": risk} for u in urls]},
+        },
+        "/api/third_asset/create": [{"code": 0, "data": {"uuid": f"u{i}"}} for i in range(10)],
+        "/api/third_asset/check": [
+            {"code": 0, "data": {"list": [{"uuid": f"u{i}", "assetId": asset_ids[i], "status": 1}]}}
+            for i in range(10)
+        ],
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": {
+            "code": 0,
+            "data": {
+                "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+            },
+        },
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(image2video=[1, 9]))
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": urls}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert "mixedList" in gen_params
+    assert len(gen_params["mixedList"]) == 10
+
+
+def test_image2video_explicit_mixed2video_override_wins():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(image2video=[1, 9]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF], "modeType": "mixed2video"},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "assetId": "asset-ONE", "mediaType": "image"}]
+
+
+@pytest.mark.asyncio
+async def test_image2video_reference_images_only_uses_asset_strings_async():
+    fake = FakeAsyncClient(
+        post_by_path=_image2video_compliance_routes(
+            [_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]
+        ),
+        get_payload=_tool_spec_payload(image2video=[1, 9]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = await llm.avideo_generation(
+        "star-video2",
+        "keep the same person",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "image2video"
+    assert gen_params["imageList"] == ["asset://asset-ONE", "asset://asset-TWO"]
+    assert "mixedList" not in gen_params
+
+
+def test_image2video_images_below_schema_min_falls_back_to_mixed2video():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(image2video=[2, 9]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "assetId": "asset-ONE", "mediaType": "image"}]
+
+
+def test_image2video_malformed_schema_bounds_fall_back_to_mixed2video():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(image2video=[1, None]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [{"url": _LIBTV_REF, "assetId": "asset-ONE", "mediaType": "image"}]
+
+
+def test_image2video_dict_settings_with_mode_bucket_keeps_mode_and_settings():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(
+            image2video=[1, 9],
+            settings={"image2video": ["ratio", "resolution", "duration"], "mixed2video": ["ratio"]},
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "image2video"
+    assert gen_params["imageList"] == ["asset://asset-ONE"]
+    assert gen_params["ratio"] == "9:16"
+    assert gen_params["resolution"] == "720p"
+    assert gen_params["duration"] == 5
+
+
+def test_image2video_dict_settings_without_mode_bucket_falls_back_to_mixed2video():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]),
+        get_payload=_tool_spec_payload(
+            image2video=[1, 9],
+            settings={"singleImage2video": ["ratio"], "mixed2video": ["ratio", "resolution", "duration"]},
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["mixedList"] == [
+        {"url": _LIBTV_REF, "assetId": "asset-ONE", "mediaType": "image"},
+        {"url": _LIBTV_REF_2, "assetId": "asset-TWO", "mediaType": "image"},
+    ]
+
+
 _AGING_FAIL = {
     "code": 0,
     "data": {"progresses": [{"status": 3, "failedReason": "视频生成失败，积分将会在2小时内返还，请稍后重试"}]},
@@ -2042,6 +2298,62 @@ async def test_frames2video_fresh_asset_fast_fail_retries_create_async():
     assert vo.status == "queued"
     creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
     assert len(creates) == 2
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+def _image2video_fresh_retry_routes(create_ids, progress_seq):
+    routes = _image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"])
+    routes["/api/task/generation/create"] = [{"code": 0, "data": {"taskId": tid}} for tid in create_ids]
+    routes["/api/task/generation/progress"] = list(progress_seq)
+    return routes
+
+
+def _image2video_call(llm, fake):
+    return llm.video_generation(
+        "star-video2",
+        "keep the same person",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF]},
+        None,
+        client=fake,
+    )
+
+
+def test_image2video_fresh_asset_fast_fail_retries_create_with_new_task():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(image2video=[1, 9]),
+    )
+    vo = _image2video_call(_fresh_retry_llm(), fake)
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert creates[0]["params"]["modeType"] == "image2video"
+    assert creates[0]["params"]["imageList"] == creates[1]["params"]["imageList"] == ["asset://asset-ONE"]
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+@pytest.mark.asyncio
+async def test_image2video_fresh_asset_fast_fail_retries_create_async():
+    fake = FakeAsyncClient(
+        post_by_path=_image2video_fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(image2video=[1, 9]),
+    )
+    vo = await _fresh_retry_llm().avideo_generation(
+        "star-video2",
+        "keep the same person",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert creates[0]["params"]["modeType"] == "image2video"
+    assert creates[0]["params"]["imageList"] == creates[1]["params"]["imageList"] == ["asset://asset-ONE"]
     assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
 
 

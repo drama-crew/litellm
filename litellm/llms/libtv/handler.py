@@ -304,6 +304,24 @@ def _wants_frames2video(optional_params: dict, spec: dict) -> bool:
     return isinstance(mode_items, dict) and "frames2video" in mode_items
 
 
+def _image2video_eligible(optional_params: dict, spec: dict, images: list, videos: list, audios: list) -> bool:
+    if videos or audios or optional_params.get("last_image"):
+        return False
+    mode_items = ((spec.get("properties") or {}).get("modeType") or {}).get("items")
+    if not isinstance(mode_items, dict):
+        return False
+    bounds = mode_items.get("image2video")
+    if not (isinstance(bounds, (list, tuple)) and len(bounds) == 2):
+        return False
+    lo, hi = bounds
+    if not (isinstance(lo, int) and isinstance(hi, int)):
+        return False
+    cfg_settings = (spec.get("config") or {}).get("settings")
+    if isinstance(cfg_settings, dict) and "image2video" not in cfg_settings:
+        return False
+    return lo <= len(images) <= hi
+
+
 def _asset_ref_to_string(ref: dict) -> str:
     # frames2video's imageList/videoList vendor contract wants "asset://<id>" strings,
     # not the {url, assetId} objects mixed2video's mixedList/imageList expect: verified
@@ -400,10 +418,10 @@ class LibTVLLM(CustomLLM):
         vo._hidden_params = {"project_uuid": created.get("project_uuid")}
         return vo
 
-    def _create_frames_with_fresh_asset_retry(
+    def _create_with_fresh_asset_retry(
         self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str
     ) -> dict:
-        """Create a frames2video task, guard-poll it briefly, and re-create on the
+        """Create a frames2video or image2video task, guard-poll it briefly, and re-create on the
         fresh-asset aging failure (see _is_fresh_asset_aging_failure). Registered
         asset ids stay valid across attempts (the server dedupes by url), so each
         retry reuses the same params; a retry a few minutes later lands after the
@@ -418,7 +436,7 @@ class LibTVLLM(CustomLLM):
             created = lt.create(model, vendor, "video", params, project_name)
         return created
 
-    async def _acreate_frames_with_fresh_asset_retry(
+    async def _acreate_with_fresh_asset_retry(
         self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str
     ) -> dict:
         created = await lt.acreate(model, vendor, "video", params, project_name)
@@ -707,13 +725,29 @@ class LibTVLLM(CustomLLM):
         _guard_reference_intent(model, optional_params, images, videos, audios)
         auto_compliance = _auto_compliance_enabled(spec)
         wants_frames = bool(images) and auto_compliance and _wants_frames2video(optional_params, spec)
+        image2video_eligible = (
+            bool(images)
+            and auto_compliance
+            and not wants_frames
+            and _image2video_eligible(optional_params, spec, images, videos, audios)
+        )
+        default_mode = "image2video" if image2video_eligible else "mixed2video"
+        wants_image2video = image2video_eligible and _resolve_mode(optional_params, default_mode) == "image2video"
         _log_reference_collection(
             model,
             optional_params,
             images,
             videos,
             audios,
-            branch="frames2video" if wants_frames else ("mixed2video" if images and auto_compliance else "else-mode"),
+            branch=(
+                "frames2video"
+                if wants_frames
+                else "image2video"
+                if wants_image2video
+                else "mixed2video"
+                if images and auto_compliance
+                else "else-mode"
+            ),
         )
 
         def url_for(ref, default_name):
@@ -730,6 +764,11 @@ class LibTVLLM(CustomLLM):
                 params["videoList"] = [_asset_ref_to_string(ref) for ref in video_refs]
             if audios:
                 params["audioList"] = [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
+        elif wants_image2video:
+            image_refs = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
+            params = build_generation_params(prompt, optional_params, spec, "image2video")
+            params["autoCompliance"] = 1
+            params["imageList"] = [_asset_ref_to_string(ref) for ref in image_refs]
         elif images and auto_compliance:
             image_refs = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
             video_refs = lt.resolve_compliant_video_refs([_reference_payload(r) for r in videos])
@@ -753,8 +792,8 @@ class LibTVLLM(CustomLLM):
                 [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
         created = (
-            self._create_frames_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
-            if wants_frames
+            self._create_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
+            if wants_frames or wants_image2video
             else lt.create(model, spec["vendor"], "video", params, _project_name(model))
         )
         return self._build_video_object(model, created, optional_params)
@@ -777,13 +816,29 @@ class LibTVLLM(CustomLLM):
         _guard_reference_intent(model, optional_params, images, videos, audios)
         auto_compliance = _auto_compliance_enabled(spec)
         wants_frames = bool(images) and auto_compliance and _wants_frames2video(optional_params, spec)
+        image2video_eligible = (
+            bool(images)
+            and auto_compliance
+            and not wants_frames
+            and _image2video_eligible(optional_params, spec, images, videos, audios)
+        )
+        default_mode = "image2video" if image2video_eligible else "mixed2video"
+        wants_image2video = image2video_eligible and _resolve_mode(optional_params, default_mode) == "image2video"
         _log_reference_collection(
             model,
             optional_params,
             images,
             videos,
             audios,
-            branch="frames2video" if wants_frames else ("mixed2video" if images and auto_compliance else "else-mode"),
+            branch=(
+                "frames2video"
+                if wants_frames
+                else "image2video"
+                if wants_image2video
+                else "mixed2video"
+                if images and auto_compliance
+                else "else-mode"
+            ),
         )
 
         async def url_for(ref, default_name):
@@ -800,6 +855,11 @@ class LibTVLLM(CustomLLM):
                 params["videoList"] = [_asset_ref_to_string(ref) for ref in video_refs]
             if audios:
                 params["audioList"] = [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
+        elif wants_image2video:
+            image_refs = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
+            params = build_generation_params(prompt, optional_params, spec, "image2video")
+            params["autoCompliance"] = 1
+            params["imageList"] = [_asset_ref_to_string(ref) for ref in image_refs]
         elif images and auto_compliance:
             image_refs = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
             video_refs = await lt.aresolve_compliant_video_refs([_reference_payload(r) for r in videos])
@@ -823,8 +883,8 @@ class LibTVLLM(CustomLLM):
                 [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
         created = (
-            await self._acreate_frames_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
-            if wants_frames
+            await self._acreate_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
+            if wants_frames or wants_image2video
             else await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
         )
         return self._build_video_object(model, created, optional_params)
