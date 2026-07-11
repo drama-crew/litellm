@@ -42,6 +42,13 @@ _CONNECT_PHASE_FAILURES: Tuple[type, ...] = (
     httpx.ConnectError,
     httpx.RemoteProtocolError,
 )
+# litellm.Timeout above also wraps genuine mid-request read timeouts (AsyncHTTPHandler
+# collapses every httpx.TimeoutException into it), and create's last http call submits
+# a paid task: re-dialing after a read timeout could double-bill a task the server
+# already accepted. Only an attempt that failed near-instantly (a stale connection
+# dies in ~1ms; a real read timeout waited out its full multi-second budget) is safe
+# to re-dial.
+_STALE_CONNECT_WINDOW_SECONDS = 2.0
 
 _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
 
@@ -447,10 +454,15 @@ class LibTVLLM(CustomLLM):
             created = self._create_after_wait(lt, model, vendor, params, project_name)
         return created
 
-    def _create_after_wait(self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str) -> dict:
+    def _create_after_wait(
+        self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str, monotonic=time.monotonic
+    ) -> dict:
+        start = monotonic()
         try:
             return lt.create(model, vendor, "video", params, project_name)
         except _CONNECT_PHASE_FAILURES:
+            if monotonic() - start >= _STALE_CONNECT_WINDOW_SECONDS:
+                raise
             return lt.create(model, vendor, "video", params, project_name)
 
     async def _acreate_with_fresh_asset_retry(
@@ -466,11 +478,14 @@ class LibTVLLM(CustomLLM):
         return created
 
     async def _acreate_after_wait(
-        self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str
+        self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str, monotonic=time.monotonic
     ) -> dict:
+        start = monotonic()
         try:
             return await lt.acreate(model, vendor, "video", params, project_name)
         except _CONNECT_PHASE_FAILURES:
+            if monotonic() - start >= _STALE_CONNECT_WINDOW_SECONDS:
+                raise
             return await lt.acreate(model, vendor, "video", params, project_name)
 
     def _guard_poll_sync(self, lt: LibTVClient, task_id: str) -> Optional[dict]:

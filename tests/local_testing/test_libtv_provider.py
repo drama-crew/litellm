@@ -2422,6 +2422,65 @@ def test_frames2video_retry_create_gives_up_after_two_consecutive_connect_failur
     assert len(creates) == 1  # only the pre-retry create ever reached generation/create
 
 
+class _RetryFakeLT:
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls = 0
+
+    def _next(self):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def create(self, model, vendor, task_type, params, project_name):
+        return self._next()
+
+    async def acreate(self, model, vendor, task_type, params, project_name):
+        return self._next()
+
+
+def test_create_after_wait_non_connect_error_propagates_without_redial():
+    lt = _RetryFakeLT([LibTVError(status_code=400, message="bad request")])
+    with pytest.raises(LibTVError):
+        LibTVLLM()._create_after_wait(lt, "m", "v", {}, "p")
+    assert lt.calls == 1
+
+
+def test_create_after_wait_slow_timeout_is_not_redialed():
+    lt = _RetryFakeLT([Timeout("read timed out", "m", "libtv")])
+    ticks = iter([0.0, 60.0])
+    with pytest.raises(Timeout):
+        LibTVLLM()._create_after_wait(lt, "m", "v", {}, "p", monotonic=lambda: next(ticks))
+    assert lt.calls == 1
+
+
+def test_create_after_wait_instant_timeout_redials_once():
+    lt = _RetryFakeLT([Timeout("connect timed out", "m", "libtv"), {"task_id": "t2"}])
+    ticks = iter([0.0, 0.001])
+    created = LibTVLLM()._create_after_wait(lt, "m", "v", {}, "p", monotonic=lambda: next(ticks))
+    assert created == {"task_id": "t2"}
+    assert lt.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_acreate_after_wait_slow_timeout_is_not_redialed():
+    lt = _RetryFakeLT([Timeout("read timed out", "m", "libtv")])
+    ticks = iter([0.0, 60.0])
+    with pytest.raises(Timeout):
+        await LibTVLLM()._acreate_after_wait(lt, "m", "v", {}, "p", monotonic=lambda: next(ticks))
+    assert lt.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_acreate_after_wait_non_connect_error_propagates_without_redial():
+    lt = _RetryFakeLT([LibTVError(status_code=400, message="bad request")])
+    with pytest.raises(LibTVError):
+        await LibTVLLM()._acreate_after_wait(lt, "m", "v", {}, "p")
+    assert lt.calls == 1
+
+
 def test_mixed2video_submit_does_not_guard_poll():
     routes = _compliance_routes(verify_passed=True)
     routes["/api/task/generation/progress"] = [_AGING_FAIL]
@@ -2654,10 +2713,13 @@ async def test_aupload_via_transfer_path_stable_across_presign_query_strings(mon
     await lt.aensure_libtv_url(
         "url", "https://minio.internal/bucket/clip.mp4?X-Amz-Signature=zzz&X-Amz-Expires=999", None, "reference.mp4"
     )
+    await lt.aensure_libtv_url(
+        "url", "https://minio.internal/bucket/clip.mp4?X-Amz-Signature=abc#t=5", None, "reference.mp4"
+    )
 
     init_bodies = [c[2] for c in fake.calls if str(c[1]).endswith("/init/4")]
-    assert len(init_bodies) == 2
-    assert init_bodies[0]["path"] == init_bodies[1]["path"]
+    assert len(init_bodies) == 3
+    assert init_bodies[0]["path"] == init_bodies[1]["path"] == init_bodies[2]["path"]
 
 
 @pytest.mark.asyncio

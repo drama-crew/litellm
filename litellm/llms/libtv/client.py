@@ -718,10 +718,11 @@ class LibTVClient:
         aupload_media, this never buffers the source bytes in this process itself --
         that only happens inside the chosen strategy."""
         user_uuid = await self.aresolve_user_uuid()
-        # Object keys drama passes here are immutable uuid-addressed generation outputs;
-        # only the query string (presign signature/expiry) varies between requests for the
-        # same object, so hashing scheme+netloc+path (not the query) keeps the upload path
-        # -- and therefore the third_asset dedupe key -- stable across repeated presigns.
+        # Invariant: same scheme+netloc+path == same immutable content (drama object keys
+        # are uuid-addressed generation outputs; only the presign signature/expiry query
+        # varies), so hashing without query/fragment keeps the upload path -- and therefore
+        # the third_asset dedupe key -- stable across repeated presigns. A caller that
+        # distinguished objects by query alone would silently cross-link compliance assets.
         content_id = urlsplit(source_url)._replace(query="", fragment="").geturl()
         path = build_upload_path(user_uuid, hashlib.sha1(content_id.encode()).hexdigest(), filename)
         init = self._check(
