@@ -1927,6 +1927,135 @@ def test_frames2video_compliance_exempt_frame_and_reference_video_use_asset_stri
     assert "mixedList" not in gen_params
 
 
+_AGING_FAIL = {
+    "code": 0,
+    "data": {"progresses": [{"status": 3, "failedReason": "视频生成失败，积分将会在2小时内返还，请稍后重试"}]},
+}
+_COMPLIANCE_FAIL = {
+    "code": 0,
+    "data": {"progresses": [{"status": 3, "failedReason": "参考图可能包含真人形象，积分将会在2小时内返还，请先进行合规校验后重试。"}]},
+}
+_RUNNING = {"code": 0, "data": {"progresses": [{"status": 1}]}}
+
+
+def _fresh_retry_routes(create_ids, progress_seq):
+    routes = _frames2video_compliance_routes()
+    routes["/api/task/generation/create"] = [{"code": 0, "data": {"taskId": tid}} for tid in create_ids]
+    routes["/api/task/generation/progress"] = list(progress_seq)
+    return routes
+
+
+def _fresh_retry_llm(**kwargs):
+    defaults = dict(poll_interval=0, fresh_asset_retry_attempts=2, fresh_asset_retry_wait=0, fresh_asset_guard_polls=2)
+    defaults.update(kwargs)
+    return LibTVLLM(**defaults)
+
+
+def _frames2video_call(llm, fake):
+    return llm.video_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+
+
+def test_frames2video_fresh_asset_fast_fail_retries_create_with_new_task():
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    vo = _frames2video_call(_fresh_retry_llm(), fake)
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert creates[0]["params"]["imageList"] == creates[1]["params"]["imageList"]
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+def test_frames2video_fresh_asset_retry_stops_on_success_during_guard():
+    completed = {
+        "code": 0,
+        "data": {"progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]},
+    }
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1"], [completed]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    vo = _frames2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+
+
+def test_frames2video_compliance_rejection_is_not_retried():
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1"], [_COMPLIANCE_FAIL]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    vo = _frames2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+
+
+def test_frames2video_fresh_asset_retry_gives_up_after_max_attempts():
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1", "t2", "t3"], [_AGING_FAIL, _AGING_FAIL, _AGING_FAIL]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    vo = _frames2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 3
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t3"
+
+
+def test_frames2video_fresh_asset_retry_returns_after_guard_window_still_pending():
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1"], [_RUNNING, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    vo = _frames2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_frames2video_fresh_asset_fast_fail_retries_create_async():
+    fake = FakeAsyncClient(
+        post_by_path=_fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    vo = await _fresh_retry_llm().avideo_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+def test_mixed2video_submit_does_not_guard_poll():
+    routes = _compliance_routes(verify_passed=True)
+    routes["/api/task/generation/progress"] = [_AGING_FAIL]
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload())
+    vo = _fresh_retry_llm().video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
+    )
+    assert vo.status == "queued"
+    assert not [p for p, _ in fake.calls if p == "/api/task/generation/progress"]
+
+
 # --- video usage -> resolution-tiered cost (authoritative spend line) ---------
 from litellm.llms.libtv.handler import _video_usage  # noqa: E402
 from litellm.llms.openai.cost_calculation import video_generation_cost  # noqa: E402

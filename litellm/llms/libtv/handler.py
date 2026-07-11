@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -313,6 +314,24 @@ def _asset_ref_to_string(ref: dict) -> str:
     return f"asset://{asset_id}" if asset_id else ref["url"]
 
 
+_FRESH_ASSET_RETRY_TOKEN = "请稍后重试"
+
+
+def _is_fresh_asset_aging_failure(state: dict) -> bool:
+    """Whether a frames2video task failed with the vendor's generic retryable
+    failure. Live-verified (2026-07-11): seedance/star-video2 frames2video with a
+    freshly registered real-person compliant asset ALWAYS fails upstream within
+    seconds with this generic reason, while the exact same asset ids succeed once
+    the registration is a few minutes old (server runs an internal deep audit with
+    no observable readiness signal in third_asset/check; assetId and status=1 are
+    returned immediately and never change). Genuine compliance rejections use a
+    different message ("请先进行合规校验后重试") and must not be retried."""
+    if state.get("status") != 3:
+        return False
+    reason = state.get("failed_reason") or ""
+    return _FRESH_ASSET_RETRY_TOKEN in reason and "合规" not in reason
+
+
 def _frame_payloads(optional_params: dict) -> list:
     # [first, last] in order; image may be absent (libtv frames2video accepts 1-2
     # frames, and the non-compliance branch already sends a single-image imageList).
@@ -321,12 +340,24 @@ def _frame_payloads(optional_params: dict) -> list:
 
 
 class LibTVLLM(CustomLLM):
-    def __init__(self, poll_interval: float = 3.0, poll_max_attempts: int = 200, http_get=None, http_put=None):
+    def __init__(
+        self,
+        poll_interval: float = 3.0,
+        poll_max_attempts: int = 200,
+        http_get=None,
+        http_put=None,
+        fresh_asset_retry_attempts: int = 5,
+        fresh_asset_retry_wait: float = 60.0,
+        fresh_asset_guard_polls: int = 10,
+    ):
         super().__init__()
         self.poll_interval = poll_interval
         self.poll_max_attempts = poll_max_attempts
         self._http_get = http_get
         self._http_put = http_put
+        self.fresh_asset_retry_attempts = fresh_asset_retry_attempts
+        self.fresh_asset_retry_wait = fresh_asset_retry_wait
+        self.fresh_asset_guard_polls = fresh_asset_guard_polls
 
     def _make_client(
         self,
@@ -368,6 +399,52 @@ class LibTVLLM(CustomLLM):
         vo.usage = _video_usage(op)
         vo._hidden_params = {"project_uuid": created.get("project_uuid")}
         return vo
+
+    def _create_frames_with_fresh_asset_retry(
+        self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str
+    ) -> dict:
+        """Create a frames2video task, guard-poll it briefly, and re-create on the
+        fresh-asset aging failure (see _is_fresh_asset_aging_failure). Registered
+        asset ids stay valid across attempts (the server dedupes by url), so each
+        retry reuses the same params; a retry a few minutes later lands after the
+        server's internal audit and succeeds. Total worst-case wall time stays
+        under the caller's submit read timeout (drama uses 600s)."""
+        created = lt.create(model, vendor, "video", params, project_name)
+        for _ in range(self.fresh_asset_retry_attempts):
+            state = self._guard_poll_sync(lt, created["task_id"])
+            if state is None or not _is_fresh_asset_aging_failure(state):
+                return created
+            time.sleep(self.fresh_asset_retry_wait)
+            created = lt.create(model, vendor, "video", params, project_name)
+        return created
+
+    async def _acreate_frames_with_fresh_asset_retry(
+        self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str
+    ) -> dict:
+        created = await lt.acreate(model, vendor, "video", params, project_name)
+        for _ in range(self.fresh_asset_retry_attempts):
+            state = await self._guard_poll_async(lt, created["task_id"])
+            if state is None or not _is_fresh_asset_aging_failure(state):
+                return created
+            await asyncio.sleep(self.fresh_asset_retry_wait)
+            created = await lt.acreate(model, vendor, "video", params, project_name)
+        return created
+
+    def _guard_poll_sync(self, lt: LibTVClient, task_id: str) -> Optional[dict]:
+        for _ in range(self.fresh_asset_guard_polls):
+            state = lt.poll_once(task_id, "video")
+            if state.get("status") in (2, 3):
+                return state
+            time.sleep(self.poll_interval)
+        return None
+
+    async def _guard_poll_async(self, lt: LibTVClient, task_id: str) -> Optional[dict]:
+        for _ in range(self.fresh_asset_guard_polls):
+            state = await lt.apoll_once(task_id, "video")
+            if state.get("status") in (2, 3):
+                return state
+            await asyncio.sleep(self.poll_interval)
+        return None
 
     def _video_status(self, video_id: str, state: dict) -> VideoObject:
         status = _LIBTV_STATUS.get(state.get("status"), "in_progress")
@@ -675,7 +752,11 @@ class LibTVLLM(CustomLLM):
                 [url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
-        created = lt.create(model, spec["vendor"], "video", params, _project_name(model))
+        created = (
+            self._create_frames_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
+            if wants_frames
+            else lt.create(model, spec["vendor"], "video", params, _project_name(model))
+        )
         return self._build_video_object(model, created, optional_params)
 
     @normalize_libtv_errors
@@ -741,5 +822,9 @@ class LibTVLLM(CustomLLM):
                 [await url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
-        created = await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
+        created = (
+            await self._acreate_frames_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
+            if wants_frames
+            else await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
+        )
         return self._build_video_object(model, created, optional_params)
