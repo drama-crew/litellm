@@ -2629,6 +2629,64 @@ async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monk
     assert init_body["fileSize"] == 11
 
 
+@pytest.mark.asyncio
+async def test_aupload_via_transfer_path_stable_across_presign_query_strings(monkeypatch):
+    pytest.importorskip("fakeredis")
+    from fakeredis import aioredis as fakeredis_aioredis
+
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)  # no heartbeat -> DirectTransfer fallback
+
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VID",
+        http_put=fake.put_bytes,
+        http_size_probe=lambda u: 3,
+        redis_client=redis,
+    )
+
+    await lt.aensure_libtv_url(
+        "url", "https://minio.internal/bucket/clip.mp4?X-Amz-Signature=abc&X-Amz-Expires=1", None, "reference.mp4"
+    )
+    await lt.aensure_libtv_url(
+        "url", "https://minio.internal/bucket/clip.mp4?X-Amz-Signature=zzz&X-Amz-Expires=999", None, "reference.mp4"
+    )
+
+    init_bodies = [c[2] for c in fake.calls if str(c[1]).endswith("/init/4")]
+    assert len(init_bodies) == 2
+    assert init_bodies[0]["path"] == init_bodies[1]["path"]
+
+
+@pytest.mark.asyncio
+async def test_aupload_via_transfer_different_object_path_produces_different_upload_path(monkeypatch):
+    pytest.importorskip("fakeredis")
+    from fakeredis import aioredis as fakeredis_aioredis
+
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
+
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_get=lambda u: b"VID",
+        http_put=fake.put_bytes,
+        http_size_probe=lambda u: 3,
+        redis_client=redis,
+    )
+
+    await lt.aensure_libtv_url("url", "https://minio.internal/bucket/clip.mp4?sig=abc", None, "reference.mp4")
+    await lt.aensure_libtv_url("url", "https://minio.internal/bucket2/clip.mp4?sig=abc", None, "reference.mp4")
+
+    init_bodies = [c[2] for c in fake.calls if str(c[1]).endswith("/init/4")]
+    assert len(init_bodies) == 2
+    assert init_bodies[0]["path"] != init_bodies[1]["path"]
+
+
 def _ranged_get_transport(status_code, headers):
     import httpx
 

@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -717,7 +718,12 @@ class LibTVClient:
         aupload_media, this never buffers the source bytes in this process itself --
         that only happens inside the chosen strategy."""
         user_uuid = await self.aresolve_user_uuid()
-        path = build_upload_path(user_uuid, hashlib.sha1(source_url.encode()).hexdigest(), filename)
+        # Object keys drama passes here are immutable uuid-addressed generation outputs;
+        # only the query string (presign signature/expiry) varies between requests for the
+        # same object, so hashing scheme+netloc+path (not the query) keeps the upload path
+        # -- and therefore the third_asset dedupe key -- stable across repeated presigns.
+        content_id = urlsplit(source_url)._replace(query="", fragment="").geturl()
+        path = build_upload_path(user_uuid, hashlib.sha1(content_id.encode()).hexdigest(), filename)
         init = self._check(
             await self.async_client.post(
                 url=self._bridge_url("init"),
