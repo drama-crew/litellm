@@ -22,6 +22,7 @@ from litellm.llms.libtv.client import (
 )
 from litellm.llms.libtv.common import (
     LibTVError,
+    build_bridge_headers,
     build_libtv_headers,
     build_upload_path,
     resolve_libtv_credentials,
@@ -175,6 +176,18 @@ def test_headers_carry_token_and_webid():
     assert h["webid"] == "wid"
     assert h["x-language"] == "zh"
     assert h["X-from-client"] == "cli"
+    # Pooled keep-alive connections to libtv hosts die during in-request idle
+    # gaps (fresh-asset-retry sleep, delegated-transfer wait); closing the
+    # connection after every call is the blanket fix for the instant-failure
+    # class this causes.
+    assert h["Connection"] == "close"
+
+
+def test_bridge_headers_carry_token_and_close_connection():
+    h = build_bridge_headers("tok")
+    assert h["Token"] == "tok"
+    assert h["X-from-client"] == "cli"
+    assert h["Connection"] == "close"
 
 
 def test_explicit_empty_credentials_fail_closed(monkeypatch):
