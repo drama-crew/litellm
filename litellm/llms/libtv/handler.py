@@ -286,11 +286,7 @@ def _is_topaz_upscale(spec: dict) -> bool:
 
 
 def _topaz_source_videos(optional_params: dict) -> list:
-    return (
-        _as_list(optional_params.get("video_references"))
-        + _as_list(optional_params.get("reference_videos"))
-        + _as_list(optional_params.get("input_reference"))
-    )
+    return _as_list(optional_params.get("video_references")) + _as_list(optional_params.get("input_reference"))
 
 
 def _default_video_mode(images: list, videos: list, audios: list) -> str:
@@ -790,7 +786,7 @@ class LibTVLLM(CustomLLM):
                 lt.ensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["video"]) for r in source_videos
             ]
             created = lt.create(model, spec["vendor"], "video", params, _project_name(model))
-            return self._build_video_object(model, created, optional_params)
+            return self._build_video_object(model, created, {**optional_params, "resolution": params["resolution"]})
         images, videos, audios = _collect_reference_groups(optional_params)
         _guard_reference_intent(model, optional_params, images, videos, audios)
         auto_compliance = _auto_compliance_enabled(spec)
@@ -895,7 +891,7 @@ class LibTVLLM(CustomLLM):
                 await lt.aensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["video"]) for r in source_videos
             ]
             created = await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
-            return self._build_video_object(model, created, optional_params)
+            return self._build_video_object(model, created, {**optional_params, "resolution": params["resolution"]})
         images, videos, audios = _collect_reference_groups(optional_params)
         _guard_reference_intent(model, optional_params, images, videos, audios)
         auto_compliance = _auto_compliance_enabled(spec)

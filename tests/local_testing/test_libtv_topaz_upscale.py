@@ -192,6 +192,44 @@ def test_video_generation_topaz_upscale_missing_source_video_raises_bad_request(
         )
 
 
+def test_video_generation_topaz_upscale_omitted_resolution_bills_at_1080p_default():
+    # regression: build_topaz_upscale_params defaults resolution to 1080p internally, but
+    # the usage/cost path reads optional_params directly. If that default doesn't reach
+    # usage.video_resolution, the tiered-only deployment (no plain output_cost_per_second)
+    # bills $0. video_resolution must be the same 1080p default the payload used.
+    fake = FakeSyncClient(post_by_path=_CREATE_ROUTES, get_payload=_topaz_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "topaz-video-upscaler",
+        "upscale this",
+        "tok",
+        None,
+        {"webid": "w", "video_references": _TOPAZ_SOURCE_URL, "seconds": "5"},
+        None,
+        client=fake,
+    )
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["resolution"] == "1080p"
+    assert vo.usage is not None
+    assert vo.usage["video_resolution"] == "1080p"
+
+
+def test_video_generation_topaz_upscale_explicit_resolution_reaches_usage():
+    fake = FakeSyncClient(post_by_path=_CREATE_ROUTES, get_payload=_topaz_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "topaz-video-upscaler",
+        "upscale this",
+        "tok",
+        None,
+        {"webid": "w", "video_references": _TOPAZ_SOURCE_URL, "resolution": "4K", "seconds": "5"},
+        None,
+        client=fake,
+    )
+    assert vo.usage is not None
+    assert vo.usage["video_resolution"] == "4K"
+
+
 @pytest.mark.asyncio
 async def test_avideo_generation_topaz_upscale_sets_no_mode_type_and_uploads_source_video():
     fake = FakeAsyncClient(post_by_path=_CREATE_ROUTES, get_payload=_topaz_tool_spec_payload())
