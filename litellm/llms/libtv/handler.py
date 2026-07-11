@@ -347,7 +347,7 @@ class LibTVLLM(CustomLLM):
         http_get=None,
         http_put=None,
         fresh_asset_retry_attempts: int = 5,
-        fresh_asset_retry_wait: float = 75.0,
+        fresh_asset_retry_wait: float = 60.0,
         fresh_asset_guard_polls: int = 10,
     ):
         super().__init__()
