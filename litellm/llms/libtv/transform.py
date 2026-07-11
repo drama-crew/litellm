@@ -123,6 +123,55 @@ def _candidate_value(
     return None
 
 
+_TOPAZ_RESOLUTIONS = ("1080p", "2K", "4K")
+_TOPAZ_SPECIFIED_MODELS = ("apo-8", "prob-4")
+_TOPAZ_FPS = (24, 30, 60, 90, 120)
+_TOPAZ_SLOWMO = ("1", "2", "3", "5")
+
+
+def build_topaz_upscale_params(prompt: str, optional_params: Dict[str, Any]) -> Dict[str, Any]:
+    """topaz-video-upscaler has a single generateType and no modeType in its schema, so
+    unlike build_generation_params this never sets "modeType" on the returned params -
+    the vendor rejects a payload that carries one. Settings are flattened onto the
+    params top-level, mirroring how build_generation_params flattens per-mode settings."""
+    op = dict(optional_params or {})
+
+    resolution = op.get("resolution")
+    if resolution not in _TOPAZ_RESOLUTIONS:
+        resolution = "1080p"
+
+    specified_model = op.get("specifiedModel")
+    if specified_model not in _TOPAZ_SPECIFIED_MODELS:
+        specified_model = "prob-4"
+
+    slowmo = str(op.get("slowmo")) if op.get("slowmo") is not None else None
+    if slowmo not in _TOPAZ_SLOWMO:
+        slowmo = "1"
+
+    params: Dict[str, Any] = {
+        "prompt": prompt,
+        "count": 1,
+        "textList": [],
+        "imageList": [],
+        "videoList": [],
+        "audioList": [],
+        "resolution": resolution,
+        "specifiedModel": specified_model,
+        "slowmo": slowmo,
+    }
+
+    if specified_model != "prob-4":
+        try:
+            fps = int(op.get("fps"))
+        except (TypeError, ValueError):
+            fps = None
+        if fps not in _TOPAZ_FPS:
+            fps = 30
+        params["fps"] = fps
+
+    return params
+
+
 def build_generation_params(
     prompt: str,
     optional_params: Dict[str, Any],

@@ -70,7 +70,9 @@ _REFERENCE_KEYS = (
 
 from .client import LibTVClient
 from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
-from .transform import _resolution_from_size, build_generation_params
+from .transform import _resolution_from_size, build_generation_params, build_topaz_upscale_params
+
+_TOPAZ_VENDOR = "topazlabs"
 
 # libtv progress status -> OpenAI-style video status. Non-terminal codes keep the
 # client polling; the app treats completed as done and failed as a terminal error.
@@ -274,6 +276,20 @@ def _log_reference_collection(
         len(videos),
         len(audios),
         branch,
+    )
+
+
+def _is_topaz_upscale(spec: dict) -> bool:
+    # topaz-video-upscaler has a single generateType and no modeType in its vendor
+    # schema; the mode-inference/modeType-injection machinery below must not touch it.
+    return spec.get("vendor") == _TOPAZ_VENDOR
+
+
+def _topaz_source_videos(optional_params: dict) -> list:
+    return (
+        _as_list(optional_params.get("video_references"))
+        + _as_list(optional_params.get("reference_videos"))
+        + _as_list(optional_params.get("input_reference"))
     )
 
 
@@ -761,6 +777,20 @@ class LibTVLLM(CustomLLM):
     ) -> VideoObject:
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
+        if _is_topaz_upscale(spec):
+            source_videos = _topaz_source_videos(optional_params)
+            if not source_videos:
+                raise LibTVError(
+                    status_code=400,
+                    message=f"libtv video_generation model={model}: topaz-video-upscaler requires "
+                    "video_references or input_reference",
+                )
+            params = build_topaz_upscale_params(prompt, optional_params)
+            params["videoList"] = [
+                lt.ensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["video"]) for r in source_videos
+            ]
+            created = lt.create(model, spec["vendor"], "video", params, _project_name(model))
+            return self._build_video_object(model, created, optional_params)
         images, videos, audios = _collect_reference_groups(optional_params)
         _guard_reference_intent(model, optional_params, images, videos, audios)
         auto_compliance = _auto_compliance_enabled(spec)
@@ -852,6 +882,20 @@ class LibTVLLM(CustomLLM):
     ) -> VideoObject:
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
+        if _is_topaz_upscale(spec):
+            source_videos = _topaz_source_videos(optional_params)
+            if not source_videos:
+                raise LibTVError(
+                    status_code=400,
+                    message=f"libtv video_generation model={model}: topaz-video-upscaler requires "
+                    "video_references or input_reference",
+                )
+            params = build_topaz_upscale_params(prompt, optional_params)
+            params["videoList"] = [
+                await lt.aensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["video"]) for r in source_videos
+            ]
+            created = await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
+            return self._build_video_object(model, created, optional_params)
         images, videos, audios = _collect_reference_groups(optional_params)
         _guard_reference_intent(model, optional_params, images, videos, audios)
         auto_compliance = _auto_compliance_enabled(spec)
