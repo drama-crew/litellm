@@ -91,6 +91,11 @@ def resolve_libtv_credentials(token: Optional[str] = None, webid: Optional[str] 
     return resolved_token, resolved_webid
 
 
+# Long in-request idle gaps (the fresh-asset-retry sleep, the delegated-transfer
+# wait) let a pooled keep-alive connection to these hosts die mid-request; the
+# next call on it then fails instantly. "Connection: close" is the blanket fix
+# (one extra handshake per call); the handler re-dial wrappers stay as
+# defense-in-depth for whatever this doesn't cover.
 def build_libtv_headers(token: str, webid: str) -> dict:
     return {
         "token": token,
@@ -99,11 +104,12 @@ def build_libtv_headers(token: str, webid: str) -> dict:
         "X-Log-ID": str(uuid.uuid4()),
         "X-from-client": "cli",
         "Content-Type": "application/json",
+        "Connection": "close",
     }
 
 
 def build_bridge_headers(token: str) -> dict:
-    return {"Token": token, "Content-Type": "application/json", "X-from-client": "cli"}
+    return {"Token": token, "Content-Type": "application/json", "X-from-client": "cli", "Connection": "close"}
 
 
 def build_upload_path(user_uuid: str, sha1_hex: str, filename: str) -> str:
