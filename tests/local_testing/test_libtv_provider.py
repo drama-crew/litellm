@@ -136,7 +136,10 @@ class FakeSyncClient:
         path = self._path(url)
         self.calls.append((path, json))
         queue = self.post_by_path[path]
-        return FakeResponse(queue.pop(0) if isinstance(queue, list) else queue)
+        item = queue.pop(0) if isinstance(queue, list) else queue
+        if isinstance(item, BaseException):
+            raise item
+        return FakeResponse(item)
 
     def get(self, url, headers=None, timeout=None, params=None):
         self.calls.append((self._path(url), None))
@@ -156,7 +159,10 @@ class FakeAsyncClient:
         path = self._path(url)
         self.calls.append((path, json))
         queue = self.post_by_path[path]
-        return FakeResponse(queue.pop(0) if isinstance(queue, list) else queue)
+        item = queue.pop(0) if isinstance(queue, list) else queue
+        if isinstance(item, BaseException):
+            raise item
+        return FakeResponse(item)
 
     async def get(self, url, headers=None, params=None):
         self.calls.append((self._path(url), None))
@@ -2355,6 +2361,65 @@ async def test_image2video_fresh_asset_fast_fail_retries_create_async():
     assert creates[0]["params"]["modeType"] == "image2video"
     assert creates[0]["params"]["imageList"] == creates[1]["params"]["imageList"] == ["asset://asset-ONE"]
     assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+def test_frames2video_retry_create_recovers_from_stale_connection_instant_timeout():
+    import httpx
+
+    routes = _fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING])
+    routes["/api/canvas/project/create"] = [
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        httpx.ConnectTimeout("stale pooled connection"),
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+    ]
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    vo = _frames2video_call(_fresh_retry_llm(), fake)
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+@pytest.mark.asyncio
+async def test_frames2video_aretry_create_recovers_from_stale_connection_instant_timeout():
+    import httpx
+
+    routes = _fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING])
+    routes["/api/canvas/project/create"] = [
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        httpx.ConnectTimeout("stale pooled connection"),
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+    ]
+    fake = FakeAsyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    vo = await _fresh_retry_llm().avideo_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+def test_frames2video_retry_create_gives_up_after_two_consecutive_connect_failures():
+    import httpx
+
+    routes = _fresh_retry_routes(["t1"], [_AGING_FAIL])
+    routes["/api/canvas/project/create"] = [
+        {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        httpx.ConnectTimeout("stale pooled connection"),
+        httpx.ConnectTimeout("dead again"),
+    ]
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
+    with pytest.raises(httpx.ConnectTimeout):
+        _frames2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1  # only the pre-retry create ever reached generation/create
 
 
 def test_mixed2video_submit_does_not_guard_poll():
