@@ -10,6 +10,7 @@ from litellm.llms.wavespeed.audio.transformation import (
 )
 from litellm.llms.wavespeed.videos.transformation import WaveSpeedVideoConfig
 from litellm.types.router import GenericLiteLLMParams
+from litellm.videos.utils import VideoGenerationRequestUtils
 
 _BASE = "https://api.wavespeed.ai/api/v3"
 _PARAMS = GenericLiteLLMParams(api_key="test-key")
@@ -112,10 +113,11 @@ def test_voice_design_submit_hits_correct_path() -> None:
 
 
 def test_music_2_6_carries_prompt_and_lyrics() -> None:
+    # Params arrive pre-flattened (extra_body already merged by get_optional_params_video_generation)
     data, _files, _url = _submit(
         "minimax/music-2.6",
         "A happy pop song",
-        extra={"extra_body": {"lyrics": "la la la\noh yeah"}},
+        extra={"lyrics": "la la la\noh yeah"},
     )
     assert data["prompt"] == "A happy pop song"
     assert data["lyrics"] == "la la la\noh yeah"
@@ -130,14 +132,13 @@ def test_music_2_6_no_video_params_injected() -> None:
 
 
 def test_voice_clone_carries_audio_and_custom_voice_id() -> None:
+    # Params arrive pre-flattened (extra_body already merged by get_optional_params_video_generation)
     data, _files, _url = _submit(
         "minimax/voice-clone",
         "Preview sentence",
         extra={
-            "extra_body": {
-                "audio": "https://cdn.example.com/sample.mp3",
-                "custom_voice_id": "drama_org1_abc123xyz456",
-            }
+            "audio": "https://cdn.example.com/sample.mp3",
+            "custom_voice_id": "drama_org1_abc123xyz456",
         },
     )
     assert data["audio"] == "https://cdn.example.com/sample.mp3"
@@ -146,14 +147,13 @@ def test_voice_clone_carries_audio_and_custom_voice_id() -> None:
 
 
 def test_voice_design_carries_prompt_and_custom_voice_id() -> None:
+    # Params arrive pre-flattened (extra_body already merged by get_optional_params_video_generation)
     data, _files, _url = _submit(
         "minimax/voice-design",
         "A warm, gentle female voice",
         extra={
-            "extra_body": {
-                "custom_voice_id": "drama_org1_xyz789abc012",
-                "text": "Hello, this is a preview.",
-            }
+            "custom_voice_id": "drama_org1_xyz789abc012",
+            "text": "Hello, this is a preview.",
         },
     )
     assert data["prompt"] == "A warm, gentle female voice"
@@ -343,3 +343,120 @@ def test_audio_model_pricing_entry_exists_with_correct_cost(model: str, expected
     assert entry["litellm_provider"] == "wavespeed"
     assert entry["mode"] == "video_generation"
     assert entry["output_cost_per_video_per_second"] == pytest.approx(expected_cost)
+
+
+# ---------------------------------------------------------------------------
+# Full-path regression tests (stage 0-1 flattening → transform)
+# These drive the REAL call chain:
+#   VideoGenerationRequestUtils.get_optional_params_video_generation
+#   → transform_video_create_request
+# to ensure audio params survive the extra_body flattening stage and reach the wire.
+# ---------------------------------------------------------------------------
+
+
+def _full_path_submit(
+    model: str,
+    prompt: str = "test",
+    raw_params: dict | None = None,
+) -> tuple[dict, list, str]:
+    """Drive the same chain litellm uses on the real /v1/videos path."""
+    config = WaveSpeedAudioConfig()
+    from litellm.types.videos.main import VideoCreateOptionalRequestParams
+
+    optional_params = VideoGenerationRequestUtils.get_optional_params_video_generation(
+        model=model,
+        video_generation_provider_config=config,
+        video_generation_optional_params=VideoCreateOptionalRequestParams(**(raw_params or {})),
+    )
+    return config.transform_video_create_request(
+        model=model,
+        prompt=prompt,
+        api_base=_BASE,
+        video_create_optional_request_params=optional_params,
+        litellm_params=_PARAMS,
+        headers={},
+    )
+
+
+def test_fullpath_music_2_6_lyrics_reaches_wire() -> None:
+    data, _files, _url = _full_path_submit(
+        "minimax/music-2.6",
+        "A happy pop song",
+        raw_params={"extra_body": {"lyrics": "la la la\noh yeah"}},
+    )
+    assert data["prompt"] == "A happy pop song", "prompt missing"
+    assert data.get("lyrics") == "la la la\noh yeah", (
+        "lyrics dropped on real /v1/videos path; extra_body was double-mapped"
+    )
+
+
+def test_fullpath_voice_clone_audio_and_custom_voice_id_reach_wire() -> None:
+    data, _files, _url = _full_path_submit(
+        "minimax/voice-clone",
+        "Preview sentence",
+        raw_params={
+            "extra_body": {
+                "audio": "https://cdn.example.com/sample.mp3",
+                "custom_voice_id": "drama_org1_abc123xyz456",
+            }
+        },
+    )
+    assert data.get("audio") == "https://cdn.example.com/sample.mp3", "audio field dropped"
+    assert data.get("custom_voice_id") == "drama_org1_abc123xyz456", "custom_voice_id dropped"
+
+
+def test_fullpath_voice_design_text_field_reaches_wire() -> None:
+    data, _files, _url = _full_path_submit(
+        "minimax/voice-design",
+        "Warm gentle voice",
+        raw_params={
+            "extra_body": {
+                "custom_voice_id": "drama_org1_xyz789abc012",
+                "text": "Hello, this is a preview.",
+            }
+        },
+    )
+    assert data.get("text") == "Hello, this is a preview.", "text field dropped"
+    assert data.get("custom_voice_id") == "drama_org1_xyz789abc012", "custom_voice_id dropped"
+
+
+def test_fullpath_no_video_params_leak_for_music_model() -> None:
+    data, _files, _url = _full_path_submit("minimax/music-2.6", "happy pop")
+    for forbidden in ("duration", "duration_seconds", "resolution", "aspect_ratio"):
+        assert forbidden not in data, f"video param {forbidden!r} leaked into audio wire body"
+
+
+def test_fullpath_reference_videos_become_video_field() -> None:
+    data, _files, _url = _full_path_submit(
+        "mirelo-ai/sfx-1.6/video-to-video",
+        "Add dramatic music",
+        raw_params={"reference_videos": ["https://cdn.example.com/clip.mp4"]},
+    )
+    assert data.get("video") == "https://cdn.example.com/clip.mp4", "reference_videos not mapped to video"
+    assert "reference_videos" not in data
+
+
+def test_fullpath_reference_audios_become_audio_field() -> None:
+    data, _files, _url = _full_path_submit(
+        "minimax/voice-clone",
+        "Clone this voice",
+        raw_params={"reference_audios": ["https://cdn.example.com/sample.mp3"]},
+    )
+    assert data.get("audio") == "https://cdn.example.com/sample.mp3", (
+        "reference_audios[0] should be routed to audio field for voice-clone"
+    )
+    assert "reference_audios" not in data, "reference_audios should not appear on wire"
+
+
+def test_fullpath_explicit_audio_param_wins_over_reference_audios() -> None:
+    data, _files, _url = _full_path_submit(
+        "minimax/voice-clone",
+        "Clone this voice",
+        raw_params={
+            "reference_audios": ["https://cdn.example.com/fallback.mp3"],
+            "extra_body": {"audio": "https://cdn.example.com/explicit.mp3"},
+        },
+    )
+    assert data.get("audio") == "https://cdn.example.com/explicit.mp3", (
+        "explicit audio param in extra_body should override reference_audios[0]"
+    )

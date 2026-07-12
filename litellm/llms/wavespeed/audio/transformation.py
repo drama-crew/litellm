@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import httpx
 from httpx._types import RequestFiles
@@ -26,7 +26,6 @@ _AUDIO_MODELS: frozenset[str] = frozenset(
 
 
 def _strip_provider_prefix(model: str) -> str:
-    """Remove leading 'wavespeed/' prefix if present."""
     if model.startswith("wavespeed/"):
         return model[len("wavespeed/"):]
     return model
@@ -42,23 +41,26 @@ class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
         no image-to-video/text-to-video discrimination).
       - No video-specific params are injected (duration, resolution, aspect_ratio).
       - All caller params in extra_body are forwarded to the wire unchanged.
+      - reference_audios[0] is routed to the wire `audio` field (for data-URL
+        upload hosting via the base class _media_list_keys machinery); an explicit
+        `audio` param always wins.
     """
 
     def map_openai_params(
         self,
-        video_create_optional_params: Dict[str, Any],
+        video_create_optional_params: dict[str, Any],
         model: str,
         drop_params: bool,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         params = video_create_optional_params
-        mapped: Dict[str, Any] = {}
-        if params.get("reference_audios"):
-            mapped["reference_audios"] = list(params["reference_audios"])
-        if params.get("reference_videos"):
-            mapped["reference_videos"] = list(params["reference_videos"])
+        reference_audios = params.get("reference_audios")
+        reference_videos = params.get("reference_videos")
         extra_body = params.get("extra_body") or {}
-        if isinstance(extra_body, dict):
-            mapped.update(extra_body)
+        mapped: dict[str, Any] = dict(extra_body) if isinstance(extra_body, dict) else {}
+        if reference_audios:
+            mapped["reference_audios"] = list(reference_audios)
+        if reference_videos:
+            mapped["reference_videos"] = list(reference_videos)
         return mapped
 
     def transform_video_create_request(
@@ -66,22 +68,28 @@ class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
         model: str,
         prompt: str,
         api_base: str,
-        video_create_optional_request_params: Dict[str, Any],
+        video_create_optional_request_params: dict[str, Any],
         litellm_params: GenericLiteLLMParams,
         headers: dict,
-    ) -> Tuple[Dict[str, Any], RequestFiles, str]:
-        params = self.map_openai_params(video_create_optional_request_params, model, drop_params=False)
-        data: Dict[str, Any] = {"prompt": prompt, **params}
+    ) -> Tuple[dict[str, Any], RequestFiles, str]:
+        # video_create_optional_request_params is already mapped and flattened by
+        # VideoGenerationRequestUtils.get_optional_params_video_generation (which ran
+        # map_openai_params and merged+popped extra_body). Do NOT re-map here or
+        # audio-specific fields (lyrics, audio, custom_voice_id, text, …) get dropped.
+        params = dict(video_create_optional_request_params)
 
-        # reference_videos is not a WaveSpeed wire field; pop and expose as `video`
-        # for video-to-audio models (e.g. mirelo sfx video-to-video).
-        reference_videos = data.pop("reference_videos", None)
+        # reference_videos → `video` scalar (for video-to-audio SFX models).
+        reference_videos = params.pop("reference_videos", None)
+        # reference_audios → `audio` scalar, unless caller already supplied `audio` explicitly.
+        reference_audios = params.pop("reference_audios", None)
+
+        data: dict[str, Any] = {"prompt": prompt, **params}
+
         if reference_videos:
             data["video"] = reference_videos[0]
 
-        # reference_audios is similarly not a standard WaveSpeed audio wire field;
-        # for voice-clone the caller provides `audio` directly via extra_body.
-        data.pop("reference_audios", None)
+        if reference_audios and not data.get("audio"):
+            data["audio"] = reference_audios[0]
 
         model_path = _strip_provider_prefix(model)
         url = f"{api_base.rstrip('/')}/{model_path}"
@@ -94,7 +102,7 @@ class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
         raw_response: httpx.Response,
         logging_obj: Any,
         custom_llm_provider: Optional[str] = None,
-        request_data: Optional[Dict[str, Any]] = None,
+        request_data: Optional[dict[str, Any]] = None,
     ) -> VideoObject:
         payload = raw_response.json()
         task_id = self._task_id(payload)
