@@ -8636,6 +8636,13 @@ class ProviderConfigManager:
 
             return RunwayMLVideoConfig()
         elif LlmProviders.WAVESPEED == provider:
+            from litellm.llms.wavespeed.audio.transformation import (
+                WaveSpeedAudioConfig,
+                is_wavespeed_audio_model,
+            )
+
+            if model is not None and is_wavespeed_audio_model(model):
+                return WaveSpeedAudioConfig()
             from litellm.llms.wavespeed.videos.transformation import (
                 WaveSpeedVideoConfig,
             )

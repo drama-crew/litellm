@@ -38962,6 +38962,95 @@
             "1920x1080"
         ]
     },
+    "wavespeed/minimax/music-2.6": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.15,
+        "supported_modalities": [
+            "text"
+        ],
+        "supported_output_modalities": [
+            "audio"
+        ]
+    },
+    "wavespeed/elevenlabs/music": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.083,
+        "supported_modalities": [
+            "text"
+        ],
+        "supported_output_modalities": [
+            "audio"
+        ]
+    },
+    "wavespeed/mureka-ai/mureka-v8/generate-song": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.045,
+        "supported_modalities": [
+            "text"
+        ],
+        "supported_output_modalities": [
+            "audio"
+        ]
+    },
+    "wavespeed/mirelo-ai/sfx-1.6/text-to-audio": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.01,
+        "supported_modalities": [
+            "text"
+        ],
+        "supported_output_modalities": [
+            "audio"
+        ]
+    },
+    "wavespeed/mirelo-ai/sfx-1.6/video-to-video": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.01,
+        "supported_modalities": [
+            "text",
+            "video"
+        ],
+        "supported_output_modalities": [
+            "audio"
+        ]
+    },
+    "wavespeed/kwaivgi/kling-text-to-audio": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.035,
+        "supported_modalities": [
+            "text"
+        ],
+        "supported_output_modalities": [
+            "audio"
+        ]
+    },
+    "wavespeed/minimax/voice-clone": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.5,
+        "supported_modalities": [
+            "audio"
+        ],
+        "supported_output_modalities": [
+            "audio"
+        ]
+    },
+    "wavespeed/minimax/voice-design": {
+        "litellm_provider": "wavespeed",
+        "mode": "video_generation",
+        "output_cost_per_video_per_second": 0.5,
+        "supported_modalities": [
+            "text"
+        ],
+        "supported_output_modalities": [
+            "audio"
+        ]
+    },
     "runwayml/gen4_turbo": {
         "litellm_provider": "runwayml",
         "mode": "video_generation",
