@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 import time
 from functools import wraps
 from inspect import iscoroutinefunction
@@ -149,8 +150,14 @@ def _decode_task_id(video_id: str) -> str:
     return task_id
 
 
+_PROJECT_NAME_POOL = ("我的项目", "未命名项目", "新建项目", "创意工坊", "日常创作")
+
+
 def _project_name(model: str) -> str:
-    return f"litellm-{model}-{int(time.time())}"
+    override = os.getenv("LIBTV_PROJECT_NAME")
+    if override:
+        return override
+    return random.choice(_PROJECT_NAME_POOL)
 
 
 def _video_usage(optional_params: dict) -> Optional[dict]:

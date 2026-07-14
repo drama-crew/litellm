@@ -32,11 +32,13 @@ from litellm.llms.libtv.persistence import account_key, normalize_source_key
 from litellm.llms.libtv.handler import (
     LIBTV_PROVIDER,
     LibTVLLM,
+    _PROJECT_NAME_POOL,
     _collect_reference_groups,
     _default_video_mode,
     _image_clarity_response_cost,
     _infer_image_mode,
     _infer_video_mode,
+    _project_name,
     _raise_normalized_libtv_error,
     _reference_payload,
 )
@@ -313,6 +315,24 @@ def test_video_id_prefers_exact_deployment_id():
     )
     decoded = decode_video_id_with_provider(video.id)
     assert decoded["model_id"] == "libtv-seedance-2-standard-account-2"
+
+
+def test_project_name_default_leaks_neither_litellm_nor_model_nor_digits(monkeypatch):
+    monkeypatch.delenv("LIBTV_PROJECT_NAME", raising=False)
+    name = _project_name("libtv-seedance-2-standard-account-2")
+    assert "litellm" not in name
+    assert "libtv-seedance-2-standard-account-2" not in name
+    assert not any(char.isdigit() for char in name)
+
+
+def test_project_name_default_comes_from_pool(monkeypatch):
+    monkeypatch.delenv("LIBTV_PROJECT_NAME", raising=False)
+    assert _project_name("any-model") in _PROJECT_NAME_POOL
+
+
+def test_project_name_env_override_wins(monkeypatch):
+    monkeypatch.setenv("LIBTV_PROJECT_NAME", "自定义名称")
+    assert _project_name("any-model") == "自定义名称"
 
 
 def test_size_to_ratio():
