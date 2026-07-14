@@ -1,3 +1,4 @@
+import hashlib
 import json
 
 import pytest
@@ -27,6 +28,7 @@ from litellm.llms.libtv.common import (
     build_upload_path,
     resolve_libtv_credentials,
 )
+from litellm.llms.libtv.persistence import account_key, normalize_source_key
 from litellm.llms.libtv.handler import (
     LIBTV_PROVIDER,
     LibTVLLM,
@@ -2851,6 +2853,244 @@ async def test_aensure_libtv_url_delegated_mode_falls_back_to_direct_without_wor
     out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
     assert out == "https://libtv-res/uploaded.png"
     assert ("PUT", "https://oss/put/1", 3, None) in fake.calls  # DirectTransfer fallback ran in-process
+
+
+class FakePersistence:
+    def __init__(self, cached=None):
+        self.cached = cached
+        self.cached_upload_calls = []
+        self.store_upload_calls = []
+        self.delete_upload_calls = []
+
+    async def cached_upload(self, account_key, source_key):
+        self.cached_upload_calls.append((account_key, source_key))
+        return self.cached
+
+    async def store_upload(self, account_key, source_key, cdn_url, size_bytes):
+        self.store_upload_calls.append((account_key, source_key, cdn_url, size_bytes))
+
+    async def delete_upload(self, account_key, source_key):
+        self.delete_upload_calls.append((account_key, source_key))
+
+
+class RaisingPersistence:
+    async def cached_upload(self, account_key, source_key):
+        raise RuntimeError("boom")
+
+    async def store_upload(self, account_key, source_key, cdn_url, size_bytes):
+        raise RuntimeError("boom")
+
+    async def delete_upload(self, account_key, source_key):
+        raise RuntimeError("boom")
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_cache_hit_alive_returns_cached_url_without_upload(monkeypatch):
+    async def fake_alive(url, timeout=5.0):
+        return True
+
+    monkeypatch.setattr("litellm.llms.libtv.client.url_alive", fake_alive)
+
+    persistence = FakePersistence(cached="https://libtv-res/cached.png")
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_put=fake.put_bytes,
+        http_get=lambda u: b"VID",
+        persistence=persistence,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+
+    assert out == "https://libtv-res/cached.png"
+    assert fake.calls == []  # zero upload calls: no getUserInfo/init/put/complete
+    assert len(persistence.cached_upload_calls) == 1
+    assert persistence.store_upload_calls == []
+    assert persistence.delete_upload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_cache_hit_alive_skips_size_probe_in_delegated_mode(monkeypatch):
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+
+    async def fake_alive(url, timeout=5.0):
+        return True
+
+    monkeypatch.setattr("litellm.llms.libtv.client.url_alive", fake_alive)
+
+    probe_calls = []
+
+    def http_size_probe(url):
+        probe_calls.append(url)
+        return 11
+
+    persistence = FakePersistence(cached="https://libtv-res/cached.png")
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_put=fake.put_bytes,
+        http_get=lambda u: b"VID",
+        http_size_probe=http_size_probe,
+        persistence=persistence,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+
+    assert out == "https://libtv-res/cached.png"
+    assert probe_calls == []
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_cache_hit_dead_deletes_and_reuploads(monkeypatch):
+    async def fake_alive(url, timeout=5.0):
+        return False
+
+    monkeypatch.setattr("litellm.llms.libtv.client.url_alive", fake_alive)
+
+    persistence = FakePersistence(cached="https://libtv-res/stale.png")
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_put=fake.put_bytes,
+        http_get=lambda u: b"VID",
+        persistence=persistence,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+
+    assert out == "https://libtv-res/uploaded.png"  # fresh upload result, not the stale cached url
+    assert len(persistence.delete_upload_calls) == 1
+    assert any(m == "POST" and str(u).endswith("/init/4") for m, u, *_ in fake.calls)  # upload actually ran
+    assert len(persistence.store_upload_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_cache_miss_uploads_and_stores():
+    persistence = FakePersistence(cached=None)
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_put=fake.put_bytes,
+        http_get=lambda u: b"VIDBYTES",
+        persistence=persistence,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+
+    assert out == "https://libtv-res/uploaded.png"
+    assert len(persistence.store_upload_calls) == 1
+    account_key_arg, source_key_arg, cdn_url_arg, size_bytes_arg = persistence.store_upload_calls[0]
+    assert account_key_arg == account_key("t")
+    assert source_key_arg == normalize_source_key("url", _EXT_VIDEO, None)
+    assert cdn_url_arg == "https://libtv-res/uploaded.png"
+    assert size_bytes_arg == len(b"VIDBYTES")
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_cache_disabled_env_never_consults_persistence(monkeypatch):
+    monkeypatch.setenv("LIBTV_UPLOAD_CACHE_DISABLED", "1")
+
+    persistence = FakePersistence(cached="https://libtv-res/cached.png")
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_put=fake.put_bytes,
+        http_get=lambda u: b"VID",
+        persistence=persistence,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+
+    assert out == "https://libtv-res/uploaded.png"  # fresh upload; cached url ignored entirely
+    assert persistence.cached_upload_calls == []
+    assert persistence.store_upload_calls == []
+    assert persistence.delete_upload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_passthrough_never_consults_cache():
+    persistence = FakePersistence(cached="https://libtv-res/should-not-be-used.png")
+    fake = AsyncUploadFake()
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence)
+    url = "https://libtv-res.liblib.art/upload-images/uid/abc.png"
+
+    out = await lt.aensure_libtv_url("url", url, None, "reference.png")
+
+    assert out == url
+    assert persistence.cached_upload_calls == []
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_bytes_input_cached_under_sha1_key():
+    persistence = FakePersistence(cached=None)
+    fake = AsyncUploadFake()
+    lt = LibTVClient(token="t", webid="w", async_client=fake, http_put=fake.put_bytes, persistence=persistence)
+    data = b"raw-bytes-content"
+
+    out = await lt.aensure_libtv_url("bytes", "my.png", data, "reference.png")
+
+    assert out == "https://libtv-res/uploaded.png"
+    assert len(persistence.cached_upload_calls) == 1
+    _, source_key_arg = persistence.cached_upload_calls[0]
+    expected_key = f"sha1:{hashlib.sha1(data).hexdigest()}"
+    assert source_key_arg == expected_key
+    assert len(persistence.store_upload_calls) == 1
+    _, stored_source_key, stored_cdn_url, stored_size = persistence.store_upload_calls[0]
+    assert stored_source_key == expected_key
+    assert stored_cdn_url == "https://libtv-res/uploaded.png"
+    assert stored_size == len(data)
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_cache_lookup_exception_falls_open_to_upload():
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_put=fake.put_bytes,
+        http_get=lambda u: b"VID",
+        persistence=RaisingPersistence(),
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+
+    assert out == "https://libtv-res/uploaded.png"
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_alive_check_exception_falls_open_to_reupload(monkeypatch):
+    async def raising_alive(url, timeout=5.0):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr("litellm.llms.libtv.client.url_alive", raising_alive)
+
+    persistence = FakePersistence(cached="https://libtv-res/stale.png")
+    fake = AsyncUploadFake()
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        async_client=fake,
+        http_put=fake.put_bytes,
+        http_get=lambda u: b"VID",
+        persistence=persistence,
+    )
+
+    out = await lt.aensure_libtv_url("url", _EXT_VIDEO, None, "reference.mp4")
+
+    assert out == "https://libtv-res/uploaded.png"
 
 
 @pytest.mark.asyncio

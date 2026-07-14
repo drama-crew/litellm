@@ -28,6 +28,7 @@ from .common import (
     build_upload_path,
     is_compliance_failure,
 )
+from .persistence import LibTVPersistence, account_key, get_persistence, normalize_source_key, url_alive
 from .transfer import PartTarget, build_transfer_strategy
 
 
@@ -302,6 +303,7 @@ class LibTVClient:
         http_put=None,
         http_size_probe=None,
         redis_client: Optional[Any] = None,
+        persistence: Optional["LibTVPersistence"] = None,
     ):
         self.token = token
         self.webid = webid
@@ -320,8 +322,13 @@ class LibTVClient:
         # Async redis client for the delegated media-transfer strategy (see transfer.py).
         # None disables delegation regardless of MEDIA_TRANSFER_MODE.
         self._redis_client = redis_client
+        self._persistence = persistence
+        self._account_key = account_key(token)
         self._tool_spec_cache: Optional[Dict[str, Dict[str, Any]]] = None
         self._user_uuid: Optional[str] = None
+
+    def _get_persistence(self) -> Optional["LibTVPersistence"]:
+        return self._persistence if self._persistence is not None else get_persistence()
 
     @property
     def headers(self) -> Dict[str, str]:
@@ -693,9 +700,66 @@ class LibTVClient:
     async def aensure_libtv_url(
         self, kind: str, url: str, data: Optional[bytes], default_name: str = "reference.png"
     ) -> str:
+        if kind == "url" and "libtv-res.liblib.art" in url:
+            return url
+        cache_target = self._resolve_cache_target(kind, url, data)
+        if cache_target is not None:
+            persistence, source_key = cache_target
+            cached_url = await self._cache_lookup(persistence, source_key)
+            if cached_url is not None:
+                return cached_url
+        cdn_url, size_bytes = await self._aensure_uploaded(kind, url, data, default_name)
+        if cache_target is not None:
+            persistence, source_key = cache_target
+            await self._cache_store(persistence, source_key, cdn_url, size_bytes)
+        return cdn_url
+
+    def _resolve_cache_target(
+        self, kind: str, url: str, data: Optional[bytes]
+    ) -> Optional[Tuple["LibTVPersistence", str]]:
+        if os.getenv("LIBTV_UPLOAD_CACHE_DISABLED") == "1":
+            return None
+        try:
+            persistence = self._get_persistence()
+            source_key = normalize_source_key(kind, url, data) if persistence is not None else None
+        except Exception:
+            logger.warning("libtv upload cache: persistence/source-key resolution failed", exc_info=True)
+            return None
+        if persistence is None or source_key is None:
+            return None
+        return persistence, source_key
+
+    async def _cache_lookup(self, persistence: "LibTVPersistence", source_key: str) -> Optional[str]:
+        try:
+            cdn_url = await persistence.cached_upload(self._account_key, source_key)
+        except Exception:
+            logger.warning("libtv upload cache: cached_upload failed", exc_info=True)
+            return None
+        if not cdn_url:
+            return None
+        try:
+            alive = await url_alive(cdn_url)
+        except Exception:
+            logger.warning("libtv upload cache: url_alive failed", exc_info=True)
+            alive = False
+        if alive:
+            return cdn_url
+        try:
+            await persistence.delete_upload(self._account_key, source_key)
+        except Exception:
+            logger.warning("libtv upload cache: delete_upload failed", exc_info=True)
+        return None
+
+    async def _cache_store(
+        self, persistence: "LibTVPersistence", source_key: str, cdn_url: str, size_bytes: int
+    ) -> None:
+        try:
+            await persistence.store_upload(self._account_key, source_key, cdn_url, size_bytes)
+        except Exception:
+            logger.warning("libtv upload cache: store_upload failed", exc_info=True)
+
+    async def _aensure_uploaded(self, kind: str, url: str, data: Optional[bytes], default_name: str) -> Tuple[str, int]:
         if kind == "url":
-            if "libtv-res.liblib.art" in url:
-                return url
             filename = _filename_from_url(url, default_name)
             if os.getenv("MEDIA_TRANSFER_MODE", "direct").lower() == "delegated":
                 try:
@@ -705,10 +769,14 @@ class LibTVClient:
                     # network fault): the delegated path needs the size up front, the
                     # legacy fetch+upload path does not.
                     logger.warning("libtv media size probe failed, using direct upload: %s", e)
-                    return await self.aupload_media(await self._afetch_bytes(url), filename)
-                return await self._aupload_via_transfer(url, filename, size)
-            return await self.aupload_media(await self._afetch_bytes(url), filename)
-        return await self.aupload_media(data or b"", url or default_name)
+                    fetched = await self._afetch_bytes(url)
+                    return await self.aupload_media(fetched, filename), len(fetched)
+                return await self._aupload_via_transfer(url, filename, size), size
+            fetched = await self._afetch_bytes(url)
+            return await self.aupload_media(fetched, filename), len(fetched)
+        uploaded_bytes = data or b""
+        cdn_url = await self.aupload_media(uploaded_bytes, url or default_name)
+        return cdn_url, len(uploaded_bytes)
 
     async def _aupload_via_transfer(self, source_url: str, filename: str, size: int) -> str:
         """Delegated-mode counterpart to aupload_media: open a bridge multipart upload
