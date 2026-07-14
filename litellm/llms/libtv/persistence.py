@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 from urllib.parse import urlsplit
 
 import httpx
@@ -64,6 +64,11 @@ def normalize_source_key(kind: str, url: Optional[str], data: Optional[bytes]) -
     return None
 
 
+class ProjectCacheEntry(TypedDict):
+    project_uuid: str
+    team_id: Optional[str]
+
+
 async def url_alive(url: str, timeout: float = 5.0) -> bool:
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -93,8 +98,8 @@ class LibTVPersistence:
             _warn("libtv persistence: failed to create tables", exc_info=True)
 
     async def cached_upload(self, account_key: str, source_key: str) -> Optional[str]:
-        await self.ensure_tables()
         try:
+            await self.ensure_tables()
             rows = await self.db.query_raw(
                 'SELECT cdn_url FROM "LiteLLM_LibTVUploadCache" WHERE account_key=$1 AND source_key=$2',
                 account_key,
@@ -117,8 +122,8 @@ class LibTVPersistence:
             return None
 
     async def store_upload(self, account_key: str, source_key: str, cdn_url: str, size_bytes: int) -> None:
-        await self.ensure_tables()
         try:
+            await self.ensure_tables()
             await self.db.execute_raw(
                 'INSERT INTO "LiteLLM_LibTVUploadCache" '
                 "(account_key, source_key, cdn_url, size_bytes) VALUES ($1, $2, $3, $4) "
@@ -133,8 +138,8 @@ class LibTVPersistence:
             _warn("libtv persistence: store_upload failed", exc_info=True)
 
     async def delete_upload(self, account_key: str, source_key: str) -> None:
-        await self.ensure_tables()
         try:
+            await self.ensure_tables()
             await self.db.execute_raw(
                 'DELETE FROM "LiteLLM_LibTVUploadCache" WHERE account_key=$1 AND source_key=$2',
                 account_key,
@@ -142,6 +147,47 @@ class LibTVPersistence:
             )
         except Exception:
             _warn("libtv persistence: delete_upload failed", exc_info=True)
+
+    async def cached_project(self, account_key: str, day: str) -> Optional[ProjectCacheEntry]:
+        try:
+            await self.ensure_tables()
+            rows = await self.db.query_raw(
+                'SELECT project_uuid, team_id FROM "LiteLLM_LibTVProjects" WHERE account_key=$1 AND day=$2',
+                account_key,
+                day,
+            )
+            if not rows:
+                return None
+            return {"project_uuid": rows[0]["project_uuid"], "team_id": rows[0]["team_id"]}
+        except Exception:
+            _warn("libtv persistence: cached_project failed", exc_info=True)
+            return None
+
+    async def store_project(self, account_key: str, day: str, project_uuid: str, team_id: Optional[str]) -> None:
+        try:
+            await self.ensure_tables()
+            await self.db.execute_raw(
+                'INSERT INTO "LiteLLM_LibTVProjects" '
+                "(account_key, day, project_uuid, team_id) VALUES ($1, $2, $3, $4) "
+                "ON CONFLICT (account_key, day) DO NOTHING",
+                account_key,
+                day,
+                project_uuid,
+                team_id,
+            )
+        except Exception:
+            _warn("libtv persistence: store_project failed", exc_info=True)
+
+    async def invalidate_project(self, account_key: str, day: str) -> None:
+        try:
+            await self.ensure_tables()
+            await self.db.execute_raw(
+                'DELETE FROM "LiteLLM_LibTVProjects" WHERE account_key=$1 AND day=$2',
+                account_key,
+                day,
+            )
+        except Exception:
+            _warn("libtv persistence: invalidate_project failed", exc_info=True)
 
 
 def get_persistence() -> Optional[LibTVPersistence]:

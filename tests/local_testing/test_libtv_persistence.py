@@ -177,6 +177,135 @@ async def test_delete_upload_execute_raw_raises_is_noop():
 
 
 @pytest.mark.asyncio
+async def test_cached_upload_miss_does_not_touch_last_used_at():
+    db = FakeDb(query_rows=[])
+    p = LibTVPersistence(db)
+
+    result = await p.cached_upload("acct1", "cdn.example.com/missing.png")
+
+    assert result is None
+    assert not any("UPDATE" in sql for sql, _ in db.execute_calls)
+
+
+@pytest.mark.asyncio
+async def test_ensure_tables_retries_after_failed_create():
+    db = FakeDb(raise_on="execute_raw")
+    p = LibTVPersistence(db)
+
+    await p.ensure_tables()
+    await p.ensure_tables()
+
+    assert len(db.execute_calls) == 2
+    assert persistence._tables_ready is False
+
+
+@pytest.mark.asyncio
+async def test_cached_project_hit_returns_project_uuid_and_team_id():
+    db = FakeDb(query_rows=[{"project_uuid": "proj-1", "team_id": "7"}])
+    p = LibTVPersistence(db)
+
+    result = await p.cached_project("acct1", "2026-07-15")
+
+    assert result == {"project_uuid": "proj-1", "team_id": "7"}
+    assert len(db.query_calls) == 1
+    select_sql, select_params = db.query_calls[0]
+    assert "SELECT" in select_sql
+    assert "LiteLLM_LibTVProjects" in select_sql
+    assert select_params == ("acct1", "2026-07-15")
+
+
+@pytest.mark.asyncio
+async def test_cached_project_hit_with_null_team_id():
+    db = FakeDb(query_rows=[{"project_uuid": "proj-1", "team_id": None}])
+    p = LibTVPersistence(db)
+
+    result = await p.cached_project("acct1", "2026-07-15")
+
+    assert result == {"project_uuid": "proj-1", "team_id": None}
+
+
+@pytest.mark.asyncio
+async def test_cached_project_miss_returns_none():
+    db = FakeDb(query_rows=[])
+    p = LibTVPersistence(db)
+
+    result = await p.cached_project("acct1", "2026-07-15")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cached_project_query_raw_raises_returns_none():
+    db = FakeDb(raise_on="query_raw")
+    p = LibTVPersistence(db)
+
+    result = await p.cached_project("acct1", "2026-07-15")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_store_project_inserts_with_do_nothing():
+    db = FakeDb()
+    p = LibTVPersistence(db)
+
+    await p.store_project("acct1", "2026-07-15", "proj-1", "7")
+
+    insert_calls = [c for c in db.execute_calls if "INSERT" in c[0]]
+    assert len(insert_calls) == 1
+    sql, params = insert_calls[0]
+    assert "LiteLLM_LibTVProjects" in sql
+    assert "ON CONFLICT" in sql
+    assert "DO NOTHING" in sql
+    assert params == ("acct1", "2026-07-15", "proj-1", "7")
+
+
+@pytest.mark.asyncio
+async def test_store_project_accepts_null_team_id():
+    db = FakeDb()
+    p = LibTVPersistence(db)
+
+    await p.store_project("acct1", "2026-07-15", "proj-1", None)
+
+    insert_calls = [c for c in db.execute_calls if "INSERT" in c[0]]
+    assert insert_calls[0][1] == ("acct1", "2026-07-15", "proj-1", None)
+
+
+@pytest.mark.asyncio
+async def test_store_project_execute_raw_raises_is_noop():
+    db = FakeDb(raise_on="execute_raw")
+    p = LibTVPersistence(db)
+
+    result = await p.store_project("acct1", "2026-07-15", "proj-1", "7")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_invalidate_project_deletes():
+    db = FakeDb()
+    p = LibTVPersistence(db)
+
+    await p.invalidate_project("acct1", "2026-07-15")
+
+    delete_calls = [c for c in db.execute_calls if "DELETE" in c[0]]
+    assert len(delete_calls) == 1
+    sql, params = delete_calls[0]
+    assert "LiteLLM_LibTVProjects" in sql
+    assert params == ("acct1", "2026-07-15")
+
+
+@pytest.mark.asyncio
+async def test_invalidate_project_execute_raw_raises_is_noop():
+    db = FakeDb(raise_on="execute_raw")
+    p = LibTVPersistence(db)
+
+    result = await p.invalidate_project("acct1", "2026-07-15")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
 async def test_ensure_tables_creates_both_tables_once():
     db = FakeDb()
     p = LibTVPersistence(db)

@@ -622,17 +622,28 @@ class LibTVClient:
         )
         return self._check(resp, step)
 
-    async def acreate(
+    async def _acreate_fresh_project(
         self,
+        project_name: str,
+        persistence: Optional["LibTVPersistence"] = None,
+        day: Optional[str] = None,
+    ) -> Tuple[str, Optional[int]]:
+        project = await self._apost("/api/canvas/project/create", {"name": project_name}, "project/create")
+        meta = parse_project(project)
+        project_uuid, team_id = meta["project_uuid"], meta["team_id"]
+        if persistence is not None and day is not None:
+            await self._project_cache_store(persistence, day, project_uuid, team_id)
+        return project_uuid, team_id
+
+    async def _acreate_nodes_and_generation(
+        self,
+        project_uuid: str,
+        team_id: Optional[int],
         model_key: str,
         vendor: str,
         task_type: str,
         params: Dict[str, Any],
-        project_name: str,
-    ) -> Dict[str, Any]:
-        project = await self._apost("/api/canvas/project/create", {"name": project_name}, "project/create")
-        meta = parse_project(project)
-        project_uuid, team_id = meta["project_uuid"], meta["team_id"]
+    ) -> Tuple[Dict[str, Any], str]:
         node_key = str(uuid.uuid4())
         await self._apost(
             "/api/canvas/nodes/batch",
@@ -644,6 +655,74 @@ class LibTVClient:
             build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
             "generation/create",
         )
+        return created, node_key
+
+    async def _project_cache_lookup(
+        self, persistence: "LibTVPersistence", day: str
+    ) -> Optional[Tuple[str, Optional[int]]]:
+        try:
+            meta = await persistence.cached_project(self._account_key, day)
+            if meta is None:
+                return None
+            team_id = meta.get("team_id")
+            return meta["project_uuid"], int(team_id) if team_id is not None else None
+        except Exception:
+            logger.warning("libtv project cache: cached_project failed", exc_info=True)
+            return None
+
+    async def _project_cache_store(
+        self, persistence: "LibTVPersistence", day: str, project_uuid: str, team_id: Optional[int]
+    ) -> None:
+        try:
+            await persistence.store_project(
+                self._account_key, day, project_uuid, str(team_id) if team_id is not None else None
+            )
+        except Exception:
+            logger.warning("libtv project cache: store_project failed", exc_info=True)
+
+    async def _project_cache_invalidate(self, persistence: "LibTVPersistence", day: str) -> None:
+        try:
+            await persistence.invalidate_project(self._account_key, day)
+        except Exception:
+            logger.warning("libtv project cache: invalidate_project failed", exc_info=True)
+
+    async def acreate(
+        self,
+        model_key: str,
+        vendor: str,
+        task_type: str,
+        params: Dict[str, Any],
+        project_name: str,
+    ) -> Dict[str, Any]:
+        persistence = self._get_persistence()
+        if persistence is None or os.getenv("LIBTV_PROJECT_REUSE_DISABLED") == "1":
+            project_uuid, team_id = await self._acreate_fresh_project(project_name)
+            created, node_key = await self._acreate_nodes_and_generation(
+                project_uuid, team_id, model_key, vendor, task_type, params
+            )
+            return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+
+        day = time.strftime("%Y-%m-%d")
+        cached = await self._project_cache_lookup(persistence, day)
+        from_cache = cached is not None
+        if cached is not None:
+            project_uuid, team_id = cached
+        else:
+            project_uuid, team_id = await self._acreate_fresh_project(project_name, persistence, day)
+
+        try:
+            created, node_key = await self._acreate_nodes_and_generation(
+                project_uuid, team_id, model_key, vendor, task_type, params
+            )
+        except LibTVError:
+            if not from_cache:
+                raise
+            await self._project_cache_invalidate(persistence, day)
+            project_uuid, team_id = await self._acreate_fresh_project(project_name, persistence, day)
+            created, node_key = await self._acreate_nodes_and_generation(
+                project_uuid, team_id, model_key, vendor, task_type, params
+            )
+
         return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
 
     async def apoll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:

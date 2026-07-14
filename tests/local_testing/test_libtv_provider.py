@@ -4013,3 +4013,214 @@ async def test_acreate_does_not_poll():
     out = await lt.acreate("star-video2-fast", "star-video2-fast", "video", {"prompt": "x"}, "proj")
     assert out["task_id"] == "task-async-2"
     assert "/api/task/generation/progress" not in [c[0] for c in client.calls]
+
+
+class FakeProjectPersistence:
+    def __init__(self, cached=None):
+        self.cached = cached
+        self.cached_project_calls = []
+        self.store_project_calls = []
+        self.invalidate_project_calls = []
+
+    async def cached_project(self, account_key, day):
+        self.cached_project_calls.append((account_key, day))
+        return self.cached
+
+    async def store_project(self, account_key, day, project_uuid, team_id):
+        self.store_project_calls.append((account_key, day, project_uuid, team_id))
+
+    async def invalidate_project(self, account_key, day):
+        self.invalidate_project_calls.append((account_key, day))
+
+
+@pytest.mark.asyncio
+async def test_acreate_cache_hit_skips_project_create_and_targets_cached_project():
+    persistence = FakeProjectPersistence(cached={"project_uuid": "cached-proj", "team_id": "7"})
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-1"}},
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    out = await lt.acreate("model-x", "vendor-x", "video", {"prompt": "hi"}, "proj-name")
+
+    assert out["project_uuid"] == "cached-proj"
+    assert out["task_id"] == "task-1"
+    paths = [p for p, _ in fake.calls]
+    assert "/api/canvas/project/create" not in paths
+    nodes_body = next(b for p, b in fake.calls if p == "/api/canvas/nodes/batch")
+    assert nodes_body["projectUuid"] == "cached-proj"
+    gen_body = next(b for p, b in fake.calls if p == "/api/task/generation/create")
+    assert gen_body["metadata"]["project_id"] == "cached-proj"
+    assert gen_body["teamId"] == 7
+    assert len(persistence.cached_project_calls) == 1
+    assert persistence.cached_project_calls[0][0] == account_key("t")
+    assert persistence.store_project_calls == []
+    assert persistence.invalidate_project_calls == []
+
+
+@pytest.mark.asyncio
+async def test_acreate_cache_miss_creates_project_and_stores():
+    persistence = FakeProjectPersistence(cached=None)
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "new-proj", "teamId": 9}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-2"}},
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    out = await lt.acreate("model-x", "vendor-x", "video", {"prompt": "hi"}, "proj-name")
+
+    assert out["project_uuid"] == "new-proj"
+    assert out["task_id"] == "task-2"
+    creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
+    assert len(creates) == 1
+    assert len(persistence.store_project_calls) == 1
+    account_key_arg, _, project_uuid_arg, team_id_arg = persistence.store_project_calls[0]
+    assert account_key_arg == account_key("t")
+    assert project_uuid_arg == "new-proj"
+    assert team_id_arg == "9"
+
+
+@pytest.mark.asyncio
+async def test_acreate_cached_project_nodes_batch_failure_invalidates_and_retries_with_fresh_project():
+    persistence = FakeProjectPersistence(cached={"project_uuid": "stale-proj", "team_id": None})
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "fresh-proj"}}},
+            "/api/canvas/nodes/batch": [
+                LibTVError(status_code=500, message="stale project"),
+                {"code": 0, "data": {}},
+            ],
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-3"}},
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    out = await lt.acreate("model-x", "vendor-x", "video", {"prompt": "hi"}, "proj-name")
+
+    assert out["project_uuid"] == "fresh-proj"
+    assert out["task_id"] == "task-3"
+    creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
+    assert len(creates) == 1
+    nodes_bodies = [b for p, b in fake.calls if p == "/api/canvas/nodes/batch"]
+    assert len(nodes_bodies) == 2
+    assert nodes_bodies[0]["projectUuid"] == "stale-proj"
+    assert nodes_bodies[1]["projectUuid"] == "fresh-proj"
+    assert len(persistence.invalidate_project_calls) == 1
+    assert len(persistence.store_project_calls) == 1
+    assert persistence.store_project_calls[0][2] == "fresh-proj"
+
+
+@pytest.mark.asyncio
+async def test_acreate_cached_project_generation_create_failure_invalidates_and_retries():
+    persistence = FakeProjectPersistence(cached={"project_uuid": "stale-proj", "team_id": "3"})
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "fresh-proj", "teamId": 3}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": [
+                LibTVError(status_code=500, message="stale project"),
+                {"code": 0, "data": {"taskId": "task-4"}},
+            ],
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    out = await lt.acreate("model-x", "vendor-x", "video", {"prompt": "hi"}, "proj-name")
+
+    assert out["project_uuid"] == "fresh-proj"
+    assert out["task_id"] == "task-4"
+    creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
+    assert len(creates) == 1
+    nodes_bodies = [b for p, b in fake.calls if p == "/api/canvas/nodes/batch"]
+    assert len(nodes_bodies) == 2
+    assert len(persistence.invalidate_project_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_acreate_cached_project_retry_also_fails_propagates_without_second_retry():
+    persistence = FakeProjectPersistence(cached={"project_uuid": "stale-proj", "team_id": None})
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "fresh-proj"}}},
+            "/api/canvas/nodes/batch": [
+                LibTVError(status_code=500, message="stale project"),
+                LibTVError(status_code=500, message="still broken"),
+            ],
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    with pytest.raises(LibTVError):
+        await lt.acreate("model-x", "vendor-x", "video", {"prompt": "hi"}, "proj-name")
+
+    creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
+    assert len(creates) == 1
+    nodes_bodies = [b for p, b in fake.calls if p == "/api/canvas/nodes/batch"]
+    assert len(nodes_bodies) == 2
+    assert len(persistence.invalidate_project_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_acreate_miss_path_failure_propagates_without_retry():
+    persistence = FakeProjectPersistence(cached=None)
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "new-proj"}}},
+            "/api/canvas/nodes/batch": LibTVError(status_code=500, message="boom"),
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    with pytest.raises(LibTVError):
+        await lt.acreate("model-x", "vendor-x", "video", {"prompt": "hi"}, "proj-name")
+
+    creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
+    assert len(creates) == 1
+    assert persistence.invalidate_project_calls == []
+    assert len(persistence.store_project_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_acreate_reuse_disabled_env_always_creates_project_and_skips_cache(monkeypatch):
+    monkeypatch.setenv("LIBTV_PROJECT_REUSE_DISABLED", "1")
+    persistence = FakeProjectPersistence(cached={"project_uuid": "cached-proj", "team_id": None})
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "new-proj"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-5"}},
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    out = await lt.acreate("model-x", "vendor-x", "video", {"prompt": "hi"}, "proj-name")
+
+    assert out["project_uuid"] == "new-proj"
+    creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
+    assert len(creates) == 1
+    assert persistence.cached_project_calls == []
+    assert persistence.store_project_calls == []
+
+
+@pytest.mark.asyncio
+async def test_acreate_no_persistence_always_creates_project():
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "new-proj"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-6"}},
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, poll_interval=0)
+
+    out = await lt.acreate("model-x", "vendor-x", "video", {"prompt": "hi"}, "proj-name")
+
+    assert out["project_uuid"] == "new-proj"
+    creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
+    assert len(creates) == 1
