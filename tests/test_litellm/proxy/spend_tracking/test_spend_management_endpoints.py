@@ -4275,3 +4275,38 @@ def test_ui_view_request_response_reads_from_cold_storage(client, monkeypatch):
         assert cold_logger.requested_object_keys == ["k/cold.json"]
     finally:
         app.dependency_overrides.pop(ps.user_api_key_auth, None)
+
+
+class TestShiftedDateBounds:
+    """Unit tests for `_shifted_date_bounds`, the helper extracted from `view_spend_logs`
+    that computes tz-shifted UTC query bounds plus the verbatim local fill boundary used
+    for zero-filling missing days in the summarized `/spend/logs` response."""
+
+    def test_zero_offset_matches_legacy_utc_midnight_bounds(self):
+        start_obj, end_obj, fill_end_date = spend_management_endpoints._shifted_date_bounds(
+            "2026-07-10", "2026-07-16", tz_offset_minutes=0
+        )
+
+        assert start_obj == datetime.datetime(2026, 7, 10, 0, 0, tzinfo=timezone.utc)
+        assert end_obj == datetime.datetime(2026, 7, 16, 0, 0, tzinfo=timezone.utc)
+        assert fill_end_date == datetime.date(2026, 7, 16)
+
+    def test_positive_offset_shifts_bounds_back_and_keeps_verbatim_fill_date(self):
+        # UTC+8 (Asia/Shanghai): local midnight is 8h *ahead* of UTC, so the UTC instant
+        # for local midnight is 8h *behind* the naive UTC-midnight parse.
+        start_obj, end_obj, fill_end_date = spend_management_endpoints._shifted_date_bounds(
+            "2026-07-10", "2026-07-16", tz_offset_minutes=480
+        )
+
+        assert start_obj == datetime.datetime(2026, 7, 9, 16, 0, tzinfo=timezone.utc)
+        assert end_obj == datetime.datetime(2026, 7, 15, 16, 0, tzinfo=timezone.utc)
+        assert fill_end_date == datetime.date(2026, 7, 16)
+
+    def test_negative_offset_shifts_bounds_forward(self):
+        start_obj, end_obj, fill_end_date = spend_management_endpoints._shifted_date_bounds(
+            "2026-07-10", "2026-07-16", tz_offset_minutes=-300
+        )
+
+        assert start_obj == datetime.datetime(2026, 7, 10, 5, 0, tzinfo=timezone.utc)
+        assert end_obj == datetime.datetime(2026, 7, 16, 5, 0, tzinfo=timezone.utc)
+        assert fill_end_date == datetime.date(2026, 7, 16)

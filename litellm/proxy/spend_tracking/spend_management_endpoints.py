@@ -2,7 +2,7 @@
 import collections
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -2203,6 +2203,19 @@ async def ui_view_request_response_for_request_id(
     return None
 
 
+def _shifted_date_bounds(start_date: str, end_date: str, tz_offset_minutes: int) -> tuple[datetime, datetime, date]:
+    """
+    Interpret `start_date`/`end_date` (YYYY-MM-DD) as calendar days in UTC+tz_offset_minutes,
+    returning the equivalent UTC instants to filter on plus the verbatim local end date to
+    use as the fill boundary when zero-filling missing days in the summarized response.
+    """
+    offset = timedelta(minutes=tz_offset_minutes)
+    start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) - offset
+    end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc) - offset
+    fill_end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+    return start_date_obj, end_date_obj, fill_end_date
+
+
 @router.get(
     "/spend/logs",
     tags=["Budget & Spend Tracking"],
@@ -2235,6 +2248,12 @@ async def view_spend_logs(
     summarize: bool = fastapi.Query(
         default=True,
         description="When start_date and end_date are provided, summarize=true returns aggregated data by date (legacy behavior), summarize=false returns filtered individual logs",
+    ),
+    tz_offset_minutes: int = fastapi.Query(
+        default=0,
+        ge=-24 * 60,
+        le=24 * 60,
+        description="Interpret start_date/end_date and bucket summarized days in UTC+offset (e.g. 480 = Asia/Shanghai). Only affects the summarize=true path with start_date/end_date.",
     ),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
@@ -2299,9 +2318,9 @@ async def view_spend_logs(
             and end_date is not None
             and isinstance(end_date, str)
         ):
-            # Convert the date strings to datetime objects
-            start_date_obj = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-            end_date_obj = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            # Convert the date strings to datetime objects, shifted into the caller's tz
+            start_date_obj, end_date_obj, fill_end_date = _shifted_date_bounds(start_date, end_date, tz_offset_minutes)
+            offset = timedelta(minutes=tz_offset_minutes)
 
             # Convert to ISO format strings for Prisma
             start_date_iso = start_date_obj.isoformat()
@@ -2349,27 +2368,31 @@ async def view_spend_logs(
                 result: dict = {}
                 for record in response:
                     dt_object = datetime.strptime(str(record["startTime"]), "%Y-%m-%dT%H:%M:%S.%fZ")  # type: ignore
-                    date = dt_object.date()
-                    if date not in result:
-                        result[date] = {"users": {}, "models": {}}
+                    local_date = (dt_object + offset).date()
+                    if local_date not in result:
+                        result[local_date] = {"users": {}, "models": {}}
                     api_key = record["api_key"]  # type: ignore
                     user_id = record["user"]  # type: ignore
                     model = record["model"]  # type: ignore
-                    result[date]["spend"] = result[date].get("spend", 0) + record.get("_sum", {}).get("spend", 0)
-                    result[date][api_key] = result[date].get(api_key, 0) + record.get("_sum", {}).get("spend", 0)
-                    result[date]["users"][user_id] = result[date]["users"].get(user_id, 0) + record.get("_sum", {}).get(
+                    result[local_date]["spend"] = result[local_date].get("spend", 0) + record.get("_sum", {}).get(
                         "spend", 0
                     )
-                    result[date]["models"][model] = result[date]["models"].get(model, 0) + record.get("_sum", {}).get(
+                    result[local_date][api_key] = result[local_date].get(api_key, 0) + record.get("_sum", {}).get(
                         "spend", 0
                     )
+                    result[local_date]["users"][user_id] = result[local_date]["users"].get(user_id, 0) + record.get(
+                        "_sum", {}
+                    ).get("spend", 0)
+                    result[local_date]["models"][model] = result[local_date]["models"].get(model, 0) + record.get(
+                        "_sum", {}
+                    ).get("spend", 0)
                 return_list = []
                 final_date = None
                 for k, v in sorted(result.items()):
                     return_list.append({**v, "startTime": k})
                     final_date = k
 
-                end_date_date = end_date_obj.date()
+                end_date_date = fill_end_date
                 if final_date is not None and final_date < end_date_date:
                     current_date = final_date + timedelta(days=1)
                     while current_date <= end_date_date:
