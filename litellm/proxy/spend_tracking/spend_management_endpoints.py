@@ -2253,7 +2253,7 @@ async def view_spend_logs(
         default=0,
         ge=-24 * 60,
         le=24 * 60,
-        description="Interpret start_date/end_date and bucket summarized days in UTC+offset (e.g. 480 = Asia/Shanghai). Only affects the summarize=true path with start_date/end_date.",
+        description="Interpret start_date/end_date as calendar days in UTC+offset (e.g. 480 = Asia/Shanghai) for both summarize paths; summarize=true additionally buckets the returned days in that timezone.",
     ),
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
