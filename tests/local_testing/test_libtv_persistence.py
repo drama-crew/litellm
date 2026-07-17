@@ -19,9 +19,11 @@ class FakeDb:
         self,
         query_rows: Optional[List[dict]] = None,
         raise_on: Optional[str] = None,
+        execute_result: int = 1,
     ):
         self.query_rows = query_rows if query_rows is not None else []
         self.raise_on = raise_on
+        self.execute_result = execute_result
         self.query_calls: List[Tuple[str, Tuple[Any, ...]]] = []
         self.execute_calls: List[Tuple[str, Tuple[Any, ...]]] = []
 
@@ -35,6 +37,8 @@ class FakeDb:
         self.execute_calls.append((sql, params))
         if self.raise_on == "execute_raw":
             raise RuntimeError("db unreachable")
+        if "LiteLLM_LibTVBilledVideoTasks" in sql and "INSERT" in sql:
+            return self.execute_result
         return 1
 
 
@@ -315,11 +319,48 @@ async def test_ensure_tables_creates_both_tables_once():
     await p.cached_upload("acct1", "cdn.example.com/g.png")
 
     create_calls = [c for c in db.execute_calls if "CREATE TABLE" in c[0]]
-    assert len(create_calls) == 2
+    assert len(create_calls) == 3
     assert any("LiteLLM_LibTVUploadCache" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVProjects" in c[0] for c in create_calls)
-    assert calls_after_first == 2
-    assert len(db.execute_calls) == 2
+    assert any("LiteLLM_LibTVBilledVideoTasks" in c[0] for c in create_calls)
+    assert calls_after_first == 3
+    assert len(db.execute_calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_mark_video_billed_first_time_returns_true_and_inserts():
+    db = FakeDb(execute_result=1)
+    p = LibTVPersistence(db)
+
+    billed = await p.mark_video_billed("libtv:task-9", 5.0, 1.25)
+
+    assert billed is True
+    insert_calls = [c for c in db.execute_calls if "LiteLLM_LibTVBilledVideoTasks" in c[0] and "INSERT" in c[0]]
+    assert len(insert_calls) == 1
+    sql, params = insert_calls[0]
+    assert "ON CONFLICT" in sql
+    assert "DO NOTHING" in sql
+    assert params == ("libtv:task-9", 5.0, 1.25)
+
+
+@pytest.mark.asyncio
+async def test_mark_video_billed_repeat_call_returns_false():
+    db = FakeDb(execute_result=0)
+    p = LibTVPersistence(db)
+
+    billed = await p.mark_video_billed("libtv:task-9", 5.0, 1.25)
+
+    assert billed is False
+
+
+@pytest.mark.asyncio
+async def test_mark_video_billed_db_failure_returns_false():
+    db = FakeDb(raise_on="execute_raw")
+    p = LibTVPersistence(db)
+
+    billed = await p.mark_video_billed("libtv:task-9", 5.0, 1.25)
+
+    assert billed is False
 
 
 def test_get_persistence_returns_none_when_prisma_client_none(monkeypatch):

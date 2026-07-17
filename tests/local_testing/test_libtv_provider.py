@@ -682,6 +682,132 @@ def test_video_status_maps_in_progress():
     assert LibTVLLM().video_status(vid, "tok", None, {"webid": "w"}, None, client=client).status == "in_progress"
 
 
+class FakeBillingPersistence:
+    def __init__(self, billed: bool = True, raises: bool = False):
+        self.billed = billed
+        self.raises = raises
+        self.calls = []
+
+    async def mark_video_billed(self, billing_key, duration_seconds, response_cost):
+        self.calls.append((billing_key, duration_seconds, response_cost))
+        if self.raises:
+            raise RuntimeError("db unreachable")
+        return self.billed
+
+
+_LIBTV_720P_MODEL_INFO = {"output_cost_per_second_720p": 0.5}
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_completed_bills_via_persistence_on_first_poll(monkeypatch):
+    fake_persistence = FakeBillingPersistence(billed=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {"webid": "w", "seconds": 5, "resolution": "720p", "model_info": _LIBTV_720P_MODEL_INFO}
+
+    status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert status.usage == {"duration_seconds": 5.0, "video_resolution": "720p"}
+    assert status._hidden_params["response_cost"] == pytest.approx(2.5)
+    assert fake_persistence.calls == [("libtv:task-9", 5.0, pytest.approx(2.5))]
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_completed_repeat_poll_does_not_double_bill(monkeypatch):
+    fake_persistence = FakeBillingPersistence(billed=False)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {"webid": "w", "seconds": 5, "resolution": "720p", "model_info": _LIBTV_720P_MODEL_INFO}
+
+    status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert status._hidden_params["response_cost"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_completed_without_duration_skips_billing(monkeypatch):
+    fake_persistence = FakeBillingPersistence(billed=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {"webid": "w"}
+
+    status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert "response_cost" not in status._hidden_params
+    assert fake_persistence.calls == []
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_completed_no_price_for_resolution_skips_billing(monkeypatch):
+    fake_persistence = FakeBillingPersistence(billed=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {"webid": "w", "seconds": 5, "resolution": "720p", "model_info": {}}
+
+    status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert "response_cost" not in status._hidden_params
+    assert fake_persistence.calls == []
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_persistence_unavailable_skips_billing(monkeypatch):
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: None)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {"webid": "w", "seconds": 5, "resolution": "720p", "model_info": _LIBTV_720P_MODEL_INFO}
+
+    status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert "response_cost" not in status._hidden_params
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_persistence_error_does_not_raise_and_skips_billing(monkeypatch):
+    fake_persistence = FakeBillingPersistence(raises=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {"webid": "w", "seconds": 5, "resolution": "720p", "model_info": _LIBTV_720P_MODEL_INFO}
+
+    status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert "response_cost" not in status._hidden_params
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_in_progress_never_calls_persistence(monkeypatch):
+    fake_persistence = FakeBillingPersistence(billed=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(1))
+    optional_params = {"webid": "w", "seconds": 5, "resolution": "720p", "model_info": _LIBTV_720P_MODEL_INFO}
+
+    status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "in_progress"
+    assert fake_persistence.calls == []
+
+
+def test_video_create_call_type_still_zero_cost_without_duration():
+    from litellm.cost_calculator import default_video_cost_calculator
+
+    assert (
+        default_video_cost_calculator(model="star-video2", duration_seconds=0.0, model_info=_LIBTV_720P_MODEL_INFO)
+        == 0.0
+    )
+
+
 class _DownloadResp:
     status_code = 200
     content = b"MP4BYTES"
@@ -1494,7 +1620,9 @@ def test_resolve_model_spec_indexes_tool_spec():
         lt.resolve_model_spec("does-not-exist")
 
 
-def _tool_spec_payload(model_key="star-video2", auto_compliance=True, frames2video=False, image2video=None, settings=None):
+def _tool_spec_payload(
+    model_key="star-video2", auto_compliance=True, frames2video=False, image2video=None, settings=None
+):
     props = {
         "ratio": {"default": "9:16", "enum": ["16:9", "9:16"]},
         "resolution": {"default": "720p", "enum": [{"value": "720p"}]},
@@ -2005,9 +2133,7 @@ def _image2video_compliance_routes(urls, asset_ids):
 
 def test_image2video_reference_images_only_uses_asset_strings_not_mixedlist():
     fake = FakeSyncClient(
-        post_by_path=_image2video_compliance_routes(
-            [_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]
-        ),
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]),
         get_payload=_tool_spec_payload(image2video=[1, 9]),
     )
     llm = LibTVLLM(poll_interval=0)
@@ -2075,8 +2201,7 @@ def test_image2video_images_above_schema_max_falls_back_to_mixed2video():
         },
         "/api/third_asset/create": [{"code": 0, "data": {"uuid": f"u{i}"}} for i in range(10)],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": f"u{i}", "assetId": asset_ids[i], "status": 1}]}}
-            for i in range(10)
+            {"code": 0, "data": {"list": [{"uuid": f"u{i}", "assetId": asset_ids[i], "status": 1}]}} for i in range(10)
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
@@ -2124,9 +2249,7 @@ def test_image2video_explicit_mixed2video_override_wins():
 @pytest.mark.asyncio
 async def test_image2video_reference_images_only_uses_asset_strings_async():
     fake = FakeAsyncClient(
-        post_by_path=_image2video_compliance_routes(
-            [_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]
-        ),
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]),
         get_payload=_tool_spec_payload(image2video=[1, 9]),
     )
     llm = LibTVLLM(poll_interval=0)
@@ -2230,7 +2353,11 @@ _AGING_FAIL = {
 }
 _COMPLIANCE_FAIL = {
     "code": 0,
-    "data": {"progresses": [{"status": 3, "failedReason": "参考图可能包含真人形象，积分将会在2小时内返还，请先进行合规校验后重试。"}]},
+    "data": {
+        "progresses": [
+            {"status": 3, "failedReason": "参考图可能包含真人形象，积分将会在2小时内返还，请先进行合规校验后重试。"}
+        ]
+    },
 }
 _RUNNING = {"code": 0, "data": {"progresses": [{"status": 1}]}}
 
@@ -2276,7 +2403,9 @@ def test_frames2video_fresh_asset_fast_fail_retries_create_with_new_task():
 def test_frames2video_fresh_asset_retry_stops_on_success_during_guard():
     completed = {
         "code": 0,
-        "data": {"progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]},
+        "data": {
+            "progresses": [{"status": 2, "taskResult": json.dumps({"videos": [{"videoUrl": "https://x/o.mp4"}]})}]
+        },
     }
     fake = FakeSyncClient(
         post_by_path=_fresh_retry_routes(["t1"], [completed]),

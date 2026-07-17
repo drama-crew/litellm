@@ -69,8 +69,11 @@ _REFERENCE_KEYS = (
     "reference_audios",
 )
 
+from litellm.llms.openai.cost_calculation import _video_output_cost_per_second
+
 from .client import LibTVClient
 from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
+from .persistence import get_persistence
 from .transform import _resolution_from_size, build_generation_params, build_topaz_upscale_params
 
 _TOPAZ_VENDOR = "topazlabs"
@@ -171,6 +174,25 @@ def _video_usage(optional_params: dict) -> Optional[dict]:
     if resolution:
         usage["video_resolution"] = resolution
     return usage
+
+
+def _video_completion_billing(optional_params: dict) -> Tuple[Optional[dict], Optional[float]]:
+    """usage + response cost for a completed libtv video task.
+
+    libtv's progress poll never returns the actual generated duration/resolution,
+    so this reuses the values the request itself asked for (same source
+    _video_usage draws on for create) as the authoritative billing basis. Returns
+    (None, None) when no duration can be resolved at all, or (usage, None) when a
+    duration is known but the deployment declares no per-second price for it.
+    """
+    usage = _video_usage(optional_params)
+    if usage is None:
+        return None, None
+    model_info = optional_params.get("model_info") or {}
+    rate = _video_output_cost_per_second(model_info, usage.get("video_resolution"))
+    if rate is None:
+        return usage, None
+    return usage, rate * usage["duration_seconds"]
 
 
 def _resolve_mode(optional_params: dict, default_mode: str) -> str:
@@ -533,6 +555,33 @@ class LibTVLLM(CustomLLM):
             vo.error = {"message": state.get("failed_reason") or "libtv generation failed"}
         return vo
 
+    async def _bill_completed_video(self, vo: VideoObject, task_id: str, optional_params: dict) -> None:
+        """Charge for a completed libtv video task exactly once.
+
+        The libtv progress poll is the only point in the async create/poll/download
+        flow that knows generation actually finished, so it is also the only correct
+        place to accrue spend (create-time cost is always 0.0: no duration is known
+        yet). Poll-to-completed fires repeatedly (client retries, repeated status
+        checks), so charging here must be idempotent: a persistence-backed
+        insert-once marker gates the charge, and any failure to reach that marker
+        (no db configured, db error) skips the charge rather than risking a double
+        bill.
+        """
+        usage, cost = _video_completion_billing(optional_params)
+        if usage is not None:
+            vo.usage = usage
+        if cost is None:
+            return
+        persistence = get_persistence()
+        if persistence is None:
+            return
+        try:
+            billed = await persistence.mark_video_billed(f"{LIBTV_PROVIDER}:{task_id}", usage["duration_seconds"], cost)
+        except Exception:
+            logger.warning("libtv video billing: persistence check failed, skipping charge", exc_info=True)
+            return
+        vo._hidden_params = {**vo._hidden_params, "response_cost": cost if billed else 0.0}
+
     def _download(self, http, state: dict) -> bytes:
         if state.get("status") != 2:
             raise LibTVError(status_code=409, message="libtv video still processing")
@@ -570,7 +619,11 @@ class LibTVLLM(CustomLLM):
         client: Optional[AsyncHTTPHandler] = None,
     ) -> VideoObject:
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
-        return self._video_status(video_id, await lt.apoll_once(_decode_task_id(video_id), "video"))
+        task_id = _decode_task_id(video_id)
+        vo = self._video_status(video_id, await lt.apoll_once(task_id, "video"))
+        if vo.status == "completed":
+            await self._bill_completed_video(vo, task_id, optional_params)
+        return vo
 
     @normalize_libtv_errors
     def video_content(

@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVProjects" (
 )
 """
 
+CREATE_BILLED_VIDEO_TASKS_TABLE = """
+CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVBilledVideoTasks" (
+  billing_key TEXT NOT NULL PRIMARY KEY,
+  duration_seconds DOUBLE PRECISION NOT NULL,
+  response_cost DOUBLE PRECISION NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+
 
 def _warn(message: str, exc_info: bool = False) -> None:
     global _last_warn_ts
@@ -93,6 +102,7 @@ class LibTVPersistence:
         try:
             await self.db.execute_raw(CREATE_UPLOAD_CACHE_TABLE)
             await self.db.execute_raw(CREATE_PROJECTS_TABLE)
+            await self.db.execute_raw(CREATE_BILLED_VIDEO_TASKS_TABLE)
             _tables_ready = True
         except Exception:
             _warn("libtv persistence: failed to create tables", exc_info=True)
@@ -177,6 +187,29 @@ class LibTVPersistence:
             )
         except Exception:
             _warn("libtv persistence: store_project failed", exc_info=True)
+
+    async def mark_video_billed(self, billing_key: str, duration_seconds: float, response_cost: float) -> bool:
+        """Record a completed video task as billed, once.
+
+        Returns True only the first time this billing_key is recorded (the caller
+        should charge response_cost); returns False on every subsequent call for the
+        same key (already billed, must not double-charge) and on any persistence
+        failure (fail-safe: skip the charge rather than risk billing twice).
+        """
+        try:
+            await self.ensure_tables()
+            affected = await self.db.execute_raw(
+                'INSERT INTO "LiteLLM_LibTVBilledVideoTasks" '
+                "(billing_key, duration_seconds, response_cost) VALUES ($1, $2, $3) "
+                "ON CONFLICT (billing_key) DO NOTHING",
+                billing_key,
+                duration_seconds,
+                response_cost,
+            )
+            return bool(affected)
+        except Exception:
+            _warn("libtv persistence: mark_video_billed failed", exc_info=True)
+            return False
 
     async def invalidate_project(self, account_key: str, day: str) -> None:
         try:
