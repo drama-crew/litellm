@@ -36,6 +36,7 @@ from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _sanitize_request_body_for_spend_logs_payload,
     _should_store_prompts_and_responses_in_spend_logs,
     get_logging_payload,
+    get_spend_logs_id,
 )
 from litellm.types.utils import (
     StandardLoggingHiddenParams,
@@ -2313,3 +2314,159 @@ def test_get_logging_payload_hashes_bearer_prefixed_api_key():
     assert not metadata_dict["user_api_key"].startswith("sk-"), (
         f"metadata user_api_key contains unhashed key: {metadata_dict['user_api_key']}"
     )
+
+
+class TestGetSpendLogsIdVideoStatusRequestIdCollision:
+    """Regression coverage for a production billing gap: a completed libtv
+    video-status poll computes the correct non-zero response_cost, but no
+    SpendLogs row was ever written for it.
+
+    Root cause: get_spend_logs_id() used response_obj["id"] as the SpendLogs
+    request_id for every call type by default. A video's status/retrieve
+    poll echoes back the *same* video id the create call returned (that's
+    how OpenAI-style video status polling works), so every poll of a given
+    video computed the identical request_id as that video's create call.
+    The periodic spend-log flush writes rows via
+    create_many(..., skip_duplicates=True) (see
+    litellm/proxy/utils.py:_create_spend_logs_with_poison_isolation), which
+    silently drops any row whose request_id already exists - no exception,
+    no log line. So the completed poll's real charge was dropped in favor
+    of the earlier create row (which is always spend=0, since libtv can't
+    price a video before it's done rendering).
+
+    These call_type strings mirror what production actually sets on the
+    shared logging object for video status/retrieve calls: custom providers
+    (e.g. libtv) keep the wrapper-assigned "avideo_status"/"video_status";
+    built-in providers get it overwritten to "video_retrieve" inside
+    litellm/videos/main.py. "avideo_retrieve" is included for forward
+    compatibility even though nothing sets it today.
+    """
+
+    VIDEO_STATUS_CALL_TYPES = ("avideo_status", "video_status", "video_retrieve", "avideo_retrieve")
+
+    @pytest.mark.parametrize("call_type", VIDEO_STATUS_CALL_TYPES)
+    def test_video_status_call_types_use_litellm_call_id_not_response_id(self, call_type):
+        response_obj = {"id": "video_shared-across-every-poll", "object": "video", "status": "completed"}
+        kwargs = {"litellm_call_id": "call-id-unique-to-this-poll"}
+
+        result = get_spend_logs_id(call_type, response_obj, kwargs)
+
+        assert result == "call-id-unique-to-this-poll"
+        assert result != response_obj["id"]
+
+    @pytest.mark.parametrize("call_type", VIDEO_STATUS_CALL_TYPES)
+    def test_video_status_call_types_fall_back_to_response_id_when_call_id_missing(self, call_type):
+        response_obj = {"id": "video_shared-across-every-poll", "object": "video", "status": "completed"}
+        kwargs: dict = {}
+
+        result = get_spend_logs_id(call_type, response_obj, kwargs)
+
+        assert result == "video_shared-across-every-poll"
+
+    def test_two_polls_of_the_same_video_get_distinct_request_ids(self):
+        """The actual collision this bug caused: two separate HTTP polls of
+        the same video_id must not compute the same SpendLogs request_id,
+        or the second (and any later) row is silently dropped by
+        create_many(..., skip_duplicates=True)."""
+        shared_video_response = {"id": "video_same-task", "object": "video", "status": "completed"}
+
+        first_poll_id = get_spend_logs_id("avideo_status", shared_video_response, {"litellm_call_id": "call-poll-1"})
+        second_poll_id = get_spend_logs_id("avideo_status", shared_video_response, {"litellm_call_id": "call-poll-2"})
+
+        assert first_poll_id != second_poll_id
+
+    def test_create_video_call_type_is_unaffected_and_still_prefers_response_id(self):
+        """Guards against over-broadening the fix: the create call's own
+        SpendLogs row must keep using the video id (unchanged behavior),
+        since only the video-status/retrieve call types collide."""
+        response_obj = {"id": "video_new-task", "object": "video", "status": "queued"}
+        kwargs = {"litellm_call_id": "call-id-for-create"}
+
+        result = get_spend_logs_id("avideo_generation", response_obj, kwargs)
+
+        assert result == "video_new-task"
+
+    def test_non_video_call_type_still_prefers_response_id(self):
+        """Regression guard: the default (non-video) precedence of
+        response_obj["id"] over litellm_call_id must be unchanged."""
+        response_obj = {"id": "chatcmpl-abc123"}
+        kwargs = {"litellm_call_id": "call-id-xyz"}
+
+        result = get_spend_logs_id("acompletion", response_obj, kwargs)
+
+        assert result == "chatcmpl-abc123"
+
+
+class TestGetLoggingPayloadVideoStatusRequestIdCollision:
+    """Same regression as above, exercised through the higher-level
+    get_logging_payload() so the fix is proven at the boundary the proxy
+    actually calls, not just against the internal helper."""
+
+    SHARED_VIDEO_ID = "video_bGl0ZWxsbTpjdXN0b21fbGxtX3Byb3ZpZGVyOmxpYnR2O3Rhc2s6MQ=="
+
+    def _video_kwargs(self, call_type: str, litellm_call_id: str) -> dict:
+        return {
+            "model": "seedance-2.0",
+            "call_type": call_type,
+            "litellm_call_id": litellm_call_id,
+            "litellm_params": {
+                "metadata": {
+                    "user_api_key": "sk-test-key",
+                    "user_api_key_user_id": "test_user",
+                    "user_api_key_team_id": "test_team",
+                }
+            },
+            "response_cost": 0.0,
+        }
+
+    def test_completed_status_poll_gets_a_request_id_distinct_from_create(self):
+        create_payload = get_logging_payload(
+            kwargs=self._video_kwargs("avideo_generation", "call-create-1"),
+            response_obj={"id": self.SHARED_VIDEO_ID, "object": "video", "status": "queued"},
+            start_time=datetime.datetime.now(timezone.utc),
+            end_time=datetime.datetime.now(timezone.utc),
+        )
+
+        status_kwargs = self._video_kwargs("avideo_status", "call-poll-completed-1")
+        status_kwargs["response_cost"] = 2.5
+        status_payload = get_logging_payload(
+            kwargs=status_kwargs,
+            response_obj={"id": self.SHARED_VIDEO_ID, "object": "video", "status": "completed"},
+            start_time=datetime.datetime.now(timezone.utc),
+            end_time=datetime.datetime.now(timezone.utc),
+        )
+
+        assert create_payload["request_id"] != status_payload["request_id"], (
+            "create and the completed-status poll computed the same SpendLogs "
+            "request_id; create_many(..., skip_duplicates=True) would silently "
+            "drop the poll's non-zero charge"
+        )
+        assert create_payload["request_id"] == self.SHARED_VIDEO_ID
+        assert status_payload["request_id"] == "call-poll-completed-1"
+        assert status_payload["spend"] == 2.5
+
+    def test_repeated_completed_polls_each_get_distinct_request_ids(self):
+        """Even once a video is billed, later polls (whose cost the app
+        layer idempotently zeroes) must not collide on request_id with the
+        first billed poll - each poll is still its own SpendLogs row."""
+        first_kwargs = self._video_kwargs("avideo_status", "call-poll-1")
+        first_kwargs["response_cost"] = 2.5
+        first_payload = get_logging_payload(
+            kwargs=first_kwargs,
+            response_obj={"id": self.SHARED_VIDEO_ID, "object": "video", "status": "completed"},
+            start_time=datetime.datetime.now(timezone.utc),
+            end_time=datetime.datetime.now(timezone.utc),
+        )
+
+        second_kwargs = self._video_kwargs("avideo_status", "call-poll-2")
+        second_kwargs["response_cost"] = 0.0  # already billed - idempotency zeroes it
+        second_payload = get_logging_payload(
+            kwargs=second_kwargs,
+            response_obj={"id": self.SHARED_VIDEO_ID, "object": "video", "status": "completed"},
+            start_time=datetime.datetime.now(timezone.utc),
+            end_time=datetime.datetime.now(timezone.utc),
+        )
+
+        assert first_payload["request_id"] != second_payload["request_id"]
+        assert first_payload["spend"] == 2.5
+        assert second_payload["spend"] == 0.0

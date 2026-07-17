@@ -170,10 +170,29 @@ def generate_hash_from_response(response_obj: Any) -> str:
         return hashlib.md5(str(response_obj).encode()).hexdigest()
 
 
+# Video status/retrieve polls echo back the *video's* persistent id - the same id
+# the original create call returned, and the same id every other poll of that video
+# returns - rather than a fresh id per call. Custom providers (e.g. libtv) keep the
+# wrapper-assigned call_type ("avideo_status"/"video_status"); built-in providers get
+# it overwritten to CallTypes.video_retrieve.value ("video_retrieve") inside
+# litellm/videos/main.py. "avideo_retrieve" is included defensively even though
+# nothing sets it today.
+_VIDEO_STATUS_CALL_TYPES = frozenset({"avideo_status", "video_status", "video_retrieve", "avideo_retrieve"})
+
+
 def get_spend_logs_id(call_type: str, response_obj: dict, kwargs: dict) -> Optional[str]:
     if call_type == "aretrieve_batch" or call_type == "acreate_file":
         # Generate a hash from the response object
         id: Optional[str] = generate_hash_from_response(response_obj)
+    elif call_type in _VIDEO_STATUS_CALL_TYPES:
+        # Using response_obj["id"] here would collide every completed poll's SpendLogs
+        # row with the video's create row (and with every other poll of the same
+        # video): the periodic flush writes rows via
+        # create_many(..., skip_duplicates=True), which silently drops any row whose
+        # request_id already exists, dropping the poll's real, non-zero cost without
+        # any error. litellm_call_id is unique per actual HTTP call, so prefer it here;
+        # fall back to response_obj["id"] only if it's somehow missing.
+        id = cast(Optional[str], kwargs.get("litellm_call_id")) or cast(Optional[str], response_obj.get("id"))
     else:
         id = cast(Optional[str], response_obj.get("id")) or cast(Optional[str], kwargs.get("litellm_call_id"))
     return id
