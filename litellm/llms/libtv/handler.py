@@ -176,23 +176,17 @@ def _video_usage(optional_params: dict) -> Optional[dict]:
     return usage
 
 
-def _video_completion_billing(optional_params: dict) -> Tuple[Optional[dict], Optional[float]]:
-    """usage + response cost for a completed libtv video task.
+def _video_billing_key(task_id: str) -> str:
+    return f"{LIBTV_PROVIDER}:{task_id}"
 
-    libtv's progress poll never returns the actual generated duration/resolution,
-    so this reuses the values the request itself asked for (same source
-    _video_usage draws on for create) as the authoritative billing basis. Returns
-    (None, None) when no duration can be resolved at all, or (usage, None) when a
-    duration is known but the deployment declares no per-second price for it.
-    """
-    usage = _video_usage(optional_params)
-    if usage is None:
-        return None, None
+
+def _video_completion_cost(optional_params: dict, usage: dict) -> Optional[float]:
+    """duration x the deployment's per-second (resolution-tiered) rate, or None when unpriced."""
     model_info = optional_params.get("model_info") or {}
     rate = _video_output_cost_per_second(model_info, usage.get("video_resolution"))
     if rate is None:
-        return usage, None
-    return usage, rate * usage["duration_seconds"]
+        return None
+    return rate * usage["duration_seconds"]
 
 
 def _resolve_mode(optional_params: dict, default_mode: str) -> str:
@@ -555,28 +549,71 @@ class LibTVLLM(CustomLLM):
             vo.error = {"message": state.get("failed_reason") or "libtv generation failed"}
         return vo
 
+    async def _record_video_task_usage(
+        self, task_id: str, optional_params: dict, generation_params: Optional[dict] = None
+    ) -> None:
+        """Persist the requested duration/resolution at create time.
+
+        The production status poll (GET /v1/videos/{id}) carries none of the create
+        request's parameters (its optional_params hold only routing/credential
+        fields), and libtv's progress response has only status/urls/failed_reason —
+        so this create-time record is the only way completion-time billing can know
+        what to charge. Best-effort: any failure just logs.
+        """
+        merged = dict(optional_params)
+        gp = generation_params or {}
+        if merged.get("seconds") is None and merged.get("duration") is None:
+            merged["duration"] = gp.get("duration")
+        if merged.get("resolution") is None and merged.get("size") is None:
+            merged["resolution"] = gp.get("resolution")
+        usage = _video_usage(merged)
+        if usage is None:
+            logger.warning(
+                "libtv video billing: create for task %s resolved no duration; task will not be billed", task_id
+            )
+            return
+        persistence = get_persistence()
+        if persistence is None:
+            return
+        try:
+            await persistence.store_video_task_usage(
+                _video_billing_key(task_id), usage["duration_seconds"], usage.get("video_resolution")
+            )
+        except Exception:
+            logger.warning("libtv video billing: failed to record task usage at create", exc_info=True)
+
     async def _bill_completed_video(self, vo: VideoObject, task_id: str, optional_params: dict) -> None:
         """Charge for a completed libtv video task exactly once.
 
         The libtv progress poll is the only point in the async create/poll/download
         flow that knows generation actually finished, so it is also the only correct
         place to accrue spend (create-time cost is always 0.0: no duration is known
-        yet). Poll-to-completed fires repeatedly (client retries, repeated status
-        checks), so charging here must be idempotent: a persistence-backed
-        insert-once marker gates the charge, and any failure to reach that marker
-        (no db configured, db error) skips the charge rather than risking a double
-        bill.
+        yet). The poll request itself carries no duration/resolution, so those come
+        from the persistence record written at create time (optional_params are
+        still consulted first for direct-SDK callers that do pass them). Poll-to-
+        completed fires repeatedly (client retries, repeated status checks), so
+        charging is idempotent: a persistence-backed insert-once marker gates the
+        charge, and any failure to reach that marker (no db configured, db error,
+        no create-time record — e.g. tasks created before this deploy) skips the
+        charge rather than risking a double bill.
         """
-        usage, cost = _video_completion_billing(optional_params)
-        if usage is not None:
-            vo.usage = usage
-        if cost is None:
-            return
         persistence = get_persistence()
-        if persistence is None:
+        usage = _video_usage(optional_params)
+        if usage is None and persistence is not None:
+            try:
+                usage = await persistence.get_video_task_usage(_video_billing_key(task_id))
+            except Exception:
+                logger.warning("libtv video billing: usage lookup failed, skipping charge", exc_info=True)
+                return
+        if usage is None:
+            logger.warning("libtv video billing: no usage record for completed task %s, skipping charge", task_id)
+            return
+        vo.usage = usage
+        cost = _video_completion_cost(optional_params, usage)
+        if cost is None or persistence is None:
             return
         try:
-            billed = await persistence.mark_video_billed(f"{LIBTV_PROVIDER}:{task_id}", usage["duration_seconds"], cost)
+            billed = await persistence.mark_video_billed(_video_billing_key(task_id), usage["duration_seconds"], cost)
         except Exception:
             logger.warning("libtv video billing: persistence check failed, skipping charge", exc_info=True)
             return
@@ -951,7 +988,10 @@ class LibTVLLM(CustomLLM):
                 await lt.aensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["video"]) for r in source_videos
             ]
             created = await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
-            return self._build_video_object(model, created, {**optional_params, "resolution": params["resolution"]})
+            op = {**optional_params, "resolution": params["resolution"]}
+            vo = self._build_video_object(model, created, op)
+            await self._record_video_task_usage(created["task_id"], op, params)
+            return vo
         images, videos, audios = _collect_reference_groups(optional_params)
         _guard_reference_intent(model, optional_params, images, videos, audios)
         auto_compliance = _auto_compliance_enabled(spec)
@@ -1027,4 +1067,6 @@ class LibTVLLM(CustomLLM):
             if wants_frames or wants_image2video
             else await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
         )
-        return self._build_video_object(model, created, optional_params)
+        vo = self._build_video_object(model, created, optional_params)
+        await self._record_video_task_usage(created["task_id"], optional_params, params)
+        return vo

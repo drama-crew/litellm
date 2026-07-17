@@ -683,16 +683,30 @@ def test_video_status_maps_in_progress():
 
 
 class FakeBillingPersistence:
-    def __init__(self, billed: bool = True, raises: bool = False):
+    def __init__(self, billed: bool = True, raises: bool = False, stored_usage=None):
         self.billed = billed
         self.raises = raises
+        self.stored_usage = stored_usage
         self.calls = []
+        self.store_usage_calls = []
+        self.get_usage_calls = []
 
     async def mark_video_billed(self, billing_key, duration_seconds, response_cost):
         self.calls.append((billing_key, duration_seconds, response_cost))
         if self.raises:
             raise RuntimeError("db unreachable")
         return self.billed
+
+    async def store_video_task_usage(self, billing_key, duration_seconds, video_resolution):
+        self.store_usage_calls.append((billing_key, duration_seconds, video_resolution))
+        if self.raises:
+            raise RuntimeError("db unreachable")
+
+    async def get_video_task_usage(self, billing_key):
+        self.get_usage_calls.append(billing_key)
+        if self.raises:
+            raise RuntimeError("db unreachable")
+        return self.stored_usage
 
 
 _LIBTV_720P_MODEL_INFO = {"output_cost_per_second_720p": 0.5}
@@ -797,6 +811,114 @@ async def test_avideo_status_in_progress_never_calls_persistence(monkeypatch):
 
     assert status.status == "in_progress"
     assert fake_persistence.calls == []
+
+
+_PRODUCTION_STATUS_OPTIONAL_PARAMS = {
+    "webid": "w",
+    "model": "star-video2",
+    "custom_llm_provider": "libtv",
+    "model_info": _LIBTV_720P_MODEL_INFO,
+}
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_production_shape_bills_from_persisted_usage(monkeypatch):
+    fake_persistence = FakeBillingPersistence(
+        billed=True, stored_usage={"duration_seconds": 5.0, "video_resolution": "720p"}
+    )
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+
+    status = await LibTVLLM().avideo_status(
+        vid, "tok", None, dict(_PRODUCTION_STATUS_OPTIONAL_PARAMS), None, client=client
+    )
+
+    assert status.status == "completed"
+    assert status.usage == {"duration_seconds": 5.0, "video_resolution": "720p"}
+    assert status._hidden_params["response_cost"] == pytest.approx(2.5)
+    assert fake_persistence.get_usage_calls == ["libtv:task-9"]
+    assert fake_persistence.calls == [("libtv:task-9", 5.0, pytest.approx(2.5))]
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_production_shape_no_persisted_usage_skips_billing(monkeypatch):
+    fake_persistence = FakeBillingPersistence(billed=True, stored_usage=None)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+
+    status = await LibTVLLM().avideo_status(
+        vid, "tok", None, dict(_PRODUCTION_STATUS_OPTIONAL_PARAMS), None, client=client
+    )
+
+    assert status.status == "completed"
+    assert "response_cost" not in status._hidden_params
+    assert fake_persistence.get_usage_calls == ["libtv:task-9"]
+    assert fake_persistence.calls == []
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_production_shape_usage_lookup_error_skips_billing(monkeypatch):
+    fake_persistence = FakeBillingPersistence(raises=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+
+    status = await LibTVLLM().avideo_status(
+        vid, "tok", None, dict(_PRODUCTION_STATUS_OPTIONAL_PARAMS), None, client=client
+    )
+
+    assert status.status == "completed"
+    assert "response_cost" not in status._hidden_params
+    assert fake_persistence.calls == []
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_records_task_usage_for_status_billing(monkeypatch):
+    fake_persistence = FakeBillingPersistence()
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    fake = FakeAsyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+
+    vo = await LibTVLLM(poll_interval=0).avideo_generation(
+        "star-video2",
+        "a fox",
+        "tok",
+        None,
+        {"webid": "w", "seconds": 8, "resolution": "720p"},
+        None,
+        client=fake,
+    )
+
+    assert vo.status == "queued"
+    assert fake_persistence.store_usage_calls == [("libtv:task-1", 8.0, "720p")]
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_records_spec_default_duration_when_request_has_none(monkeypatch):
+    fake_persistence = FakeBillingPersistence()
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    fake = FakeAsyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+
+    vo = await LibTVLLM(poll_interval=0).avideo_generation(
+        "star-video2", "a fox", "tok", None, {"webid": "w"}, None, client=fake
+    )
+
+    assert vo.status == "queued"
+    assert fake_persistence.store_usage_calls == [("libtv:task-1", 5.0, "720p")]
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_store_usage_error_does_not_break_create(monkeypatch):
+    fake_persistence = FakeBillingPersistence(raises=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    fake = FakeAsyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload(auto_compliance=False))
+
+    vo = await LibTVLLM(poll_interval=0).avideo_generation(
+        "star-video2", "a fox", "tok", None, {"webid": "w", "seconds": 8}, None, client=fake
+    )
+
+    assert vo.status == "queued"
 
 
 def test_video_create_call_type_still_zero_cost_without_duration():

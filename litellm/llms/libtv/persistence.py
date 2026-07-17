@@ -36,6 +36,15 @@ CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVProjects" (
 )
 """
 
+CREATE_VIDEO_TASK_USAGE_TABLE = """
+CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVVideoTaskUsage" (
+  billing_key TEXT NOT NULL PRIMARY KEY,
+  duration_seconds DOUBLE PRECISION NOT NULL,
+  video_resolution TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"""
+
 CREATE_BILLED_VIDEO_TASKS_TABLE = """
 CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVBilledVideoTasks" (
   billing_key TEXT NOT NULL PRIMARY KEY,
@@ -102,6 +111,7 @@ class LibTVPersistence:
         try:
             await self.db.execute_raw(CREATE_UPLOAD_CACHE_TABLE)
             await self.db.execute_raw(CREATE_PROJECTS_TABLE)
+            await self.db.execute_raw(CREATE_VIDEO_TASK_USAGE_TABLE)
             await self.db.execute_raw(CREATE_BILLED_VIDEO_TASKS_TABLE)
             _tables_ready = True
         except Exception:
@@ -187,6 +197,46 @@ class LibTVPersistence:
             )
         except Exception:
             _warn("libtv persistence: store_project failed", exc_info=True)
+
+    async def store_video_task_usage(
+        self, billing_key: str, duration_seconds: float, video_resolution: Optional[str]
+    ) -> None:
+        """Persist the requested duration/resolution of a just-created video task.
+
+        The status poll (the only point that knows generation completed, and thus
+        the only correct billing point) receives none of the create request's
+        parameters, so it reads this record back to price the task.
+        """
+        try:
+            await self.ensure_tables()
+            await self.db.execute_raw(
+                'INSERT INTO "LiteLLM_LibTVVideoTaskUsage" '
+                "(billing_key, duration_seconds, video_resolution) VALUES ($1, $2, $3) "
+                "ON CONFLICT (billing_key) DO NOTHING",
+                billing_key,
+                duration_seconds,
+                video_resolution,
+            )
+        except Exception:
+            _warn("libtv persistence: store_video_task_usage failed", exc_info=True)
+
+    async def get_video_task_usage(self, billing_key: str) -> Optional[dict]:
+        """Read back a task's recorded usage: {'duration_seconds', 'video_resolution'} or None."""
+        try:
+            await self.ensure_tables()
+            rows = await self.db.query_raw(
+                'SELECT duration_seconds, video_resolution FROM "LiteLLM_LibTVVideoTaskUsage" WHERE billing_key=$1',
+                billing_key,
+            )
+            if not rows:
+                return None
+            return {
+                "duration_seconds": float(rows[0]["duration_seconds"]),
+                "video_resolution": rows[0]["video_resolution"],
+            }
+        except Exception:
+            _warn("libtv persistence: get_video_task_usage failed", exc_info=True)
+            return None
 
     async def mark_video_billed(self, billing_key: str, duration_seconds: float, response_cost: float) -> bool:
         """Record a completed video task as billed, once.

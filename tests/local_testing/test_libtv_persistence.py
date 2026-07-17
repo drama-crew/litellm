@@ -319,12 +319,65 @@ async def test_ensure_tables_creates_both_tables_once():
     await p.cached_upload("acct1", "cdn.example.com/g.png")
 
     create_calls = [c for c in db.execute_calls if "CREATE TABLE" in c[0]]
-    assert len(create_calls) == 3
+    assert len(create_calls) == 4
     assert any("LiteLLM_LibTVUploadCache" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVProjects" in c[0] for c in create_calls)
+    assert any("LiteLLM_LibTVVideoTaskUsage" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVBilledVideoTasks" in c[0] for c in create_calls)
-    assert calls_after_first == 3
-    assert len(db.execute_calls) == 3
+    assert calls_after_first == 4
+    assert len(db.execute_calls) == 4
+
+
+@pytest.mark.asyncio
+async def test_store_video_task_usage_inserts_with_do_nothing():
+    db = FakeDb()
+    p = LibTVPersistence(db)
+
+    await p.store_video_task_usage("libtv:task-9", 5.0, "720p")
+
+    insert_calls = [c for c in db.execute_calls if "LiteLLM_LibTVVideoTaskUsage" in c[0] and "INSERT" in c[0]]
+    assert len(insert_calls) == 1
+    sql, params = insert_calls[0]
+    assert "ON CONFLICT" in sql
+    assert "DO NOTHING" in sql
+    assert params == ("libtv:task-9", 5.0, "720p")
+
+
+@pytest.mark.asyncio
+async def test_store_video_task_usage_db_failure_is_noop():
+    db = FakeDb(raise_on="execute_raw")
+    p = LibTVPersistence(db)
+
+    assert await p.store_video_task_usage("libtv:task-9", 5.0, "720p") is None
+
+
+@pytest.mark.asyncio
+async def test_get_video_task_usage_hit_returns_usage():
+    db = FakeDb(query_rows=[{"duration_seconds": 5.0, "video_resolution": "720p"}])
+    p = LibTVPersistence(db)
+
+    usage = await p.get_video_task_usage("libtv:task-9")
+
+    assert usage == {"duration_seconds": 5.0, "video_resolution": "720p"}
+    sql, params = db.query_calls[0]
+    assert "LiteLLM_LibTVVideoTaskUsage" in sql
+    assert params == ("libtv:task-9",)
+
+
+@pytest.mark.asyncio
+async def test_get_video_task_usage_miss_returns_none():
+    db = FakeDb(query_rows=[])
+    p = LibTVPersistence(db)
+
+    assert await p.get_video_task_usage("libtv:task-9") is None
+
+
+@pytest.mark.asyncio
+async def test_get_video_task_usage_db_failure_returns_none():
+    db = FakeDb(raise_on="query_raw")
+    p = LibTVPersistence(db)
+
+    assert await p.get_video_task_usage("libtv:task-9") is None
 
 
 @pytest.mark.asyncio
