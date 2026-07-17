@@ -559,6 +559,10 @@ class LibTVLLM(CustomLLM):
         fields), and libtv's progress response has only status/urls/failed_reason —
         so this create-time record is the only way completion-time billing can know
         what to charge. Best-effort: any failure just logs.
+
+        Async-only by design (persistence is async): only avideo_generation records
+        and only avideo_status bills; the sync video_generation/video_status paths
+        are unused by the production proxy and stay billing-free.
         """
         merged = dict(optional_params)
         gp = generation_params or {}
@@ -585,17 +589,22 @@ class LibTVLLM(CustomLLM):
     async def _bill_completed_video(self, vo: VideoObject, task_id: str, optional_params: dict) -> None:
         """Charge for a completed libtv video task exactly once.
 
-        The libtv progress poll is the only point in the async create/poll/download
-        flow that knows generation actually finished, so it is also the only correct
-        place to accrue spend (create-time cost is always 0.0: no duration is known
-        yet). The poll request itself carries no duration/resolution, so those come
-        from the persistence record written at create time (optional_params are
-        still consulted first for direct-SDK callers that do pass them). Poll-to-
-        completed fires repeatedly (client retries, repeated status checks), so
-        charging is idempotent: a persistence-backed insert-once marker gates the
-        charge, and any failure to reach that marker (no db configured, db error,
-        no create-time record — e.g. tasks created before this deploy) skips the
-        charge rather than risking a double bill.
+        Billing is deliberately deferred to completion: create knows the requested
+        duration, but its cost pipeline computes 0.0 (deployment tier pricing never
+        reaches the create-time calculator), and charging at create would bill tasks
+        that later fail. The progress poll is the only point that knows generation
+        actually succeeded. The poll request itself carries no duration/resolution,
+        so those come from the persistence record written at create time
+        (optional_params are still consulted first for direct-SDK callers that do
+        pass them). Poll-to-completed fires repeatedly (client retries, repeated
+        status checks), so charging is idempotent: a persistence-backed insert-once
+        marker gates the charge, and any failure to reach that marker (no db
+        configured, db error, no create-time record — e.g. tasks created before
+        this deploy) skips the charge rather than risking a double bill.
+
+        Async-only, like _record_video_task_usage: persistence is async and the
+        production proxy routes exclusively through avideo_generation/avideo_status,
+        so the sync video_generation/video_status paths neither record nor bill.
         """
         persistence = get_persistence()
         usage = _video_usage(optional_params)
@@ -606,7 +615,10 @@ class LibTVLLM(CustomLLM):
                 logger.warning("libtv video billing: usage lookup failed, skipping charge", exc_info=True)
                 return
         if usage is None:
-            logger.warning("libtv video billing: no usage record for completed task %s, skipping charge", task_id)
+            # debug, not warning: every poll of a task without a record (created
+            # before this deploy, or a duration-less create like topaz upscale)
+            # lands here, and completed tasks keep getting polled.
+            logger.debug("libtv video billing: no usage record for completed task %s, skipping charge", task_id)
             return
         vo.usage = usage
         cost = _video_completion_cost(optional_params, usage)
