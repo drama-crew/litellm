@@ -15,6 +15,7 @@ from litellm.llms.custom_httpx.http_handler import (
     _get_httpx_client,
     get_async_httpx_client,
 )
+from litellm.llms.openai.cost_calculation import _video_output_cost_per_second
 from litellm.secret_managers.main import get_secret_str
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.videos.main import VideoCreateOptionalRequestParams, VideoObject
@@ -219,7 +220,37 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         if resolution:
             usage["video_resolution"] = str(resolution).lower()
         video.usage = usage
+        response_cost = self._create_response_cost(usage, logging_obj)
+        if response_cost is not None:
+            video._hidden_params = {**video._hidden_params, "response_cost": response_cost}
         return video
+
+    @staticmethod
+    def _deployment_model_info(logging_obj: Any) -> Dict[str, Any]:
+        litellm_params = getattr(logging_obj, "litellm_params", None)
+        if not isinstance(litellm_params, dict):
+            return {}
+        for key in ("litellm_metadata", "metadata"):
+            metadata = litellm_params.get(key)
+            if isinstance(metadata, dict) and isinstance(metadata.get("model_info"), dict):
+                return metadata["model_info"]
+        return {}
+
+    @classmethod
+    def _create_response_cost(cls, usage: Dict[str, Any], logging_obj: Any) -> Optional[float]:
+        duration_seconds = usage.get("duration_seconds")
+        if duration_seconds is None:
+            return None
+        model_info = cls._deployment_model_info(logging_obj)
+        if not model_info:
+            verbose_logger.debug(
+                "wavespeed video billing: no deployment model_info on logging_obj, skipping response_cost"
+            )
+            return None
+        rate = _video_output_cost_per_second(model_info, usage.get("video_resolution"))
+        if rate is None:
+            return None
+        return rate * float(duration_seconds)
 
     def transform_video_status_retrieve_request(
         self,
