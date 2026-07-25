@@ -2913,15 +2913,78 @@ async def test_acreate_after_wait_non_connect_error_propagates_without_redial():
     assert lt.calls == 1
 
 
-def test_mixed2video_submit_does_not_guard_poll():
+def _mixed2video_fresh_retry_routes(create_ids, progress_seq):
     routes = _compliance_routes(verify_passed=True)
-    routes["/api/task/generation/progress"] = [_AGING_FAIL]
-    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload())
-    vo = _fresh_retry_llm().video_generation(
+    routes["/api/task/generation/create"] = [{"code": 0, "data": {"taskId": tid}} for tid in create_ids]
+    routes["/api/task/generation/progress"] = list(progress_seq)
+    return routes
+
+
+def _mixed2video_call(llm, fake):
+    return llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
+    )
+
+
+def test_mixed2video_fresh_asset_fast_fail_retries_create_with_new_task():
+    fake = FakeSyncClient(
+        post_by_path=_mixed2video_fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(),
+    )
+    vo = _mixed2video_call(_fresh_retry_llm(), fake)
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert creates[0]["params"]["mixedList"] == creates[1]["params"]["mixedList"]
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+@pytest.mark.asyncio
+async def test_mixed2video_fresh_asset_fast_fail_retries_create_async():
+    fake = FakeAsyncClient(
+        post_by_path=_mixed2video_fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(),
+    )
+    vo = await _fresh_retry_llm().avideo_generation(
         "star-video2", "x", "tok", None, {"webid": "w", "reference_images": [_LIBTV_REF]}, None, client=fake
     )
     assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert creates[0]["params"]["mixedList"] == creates[1]["params"]["mixedList"]
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+
+
+def test_mixed2video_compliance_rejection_is_not_retried():
+    fake = FakeSyncClient(
+        post_by_path=_mixed2video_fresh_retry_routes(["t1"], [_COMPLIANCE_FAIL]),
+        get_payload=_tool_spec_payload(),
+    )
+    vo = _mixed2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+
+
+def test_non_auto_compliance_video_generation_does_not_guard_poll():
+    # Scope guard: the non-auto-compliance `else` branch (e.g. text2video, or any
+    # mode with auto_compliance disabled) must keep submitting with a plain create
+    # and never guard-poll, even when the vendor returns the fresh-asset-style
+    # failure text on the very first poll.
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+        "/api/task/generation/progress": [_AGING_FAIL],
+    }
+    fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(auto_compliance=False))
+    vo = _fresh_retry_llm().video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "queued"
     assert not [p for p, _ in fake.calls if p == "/api/task/generation/progress"]
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
 
 
 # --- video usage -> resolution-tiered cost (authoritative spend line) ---------

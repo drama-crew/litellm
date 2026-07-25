@@ -474,8 +474,9 @@ class LibTVLLM(CustomLLM):
     def _create_with_fresh_asset_retry(
         self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str
     ) -> dict:
-        """Create a frames2video or image2video task, guard-poll it briefly, and re-create on the
-        fresh-asset aging failure (see _is_fresh_asset_aging_failure). Registered
+        """Create a frames2video, image2video, or auto-compliance mixed2video task,
+        guard-poll it briefly, and re-create on the fresh-asset aging failure (see
+        _is_fresh_asset_aging_failure). Registered
         asset ids stay valid across attempts (the server dedupes by url), so each
         retry reuses the same params; a retry a few minutes later lands after the
         server's internal audit and succeeds. Total worst-case wall time stays
@@ -964,9 +965,14 @@ class LibTVLLM(CustomLLM):
                 [url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
+        # frames2video/image2video/mixed2video all register real-person refs as
+        # freshly-created assets and hit the same aging failure (see
+        # _is_fresh_asset_aging_failure); only the non-auto-compliance else branch
+        # above (raw cdn urls, e.g. text2video) skips the guard-poll retry.
+        wants_fresh_asset_retry = wants_frames or wants_image2video or (bool(images) and auto_compliance)
         created = (
             self._create_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
-            if wants_frames or wants_image2video
+            if wants_fresh_asset_retry
             else lt.create(model, spec["vendor"], "video", params, _project_name(model))
         )
         return self._build_video_object(model, created, optional_params)
@@ -1070,9 +1076,10 @@ class LibTVLLM(CustomLLM):
                 [await url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
+        wants_fresh_asset_retry = wants_frames or wants_image2video or (bool(images) and auto_compliance)
         created = (
             await self._acreate_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
-            if wants_frames or wants_image2video
+            if wants_fresh_asset_retry
             else await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
         )
         vo = self._build_video_object(model, created, optional_params)
