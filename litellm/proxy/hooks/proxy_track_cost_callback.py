@@ -280,6 +280,12 @@ class _ProxyDBLogger(CustomLogger):
                         kwargs.get("call_type", "unknown"),
                     )
                     return
+                if kwargs.get("call_type") in ("avideo_content", "video_content"):
+                    verbose_proxy_logger.debug(
+                        "Cost tracking - skipping, call_type=%s has no cost of its own",
+                        kwargs.get("call_type"),
+                    )
+                    return
                 if kwargs.get("stream") is not True or (
                     kwargs.get("stream") is True and "complete_streaming_response" in kwargs
                 ):

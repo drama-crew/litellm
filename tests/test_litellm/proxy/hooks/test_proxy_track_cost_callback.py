@@ -299,6 +299,88 @@ async def test_track_cost_callback_releases_budget_reservation_when_response_cos
         )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call_type", ["avideo_content", "video_content"])
+async def test_track_cost_callback_skips_for_video_content_download(call_type):
+    """
+    Video content downloads (GET /v1/videos/{id}/content) have no pricing semantics
+    of their own -- generation spend is billed once, at completion, by the provider's
+    own completion-time billing (e.g. libtv's LibTVLLM._bill_completed_video). Before
+    this fix, every download raised "Cost tracking failed for model=..." because
+    litellm's generic cost calculator has no notion of pricing a raw video byte
+    stream, flooding logs for every libtv video model regardless of whether that
+    model's completion-time billing worked.
+
+    kwargs intentionally omits standard_logging_object entirely: that is the shape
+    seen in production ("Cost tracking failed for model=libtv-seedance-2-fast-account-1.
+    Debug info - standard_logging_object not found"), not a standard_logging_object
+    present with a null response_cost.
+    """
+    logger = _ProxyDBLogger()
+
+    kwargs = {
+        "model": "libtv-kling-v3-omni",
+        "call_type": call_type,
+        "litellm_params": {},
+        "stream": False,
+    }
+
+    with patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj",
+    ) as mock_proxy_logging:
+        mock_proxy_logging.failed_tracking_alert = AsyncMock()
+        mock_proxy_logging.db_spend_update_writer = MagicMock()
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock()
+
+        await logger._PROXY_track_cost_callback(
+            kwargs=kwargs,
+            completion_response=None,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+
+        mock_proxy_logging.failed_tracking_alert.assert_not_called()
+        mock_proxy_logging.db_spend_update_writer.update_database.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_track_cost_callback_still_reports_failure_for_other_call_types_missing_standard_logging_object():
+    """
+    Control for the test above: avideo_status hits the exact same missing-
+    standard_logging_object shape (its own billing is done inside
+    LibTVLLM._bill_completed_video, not through the generic cost calculator) but
+    must NOT be silenced -- only avideo_content/video_content are known to have no
+    pricing semantics of their own. Without this control, a test that only checks
+    avideo_content/video_content go quiet cannot tell "the fix correctly scoped to
+    downloads" apart from "the fix accidentally swallowed the whole missing-
+    standard_logging_object branch for every call_type".
+    """
+    logger = _ProxyDBLogger()
+
+    kwargs = {
+        "model": "libtv-kling-v3-omni",
+        "call_type": "avideo_status",
+        "litellm_params": {},
+        "stream": False,
+    }
+
+    with patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj",
+    ) as mock_proxy_logging:
+        mock_proxy_logging.failed_tracking_alert = AsyncMock()
+        mock_proxy_logging.db_spend_update_writer = MagicMock()
+        mock_proxy_logging.db_spend_update_writer.update_database = AsyncMock()
+
+        await logger._PROXY_track_cost_callback(
+            kwargs=kwargs,
+            completion_response=None,
+            start_time=datetime.now(),
+            end_time=datetime.now(),
+        )
+
+        mock_proxy_logging.failed_tracking_alert.assert_called_once()
+
+
 def test_get_budget_reservation_from_metadata_handles_dict_auth_object():
     budget_reservation = {
         "reserved_cost": 0.5,
