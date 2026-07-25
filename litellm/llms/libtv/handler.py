@@ -386,21 +386,78 @@ def _asset_ref_to_string(ref: dict) -> str:
 
 
 _FRESH_ASSET_RETRY_TOKEN = "请稍后重试"
+_TERMINAL_REJECTION_MARKER = "合规"
 
 
 def _is_fresh_asset_aging_failure(state: dict) -> bool:
-    """Whether a frames2video task failed with the vendor's generic retryable
-    failure. Live-verified (2026-07-11): seedance/star-video2 frames2video with a
-    freshly registered real-person compliant asset ALWAYS fails upstream within
-    seconds with this generic reason, while the exact same asset ids succeed once
-    the registration is a few minutes old (server runs an internal deep audit with
-    no observable readiness signal in third_asset/check; assetId and status=1 are
-    returned immediately and never change). Genuine compliance rejections use a
-    different message ("请先进行合规校验后重试") and must not be retried."""
+    """Whether a frames2video, image2video, or mixed2video task failed with the
+    vendor's generic retryable failure. Live-verified (2026-07-11): seedance/star-video2
+    with a freshly registered real-person compliant asset ALWAYS fails upstream within
+    seconds with this generic reason, while the exact same asset ids succeed once the
+    registration is a few minutes old (server runs an internal deep audit with no
+    observable readiness signal in third_asset/check; assetId and status=1 are returned
+    immediately and never change).
+
+    Production's full libtv failedReason corpus (SpendLogs, 2026-06-05..07-25) has
+    exactly four distinct reasons. The three genuinely terminal ones each end with
+    an actionable remediation instruction -- 请先进行合规校验后重试 / 请选择其他参考素材 /
+    请尝试修改信息后重试 -- while the one retryable reason ends with the bare
+    "请稍后重试" and nothing else, which is why matching that token alone is
+    sufficient. An earlier, ad-hoc-captured terminal reason outside this corpus
+    (生成视频可能涉及版权限制...请调整描述或素材后重试) follows the same pattern. "合规"
+    stays excluded defensively even though no terminal reason seen so far -- corpus
+    or ad hoc -- has ever combined it with the retry token: if a future terminal
+    wording regressed to something like "合规审核中，请稍后重试", matching the retry
+    token alone would fail open and silently retry a rejection that must never be
+    retried."""
     if state.get("status") != 3:
         return False
     reason = state.get("failed_reason") or ""
-    return _FRESH_ASSET_RETRY_TOKEN in reason and "合规" not in reason
+    return _FRESH_ASSET_RETRY_TOKEN in reason and _TERMINAL_REJECTION_MARKER not in reason
+
+
+def _excluded_terminal_rejection_reason(state: dict) -> Optional[str]:
+    """The failed_reason when _is_fresh_asset_aging_failure returned False
+    specifically because the reason carried the generic retry token but was
+    excluded by _TERMINAL_REJECTION_MARKER, as opposed to any other reason it
+    might return False for (wrong status, no retry token at all). None otherwise.
+    Exists only so the retry call sites can log the exclusion: without it, a
+    failure that looked retryable but got treated as a terminal content
+    rejection leaves no trace in production logs."""
+    if state.get("status") != 3:
+        return None
+    reason = state.get("failed_reason") or ""
+    if _FRESH_ASSET_RETRY_TOKEN in reason and _TERMINAL_REJECTION_MARKER in reason:
+        return reason
+    return None
+
+
+def _log_terminal_rejection(task_id: str, state: dict) -> None:
+    """Log the one guard-poll outcome per fresh-asset-retry cycle that ends the
+    cycle without a retry because the task hit a terminal (non-retryable)
+    failure, distinguishing the specific case excluded by
+    _TERMINAL_REJECTION_MARKER from any other terminal failed_reason. Called at
+    most once per guard-poll, from both the sync and async retry loops, so
+    production always has a trace of "submitted then upstream terminally
+    rejected it" even when the rejection never carried the fresh-asset retry
+    token in the first place."""
+    reason = state.get("failed_reason") or ""
+    if _excluded_terminal_rejection_reason(state) is not None:
+        logger.warning(
+            "libtv fresh-asset retry: task %s failed_reason %r matched the "
+            "terminal-rejection marker %r despite also containing the retry "
+            "token %r; treating as a genuine content rejection and not retrying",
+            task_id,
+            reason,
+            _TERMINAL_REJECTION_MARKER,
+            _FRESH_ASSET_RETRY_TOKEN,
+        )
+    else:
+        logger.warning(
+            "libtv fresh-asset retry: task %s failed_reason %r is a terminal (non-retryable) rejection; not retrying",
+            task_id,
+            reason,
+        )
 
 
 def _frame_payloads(optional_params: dict) -> list:
@@ -484,7 +541,10 @@ class LibTVLLM(CustomLLM):
         created = lt.create(model, vendor, "video", params, project_name)
         for attempt in range(self.fresh_asset_retry_attempts):
             state = self._guard_poll_sync(lt, created["task_id"])
-            if state is None or not _is_fresh_asset_aging_failure(state):
+            aging_failure = state is not None and _is_fresh_asset_aging_failure(state)
+            if state is not None and state.get("status") == 3 and not aging_failure:
+                _log_terminal_rejection(created["task_id"], state)
+            if not aging_failure:
                 return created
             logger.warning(
                 "libtv fresh-asset retry: task %s hit the fresh-asset aging failure "
@@ -515,7 +575,10 @@ class LibTVLLM(CustomLLM):
         created = await lt.acreate(model, vendor, "video", params, project_name)
         for attempt in range(self.fresh_asset_retry_attempts):
             state = await self._guard_poll_async(lt, created["task_id"])
-            if state is None or not _is_fresh_asset_aging_failure(state):
+            aging_failure = state is not None and _is_fresh_asset_aging_failure(state)
+            if state is not None and state.get("status") == 3 and not aging_failure:
+                _log_terminal_rejection(created["task_id"], state)
+            if not aging_failure:
                 return created
             logger.warning(
                 "libtv fresh-asset retry: task %s hit the fresh-asset aging failure "

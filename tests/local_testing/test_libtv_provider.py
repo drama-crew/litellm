@@ -34,11 +34,14 @@ from litellm.llms.libtv.handler import (
     LIBTV_PROVIDER,
     LibTVLLM,
     _PROJECT_NAME_POOL,
+    _TERMINAL_REJECTION_MARKER,
     _collect_reference_groups,
     _default_video_mode,
+    _excluded_terminal_rejection_reason,
     _image_clarity_response_cost,
     _infer_image_mode,
     _infer_video_mode,
+    _is_fresh_asset_aging_failure,
     _project_name,
     _raise_normalized_libtv_error,
     _reference_payload,
@@ -2697,6 +2700,69 @@ def test_frames2video_compliance_rejection_is_not_retried():
     assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
 
 
+# Real production libtv failedReason values (LiteLLM_SpendLogs full corpus,
+# 2026-06-05..07-25): exactly four distinct reasons exist there. Every
+# genuinely terminal one ends with an actionable remediation instruction; only
+# the retryable one ends with the bare "请稍后重试" and nothing else.
+_REAL_PORTRAIT_COMPLIANCE_REJECTION = "参考图可能包含真人形象，积分将会在2小时内返还，请先进行合规校验后重试。"
+_REAL_FRESH_ASSET_AGING_FAILURE = "视频生成失败，积分将会在2小时内返还，请稍后重试"
+_REAL_REFERENCE_DURATION_REJECTION = (
+    "参考视频与音频总时长均不可超过 15 秒，单长度须大于 1.8 秒，积分将会在2小时内返还，请选择其他参考素材"
+)
+_REAL_UNSUPPORTED_MODEL_INPUT_REJECTION = "当前任务模型无法处理，请尝试修改信息后重试"
+
+# Not part of the SpendLogs corpus above (0 hits there, and 0 hits in the
+# drama library either): an earlier ad-hoc capture of a libtv copyright
+# rejection, predating this branch. Defined here and reused below by the
+# is_compliance_failure tests instead of being duplicated under a second name.
+_CAPTURED_COMPLIANCE_REASON = "生成视频可能涉及版权限制，积分将会在2小时内返还，请调整描述或素材后重试"
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        (_REAL_PORTRAIT_COMPLIANCE_REJECTION, False),
+        (_REAL_FRESH_ASSET_AGING_FAILURE, True),
+        (_REAL_REFERENCE_DURATION_REJECTION, False),
+        (_REAL_UNSUPPORTED_MODEL_INPUT_REJECTION, False),
+        (_CAPTURED_COMPLIANCE_REASON, False),
+    ],
+)
+def test_is_fresh_asset_aging_failure_matches_known_production_reasons(reason, expected):
+    assert _is_fresh_asset_aging_failure({"status": 3, "failed_reason": reason}) is expected
+
+
+def test_is_fresh_asset_aging_failure_false_when_status_not_terminal():
+    state = {"status": 2, "failed_reason": _REAL_FRESH_ASSET_AGING_FAILURE}
+    assert _is_fresh_asset_aging_failure(state) is False
+
+
+def test_is_fresh_asset_aging_failure_false_when_reason_missing():
+    assert _is_fresh_asset_aging_failure({"status": 3}) is False
+
+
+def test_is_fresh_asset_aging_failure_false_when_reason_none():
+    assert _is_fresh_asset_aging_failure({"status": 3, "failed_reason": None}) is False
+
+
+def test_terminal_rejection_marker_is_a_single_keyword_not_a_widened_set():
+    # Anti-drift guard: the exclusion in _is_fresh_asset_aging_failure must stay
+    # exactly the single keyword "合规", not grow back into the wider token set
+    # (合规/审核/敏感/违规/违禁/侵权/版权/涉黄/涉政/色情/血腥/未成年) that
+    # bc3ab69d53 disproved against the full production failedReason corpus.
+    assert _TERMINAL_REJECTION_MARKER == "合规"
+
+
+def test_is_fresh_asset_aging_failure_true_for_generic_audit_wording_without_compliance_marker():
+    # This is exactly the scenario the docstring's defensive example describes:
+    # a future terminal wording that names the audit mechanism ("审核") without
+    # also containing "合规" must still be classified as the retryable
+    # fresh-asset aging failure. If "审核" (or any token beyond "合规") were ever
+    # reintroduced into the exclusion, this reason would flip to False and this
+    # test would fail -- that is the point of the assertion.
+    assert _is_fresh_asset_aging_failure({"status": 3, "failed_reason": "审核中，请稍后重试"}) is True
+
+
 def test_frames2video_fresh_asset_retry_gives_up_after_max_attempts():
     fake = FakeSyncClient(
         post_by_path=_fresh_retry_routes(["t1", "t2", "t3"], [_AGING_FAIL, _AGING_FAIL, _AGING_FAIL]),
@@ -2797,6 +2863,127 @@ async def test_fresh_asset_retry_logs_warning_with_task_and_attempt_info_async(c
     assert len(retry_logs) == 1
     assert "t1" in retry_logs[0]
     assert "1/2" in retry_logs[0]
+
+
+# Synthetic: no reason in the real production corpus currently combines the retry
+# token with "合规" (see _REAL_PORTRAIT_COMPLIANCE_REJECTION, which never contains
+# "请稍后重试" at all). This reason is constructed purely to exercise the
+# exclusion-observability branch for the day upstream wording does combine them.
+_SYNTHETIC_EXCLUDED_REASON = "视频生成失败，因合规问题，请稍后重试"
+
+
+def test_fresh_asset_retry_excluded_by_terminal_marker_logs_warning(caplog):
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(
+            ["t1"],
+            [{"code": 0, "data": {"progresses": [{"status": 3, "failedReason": _SYNTHETIC_EXCLUDED_REASON}]}}],
+        ),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        vo = _frames2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+    excluded_logs = [r.message for r in caplog.records if "terminal-rejection marker" in r.message]
+    assert len(excluded_logs) == 1
+    assert "t1" in excluded_logs[0]
+    assert "合规" in excluded_logs[0]
+
+
+@pytest.mark.asyncio
+async def test_fresh_asset_retry_excluded_by_terminal_marker_logs_warning_async(caplog):
+    fake = FakeAsyncClient(
+        post_by_path=_fresh_retry_routes(
+            ["t1"],
+            [{"code": 0, "data": {"progresses": [{"status": 3, "failedReason": _SYNTHETIC_EXCLUDED_REASON}]}}],
+        ),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        vo = await _fresh_retry_llm().avideo_generation(
+            "star-video2",
+            "smile then wave",
+            "tok",
+            None,
+            {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+            None,
+            client=fake,
+        )
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+    excluded_logs = [r.message for r in caplog.records if "terminal-rejection marker" in r.message]
+    assert len(excluded_logs) == 1
+    assert "t1" in excluded_logs[0]
+    assert "合规" in excluded_logs[0]
+
+
+def test_fresh_asset_retry_generic_terminal_rejection_logs_warning(caplog):
+    # A terminal failure that never carried the fresh-asset retry token at all
+    # (the real portrait-compliance rejection, which ends with 后重试 but not
+    # 稍后重试) must still be logged: this is production's most frequent
+    # failedReason and, before this test, the guard-poll call sites logged
+    # nothing for it.
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1"], [_COMPLIANCE_FAIL]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        vo = _frames2video_call(_fresh_retry_llm(), fake)
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+    terminal_logs = [r.message for r in caplog.records if "is a terminal" in r.message]
+    assert len(terminal_logs) == 1
+    assert "t1" in terminal_logs[0]
+    assert "合规校验" in terminal_logs[0]
+    assert not any("terminal-rejection marker" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_fresh_asset_retry_generic_terminal_rejection_logs_warning_async(caplog):
+    fake = FakeAsyncClient(
+        post_by_path=_fresh_retry_routes(["t1"], [_COMPLIANCE_FAIL]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        vo = await _fresh_retry_llm().avideo_generation(
+            "star-video2",
+            "smile then wave",
+            "tok",
+            None,
+            {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+            None,
+            client=fake,
+        )
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+    terminal_logs = [r.message for r in caplog.records if "is a terminal" in r.message]
+    assert len(terminal_logs) == 1
+    assert "t1" in terminal_logs[0]
+    assert "合规校验" in terminal_logs[0]
+    assert not any("terminal-rejection marker" in r.message for r in caplog.records)
+
+
+def test_excluded_terminal_rejection_reason_none_when_status_not_terminal():
+    state = {"status": 2, "failed_reason": _SYNTHETIC_EXCLUDED_REASON}
+    assert _excluded_terminal_rejection_reason(state) is None
+
+
+def test_excluded_terminal_rejection_reason_none_when_no_retry_token():
+    state = {"status": 3, "failed_reason": _REAL_PORTRAIT_COMPLIANCE_REJECTION}
+    assert _excluded_terminal_rejection_reason(state) is None
+
+
+def test_excluded_terminal_rejection_reason_none_when_reason_none():
+    assert _excluded_terminal_rejection_reason({"status": 3, "failed_reason": None}) is None
+
+
+def test_excluded_terminal_rejection_reason_returns_reason_when_marker_and_token_present():
+    state = {"status": 3, "failed_reason": _SYNTHETIC_EXCLUDED_REASON}
+    assert _excluded_terminal_rejection_reason(state) == _SYNTHETIC_EXCLUDED_REASON
 
 
 @pytest.mark.asyncio
@@ -4381,8 +4568,6 @@ from litellm.llms.libtv.common import (  # noqa: E402
     LibTVContentPolicyError,
     is_compliance_failure,
 )
-
-_CAPTURED_COMPLIANCE_REASON = "生成视频可能涉及版权限制，积分将会在2小时内返还，请调整描述或素材后重试"
 
 
 def test_is_compliance_failure_matches_captured_copyright_reason():
