@@ -39,6 +39,7 @@ class LibTVContentPolicyError(LibTVError):
 
 
 _COMPLIANCE_REASON_TOKENS = (
+    "合规",
     "版权",
     "侵权",
     "违规",

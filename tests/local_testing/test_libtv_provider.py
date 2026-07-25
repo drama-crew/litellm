@@ -4574,6 +4574,14 @@ def test_is_compliance_failure_matches_captured_copyright_reason():
     assert is_compliance_failure(_CAPTURED_COMPLIANCE_REASON) is True
 
 
+def test_is_compliance_failure_matches_real_portrait_compliance_rejection():
+    # Production's single most frequent libtv failedReason (9x in the
+    # 2026-06-05..07-25 SpendLogs corpus): a real-person reference image
+    # rejected pending compliance review. It names the compliance mechanism
+    # directly ("合规校验") yet matched none of the existing keywords.
+    assert is_compliance_failure(_REAL_PORTRAIT_COMPLIANCE_REJECTION) is True
+
+
 @pytest.mark.parametrize(
     "reason",
     ["版权", "涉黄内容", "内容审核未通过", "疑似侵权", "copyright detected", "nsfw content"],
@@ -4613,6 +4621,21 @@ def test_generate_raises_content_policy_error_on_compliance_reason():
     )
     with pytest.raises(LibTVContentPolicyError):
         lt.generate("m", "v", "video", {"prompt": "x"}, "n")
+
+
+def test_generate_raises_content_policy_error_on_real_portrait_compliance_reason():
+    lt = LibTVClient(
+        token="t",
+        webid="w",
+        sync_client=FakeSyncClient(post_by_path=_failed_routes(_REAL_PORTRAIT_COMPLIANCE_REJECTION)),
+        poll_interval=0,
+    )
+    with pytest.raises(LibTVContentPolicyError) as ei:
+        lt.generate("m", "v", "video", {"prompt": "x"}, "n")
+    # Before the fix this fell through to the generic LibTVError(502) branch,
+    # which handler.py's normalize_libtv_errors maps to BadGatewayError (5xx,
+    # retryable/fallback-eligible) instead of a fast-failing 400.
+    assert ei.value.status_code == 400
 
 
 def test_generate_capacity_failure_is_plain_error_not_content_policy():
