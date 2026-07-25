@@ -77,6 +77,29 @@ from .persistence import get_persistence
 from .transform import _resolution_from_size, build_generation_params, build_topaz_upscale_params
 
 _TOPAZ_VENDOR = "topazlabs"
+_BILLING_WARN_INTERVAL_SECONDS = 300.0
+_last_billing_warn: dict[str, Optional[float]] = {}  # mutable-ok: per-key last-emitted-time cache for rate limiting
+
+
+def _warn_billing_gap(key: str, message: str) -> None:
+    """Rate-limit per distinct billing gap.
+
+    Keyed (not global like persistence._warn) so a chatty condition -- e.g. every
+    poll of a duration-less topaz task -- can't starve the warning for a genuinely
+    new misconfiguration on another deployment. Key cardinality is bounded by
+    (deployment id x resolution tier), never by task id.
+
+    A never-before-seen key's first warning must always fire: time.monotonic()'s
+    absolute value is platform-defined, not guaranteed to already exceed the
+    interval, so a 0.0 default would silently swallow the first (and often most
+    actionable) warning right after a fresh deploy.
+    """
+    now = time.monotonic()
+    last = _last_billing_warn.get(key)
+    if last is None or now - last >= _BILLING_WARN_INTERVAL_SECONDS:
+        _last_billing_warn[key] = now
+        logger.warning(message)
+
 
 # libtv progress status -> OpenAI-style video status. Non-terminal codes keep the
 # client polling; the app treats completed as done and failed as a terminal error.
@@ -164,13 +187,25 @@ def _project_name(model: str) -> str:
 
 
 def _video_usage(optional_params: dict) -> Optional[dict]:
-    """duration_seconds + video_resolution for cost calc; None when no duration."""
+    """duration_seconds + video_resolution for cost calc; None when no duration.
+
+    Known limitation: `quality` is checked before the size-derived resolution, so an
+    OpenAI-style direct caller that sends both `size` and an unrelated `quality` value
+    would have its resolution tier silently overridden. Unreachable in production --
+    drama is the only client and never sends both -- but a `quality` config regression
+    on any deployment would now surface immediately via `_warn_billing_gap`'s
+    no-price warning instead of staying silent.
+    """
     try:
         duration_seconds = float(optional_params.get("seconds") or optional_params.get("duration"))
     except (TypeError, ValueError):
         return None
     usage: dict = {"duration_seconds": duration_seconds}
-    resolution = optional_params.get("resolution") or _resolution_from_size(optional_params.get("size"))
+    resolution = (
+        optional_params.get("resolution")
+        or optional_params.get("quality")
+        or _resolution_from_size(optional_params.get("size"))
+    )
     if resolution:
         usage["video_resolution"] = resolution
     return usage
@@ -181,7 +216,14 @@ def _video_billing_key(task_id: str) -> str:
 
 
 def _video_completion_cost(optional_params: dict, usage: dict) -> Optional[float]:
-    """duration x the deployment's per-second (resolution-tiered) rate, or None when unpriced."""
+    """duration x the deployment's per-second (resolution-tiered) rate, or None when unpriced.
+
+    Deliberately does not check `output_cost_per_video_per_second` the way
+    litellm.llms.openai.cost_calculation.video_generation_cost does: production
+    model_info config never sets it for libtv deployments, by convention (all libtv
+    pricing goes through the resolution-tiered `output_cost_per_second_<tier>` keys),
+    so this branch is currently unreachable.
+    """
     model_info = optional_params.get("model_info") or {}
     rate = _video_output_cost_per_second(model_info, usage.get("video_resolution"))
     if rate is None:
@@ -660,8 +702,16 @@ class LibTVLLM(CustomLLM):
         gp = generation_params or {}
         if merged.get("seconds") is None and merged.get("duration") is None:
             merged["duration"] = gp.get("duration")
+        # build_generation_params' output buckets duration/resolution/quality under
+        # per-mode vendor spellings (e.g. kling's quality_4k, singleImage2video's
+        # resolution_480; see transform._candidate_value), never a bare "resolution"
+        # or "quality" key -- so these fallbacks must prefix-match the same way
+        # _candidate_value does, or every mode using a bucketed key silently drops
+        # the tier (the root cause of the 15-day kling-v3-omni billing gap).
         if merged.get("resolution") is None and merged.get("size") is None:
-            merged["resolution"] = gp.get("resolution")
+            merged["resolution"] = next((v for k, v in gp.items() if k.startswith("resolution")), None)
+        if merged.get("quality") is None:
+            merged["quality"] = next((v for k, v in gp.items() if k.startswith("quality")), None)
         usage = _video_usage(merged)
         if usage is None:
             logger.warning(
@@ -697,8 +747,16 @@ class LibTVLLM(CustomLLM):
         Async-only, like _record_video_task_usage: persistence is async and the
         production proxy routes exclusively through avideo_generation/avideo_status,
         so the sync video_generation/video_status paths neither record nor bill.
+
+        Both no-usage and no-price gaps warn (via _warn_billing_gap, keyed by
+        deployment id so a chatty task can't drown out a different deployment's
+        warning) rather than fail silently: a completed task without a usage record
+        or without a matching price both mean real spend went unbilled, and staying
+        silent is exactly what let the kling-v3-omni gap run 15 days unnoticed.
         """
         persistence = get_persistence()
+        model_info = optional_params.get("model_info") or {}
+        deployment_id = model_info.get("id")
         usage = _video_usage(optional_params)
         if usage is None and persistence is not None:
             try:
@@ -707,14 +765,27 @@ class LibTVLLM(CustomLLM):
                 logger.warning("libtv video billing: usage lookup failed, skipping charge", exc_info=True)
                 return
         if usage is None:
-            # debug, not warning: every poll of a task without a record (created
-            # before this deploy, or a duration-less create like topaz upscale)
-            # lands here, and completed tasks keep getting polled.
-            logger.debug("libtv video billing: no usage record for completed task %s, skipping charge", task_id)
+            _warn_billing_gap(
+                f"no-usage:{deployment_id}",
+                f"libtv video billing: no usage record for completed task {task_id} "
+                f"(model_info id={deployment_id!r}); skipping charge -- if this deployment is "
+                "topaz-video-upscaler, its create request may not be sending `seconds` "
+                "(see _build_upscale_payload on the drama side); otherwise this task "
+                "predates usage recording",
+            )
             return
         vo.usage = usage
         cost = _video_completion_cost(optional_params, usage)
-        if cost is None or persistence is None:
+        if cost is None:
+            _warn_billing_gap(
+                f"no-price:{deployment_id}:{usage.get('video_resolution')}",
+                f"libtv video billing: no price for video_resolution={usage.get('video_resolution')!r} "
+                f"on completed task {task_id} (model_info id={deployment_id!r}); skipping charge -- "
+                "add output_cost_per_second[_<tier>] (or a bare output_cost_per_second fallback) to this "
+                "deployment's model_info",
+            )
+            return
+        if persistence is None:
             return
         try:
             billed = await persistence.mark_video_billed(_video_billing_key(task_id), usage["duration_seconds"], cost)

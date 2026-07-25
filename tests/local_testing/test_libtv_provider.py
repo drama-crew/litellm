@@ -3394,6 +3394,291 @@ def test_libtv_video_cost_is_resolution_tiered():
     ) == pytest.approx(1.20)
 
 
+def test_video_usage_falls_back_to_quality_tier_when_no_resolution():
+    assert _video_usage({"quality": "high", "seconds": 12}) == {
+        "duration_seconds": 12.0,
+        "video_resolution": "high",
+    }
+
+
+def test_video_usage_prefers_resolution_over_quality_when_both_present():
+    assert _video_usage({"resolution": "720p", "quality": "high", "seconds": 5}) == {
+        "duration_seconds": 5.0,
+        "video_resolution": "720p",
+    }
+
+
+def test_libtv_video_cost_is_quality_tiered_for_kling_omni():
+    model_info = {
+        "mode": "video_generation",
+        "output_cost_per_second_low": 0.28,
+        "output_cost_per_second_high": 0.36,
+        "output_cost_per_second_4k": 1.1,
+    }
+    for quality, rate in (("low", 0.28), ("high", 0.36), ("4k", 1.1)):
+        usage = _video_usage({"quality": quality, "seconds": 10})
+        assert usage["video_resolution"] == quality
+        assert video_generation_cost(
+            model="kling-v3-omni",
+            duration_seconds=10.0,
+            custom_llm_provider="libtv",
+            model_info=model_info,
+            video_resolution=usage["video_resolution"],
+        ) == pytest.approx(rate * 10.0)
+
+
+_KLING_OMNI_MODEL_INFO = {
+    "output_cost_per_second_low": 0.28,
+    "output_cost_per_second_high": 0.36,
+    "output_cost_per_second_4k": 1.1,
+}
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_bills_kling_omni_quality_tier_model(monkeypatch):
+    """Regression gate for the production incident: if `_video_usage` (or the
+    resolution/quality lookup it feeds into cost calculation) ever regresses back to
+    ignoring `quality`, this must fail -- video_resolution would come back None,
+    _video_output_cost_per_second would have no tier to match (this model_info has no
+    bare `output_cost_per_second` fallback, matching production), and the completed
+    task would go unbilled exactly like the 15-day production gap."""
+    fake_persistence = FakeBillingPersistence(billed=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {"webid": "w", "seconds": 12, "quality": "high", "model_info": _KLING_OMNI_MODEL_INFO}
+
+    status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert status.usage == {"duration_seconds": 12.0, "video_resolution": "high"}
+    assert status._hidden_params["response_cost"] == pytest.approx(0.36 * 12.0)
+    assert fake_persistence.calls == [("libtv:task-9", 12.0, pytest.approx(0.36 * 12.0))]
+
+
+@pytest.mark.asyncio
+async def test_record_video_task_usage_falls_back_to_generation_params_quality(monkeypatch):
+    fake_persistence = FakeBillingPersistence()
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+
+    await LibTVLLM()._record_video_task_usage(
+        "task-1",
+        {"webid": "w", "seconds": 8},
+        {"quality": "low"},
+    )
+
+    assert fake_persistence.store_usage_calls == [("libtv:task-1", 8.0, "low")]
+
+
+@pytest.mark.asyncio
+async def test_record_video_task_usage_falls_back_to_bucketed_quality_key(monkeypatch):
+    """kling-v3-omni's real spec (see _KLING_V3_OMNI_SPEC) never puts a bare `quality`
+    key in build_generation_params' output -- it buckets the tier under `quality_4k`
+    (text2video/singleImage2video/mixed2video) or plain `quality` (videoEdit2video),
+    per _candidate_value's key.startswith("quality") contract. A generation_params
+    fallback that only reads the literal "quality" key silently drops the tier for
+    every mode that uses a bucketed key, which is exactly what happened in
+    production for 15 days."""
+    fake_persistence = FakeBillingPersistence()
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+
+    await LibTVLLM()._record_video_task_usage(
+        "task-1",
+        {"webid": "w", "seconds": 8},
+        {"quality_4k": "high", "ratio": "16:9"},
+    )
+
+    assert fake_persistence.store_usage_calls == [("libtv:task-1", 8.0, "high")]
+
+
+@pytest.mark.asyncio
+async def test_record_video_task_usage_falls_back_to_bucketed_resolution_key(monkeypatch):
+    """Same bucketing problem as quality, for resolution (e.g. singleImage2video's
+    `resolution_480`, see test_build_params_resolution_480_key)."""
+    fake_persistence = FakeBillingPersistence()
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+
+    await LibTVLLM()._record_video_task_usage(
+        "task-1",
+        {"webid": "w", "seconds": 8},
+        {"resolution_480": "480p"},
+    )
+
+    assert fake_persistence.store_usage_calls == [("libtv:task-1", 8.0, "480p")]
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_completed_no_price_for_resolution_logs_warning(monkeypatch, caplog):
+    """A completed task whose usage resolves but whose video_resolution/quality tier
+    has no matching price must surface a warning (rate-limited via the handler's own
+    _warn_billing_gap, keyed by deployment+tier so it can't be starved by an unrelated
+    chatty billing-gap key), not fail silently."""
+    import litellm.llms.libtv.handler as libtv_handler
+
+    libtv_handler._last_billing_warn.clear()
+    fake_persistence = FakeBillingPersistence(billed=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {"webid": "w", "seconds": 5, "resolution": "720p", "model_info": {}}
+
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert "response_cost" not in status._hidden_params
+    warnings = [r.message for r in caplog.records if "no price" in r.message]
+    assert len(warnings) == 1
+    assert "task-9" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_no_price_warning_is_rate_limited_across_repeated_polls(monkeypatch, caplog):
+    """Repeated polls of the same still-unpriced completed task must not flood logs."""
+    import litellm.llms.libtv.handler as libtv_handler
+
+    libtv_handler._last_billing_warn.clear()
+    fake_persistence = FakeBillingPersistence(billed=True)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    optional_params = {"webid": "w", "seconds": 5, "resolution": "720p", "model_info": {}}
+
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        for _ in range(3):
+            client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+            await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    warnings = [r.message for r in caplog.records if "no price" in r.message]
+    assert len(warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_completed_no_usage_record_logs_warning(monkeypatch, caplog):
+    """A completed task with no persisted usage at all (topaz upscale, whose create
+    never sends `seconds`, or a task created before this deploy) must also surface a
+    warning, not the silent debug-log it used to get. The original justification for
+    staying silent -- log-flood risk -- was disproven against production SpendLogs:
+    this path only fires for a handful of deployments/tiers, not one row per task."""
+    import litellm.llms.libtv.handler as libtv_handler
+
+    libtv_handler._last_billing_warn.clear()
+    fake_persistence = FakeBillingPersistence(billed=True, stored_usage=None)
+    monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: fake_persistence)
+    vid = LibTVLLM()._build_video_object("m", {"task_id": "task-9"}).id
+    client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+    optional_params = {**_PRODUCTION_STATUS_OPTIONAL_PARAMS, "model_info": {"id": "dep-topaz"}}
+
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        status = await LibTVLLM().avideo_status(vid, "tok", None, optional_params, None, client=client)
+
+    assert status.status == "completed"
+    assert "response_cost" not in status._hidden_params
+    warnings = [r.message for r in caplog.records if "no usage record" in r.message]
+    assert len(warnings) == 1
+    assert "task-9" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_no_usage_and_no_price_warnings_do_not_starve_each_other(monkeypatch, caplog):
+    """Core regression for the rate-limiter refactor: _warn_billing_gap keys by
+    (kind, deployment[, tier]), unlike persistence._warn's single shared timestamp.
+    A chatty no-usage key (repeated polls of the same duration-less task) must not
+    suppress a genuinely different no-price warning on another deployment, and the
+    no-usage key itself must still be rate-limited across its own repeated polls."""
+    import litellm.llms.libtv.handler as libtv_handler
+
+    libtv_handler._last_billing_warn.clear()
+
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        no_usage_persistence = FakeBillingPersistence(stored_usage=None)
+        monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: no_usage_persistence)
+        for _ in range(3):
+            client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+            await LibTVLLM().avideo_status(
+                LibTVLLM()._build_video_object("m", {"task_id": "task-topaz"}).id,
+                "tok",
+                None,
+                {**_PRODUCTION_STATUS_OPTIONAL_PARAMS, "model_info": {"id": "dep-topaz"}},
+                None,
+                client=client,
+            )
+
+        no_price_persistence = FakeBillingPersistence(
+            stored_usage={"duration_seconds": 5.0, "video_resolution": "1080p"}
+        )
+        monkeypatch.setattr("litellm.llms.libtv.handler.get_persistence", lambda: no_price_persistence)
+        client = FakeAsyncClient(post_by_path=_progress_route(2, url="https://libtv-res/v.mp4"))
+        await LibTVLLM().avideo_status(
+            LibTVLLM()._build_video_object("m", {"task_id": "task-other"}).id,
+            "tok",
+            None,
+            {**_PRODUCTION_STATUS_OPTIONAL_PARAMS, "model_info": {"id": "dep-other"}},
+            None,
+            client=client,
+        )
+
+    no_usage_warnings = [r.message for r in caplog.records if "no usage record" in r.message]
+    no_price_warnings = [r.message for r in caplog.records if "no price" in r.message]
+    assert len(no_usage_warnings) == 1
+    assert len(no_price_warnings) == 1
+
+
+def test_warn_billing_gap_fires_first_warning_before_one_interval_of_uptime(monkeypatch, caplog):
+    """time.monotonic()'s absolute value is platform-defined -- it is not guaranteed
+    to start at 0, but it is also not guaranteed to already exceed the 300s interval
+    by the time the first billing gap is observed (e.g. right after a fresh deploy).
+    A never-before-seen key must always get its first warning through, regardless of
+    how small time.monotonic() happens to read."""
+    import litellm.llms.libtv.handler as libtv_handler
+
+    libtv_handler._last_billing_warn.clear()
+    monkeypatch.setattr(libtv_handler.time, "monotonic", lambda: 0.5)
+
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        libtv_handler._warn_billing_gap("k", "first")
+
+    messages = [r.message for r in caplog.records]
+    assert messages == ["first"]
+
+
+def test_warn_billing_gap_rate_limits_independently_per_key(monkeypatch, caplog):
+    """Unit-level proof that _warn_billing_gap's rate limit is keyed, not global: two
+    distinct keys each get their first warning through in the same instant, and a
+    repeat of an already-warned key within the interval is suppressed."""
+    import litellm.llms.libtv.handler as libtv_handler
+
+    libtv_handler._last_billing_warn.clear()
+    # Start well under one interval of process uptime -- the worst case for a
+    # never-before-seen key's first warning, and the case a stale 0.0 sentinel
+    # would have silently swallowed.
+    fake_now = [0.5]
+    monkeypatch.setattr(libtv_handler.time, "monotonic", lambda: fake_now[0])
+
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        libtv_handler._warn_billing_gap("no-usage:dep-1", "no usage for dep-1")
+        libtv_handler._warn_billing_gap("no-usage:dep-1", "no usage for dep-1 again")
+        libtv_handler._warn_billing_gap("no-price:dep-1:720p", "no price for dep-1 720p")
+
+    messages = [r.message for r in caplog.records]
+    assert messages == ["no usage for dep-1", "no price for dep-1 720p"]
+
+
+def test_warn_billing_gap_refires_after_interval_elapses(monkeypatch, caplog):
+    import litellm.llms.libtv.handler as libtv_handler
+
+    libtv_handler._last_billing_warn.clear()
+    fake_now = [10_000.0]
+    monkeypatch.setattr(libtv_handler.time, "monotonic", lambda: fake_now[0])
+
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        libtv_handler._warn_billing_gap("k", "first")
+        fake_now[0] += libtv_handler._BILLING_WARN_INTERVAL_SECONDS
+        libtv_handler._warn_billing_gap("k", "second")
+
+    messages = [r.message for r in caplog.records]
+    assert messages == ["first", "second"]
+
+
 # --- reference media must be uploaded into the libtv project before generation -------
 # libtv (canvas/star-video2) cannot fetch arbitrary external presigned urls; every
 # reference (image/video/audio) must first land on libtv-res.liblib.art. Only the
