@@ -1,5 +1,6 @@
 import hashlib
 import json
+import logging
 
 import pytest
 
@@ -2718,6 +2719,86 @@ def test_frames2video_fresh_asset_retry_returns_after_guard_window_still_pending
     assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
 
 
+def test_guard_poll_exception_returns_already_created_task_without_retrying():
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1"], [LibTVError(status_code=429, message="rate limited")]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    vo = _frames2video_call(_fresh_retry_llm(), fake)
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_guard_poll_exception_returns_already_created_task_without_retrying_async():
+    fake = FakeAsyncClient(
+        post_by_path=_fresh_retry_routes(["t1"], [LibTVError(status_code=429, message="rate limited")]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    vo = await _fresh_retry_llm().avideo_generation(
+        "star-video2",
+        "smile then wave",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+
+
+def test_guard_poll_exception_logs_warning_with_task_id(caplog):
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1"], [LibTVError(status_code=429, message="rate limited")]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        _frames2video_call(_fresh_retry_llm(), fake)
+    guard_logs = [r.message for r in caplog.records if "guard-poll failed" in r.message]
+    assert len(guard_logs) == 1
+    assert "t1" in guard_logs[0]
+
+
+def test_fresh_asset_retry_logs_warning_with_task_and_attempt_info(caplog):
+    fake = FakeSyncClient(
+        post_by_path=_fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        _frames2video_call(_fresh_retry_llm(), fake)
+    retry_logs = [r.message for r in caplog.records if "fresh-asset retry" in r.message]
+    assert len(retry_logs) == 1
+    assert "t1" in retry_logs[0]
+    assert "1/2" in retry_logs[0]
+
+
+@pytest.mark.asyncio
+async def test_fresh_asset_retry_logs_warning_with_task_and_attempt_info_async(caplog):
+    fake = FakeAsyncClient(
+        post_by_path=_fresh_retry_routes(["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]),
+        get_payload=_tool_spec_payload(frames2video=True),
+    )
+    with caplog.at_level(logging.WARNING, logger="litellm.llms.libtv.handler"):
+        await _fresh_retry_llm().avideo_generation(
+            "star-video2",
+            "smile then wave",
+            "tok",
+            None,
+            {"webid": "w", "image": _LIBTV_REF, "last_image": _LIBTV_LAST},
+            None,
+            client=fake,
+        )
+    retry_logs = [r.message for r in caplog.records if "fresh-asset retry" in r.message]
+    assert len(retry_logs) == 1
+    assert "t1" in retry_logs[0]
+    assert "1/2" in retry_logs[0]
+
+
 @pytest.mark.asyncio
 async def test_frames2video_fresh_asset_fast_fail_retries_create_async():
     fake = FakeAsyncClient(
@@ -2964,6 +3045,92 @@ def test_mixed2video_compliance_rejection_is_not_retried():
     creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
     assert len(creates) == 1
     assert decode_video_id_with_provider(vo.id)["video_id"] == "t1"
+
+
+_LIBTV_REF_A = "https://libtv-res.liblib.art/upload-images/uid/a.png"
+_LIBTV_REF_B = "https://libtv-res.liblib.art/upload-images/uid/b.png"
+_LIBTV_REF_C = "https://libtv-res.liblib.art/upload-images/uid/c.png"
+
+
+def _mixed2video_three_images_one_video_fresh_retry_routes(create_ids, progress_seq):
+    risk = json.dumps({"passed": True, "needsReview": False, "riskDescription": "正常"})
+    return {
+        "/api/community/image/verify": {
+            "code": 0,
+            "data": {
+                "list": [
+                    {"url": _LIBTV_REF_A, "riskLabels": risk},
+                    {"url": _LIBTV_REF_B, "riskLabels": risk},
+                    {"url": _LIBTV_REF_C, "riskLabels": risk},
+                ]
+            },
+        },
+        "/api/third_asset/create": [
+            {"code": 0, "data": {"uuid": "u-a"}},
+            {"code": 0, "data": {"uuid": "u-b"}},
+            {"code": 0, "data": {"uuid": "u-c"}},
+            {"code": 0, "data": {"uuid": "u-vid"}},
+        ],
+        "/api/third_asset/check": [
+            {"code": 0, "data": {"list": [{"uuid": "u-a", "assetId": "asset-A", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-b", "assetId": "asset-B", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-c", "assetId": "asset-C", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "status": 0}]}},
+        ],
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": [{"code": 0, "data": {"taskId": tid}} for tid in create_ids],
+        "/api/task/generation/progress": list(progress_seq),
+    }
+
+
+def test_mixed2video_three_images_one_video_fresh_asset_retry_reuses_params_without_reregistering_compliance():
+    fake = FakeSyncClient(
+        post_by_path=_mixed2video_three_images_one_video_fresh_retry_routes(
+            ["t1", "t2"], [_AGING_FAIL, _RUNNING, _RUNNING]
+        ),
+        get_payload=_tool_spec_payload(),
+    )
+    vo = _fresh_retry_llm().video_generation(
+        "star-video2",
+        "swap the lead",
+        "tok",
+        None,
+        {
+            "webid": "w",
+            "reference_images": [_LIBTV_REF_A, _LIBTV_REF_B, _LIBTV_REF_C],
+            "reference_videos": [_LIBTV_VIDEO],
+        },
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 2
+    assert creates[0]["params"] == creates[1]["params"]
+    assert creates[0]["params"]["mixedList"] == [
+        {"url": "asset://asset-A", "type": "image"},
+        {"url": "asset://asset-B", "type": "image"},
+        {"url": "asset://asset-C", "type": "image"},
+        {"url": "asset://asset-VID", "type": "video"},
+    ]
+    assert decode_video_id_with_provider(vo.id)["video_id"] == "t2"
+    verify_calls = [c for c in fake.calls if c[0] == "/api/community/image/verify"]
+    assert len(verify_calls) == 1
+    create_asset_calls = [c for c in fake.calls if c[0] == "/api/third_asset/create"]
+    assert len(create_asset_calls) == 4
+
+
+def test_auto_compliance_text2video_does_not_guard_poll():
+    # Scope guard: an auto-compliance-capable model with zero image references
+    # (text2video, or a video/audio-only mixed request) must fall into the plain
+    # `else` branch and never guard-poll, even though auto_compliance is True.
+    fake = FakeSyncClient(post_by_path=_submit_routes(), get_payload=_tool_spec_payload())
+    vo = _fresh_retry_llm().video_generation("star-video2", "x", "tok", None, {"webid": "w"}, None, client=fake)
+    assert vo.status == "queued"
+    assert not [p for p, _ in fake.calls if p == "/api/task/generation/progress"]
+    creates = [body for path, body in fake.calls if path == "/api/task/generation/create"]
+    assert len(creates) == 1
 
 
 def test_non_auto_compliance_video_generation_does_not_guard_poll():

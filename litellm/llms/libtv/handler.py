@@ -482,10 +482,18 @@ class LibTVLLM(CustomLLM):
         server's internal audit and succeeds. Total worst-case wall time stays
         under the caller's submit read timeout (drama uses 600s)."""
         created = lt.create(model, vendor, "video", params, project_name)
-        for _ in range(self.fresh_asset_retry_attempts):
+        for attempt in range(self.fresh_asset_retry_attempts):
             state = self._guard_poll_sync(lt, created["task_id"])
             if state is None or not _is_fresh_asset_aging_failure(state):
                 return created
+            logger.warning(
+                "libtv fresh-asset retry: task %s hit the fresh-asset aging failure "
+                "(attempt %d/%d), retrying after %.0fs",
+                created["task_id"],
+                attempt + 1,
+                self.fresh_asset_retry_attempts,
+                self.fresh_asset_retry_wait,
+            )
             time.sleep(self.fresh_asset_retry_wait)
             created = self._create_after_wait(lt, model, vendor, params, project_name)
         return created
@@ -505,10 +513,18 @@ class LibTVLLM(CustomLLM):
         self, lt: LibTVClient, model: str, vendor: str, params: dict, project_name: str
     ) -> dict:
         created = await lt.acreate(model, vendor, "video", params, project_name)
-        for _ in range(self.fresh_asset_retry_attempts):
+        for attempt in range(self.fresh_asset_retry_attempts):
             state = await self._guard_poll_async(lt, created["task_id"])
             if state is None or not _is_fresh_asset_aging_failure(state):
                 return created
+            logger.warning(
+                "libtv fresh-asset retry: task %s hit the fresh-asset aging failure "
+                "(attempt %d/%d), retrying after %.0fs",
+                created["task_id"],
+                attempt + 1,
+                self.fresh_asset_retry_attempts,
+                self.fresh_asset_retry_wait,
+            )
             await asyncio.sleep(self.fresh_asset_retry_wait)
             created = await self._acreate_after_wait(lt, model, vendor, params, project_name)
         return created
@@ -526,7 +542,13 @@ class LibTVLLM(CustomLLM):
 
     def _guard_poll_sync(self, lt: LibTVClient, task_id: str) -> Optional[dict]:
         for _ in range(self.fresh_asset_guard_polls):
-            state = lt.poll_once(task_id, "video")
+            try:
+                state = lt.poll_once(task_id, "video")
+            except Exception:
+                logger.warning(
+                    "libtv fresh-asset guard-poll failed for task %s; treating as inconclusive", task_id, exc_info=True
+                )
+                return None
             if state.get("status") in (2, 3):
                 return state
             time.sleep(self.poll_interval)
@@ -534,7 +556,13 @@ class LibTVLLM(CustomLLM):
 
     async def _guard_poll_async(self, lt: LibTVClient, task_id: str) -> Optional[dict]:
         for _ in range(self.fresh_asset_guard_polls):
-            state = await lt.apoll_once(task_id, "video")
+            try:
+                state = await lt.apoll_once(task_id, "video")
+            except Exception:
+                logger.warning(
+                    "libtv fresh-asset guard-poll failed for task %s; treating as inconclusive", task_id, exc_info=True
+                )
+                return None
             if state.get("status") in (2, 3):
                 return state
             await asyncio.sleep(self.poll_interval)
@@ -965,11 +993,7 @@ class LibTVLLM(CustomLLM):
                 [url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
-        # frames2video/image2video/mixed2video all register real-person refs as
-        # freshly-created assets and hit the same aging failure (see
-        # _is_fresh_asset_aging_failure); only the non-auto-compliance else branch
-        # above (raw cdn urls, e.g. text2video) skips the guard-poll retry.
-        wants_fresh_asset_retry = wants_frames or wants_image2video or (bool(images) and auto_compliance)
+        wants_fresh_asset_retry = bool(images) and auto_compliance
         created = (
             self._create_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
             if wants_fresh_asset_retry
@@ -1076,7 +1100,7 @@ class LibTVLLM(CustomLLM):
                 [await url_for(r, _REF_DEFAULT_NAME["video"]) for r in videos],
                 [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios],
             )
-        wants_fresh_asset_retry = wants_frames or wants_image2video or (bool(images) and auto_compliance)
+        wants_fresh_asset_retry = bool(images) and auto_compliance
         created = (
             await self._acreate_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
             if wants_fresh_asset_retry
