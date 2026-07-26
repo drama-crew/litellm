@@ -192,7 +192,7 @@ def get_spend_logs_id(call_type: str, response_obj: dict, kwargs: dict) -> Optio
         # request_id already exists, dropping the poll's real, non-zero cost without
         # any error. litellm_call_id is unique per actual HTTP call, so prefer it here;
         # fall back to response_obj["id"] only if it's somehow missing.
-        id = cast(Optional[str], kwargs.get("litellm_call_id")) or cast(Optional[str], response_obj.get("id"))
+        id = cast(str | None, kwargs.get("litellm_call_id")) or cast(str | None, response_obj.get("id"))
     else:
         id = cast(Optional[str], response_obj.get("id")) or cast(Optional[str], kwargs.get("litellm_call_id"))
     return id

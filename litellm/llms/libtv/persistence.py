@@ -1,7 +1,7 @@
 import hashlib
 import logging
 import time
-from typing import Any, Optional, TypedDict
+from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
 import httpx
@@ -67,7 +67,7 @@ def account_key(token: str) -> str:
     return hashlib.sha1(token.encode()).hexdigest()[:16]
 
 
-def normalize_source_key(kind: str, url: Optional[str], data: Optional[bytes]) -> Optional[str]:
+def normalize_source_key(kind: str, url: str | None, data: bytes | None) -> str | None:
     if kind == "bytes":
         if not data:
             return None
@@ -84,7 +84,7 @@ def normalize_source_key(kind: str, url: Optional[str], data: Optional[bytes]) -
 
 class ProjectCacheEntry(TypedDict):
     project_uuid: str
-    team_id: Optional[str]
+    team_id: str | None
 
 
 async def url_alive(url: str, timeout: float = 5.0) -> bool:
@@ -96,7 +96,7 @@ async def url_alive(url: str, timeout: float = 5.0) -> bool:
         if 400 <= resp.status_code < 500:
             return False
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001  # any GET failure should be treated as "unconfirmed", not "dead"
         return True
 
 
@@ -114,10 +114,10 @@ class LibTVPersistence:
             await self.db.execute_raw(CREATE_VIDEO_TASK_USAGE_TABLE)
             await self.db.execute_raw(CREATE_BILLED_VIDEO_TASKS_TABLE)
             _tables_ready = True
-        except Exception:
+        except Exception:  # noqa: BLE001  # table creation is best-effort; caller falls through to a fresh, ungated write path
             _warn("libtv persistence: failed to create tables", exc_info=True)
 
-    async def cached_upload(self, account_key: str, source_key: str) -> Optional[str]:
+    async def cached_upload(self, account_key: str, source_key: str) -> str | None:
         try:
             await self.ensure_tables()
             rows = await self.db.query_raw(
@@ -134,10 +134,10 @@ class LibTVPersistence:
                     account_key,
                     source_key,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001  # touching last_used_at is housekeeping; the cache hit above must still return
                 _warn("libtv persistence: failed to touch last_used_at", exc_info=True)
             return cdn_url
-        except Exception:
+        except Exception:  # noqa: BLE001  # any read failure degrades to a cache miss, never breaks the upload path
             _warn("libtv persistence: cached_upload failed", exc_info=True)
             return None
 
@@ -154,7 +154,7 @@ class LibTVPersistence:
                 cdn_url,
                 size_bytes,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # cache write is best-effort; a failed insert just means no reuse next time
             _warn("libtv persistence: store_upload failed", exc_info=True)
 
     async def delete_upload(self, account_key: str, source_key: str) -> None:
@@ -165,10 +165,10 @@ class LibTVPersistence:
                 account_key,
                 source_key,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # eviction is best-effort; a failed delete just leaves a stale row
             _warn("libtv persistence: delete_upload failed", exc_info=True)
 
-    async def cached_project(self, account_key: str, day: str) -> Optional[ProjectCacheEntry]:
+    async def cached_project(self, account_key: str, day: str) -> ProjectCacheEntry | None:
         try:
             await self.ensure_tables()
             rows = await self.db.query_raw(
@@ -179,11 +179,11 @@ class LibTVPersistence:
             if not rows:
                 return None
             return {"project_uuid": rows[0]["project_uuid"], "team_id": rows[0]["team_id"]}
-        except Exception:
+        except Exception:  # noqa: BLE001  # any read failure degrades to a cache miss, never breaks the project-reuse path
             _warn("libtv persistence: cached_project failed", exc_info=True)
             return None
 
-    async def store_project(self, account_key: str, day: str, project_uuid: str, team_id: Optional[str]) -> None:
+    async def store_project(self, account_key: str, day: str, project_uuid: str, team_id: str | None) -> None:
         try:
             await self.ensure_tables()
             await self.db.execute_raw(
@@ -195,11 +195,11 @@ class LibTVPersistence:
                 project_uuid,
                 team_id,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # cache write is best-effort; a failed insert just means no reuse next time
             _warn("libtv persistence: store_project failed", exc_info=True)
 
     async def store_video_task_usage(
-        self, billing_key: str, duration_seconds: float, video_resolution: Optional[str]
+        self, billing_key: str, duration_seconds: float, video_resolution: str | None
     ) -> None:
         """Persist the requested duration/resolution of a just-created video task.
 
@@ -217,10 +217,10 @@ class LibTVPersistence:
                 duration_seconds,
                 video_resolution,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # best-effort; a failed write just means the later poll can't bill
             _warn("libtv persistence: store_video_task_usage failed", exc_info=True)
 
-    async def get_video_task_usage(self, billing_key: str) -> Optional[dict]:
+    async def get_video_task_usage(self, billing_key: str) -> dict | None:
         """Read back a task's recorded usage: {'duration_seconds', 'video_resolution'} or None."""
         try:
             await self.ensure_tables()
@@ -234,7 +234,7 @@ class LibTVPersistence:
                 "duration_seconds": float(rows[0]["duration_seconds"]),
                 "video_resolution": rows[0]["video_resolution"],
             }
-        except Exception:
+        except Exception:  # noqa: BLE001  # any read failure degrades to "no recorded usage", never breaks the poll
             _warn("libtv persistence: get_video_task_usage failed", exc_info=True)
             return None
 
@@ -257,7 +257,7 @@ class LibTVPersistence:
                 response_cost,
             )
             return bool(affected)
-        except Exception:
+        except Exception:  # noqa: BLE001  # fail-safe: a persistence error must skip the charge, never risk double-billing
             _warn("libtv persistence: mark_video_billed failed", exc_info=True)
             return False
 
@@ -269,16 +269,16 @@ class LibTVPersistence:
                 account_key,
                 day,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001  # best-effort; a failed delete leaves a stale row to expire later
             _warn("libtv persistence: invalidate_project failed", exc_info=True)
 
 
-def get_persistence() -> Optional[LibTVPersistence]:
+def get_persistence() -> LibTVPersistence | None:
     try:
         from litellm.proxy import proxy_server
 
         pc = getattr(proxy_server, "prisma_client", None)
-    except Exception:
+    except Exception:  # noqa: BLE001  # prisma_client may be absent/misconfigured; treat lookup failure as "no persistence"
         return None
     if pc is None or getattr(pc, "db", None) is None:
         return None

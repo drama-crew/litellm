@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import Any
 
 import httpx
 from httpx._types import RequestFiles
@@ -9,7 +9,6 @@ from litellm.llms.wavespeed.videos.transformation import WaveSpeedVideoConfig
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import encode_video_id_with_provider
-
 
 _AUDIO_MODELS: frozenset[str] = frozenset(
     (
@@ -27,7 +26,7 @@ _AUDIO_MODELS: frozenset[str] = frozenset(
 
 def _strip_provider_prefix(model: str) -> str:
     if model.startswith("wavespeed/"):
-        return model[len("wavespeed/"):]
+        return model[len("wavespeed/") :]
     return model
 
 
@@ -71,7 +70,7 @@ class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
         video_create_optional_request_params: dict[str, Any],
         litellm_params: GenericLiteLLMParams,
         headers: dict,
-    ) -> Tuple[dict[str, Any], RequestFiles, str]:
+    ) -> tuple[dict[str, Any], RequestFiles, str]:
         # video_create_optional_request_params is already mapped and flattened by
         # VideoGenerationRequestUtils.get_optional_params_video_generation (which ran
         # map_openai_params and merged+popped extra_body). Do NOT re-map here or
@@ -95,14 +94,13 @@ class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
         url = f"{api_base.rstrip('/')}/{model_path}"
         return data, [], url
 
-
     def transform_video_create_response(
         self,
         model: str,
         raw_response: httpx.Response,
         logging_obj: Any,
-        custom_llm_provider: Optional[str] = None,
-        request_data: Optional[dict[str, Any]] = None,
+        custom_llm_provider: str | None = None,
+        request_data: dict[str, Any] | None = None,
     ) -> VideoObject:
         payload = raw_response.json()
         task_id = self._task_id(payload)

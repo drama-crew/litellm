@@ -78,7 +78,7 @@ from .transform import _resolution_from_size, build_generation_params, build_top
 
 _TOPAZ_VENDOR = "topazlabs"
 _BILLING_WARN_INTERVAL_SECONDS = 300.0
-_last_billing_warn: dict[str, Optional[float]] = {}  # mutable-ok: per-key last-emitted-time cache for rate limiting
+_last_billing_warn: dict[str, float | None] = {}  # mutable-ok: per-key last-emitted-time cache for rate limiting
 
 
 def _warn_billing_gap(key: str, message: str) -> None:
@@ -215,7 +215,7 @@ def _video_billing_key(task_id: str) -> str:
     return f"{LIBTV_PROVIDER}:{task_id}"
 
 
-def _video_completion_cost(optional_params: dict, usage: dict) -> Optional[float]:
+def _video_completion_cost(optional_params: dict, usage: dict) -> float | None:
     """duration x the deployment's per-second (resolution-tiered) rate, or None when unpriced.
 
     Deliberately does not check `output_cost_per_video_per_second` the way
@@ -458,7 +458,7 @@ def _is_fresh_asset_aging_failure(state: dict) -> bool:
     return _FRESH_ASSET_RETRY_TOKEN in reason and _TERMINAL_REJECTION_MARKER not in reason
 
 
-def _excluded_terminal_rejection_reason(state: dict) -> Optional[str]:
+def _excluded_terminal_rejection_reason(state: dict) -> str | None:
     """The failed_reason when _is_fresh_asset_aging_failure returned False
     specifically because the reason carried the generic retry token but was
     excluded by _TERMINAL_REJECTION_MARKER, as opposed to any other reason it
@@ -684,7 +684,7 @@ class LibTVLLM(CustomLLM):
         return vo
 
     async def _record_video_task_usage(
-        self, task_id: str, optional_params: dict, generation_params: Optional[dict] = None
+        self, task_id: str, optional_params: dict, generation_params: dict | None = None
     ) -> None:
         """Persist the requested duration/resolution at create time.
 

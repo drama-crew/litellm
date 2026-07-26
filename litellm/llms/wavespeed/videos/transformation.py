@@ -226,7 +226,7 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         return video
 
     @staticmethod
-    def _deployment_model_info(logging_obj: Any) -> Dict[str, Any]:
+    def _deployment_model_info(logging_obj: Any) -> dict[str, Any]:
         litellm_params = getattr(logging_obj, "litellm_params", None)
         if not isinstance(litellm_params, dict):
             return {}
@@ -237,7 +237,7 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         return {}
 
     @classmethod
-    def _create_response_cost(cls, usage: Dict[str, Any], logging_obj: Any) -> Optional[float]:
+    def _create_response_cost(cls, usage: dict[str, Any], logging_obj: Any) -> float | None:
         duration_seconds = usage.get("duration_seconds")
         if duration_seconds is None:
             return None

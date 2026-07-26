@@ -626,8 +626,8 @@ class LibTVClient:
         self,
         project_name: str,
         persistence: Optional["LibTVPersistence"] = None,
-        day: Optional[str] = None,
-    ) -> Tuple[str, Optional[int]]:
+        day: str | None = None,
+    ) -> tuple[str, int | None]:
         project = await self._apost("/api/canvas/project/create", {"name": project_name}, "project/create")
         meta = parse_project(project)
         project_uuid, team_id = meta["project_uuid"], meta["team_id"]
@@ -638,12 +638,12 @@ class LibTVClient:
     async def _acreate_nodes_and_generation(
         self,
         project_uuid: str,
-        team_id: Optional[int],
+        team_id: int | None,
         model_key: str,
         vendor: str,
         task_type: str,
-        params: Dict[str, Any],
-    ) -> Tuple[Dict[str, Any], str]:
+        params: dict[str, Any],
+    ) -> tuple[dict[str, Any], str]:
         node_key = str(uuid.uuid4())
         await self._apost(
             "/api/canvas/nodes/batch",
@@ -657,9 +657,7 @@ class LibTVClient:
         )
         return created, node_key
 
-    async def _project_cache_lookup(
-        self, persistence: "LibTVPersistence", day: str
-    ) -> Optional[Tuple[str, Optional[int]]]:
+    async def _project_cache_lookup(self, persistence: "LibTVPersistence", day: str) -> tuple[str, int | None] | None:
         try:
             meta = await persistence.cached_project(self._account_key, day)
             if meta is None:
@@ -671,7 +669,7 @@ class LibTVClient:
             return None
 
     async def _project_cache_store(
-        self, persistence: "LibTVPersistence", day: str, project_uuid: str, team_id: Optional[int]
+        self, persistence: "LibTVPersistence", day: str, project_uuid: str, team_id: int | None
     ) -> None:
         try:
             await persistence.store_project(
@@ -691,9 +689,9 @@ class LibTVClient:
         model_key: str,
         vendor: str,
         task_type: str,
-        params: Dict[str, Any],
+        params: dict[str, Any],
         project_name: str,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         persistence = self._get_persistence()
         if persistence is None or os.getenv("LIBTV_PROJECT_REUSE_DISABLED") == "1":
             project_uuid, team_id = await self._acreate_fresh_project(project_name)
@@ -793,9 +791,7 @@ class LibTVClient:
             await self._cache_store(persistence, source_key, cdn_url, size_bytes)
         return cdn_url
 
-    def _resolve_cache_target(
-        self, kind: str, url: str, data: Optional[bytes]
-    ) -> Optional[Tuple["LibTVPersistence", str]]:
+    def _resolve_cache_target(self, kind: str, url: str, data: bytes | None) -> tuple["LibTVPersistence", str] | None:
         if os.getenv("LIBTV_UPLOAD_CACHE_DISABLED") == "1":
             return None
         try:
@@ -808,7 +804,7 @@ class LibTVClient:
             return None
         return persistence, source_key
 
-    async def _cache_lookup(self, persistence: "LibTVPersistence", source_key: str) -> Optional[str]:
+    async def _cache_lookup(self, persistence: "LibTVPersistence", source_key: str) -> str | None:
         try:
             cdn_url = await persistence.cached_upload(self._account_key, source_key)
         except Exception:
@@ -837,7 +833,7 @@ class LibTVClient:
         except Exception:
             logger.warning("libtv upload cache: store_upload failed", exc_info=True)
 
-    async def _aensure_uploaded(self, kind: str, url: str, data: Optional[bytes], default_name: str) -> Tuple[str, int]:
+    async def _aensure_uploaded(self, kind: str, url: str, data: bytes | None, default_name: str) -> tuple[str, int]:
         if kind == "url":
             filename = _filename_from_url(url, default_name)
             if os.getenv("MEDIA_TRANSFER_MODE", "direct").lower() == "delegated":
