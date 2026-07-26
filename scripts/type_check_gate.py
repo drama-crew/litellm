@@ -48,7 +48,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BUDGET_PATH = REPO_ROOT / "basedpyright-code-budget.json"
 PYRIGHT_CONFIG = REPO_ROOT / "pyrightconfig.json"
 UV_LOCK = REPO_ROOT / "uv.lock"
-DEFAULT_BASE = "origin/litellm_internal_staging"
+DEFAULT_BASE = "origin/main"
 CACHE_FILE_PREFIX = "basedpyright-base-"
 
 # Bucket for a basedpyright diagnostic with no `rule`. Counted so it's gated.

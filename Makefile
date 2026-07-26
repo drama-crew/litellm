@@ -30,7 +30,7 @@ help:
 	@echo "  make lint-basedpyright-budget-update - Ratchet basedpyright limits down by what this branch fixed"
 	@echo "  make lint-format        - Check ruff format formatting (matches CI)"
 	@echo "  make lint-ruff-budget - Gate the codebase total of each strict ruff rule against its limit"
-	@echo "  make lint-gate        - Strict ruff gate in CI-parity mode (fetches staging, simulates the merge)"
+	@echo "  make lint-gate        - Strict ruff gate in CI-parity mode (fetches main, simulates the merge)"
 	@echo "  make lint-ruff-budget-update - Ratchet ruff-strict-budget.json limits down by what this branch fixed"
 	@echo "  make lint-budget-update - Ratchet all budgets down (ruff + type-discipline + basedpyright)"
 	@echo "  make check-circular-imports - Check for circular imports"
@@ -101,9 +101,12 @@ format-check: install-dev
 	cd litellm && $(UV_RUN) ruff format --check --exclude '/enterprise/' . && cd ..
 
 # Single fetch of the PR base so the delta-based gates below share one network round
-# trip instead of each re-fetching when chained from `lint`.
+# trip instead of each re-fetching when chained from `lint`. This fork merges directly
+# to `main` (its `litellm_internal_staging` mirror is a stale, upstream-tracking-only
+# ref, not this fork's integration branch), so `main` is the base every delta gate
+# below compares against.
 lint-fetch-base:
-	git fetch origin litellm_internal_staging
+	git fetch origin main
 
 # Mirror test-linting.yml's lint job environment: the proxy-dev group plus a generated
 # Prisma client, so basedpyright resolves the same modules CI does (without the generated
@@ -118,7 +121,7 @@ lint-install:
 # only the litellm Python files changed vs the base are checked, so a pre-existing
 # format issue elsewhere doesn't block an unrelated commit.
 lint-format-check-changed: $(LINT_DEP_INSTALL) $(LINT_DEP_BASE)
-	@files=$$(git diff --name-only origin/litellm_internal_staging...HEAD -- 'litellm/**/*.py' | grep -v '^litellm/enterprise/' || true); \
+	@files=$$(git diff --name-only origin/main...HEAD -- 'litellm/**/*.py' | grep -v '^litellm/enterprise/' || true); \
 	if [ -z "$$files" ]; then \
 		echo "No changed litellm Python files to format-check."; \
 	else \
@@ -162,12 +165,12 @@ lint-ruff-FULL-dev: install-dev
 	else echo "No changed .py files to check."; fi
 
 lint-basedpyright: $(LINT_DEP_INSTALL) $(LINT_DEP_BASE)
-	($(UV_RUN) basedpyright --outputjson || true) | $(UV_RUN) python scripts/type_check_gate.py --base origin/litellm_internal_staging
+	($(UV_RUN) basedpyright --outputjson || true) | $(UV_RUN) python scripts/type_check_gate.py --base origin/main
 
 # Type-discipline budget (mutable collections / casts / type guards / kwargs /
 # unexplained suppressions), the test-linting.yml step `make lint` used to omit.
 lint-type-discipline: $(LINT_DEP_INSTALL) $(LINT_DEP_BASE)
-	$(UV_RUN) python scripts/type_discipline_gate.py --base origin/litellm_internal_staging
+	$(UV_RUN) python scripts/type_discipline_gate.py --base origin/main
 
 # --update lowers each limit by what this branch fixed since its branch point, so
 # it needs the base ref fetched to resolve the merge-base.
@@ -180,9 +183,10 @@ lint-ruff-budget: install-dev
 	$(UV_RUN) python scripts/ruff_strict_gate.py
 
 # Strict gate, invoked the same way CI does in test-linting.yml so a local pass
-# means the CI check will pass too.
+# means the CI check will pass too (CI passes the PR's actual base SHA; locally we
+# default to this fork's integration branch, `main`).
 lint-gate: $(LINT_DEP_INSTALL) $(LINT_DEP_BASE)
-	$(UV_RUN) python scripts/ruff_strict_gate.py --base origin/litellm_internal_staging
+	$(UV_RUN) python scripts/ruff_strict_gate.py --base origin/main
 
 lint-ruff-budget-update: install-dev lint-fetch-base
 	$(UV_RUN) python scripts/ruff_strict_gate.py --update
@@ -204,9 +208,9 @@ check-import-safety: $(LINT_DEP_INSTALL)
 # runs the diff-scoped ruff format check, whole-tree ruff check, the strict-rule /
 # type-discipline / basedpyright budgets as a delta vs the base, then the circular-import
 # and import-safety checks. Steps that compare against the base resolve it the same way CI
-# does (merge-base with origin/litellm_internal_staging). Setup (env sync, Prisma client,
-# base fetch) runs once up front; the checks themselves are independent, so a sub-make
-# fans them out with -j and the fast ones finish under basedpyright's shadow.
+# does (merge-base with origin/main, this fork's integration branch). Setup (env sync,
+# Prisma client, base fetch) runs once up front; the checks themselves are independent, so
+# a sub-make fans them out with -j and the fast ones finish under basedpyright's shadow.
 lint: lint-install lint-fetch-base
 	$(MAKE) -j $(LINT_JOBS) $(LINT_OUTPUT_SYNC) LINT_DEP_INSTALL= LINT_DEP_BASE= lint-checks
 

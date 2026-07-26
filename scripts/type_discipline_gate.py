@@ -34,7 +34,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CHECKER = REPO_ROOT / "scripts" / "check_type_discipline.py"
 BUDGET_PATH = REPO_ROOT / "type-discipline-budget.json"
 TARGET = "litellm"
-DEFAULT_BASE = "origin/litellm_internal_staging"
+DEFAULT_BASE = "origin/main"
 
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _LINE = re.compile(r"^(?P<file>.+?):(?P<line>\d+): (?P<code>LIT\d+) ")

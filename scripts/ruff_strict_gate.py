@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STRICT_CONFIG = REPO_ROOT / "ruff-strict.toml"
 BUDGET_PATH = REPO_ROOT / "ruff-strict-budget.json"
 TARGET = "litellm"
-DEFAULT_BASE = "origin/litellm_internal_staging"
+DEFAULT_BASE = "origin/main"
 
 _HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
