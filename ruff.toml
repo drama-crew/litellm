@@ -9,6 +9,7 @@ lint.external = [
     "C901",
     # Enforced by upstream litellm's ruff config, but not run in this repo's CI
     "PLC0415", "E402", "BLE001", "ARG002", "S102", "S324", "S606", "D401", "F403", "F405",
+    "PLR0915",
 ]
 line-length = 120
 
