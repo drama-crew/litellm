@@ -70,7 +70,9 @@ def get_transfer_redis() -> Optional[Any]:
     if client is None:
         import redis.asyncio as async_redis
 
-        for stale_key in [k for k in _redis_clients if (k[0] is loop and k[1] != url) or (k[0] is not None and k[0].is_closed())]:
+        for stale_key in [
+            k for k in _redis_clients if (k[0] is loop and k[1] != url) or (k[0] is not None and k[0].is_closed())
+        ]:
             stale = _redis_clients.pop(stale_key)
             if loop is not None and stale_key[0] is loop and not loop.is_closed():
                 loop.create_task(stale.aclose())
@@ -238,11 +240,13 @@ class DelegatedTransfer:
                 # uploadId/partNumber just overwrite each other, so the double
                 # upload is harmless.
                 await self._cas_cancel(task_id)
-            except Exception:
+            except Exception:  # noqa: BLE001  # best-effort cancel; a failure here is harmless, see comment above
                 pass
             return await self.fallback.transfer(source_url, size, parts)
 
-    async def _transfer_delegated(self, task_id: str, source_url: str, size: int, parts: List[PartTarget]) -> List[PartEtag]:
+    async def _transfer_delegated(
+        self, task_id: str, source_url: str, size: int, parts: List[PartTarget]
+    ) -> List[PartEtag]:
         if not await self._has_active_worker():
             return await self.fallback.transfer(source_url, size, parts)
 
@@ -289,8 +293,7 @@ def build_transfer_strategy(
         redis_client = get_transfer_redis()
     if redis_client is None:
         _warn_unavailable(
-            "MEDIA_TRANSFER_MODE=delegated but no redis client (set MEDIA_TRANSFER_REDIS_URL); "
-            "using direct transfer"
+            "MEDIA_TRANSFER_MODE=delegated but no redis client (set MEDIA_TRANSFER_REDIS_URL); using direct transfer"
         )
         return direct
     min_bytes = int(os.getenv("MEDIA_TRANSFER_MIN_BYTES", str(DEFAULT_MIN_BYTES)))

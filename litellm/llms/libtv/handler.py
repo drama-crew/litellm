@@ -267,7 +267,7 @@ def _reference_payload(ref: Any) -> Optional[Tuple[str, str, Optional[bytes]]]:
     if ref is None:
         return None
     if isinstance(ref, str):
-        if ref.startswith("http://") or ref.startswith("https://"):
+        if ref.startswith(("http://", "https://")):
             return ("url", ref, None)
         with open(ref, "rb") as f:
             return ("bytes", os.path.basename(ref) or "reference.png", f.read())

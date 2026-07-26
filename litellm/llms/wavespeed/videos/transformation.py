@@ -352,7 +352,7 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
                 )
                 resp.raise_for_status()
                 mapping[value] = self._require_download_url(resp.json())
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # any upload failure degrades to a dropped reference, never breaks the request
                 verbose_logger.warning("WaveSpeed media upload failed, dropping reference: %s", e)
                 mapping[value] = None
         return self._apply_media_mapping(optional_params, mapping)
@@ -383,7 +383,7 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
                 )
                 resp.raise_for_status()
                 mapping[value] = self._require_download_url(resp.json())
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001  # any upload failure degrades to a dropped reference, never breaks the request
                 verbose_logger.warning("WaveSpeed media upload failed, dropping reference: %s", e)
                 mapping[value] = None
         return self._apply_media_mapping(optional_params, mapping)

@@ -545,7 +545,7 @@ class LibTVClient:
         # reference url cannot read local files.
         if self._http_get is not None:
             return self._http_get(url)
-        if not (url.startswith("http://") or url.startswith("https://")):
+        if not url.startswith(("http://", "https://")):
             raise LibTVError(status_code=400, message="libtv reference url must be http(s)")
         resp = httpx.get(url, follow_redirects=True, timeout=self.request_timeout)
         if resp.status_code != 200:
@@ -753,7 +753,7 @@ class LibTVClient:
         # url must not pick up the litellm http wrapper's default headers.
         if self._http_size_probe is not None:
             return self._http_size_probe(url)
-        if not (url.startswith("http://") or url.startswith("https://")):
+        if not url.startswith(("http://", "https://")):
             raise LibTVError(status_code=400, message="libtv reference url must be http(s)")
         return probe_size_via_ranged_get(url, timeout=self.request_timeout)
 
@@ -770,7 +770,7 @@ class LibTVClient:
         # content= (sends no Content-Type) rather than the litellm wrappers.
         if self._http_put is not None:
             return self._http_put(url, data)
-        if not (url.startswith("http://") or url.startswith("https://")):
+        if not url.startswith(("http://", "https://")):
             raise LibTVError(status_code=400, message="libtv upload url must be http(s)")
         return httpx.put(url, content=data, timeout=self.request_timeout).status_code
 
