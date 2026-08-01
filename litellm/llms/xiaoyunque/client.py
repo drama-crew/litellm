@@ -30,7 +30,7 @@ _ACCOUNT_KEY_NAMESPACE = "xiaoyunque"
 def parse_upload_asset_id(payload: Dict[str, Any]) -> str:
     asset_id = (payload.get("data") or {}).get("pippit_asset_id")
     if not asset_id:
-        raise XiaoyunqueError(status_code=502, message=f"xiaoyunque upload_file returned no pippit_asset_id: {payload}")
+        raise XiaoyunqueError(status_code=502, message=f"upload_file response missing asset id: {payload}")
     return str(asset_id)
 
 
@@ -38,7 +38,7 @@ def parse_submit_run(payload: Dict[str, Any]) -> Dict[str, str]:
     run = (payload.get("data") or {}).get("run") or {}
     thread_id, run_id = run.get("thread_id"), run.get("run_id")
     if not thread_id or not run_id:
-        raise XiaoyunqueError(status_code=502, message=f"xiaoyunque submit_run returned no thread_id/run_id: {payload}")
+        raise XiaoyunqueError(status_code=502, message=f"submit_run returned no thread_id/run_id: {payload}")
     return {"thread_id": str(thread_id), "run_id": str(run_id)}
 
 
@@ -69,12 +69,10 @@ def encode_composite_task_id(thread_id: str, run_id: str) -> str:
 
 def decode_composite_task_id(task_id: str) -> Tuple[str, str]:
     if "~" not in task_id:
-        raise XiaoyunqueError(
-            status_code=400, message=f"xiaoyunque video id does not carry thread_id~run_id: {task_id!r}"
-        )
+        raise XiaoyunqueError(status_code=400, message=f"video id does not carry thread_id~run_id: {task_id!r}")
     thread_id, run_id = task_id.split("~", 1)
     if not thread_id or not run_id:
-        raise XiaoyunqueError(status_code=400, message=f"xiaoyunque video id has empty thread_id/run_id: {task_id!r}")
+        raise XiaoyunqueError(status_code=400, message=f"video id has empty thread_id/run_id: {task_id!r}")
     return thread_id, run_id
 
 
@@ -132,7 +130,7 @@ class XiaoyunqueClient:
         if response.status_code != 200:
             raise XiaoyunqueError(
                 status_code=response.status_code,
-                message=f"xiaoyunque {step} HTTP {response.status_code}: {response.text[:300]}",
+                message=f"{step} HTTP {response.status_code}: {response.text[:300]}",
                 headers=headers,
             )
         payload = response.json()
@@ -140,7 +138,7 @@ class XiaoyunqueClient:
         if ret == "0":
             return payload
         errmsg = str(payload.get("errmsg") or "")
-        message = f"xiaoyunque {step} ret={ret} errmsg={errmsg}"
+        message = f"{step} ret={ret} errmsg={errmsg}"
         if is_compliance_ret(ret):
             raise XiaoyunqueContentPolicyError(message=message)
         raise XiaoyunqueError(status_code=_status_code_for_ret(ret, errmsg), message=message, headers=headers)
@@ -185,12 +183,10 @@ class XiaoyunqueClient:
         if self._http_get is not None:
             return self._http_get(url)
         if not url.startswith(("http://", "https://")):
-            raise XiaoyunqueError(status_code=400, message="xiaoyunque reference url must be http(s)")
+            raise XiaoyunqueError(status_code=400, message="reference url must be http(s)")
         resp = httpx.get(url, follow_redirects=True, timeout=self.request_timeout)
         if resp.status_code != 200:
-            raise XiaoyunqueError(
-                status_code=resp.status_code, message=f"xiaoyunque reference fetch HTTP {resp.status_code}"
-            )
+            raise XiaoyunqueError(status_code=resp.status_code, message=f"reference fetch HTTP {resp.status_code}")
         return resp.content
 
     def _resolve_cache_target(self, source_key: Optional[str]) -> Optional[Tuple["LibTVPersistence", str]]:

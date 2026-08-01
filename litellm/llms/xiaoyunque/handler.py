@@ -30,7 +30,7 @@ from .client import XiaoyunqueClient, decode_composite_task_id, encode_composite
 from .common import XiaoyunqueContentPolicyError, XiaoyunqueError, resolve_xiaoyunque_credentials
 from .transform import build_video_part_tool_param, resolution_from_size
 
-XIAOYUNQUE_PROVIDER = "xiaoyunque"
+FB3_PROVIDER = "fb3"
 logger = logging.getLogger(__name__)
 
 _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
@@ -68,9 +68,9 @@ def _raise_normalized_xiaoyunque_error(error: XiaoyunqueError, model: str) -> No
     response = httpx.Response(
         status_code=error.status_code,
         headers=error.headers,
-        request=httpx.Request("POST", "https://xyq.jianying.com"),
+        request=httpx.Request("POST", "https://fb3.internal"),
     )
-    common = {"message": error.message, "model": model, "llm_provider": XIAOYUNQUE_PROVIDER}
+    common = {"message": error.message, "model": model, "llm_provider": FB3_PROVIDER}
     if isinstance(error, XiaoyunqueContentPolicyError):
         raise ContentPolicyViolationError(**common, response=response) from error
     if error.status_code == 400:
@@ -99,7 +99,7 @@ def normalize_xiaoyunque_errors(func):
         value = kwargs.get("model") or kwargs.get("video_id")
         if value is None and len(args) > 1:
             value = args[1]
-        return str(value or "xiaoyunque")
+        return str(value or "fb3")
 
     if iscoroutinefunction(func):
 
@@ -125,7 +125,7 @@ def normalize_xiaoyunque_errors(func):
 def _decode_task_id(video_id: str) -> str:
     task_id = (decode_video_id_with_provider(video_id) or {}).get("video_id") or ""
     if not task_id:
-        raise XiaoyunqueError(status_code=400, message="xiaoyunque video id does not carry a task id")
+        raise XiaoyunqueError(status_code=400, message="fb3 video id does not carry a task id")
     return task_id
 
 
@@ -206,7 +206,7 @@ def _guard_reference_intent(model: str, optional_params: dict, images: list, vid
     raise XiaoyunqueError(
         status_code=400,
         message=(
-            f"xiaoyunque video_generation model={model}: reference keys present ({', '.join(present_keys)}) "
+            f"fb3 video_generation model={model}: reference keys present ({', '.join(present_keys)}) "
             "but resolved to no references; refusing to degrade to text2video"
         ),
     )
@@ -216,7 +216,7 @@ def _guard_audio_requires_visual(model: str, images: list, videos: list, audios:
     if audios and not images and not videos:
         raise XiaoyunqueError(
             status_code=400,
-            message=f"xiaoyunque video_generation model={model}: audio references require image or video references "
+            message=f"fb3 video_generation model={model}: audio references require image or video references "
             "(upstream rejects audio-only submissions)",
         )
 
@@ -234,7 +234,7 @@ def _video_usage(optional_params: dict) -> Optional[dict]:
 
 
 def _video_billing_key(task_id: str) -> str:
-    return f"{XIAOYUNQUE_PROVIDER}:{task_id}"
+    return f"xiaoyunque:{task_id}"
 
 
 def _video_completion_cost(optional_params: dict, usage: dict) -> Optional[float]:
@@ -272,7 +272,7 @@ class XiaoyunqueLLM(CustomLLM):
         model_info = op.get("model_info") or {}
         deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
         video_id = encode_video_id_with_provider(
-            task_id, XIAOYUNQUE_PROVIDER, deployment_id or op.get("xiaoyunque_status_model")
+            task_id, FB3_PROVIDER, deployment_id or op.get("xiaoyunque_status_model")
         )
         vo = VideoObject(id=video_id, object="video", status="queued", model=model)
         vo.usage = _video_usage(op)
@@ -287,7 +287,7 @@ class XiaoyunqueLLM(CustomLLM):
         elif status == "failed":
             fail_reason = state.get("fail_reason")
             message = fail_reason.get("message") if isinstance(fail_reason, dict) else None
-            vo.error = {"message": message or "xiaoyunque generation failed"}
+            vo.error = {"message": message or "fb3 generation failed"}
         return vo
 
     async def _record_video_task_usage(self, task_id: str, optional_params: dict, params: dict) -> None:
@@ -483,13 +483,13 @@ class XiaoyunqueLLM(CustomLLM):
         thread_id, run_id = decode_composite_task_id(_decode_task_id(video_id))
         state = xq.query_result(thread_id, run_id)
         if state.get("run_state") != 3:
-            raise XiaoyunqueError(status_code=409, message="xiaoyunque video still processing")
+            raise XiaoyunqueError(status_code=409, message="fb3 video still processing")
         urls = state.get("video_urls") or state.get("image_urls") or []
         if not urls:
-            raise XiaoyunqueError(status_code=502, message="xiaoyunque video completed without a result url")
+            raise XiaoyunqueError(status_code=502, message="fb3 video completed without a result url")
         resp = http.get(url=urls[0])
         if resp.status_code != 200:
-            raise XiaoyunqueError(status_code=resp.status_code, message="xiaoyunque video content download failed")
+            raise XiaoyunqueError(status_code=resp.status_code, message="fb3 video content download failed")
         return resp.content
 
     @normalize_xiaoyunque_errors
@@ -508,11 +508,11 @@ class XiaoyunqueLLM(CustomLLM):
         thread_id, run_id = decode_composite_task_id(_decode_task_id(video_id))
         state = await xq.aquery_result(thread_id, run_id)
         if state.get("run_state") != 3:
-            raise XiaoyunqueError(status_code=409, message="xiaoyunque video still processing")
+            raise XiaoyunqueError(status_code=409, message="fb3 video still processing")
         urls = state.get("video_urls") or state.get("image_urls") or []
         if not urls:
-            raise XiaoyunqueError(status_code=502, message="xiaoyunque video completed without a result url")
+            raise XiaoyunqueError(status_code=502, message="fb3 video completed without a result url")
         resp = await http.get(url=urls[0])
         if resp.status_code != 200:
-            raise XiaoyunqueError(status_code=resp.status_code, message="xiaoyunque video content download failed")
+            raise XiaoyunqueError(status_code=resp.status_code, message="fb3 video content download failed")
         return resp.content

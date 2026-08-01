@@ -64,7 +64,7 @@ def resolve_xiaoyunque_credentials(token: Optional[str] = None) -> str:
     if not resolved_token:
         raise XiaoyunqueError(
             status_code=401,
-            message="Xiaoyunque access key missing. Set XIAOYUNQUE_TOKEN (or pass api_key).",
+            message="fb3 access key missing. Configure the provider credentials, or pass api_key.",
         )
     return resolved_token
 

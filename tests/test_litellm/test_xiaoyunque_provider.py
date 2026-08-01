@@ -1,3 +1,4 @@
+import base64
 import json
 from typing import Any, Dict, Optional
 
@@ -30,7 +31,7 @@ from litellm.llms.xiaoyunque.common import (
     resolve_xiaoyunque_credentials,
 )
 from litellm.llms.xiaoyunque.handler import (
-    XIAOYUNQUE_PROVIDER,
+    FB3_PROVIDER,
     XiaoyunqueLLM,
     _collect_reference_groups,
     _raise_normalized_xiaoyunque_error,
@@ -42,7 +43,12 @@ from litellm.llms.xiaoyunque.transform import (
     resolve_resolution,
     size_to_ratio,
 )
-from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
+from litellm.types.videos.utils import (
+    VIDEO_ID_PREFIX,
+    _add_base64_padding,
+    decode_video_id_with_provider,
+    encode_video_id_with_provider,
+)
 
 # ---------------------------------------------------------------------------
 # fakes: dependency-injected fake HTTP clients keyed by request path, mirroring
@@ -346,12 +352,12 @@ def test_composite_task_id_roundtrip():
 def test_composite_task_id_survives_video_id_encode_decode_with_provider():
     thread_id, run_id = "marketing_thread", "marketing_run"
     composite = encode_composite_task_id(thread_id, run_id)
-    video_id = encode_video_id_with_provider(composite, XIAOYUNQUE_PROVIDER, "fb3-seedance-2-standard-account-1")
+    video_id = encode_video_id_with_provider(composite, FB3_PROVIDER, "fb3-seedance-2-standard-account-1")
     decoded = decode_video_id_with_provider(video_id)
     assert decoded["video_id"] == composite  # not truncated at '~'
     assert decode_composite_task_id(decoded["video_id"]) == (thread_id, run_id)
     assert decoded["model_id"] == "fb3-seedance-2-standard-account-1"
-    assert decoded["custom_llm_provider"] == XIAOYUNQUE_PROVIDER
+    assert decoded["custom_llm_provider"] == FB3_PROVIDER
 
 
 def test_decode_composite_task_id_rejects_malformed():
@@ -376,6 +382,33 @@ def test_build_video_object_falls_back_to_status_model():
     vo = XiaoyunqueLLM()._build_video_object("m", "thread-1", "run-1", {"xiaoyunque_status_model": "seedance-2.0"})
     decoded = decode_video_id_with_provider(vo.id)
     assert decoded["model_id"] == "seedance-2.0"
+
+
+_FORBIDDEN_VENDOR_SUBSTRINGS = ("xiaoyunque", "jianying", "pippit", "xyq", "剪映", "capcut")
+
+
+def test_video_id_produced_by_provider_leaks_no_vendor_identity():
+    """A video_id built by the real production path (_build_video_object, the same
+    call video_generation/avideo_generation make) must decode to a blob carrying
+    none of the vendor's names, anywhere in the string -- not merely equal "fb3".
+    An equality assertion on custom_llm_provider alone would pass just as happily
+    if a vendor token slipped back in through some other segment (e.g. a
+    deployment id or a future field); only a forbidden-substring scan over the
+    full decoded blob actually holds the property this test exists to pin."""
+    vo = XiaoyunqueLLM()._build_video_object(
+        "seedance2.0_vision",
+        "thread-real-123",
+        "run-real-456",
+        {"model_info": {"id": "fb3-seedance-2-standard-account-1"}},
+    )
+
+    cleaned = _add_base64_padding(vo.id.replace(VIDEO_ID_PREFIX, ""))
+    decoded_blob = base64.b64decode(cleaned).decode("utf-8")
+
+    for forbidden in _FORBIDDEN_VENDOR_SUBSTRINGS:
+        assert forbidden.lower() not in decoded_blob.lower(), (
+            f"video id leaks vendor identity via {forbidden!r} in decoded blob: {decoded_blob!r}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1090,7 +1123,7 @@ async def test_avideo_status_production_shape_bills_from_persisted_usage(monkeyp
     )
     monkeypatch.setattr("litellm.llms.xiaoyunque.handler.get_persistence", lambda: fake_persistence)
     client = FakeAsyncClient(post_by_path=_query_result_route(3, video_urls=["https://x/v.mp4"]))
-    optional_params = {"model": "seedance-2.0", "custom_llm_provider": "xiaoyunque", "model_info": _720P_MODEL_INFO}
+    optional_params = {"model": "seedance-2.0", "custom_llm_provider": "fb3", "model_info": _720P_MODEL_INFO}
 
     status = await XiaoyunqueLLM().avideo_status(_vid(), "tok", None, optional_params, None, client=client)
 
@@ -1109,6 +1142,6 @@ async def test_avideo_status_production_shape_bills_from_persisted_usage(monkeyp
 @pytest.mark.asyncio
 async def test_avideo_status_malformed_composite_id_raises_bad_request(monkeypatch):
     monkeypatch.setenv("XIAOYUNQUE_TOKEN", "tok")
-    video_id = encode_video_id_with_provider("no-tilde-here", XIAOYUNQUE_PROVIDER, "some-model")
+    video_id = encode_video_id_with_provider("no-tilde-here", FB3_PROVIDER, "some-model")
     with pytest.raises(BadRequestError):
         await XiaoyunqueLLM().avideo_status(video_id, None, None, {}, None, client=FakeAsyncClient())
