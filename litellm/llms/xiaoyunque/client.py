@@ -9,6 +9,7 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.libtv.persistence import LibTVPersistence, account_key, get_persistence, normalize_source_key
 
 from .common import (
+    AGENT_NAME,
     QUERY_RESULT_PATH,
     SUBMIT_RUN_PATH,
     UPLOAD_FILE_PATH,
@@ -166,7 +167,7 @@ class XiaoyunqueClient:
     ) -> Dict[str, str]:
         body: Dict[str, Any] = {
             "message": message,
-            "agent_name": "pippit_video_part_agent",
+            "agent_name": AGENT_NAME,
             "video_part_tool_param": video_part_tool_param,
         }
         if asset_ids:
@@ -229,7 +230,7 @@ class XiaoyunqueClient:
     ) -> Dict[str, str]:
         body: Dict[str, Any] = {
             "message": message,
-            "agent_name": "pippit_video_part_agent",
+            "agent_name": AGENT_NAME,
             "video_part_tool_param": video_part_tool_param,
         }
         if asset_ids:

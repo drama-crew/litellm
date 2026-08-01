@@ -22,6 +22,7 @@ from litellm.llms.xiaoyunque.client import (
     parse_upload_asset_id,
 )
 from litellm.llms.xiaoyunque.common import (
+    AGENT_NAME,
     XiaoyunqueContentPolicyError,
     XiaoyunqueError,
     build_xiaoyunque_headers,
@@ -161,10 +162,12 @@ def _submit_ok(run_id: str = "run-1", thread_id: str = "thread-1") -> Dict[str, 
     return {"ret": "0", "errmsg": "", "data": {"run": {"run_id": run_id, "thread_id": thread_id, "state": 1}}}
 
 
-def _query_result_route(run_state, video_urls=None, fail_reason=None) -> Dict[str, Any]:
+def _query_result_route(run_state, video_urls=None, image_urls=None, fail_reason=None) -> Dict[str, Any]:
     data: Dict[str, Any] = {"run_state": run_state}
     if video_urls is not None:
         data["video_urls"] = video_urls
+    if image_urls is not None:
+        data["image_urls"] = image_urls
     if fail_reason is not None:
         data["fail_reason"] = fail_reason
     return {"/api/biz/v1/agent/query_generate_video_result": {"ret": "0", "errmsg": "", "data": data}}
@@ -211,6 +214,20 @@ def test_none_credential_falls_back_to_env_and_missing_env_still_fails_closed(mo
     assert exc.value.status_code == 401
 
 
+class _NetworkForbiddenClient:
+    """Injected in place of a real HTTPHandler/AsyncHTTPHandler for tests that claim
+    the credential guard raises BEFORE any client method runs. Any call here proves
+    that claim false -- and does so hermetically (AssertionError) instead of the
+    test actually reaching https://xyq.jianying.com and failing on a live upstream
+    body, which is what happened once the guard regressed under mutation."""
+
+    def post(self, *args, **kwargs):
+        raise AssertionError("credential guard regressed: reached network POST")
+
+    def get(self, *args, **kwargs):
+        raise AssertionError("credential guard regressed: reached network GET")
+
+
 def test_pool_deployment_missing_explicit_slot_never_borrows_global_account(monkeypatch):
     monkeypatch.setenv("XIAOYUNQUE_TOKEN", "global-token")
     with pytest.raises(AuthenticationError):
@@ -221,13 +238,29 @@ def test_pool_deployment_missing_explicit_slot_never_borrows_global_account(monk
             api_base=None,
             optional_params={"xiaoyunque_require_explicit_credentials": True},
             logging_obj=None,
+            client=_NetworkForbiddenClient(),
         )
 
 
 def test_video_status_missing_credentials_raises_auth_error_before_reaching_client(monkeypatch):
     monkeypatch.delenv("XIAOYUNQUE_TOKEN", raising=False)
     with pytest.raises(AuthenticationError):
-        XiaoyunqueLLM().video_status("plain-id", None, None, {}, None)
+        XiaoyunqueLLM().video_status("plain-id", None, None, {}, None, client=_NetworkForbiddenClient())
+
+
+def test_xiaoyunque_llm_constructor_matches_custom_handlers_zero_arg_contract():
+    """Pins the exact construction openhands-multi-acp-image/litellm_custom_handlers.py
+    performs at proxy boot: `xiaoyunque_proxy_handler = XiaoyunqueLLM()`. Unlike
+    LibTVLLM (which needs poll_interval/poll_max_attempts because it also serves
+    synchronous image generation), XiaoyunqueLLM is submit-only and takes no
+    constructor arguments at all -- reverting to the libtv-style call signature
+    would raise TypeError at proxy import time and take down every LLM call on the
+    platform. Deliberately mirror the handlers-file call rather than merely
+    checking XiaoyunqueLLM() succeeds, so a signature drift on either side of that
+    seam fails this test."""
+    XiaoyunqueLLM()
+    with pytest.raises(TypeError):
+        XiaoyunqueLLM(poll_interval=3.0, poll_max_attempts=160)
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +466,8 @@ def test_video_generation_sync_submit_only():
     )
     assert vo.status == "queued"
     assert [c[0] for c in client.calls] == ["/api/biz/v1/skill/submit_run"]
+    _, submit_body, _ = client.calls[0]
+    assert submit_body["agent_name"] == AGENT_NAME
 
 
 @pytest.mark.parametrize(
@@ -462,6 +497,17 @@ def test_video_status_completed_hidden_params_carry_url():
     client = FakeSyncClient(post_by_path=_query_result_route(3, video_urls=["https://x/v.mp4"]))
     status = XiaoyunqueLLM().video_status(_vid(), "tok", None, {}, None, client=client)
     assert status._hidden_params["url"] == "https://x/v.mp4"
+
+
+def test_video_status_completed_falls_back_to_image_urls_when_no_video_urls():
+    # image_urls is a real upstream shape, not a hypothetical: some completed runs
+    # (e.g. frames2video / non-video outputs) report through image_urls with
+    # video_urls absent entirely. Without the `or state.get("image_urls")` fallback
+    # this reports completed with url=None, silently losing the result.
+    client = FakeSyncClient(post_by_path=_query_result_route(3, image_urls=["https://x/frame.png"]))
+    status = XiaoyunqueLLM().video_status(_vid(), "tok", None, {}, None, client=client)
+    assert status.status == "completed"
+    assert status._hidden_params["url"] == "https://x/frame.png"
 
 
 def test_video_status_failed_sets_error_data_not_exception():
@@ -533,6 +579,27 @@ async def test_avideo_content_raises_while_still_processing():
     with pytest.raises(APIError) as exc:
         await XiaoyunqueLLM().avideo_content(_vid(), "tok", None, {}, None, client=c)
     assert exc.value.status_code == 409
+
+
+def test_video_content_completed_without_url_raises_instead_of_empty_bytes():
+    # Upstream reported run_state=3 (completed) but no video_urls/image_urls -- this
+    # must be a hard 502, never a silent b"". This repo has a live incident class
+    # for exactly this shape (silent download truncation corrupted 4/19 artifacts);
+    # an empty MP4 reaching the backend is the same failure mode, just at ret=0.
+    c = _PollAndDownloadSyncClient(3, url=None)
+    with pytest.raises(BadGatewayError) as exc:
+        XiaoyunqueLLM().video_content(_vid(), "tok", None, {}, None, client=c)
+    assert exc.value.status_code == 502
+    assert c.got is None  # must fail before ever attempting a download GET
+
+
+@pytest.mark.asyncio
+async def test_avideo_content_completed_without_url_raises_instead_of_empty_bytes():
+    c = _PollAndDownloadAsyncClient(3, url=None)
+    with pytest.raises(BadGatewayError) as exc:
+        await XiaoyunqueLLM().avideo_content(_vid(), "tok", None, {}, None, client=c)
+    assert exc.value.status_code == 502
+    assert c.got is None  # must fail before ever attempting a download GET
 
 
 # ---------------------------------------------------------------------------
@@ -712,7 +779,7 @@ async def test_avideo_generation_full_payload_shape_and_ignores_unknown_params()
     )
     assert vo.status == "queued"
     submit_body = next(body for path, body, _files in fake.calls if path == "/api/biz/v1/skill/submit_run")
-    assert submit_body["agent_name"] == "pippit_video_part_agent"
+    assert submit_body["agent_name"] == AGENT_NAME
     assert set(submit_body["asset_ids"]) == {"asset-img", "asset-vid", "asset-aud"}
     vptp = submit_body["video_part_tool_param"]
     assert vptp["images"] == [{"pippit_asset_id": "asset-img"}]
