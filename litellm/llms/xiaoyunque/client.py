@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -20,12 +21,15 @@ from .common import (
     build_xiaoyunque_upload_headers,
     is_compliance_ret,
     is_rate_limit_ret,
+    is_submit_rate_limit_retryable,
 )
 from .common import is_ak_error as _is_ak_error
 
 logger = logging.getLogger(__name__)
 
 _ACCOUNT_KEY_NAMESPACE = "xiaoyunque"
+_SUBMIT_RATE_LIMIT_MAX_RETRIES = 2
+_SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS = 30.0
 
 
 def parse_upload_asset_id(payload: Dict[str, Any]) -> str:
@@ -100,6 +104,8 @@ class XiaoyunqueClient:
         request_timeout: float = 600.0,
         http_get=None,
         persistence: Optional["LibTVPersistence"] = None,
+        sleep: Callable[[float], None] | None = None,
+        asleep: Callable[[float], Awaitable[None]] | None = None,
     ):
         self.token = token
         self.sync_client = sync_client
@@ -110,6 +116,8 @@ class XiaoyunqueClient:
         # reaches the store. Injectable for tests.
         self._http_get = http_get
         self._persistence = persistence
+        self._sleep = sleep or time.sleep
+        self._asleep = asleep or asyncio.sleep
         # Namespaced so the shared LibTV*-named cache/billing tables (reused rather than
         # duplicated -- see persistence.py) can never collide a xiaoyunque row with a
         # libtv row that happens to hash to the same bare account_key.
@@ -142,7 +150,7 @@ class XiaoyunqueClient:
         message = f"{step} ret={ret} errmsg={errmsg}"
         if is_compliance_ret(ret):
             raise XiaoyunqueContentPolicyError(message=message)
-        raise XiaoyunqueError(status_code=_status_code_for_ret(ret, errmsg), message=message, headers=headers)
+        raise XiaoyunqueError(status_code=_status_code_for_ret(ret, errmsg), message=message, headers=headers, ret=ret)
 
     # ---------- sync ----------
     def _post(self, path: str, body: Dict[str, Any], step: str) -> Dict[str, Any]:
@@ -174,7 +182,16 @@ class XiaoyunqueClient:
             body["asset_ids"] = asset_ids
         if thread_id:
             body["thread_id"] = thread_id
-        return parse_submit_run(self._post(SUBMIT_RUN_PATH, body, "submit_run"))
+        return self._submit_run_attempt(body, retries_left=_SUBMIT_RATE_LIMIT_MAX_RETRIES)
+
+    def _submit_run_attempt(self, body: dict[str, Any], retries_left: int) -> dict[str, str]:
+        try:
+            return parse_submit_run(self._post(SUBMIT_RUN_PATH, body, "submit_run"))
+        except XiaoyunqueError as error:
+            if retries_left <= 0 or not is_submit_rate_limit_retryable(error.ret):
+                raise
+            self._sleep(_SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS)
+            return self._submit_run_attempt(body, retries_left - 1)
 
     def query_result(self, thread_id: str, run_id: str) -> Dict[str, Any]:
         body = {"thread_id": thread_id, "run_id": run_id}
@@ -237,7 +254,16 @@ class XiaoyunqueClient:
             body["asset_ids"] = asset_ids
         if thread_id:
             body["thread_id"] = thread_id
-        return parse_submit_run(await self._apost(SUBMIT_RUN_PATH, body, "submit_run"))
+        return await self._asubmit_run_attempt(body, retries_left=_SUBMIT_RATE_LIMIT_MAX_RETRIES)
+
+    async def _asubmit_run_attempt(self, body: dict[str, Any], retries_left: int) -> dict[str, str]:
+        try:
+            return parse_submit_run(await self._apost(SUBMIT_RUN_PATH, body, "submit_run"))
+        except XiaoyunqueError as error:
+            if retries_left <= 0 or not is_submit_rate_limit_retryable(error.ret):
+                raise
+            await self._asleep(_SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS)
+            return await self._asubmit_run_attempt(body, retries_left - 1)
 
     async def aquery_result(self, thread_id: str, run_id: str) -> Dict[str, Any]:
         body = {"thread_id": thread_id, "run_id": run_id}

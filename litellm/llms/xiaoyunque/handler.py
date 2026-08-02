@@ -246,9 +246,11 @@ def _video_completion_cost(optional_params: dict, usage: dict) -> Optional[float
 
 
 class XiaoyunqueLLM(CustomLLM):
-    def __init__(self, http_get=None):
+    def __init__(self, http_get=None, sleep=None, asleep=None):
         super().__init__()
         self._http_get = http_get
+        self._sleep = sleep
+        self._asleep = asleep
 
     def _make_client(
         self,
@@ -261,7 +263,12 @@ class XiaoyunqueLLM(CustomLLM):
         token = api_key if api_key is not None or not require_explicit else ""
         token = resolve_xiaoyunque_credentials(token=token)
         return XiaoyunqueClient(
-            token=token, sync_client=sync_client, async_client=async_client, http_get=self._http_get
+            token=token,
+            sync_client=sync_client,
+            async_client=async_client,
+            http_get=self._http_get,
+            sleep=self._sleep,
+            asleep=self._asleep,
         )
 
     def _build_video_object(
