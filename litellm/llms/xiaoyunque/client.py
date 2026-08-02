@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import os
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -29,7 +30,26 @@ logger = logging.getLogger(__name__)
 
 _ACCOUNT_KEY_NAMESPACE = "xiaoyunque"
 _SUBMIT_RATE_LIMIT_MAX_RETRIES = 2
-_SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS = 30.0
+# Upstream's own ret=16010 text says "请一分钟后再试". 30s was too short: if the
+# throttle window is SLIDING (re-armed by every request, not just the first),
+# a 30s retry re-arms it and is guaranteed to fail, converting an instant 429
+# into a 60s-latency 429 for no benefit. We could not determine the window
+# semantics for free -- validation-rejected requests (ret=2) are NOT counted by
+# the limiter (probed 2026-08-02: four rapid 1080p rejects, zero 16010), so
+# mapping it would cost real generations. 60s + jitter is correct under EITHER
+# semantics, which is why it is preferred over probing. Jitter spreads a burst
+# of simultaneously-throttled submits so they do not all retry in lockstep and
+# re-collide.
+_SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS = 60.0
+_SUBMIT_RATE_LIMIT_RETRY_JITTER_SECONDS = 10.0
+
+
+def _submit_rate_limit_delay(jitter: Callable[[float, float], float]) -> float:
+    """Delay before re-attempting a 16010-throttled submit. See the constants
+    above for why it is 60s rather than the upstream-suggested minimum."""
+    return _SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS + jitter(
+        0.0, _SUBMIT_RATE_LIMIT_RETRY_JITTER_SECONDS
+    )
 
 
 def parse_upload_asset_id(payload: Dict[str, Any]) -> str:
@@ -106,6 +126,7 @@ class XiaoyunqueClient:
         persistence: Optional["LibTVPersistence"] = None,
         sleep: Callable[[float], None] | None = None,
         asleep: Callable[[float], Awaitable[None]] | None = None,
+        jitter: Callable[[float, float], float] | None = None,
     ):
         self.token = token
         self.sync_client = sync_client
@@ -118,6 +139,8 @@ class XiaoyunqueClient:
         self._persistence = persistence
         self._sleep = sleep or time.sleep
         self._asleep = asleep or asyncio.sleep
+        # Injectable so retry-delay tests stay deterministic (same DI seam as sleep).
+        self._jitter = jitter or random.uniform
         # Namespaced so the shared LibTV*-named cache/billing tables (reused rather than
         # duplicated -- see persistence.py) can never collide a xiaoyunque row with a
         # libtv row that happens to hash to the same bare account_key.
@@ -190,7 +213,7 @@ class XiaoyunqueClient:
         except XiaoyunqueError as error:
             if retries_left <= 0 or not is_submit_rate_limit_retryable(error.ret):
                 raise
-            self._sleep(_SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS)
+            self._sleep(_submit_rate_limit_delay(self._jitter))
             return self._submit_run_attempt(body, retries_left - 1)
 
     def query_result(self, thread_id: str, run_id: str) -> Dict[str, Any]:
@@ -262,7 +285,7 @@ class XiaoyunqueClient:
         except XiaoyunqueError as error:
             if retries_left <= 0 or not is_submit_rate_limit_retryable(error.ret):
                 raise
-            await self._asleep(_SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS)
+            await self._asleep(_submit_rate_limit_delay(self._jitter))
             return await self._asubmit_run_attempt(body, retries_left - 1)
 
     async def aquery_result(self, thread_id: str, run_id: str) -> Dict[str, Any]:

@@ -246,11 +246,12 @@ def _video_completion_cost(optional_params: dict, usage: dict) -> Optional[float
 
 
 class XiaoyunqueLLM(CustomLLM):
-    def __init__(self, http_get=None, sleep=None, asleep=None):
+    def __init__(self, http_get=None, sleep=None, asleep=None, jitter=None):
         super().__init__()
         self._http_get = http_get
         self._sleep = sleep
         self._asleep = asleep
+        self._jitter = jitter
 
     def _make_client(
         self,
@@ -269,6 +270,7 @@ class XiaoyunqueLLM(CustomLLM):
             http_get=self._http_get,
             sleep=self._sleep,
             asleep=self._asleep,
+            jitter=self._jitter,
         )
 
     def _build_video_object(
