@@ -1525,3 +1525,49 @@ def test_retry_delay_applies_real_jitter_by_default():
         'burst would retry in lockstep'
     )
     assert all(d >= 60.0 for d in delays)
+
+
+# ---------------------------------------------------------------------------
+# A retry must resubmit the SAME request.
+#
+# The existing retry tests assert control flow (how many attempts, how long the
+# waits, what the final result is) but never inspect the retried BODY. An
+# adversarial review showed that a retry which silently changed the model and
+# the prompt, and dropped asset_ids/thread_id, left the whole suite green — i.e.
+# it could have generated a different video from a different model and nothing
+# would have noticed.
+#
+# The old fixtures could not have caught it even in principle: they all pass
+# asset_ids=[], and the client only sets body["asset_ids"] when truthy, so the
+# key under test was never present. This uses a NON-EMPTY reference set and a
+# thread_id for that reason.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retry_resubmits_a_byte_identical_body():
+    fake = FakeAsyncClient(
+        post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]}
+    )
+    client = XiaoyunqueClient(
+        token="t", async_client=fake, asleep=_RecordingAsleep(), jitter=_no_jitter
+    )
+    await client.asubmit_run(
+        message="a cat on a windowsill",
+        asset_ids=["asset-1", "asset-2"],
+        video_part_tool_param={"model": "Seedance_2.5", "duration_sec": 30, "prompt": "a cat on a windowsill"},
+        thread_id="thread-existing",
+    )
+
+    assert len(fake.calls) == 2, 'expected exactly one retry'
+    first_body, second_body = fake.calls[0][1], fake.calls[1][1]
+    assert second_body == first_body, (
+        'the retried submit body differs from the original — a retry that '
+        'changes the model, prompt or reference set would generate a '
+        f'different video at full cost.\nfirst:  {first_body!r}\nsecond: {second_body!r}'
+    )
+    # Guard the guard: if the fixture ever stopped carrying these, the equality
+    # above would still pass while testing nothing interesting.
+    assert first_body["asset_ids"] == ["asset-1", "asset-2"]
+    assert first_body["thread_id"] == "thread-existing"
+    assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
