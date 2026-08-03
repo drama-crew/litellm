@@ -1,6 +1,8 @@
 from math import gcd
 from typing import Any, Dict, List, Optional
 
+from typing_extensions import Required, TypedDict
+
 DEFAULT_DURATION_SEC = 5
 VISION_1080P_MODEL = "seedance2.0_vision"
 
@@ -11,6 +13,22 @@ _RATIO_BY_WH = {
     (4, 3): "4:3",
     (3, 4): "3:4",
 }
+
+
+class XiaoyunqueAssetReference(TypedDict):
+    pippit_asset_id: str
+
+
+class XiaoyunqueVideoPartToolParam(TypedDict, total=False):
+    prompt: Required[str]
+    model: Required[str]
+    duration_sec: Required[int]
+    ratio: str
+    resolution: str
+    generate_type: int
+    images: List[XiaoyunqueAssetReference]
+    videos: List[XiaoyunqueAssetReference]
+    audios: List[XiaoyunqueAssetReference]
 
 
 def _parse_wh(size: Optional[str]):
@@ -60,7 +78,7 @@ def resolve_resolution(model: str, requested: Optional[str], warn) -> Optional[s
     return requested
 
 
-def _asset_refs(asset_ids: List[str]) -> List[Dict[str, str]]:
+def _asset_refs(asset_ids: List[str]) -> List[XiaoyunqueAssetReference]:
     return [{"pippit_asset_id": asset_id} for asset_id in asset_ids]
 
 
@@ -73,7 +91,7 @@ def build_video_part_tool_param(
     audio_asset_ids: List[str],
     generate_type: Optional[int],
     warn,
-) -> Dict[str, Any]:
+) -> XiaoyunqueVideoPartToolParam:
     op = optional_params or {}
     ratio = op.get("ratio") or op.get("aspect_ratio") or size_to_ratio(op.get("size"))
     resolution = op.get("resolution") or resolution_from_size(op.get("size"))
@@ -83,7 +101,7 @@ def build_video_part_tool_param(
     except (TypeError, ValueError):
         duration_sec = DEFAULT_DURATION_SEC
 
-    param: Dict[str, Any] = {"prompt": prompt, "model": model, "duration_sec": duration_sec}
+    param: XiaoyunqueVideoPartToolParam = {"prompt": prompt, "model": model, "duration_sec": duration_sec}
     if ratio:
         param["ratio"] = ratio
     if resolution:

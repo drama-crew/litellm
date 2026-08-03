@@ -26,7 +26,15 @@ from litellm.llms.openai.cost_calculation import _video_output_cost_per_second
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
 
-from .client import XiaoyunqueClient, decode_composite_task_id, encode_composite_task_id
+from .client import (
+    XiaoyunqueAsyncSleep,
+    XiaoyunqueClient,
+    XiaoyunqueHTTPGet,
+    XiaoyunqueJitter,
+    XiaoyunqueSleep,
+    decode_composite_task_id,
+    encode_composite_task_id,
+)
 from .common import XiaoyunqueContentPolicyError, XiaoyunqueError, resolve_xiaoyunque_credentials
 from .transform import build_video_part_tool_param, resolution_from_size
 
@@ -246,7 +254,13 @@ def _video_completion_cost(optional_params: dict, usage: dict) -> Optional[float
 
 
 class XiaoyunqueLLM(CustomLLM):
-    def __init__(self, http_get=None, sleep=None, asleep=None, jitter=None):
+    def __init__(
+        self,
+        http_get: XiaoyunqueHTTPGet | None = None,
+        sleep: XiaoyunqueSleep | None = None,
+        asleep: XiaoyunqueAsyncSleep | None = None,
+        jitter: XiaoyunqueJitter | None = None,
+    ):
         super().__init__()
         self._http_get = http_get
         self._sleep = sleep
