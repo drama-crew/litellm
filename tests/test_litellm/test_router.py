@@ -6,6 +6,7 @@ import sys
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 
 sys.path.insert(
     0, os.path.abspath("../../..")
@@ -5481,3 +5482,160 @@ async def test_max_parallel_request_cache_keys_do_not_collide_across_deployments
 
     assert status_semaphore._value == 1
     assert non_video_semaphore._value == 7
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "capacity_one_initialized_first",
+    [True, False],
+    ids=["capacity-one-first", "capacity-seven-first"],
+)
+async def test_max_parallel_request_cache_keys_preserve_unicode_code_points(
+    capacity_one_initialized_first: bool,
+):
+    deployments = yaml.safe_load(
+        """
+- model_name: unicode-capacity-one-model
+  litellm_params:
+    model: openai/gpt-5.2
+    api_key: test-api-key
+    max_parallel_requests: 1
+  model_info:
+    id: "😀"
+- model_name: unicode-capacity-seven-model
+  litellm_params:
+    model: openai/gpt-5.2
+    api_key: test-api-key
+    max_parallel_requests: 7
+  model_info:
+    id: "\\uD83D\\uDE00"
+"""
+    )
+    capacity_one_deployment, capacity_seven_deployment = deployments
+    scalar_id = capacity_one_deployment["model_info"]["id"]
+    surrogate_id = capacity_seven_deployment["model_info"]["id"]
+
+    assert scalar_id == chr(0x1F600)
+    assert surrogate_id == chr(0xD83D) + chr(0xDE00)
+    assert scalar_id != surrogate_id
+
+    capacity_one_entries: asyncio.Queue[None] = asyncio.Queue()
+    capacity_seven_entries: asyncio.Queue[None] = asyncio.Queue()
+    capacity_one_release = asyncio.Event()
+    capacity_seven_release = asyncio.Event()
+
+    async def capacity_one_provider(**kwargs):
+        capacity_one_entries.put_nowait(None)
+        await capacity_one_release.wait()
+        return {"output": kwargs["contents"]}
+
+    async def capacity_seven_provider(**kwargs):
+        capacity_seven_entries.put_nowait(None)
+        await capacity_seven_release.wait()
+        return {"output": kwargs["contents"]}
+
+    router = litellm.Router(model_list=deployments, num_retries=0)
+    routed_capacity_one = router.factory_function(
+        capacity_one_provider, call_type="agenerate_content"
+    )
+    routed_capacity_seven = router.factory_function(
+        capacity_seven_provider, call_type="agenerate_content"
+    )
+
+    try:
+        if capacity_one_initialized_first:
+            capacity_one_task = asyncio.create_task(
+                routed_capacity_one(
+                    model="unicode-capacity-one-model", contents="first"
+                )
+            )
+            await asyncio.wait_for(capacity_one_entries.get(), timeout=1)
+            capacity_seven_task = asyncio.create_task(
+                routed_capacity_seven(
+                    model="unicode-capacity-seven-model", contents="second"
+                )
+            )
+
+            try:
+                await asyncio.wait_for(capacity_seven_entries.get(), timeout=0.2)
+            finally:
+                capacity_one_release.set()
+                capacity_seven_release.set()
+                await asyncio.gather(capacity_one_task, capacity_seven_task)
+        else:
+            bootstrap_capacity_seven_task = asyncio.create_task(
+                routed_capacity_seven(
+                    model="unicode-capacity-seven-model", contents="bootstrap"
+                )
+            )
+            await asyncio.wait_for(capacity_seven_entries.get(), timeout=1)
+            capacity_seven_release.set()
+            await bootstrap_capacity_seven_task
+
+            capacity_one_tasks = [
+                asyncio.create_task(
+                    routed_capacity_one(
+                        model="unicode-capacity-one-model", contents=f"request-{index}"
+                    )
+                )
+                for index in range(2)
+            ]
+            await asyncio.wait_for(capacity_one_entries.get(), timeout=1)
+
+            try:
+                with pytest.raises(asyncio.TimeoutError):
+                    await asyncio.wait_for(capacity_one_entries.get(), timeout=0.2)
+            finally:
+                capacity_one_release.set()
+                await asyncio.gather(*capacity_one_tasks)
+
+        capacity_one_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(
+            model_id=scalar_id
+        )
+        capacity_seven_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(
+            model_id=surrogate_id
+        )
+        capacity_one_semaphore = router._get_client(
+            deployment=capacity_one_deployment,
+            kwargs={},
+            client_type="max_parallel_requests",
+        )
+        capacity_seven_semaphore = router._get_client(
+            deployment=capacity_seven_deployment,
+            kwargs={},
+            client_type="max_parallel_requests",
+        )
+
+        assert capacity_one_key != capacity_seven_key
+        assert capacity_one_semaphore is not capacity_seven_semaphore
+        assert capacity_one_semaphore._value == 1
+        assert capacity_seven_semaphore._value == 7
+    finally:
+        router.discard()
+
+
+def test_max_parallel_request_cache_key_round_trips_structured_identity():
+    identities = (
+        ("", None),
+        ("", "video_status"),
+        ('quote"backslash\\control\x00\n\t', None),
+        ("model", ""),
+        ("model", 'quote"backslash\\control\x01'),
+        (chr(0x1F600), None),
+        (chr(0xD83D) + chr(0xDE00), None),
+    )
+    keys = tuple(
+        InitalizeCachedClient.get_max_parallel_requests_cache_key(
+            model_id=model_id,
+            operation=operation,
+        )
+        for model_id, operation in identities
+    )
+
+    assert len(set(keys)) == len(identities)
+    assert tuple(
+        tuple(
+            json.loads(key.removeprefix("max_parallel_requests_client:"))
+        )
+        for key in keys
+    ) == identities

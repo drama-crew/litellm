@@ -15,7 +15,7 @@ else:
 class InitalizeCachedClient:
     @staticmethod
     def get_max_parallel_requests_cache_key(model_id: str, operation: str | None = None) -> str:
-        encoded_identity = json.dumps((model_id, operation), separators=(",", ":"))
+        encoded_identity = json.dumps((model_id, operation), ensure_ascii=False, separators=(",", ":"))
         return f"max_parallel_requests_client:{encoded_identity}"
 
     @staticmethod
