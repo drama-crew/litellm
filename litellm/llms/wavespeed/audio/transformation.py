@@ -22,6 +22,12 @@ _AUDIO_MODELS: frozenset[str] = frozenset(
         "minimax/voice-design",
     )
 )
+_PER_SECOND_AUDIO_MODELS: frozenset[str] = frozenset(
+    (
+        "mirelo-ai/sfx-1.6/text-to-audio",
+        "mirelo-ai/sfx-1.6/video-to-video",
+    )
+)
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -108,10 +114,24 @@ class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
         video = VideoObject(id=task_id, object="video", status=status, model=model)
         if custom_llm_provider and video.id:
             video.id = encode_video_id_with_provider(video.id, custom_llm_provider, model)
-        # Audio models are billed per-request.  Set duration_seconds=1 so that
-        # the cost calculator computes:  cost = output_cost_per_video_per_second * 1
-        # (the pricing field stores the flat per-request price).
-        video.usage = {"duration_seconds": 1.0}
+        # Audio models: most are billed a flat per-request price, so we report
+        # duration_seconds=1.0 and the pricing field stores that flat price.
+        # The per-second models (mirelo sfx: the upstream charges per generated
+        # second) report their real requested duration so the cost calculator
+        # computes cost = output_cost_per_video_per_second * seconds.
+        #
+        # Coupled to the OpenHands litellm-config*.yaml pricing semantics:
+        # models in _PER_SECOND_AUDIO_MODELS must store a per-second rate; all
+        # other audio models must store a flat per-request price.
+        duration = 1.0
+        if _strip_provider_prefix(model) in _PER_SECOND_AUDIO_MODELS:
+            raw = (request_data or {}).get("duration")
+            if raw is not None:
+                try:
+                    duration = float(raw)
+                except (TypeError, ValueError):
+                    duration = 1.0
+        video.usage = {"duration_seconds": duration}
         return video
 
 

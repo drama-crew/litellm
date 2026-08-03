@@ -190,18 +190,35 @@ def test_audio_files_is_empty_list() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_audio_create_response_sets_duration_1_for_per_request_billing() -> None:
+@pytest.mark.parametrize(
+    "model",
+    (
+        "wavespeed/mirelo-ai/sfx-1.6/text-to-audio",
+        "wavespeed/mirelo-ai/sfx-1.6/video-to-video",
+    ),
+)
+def test_audio_usage_reports_real_duration_not_constant_one(model: str) -> None:
+    """Per-second audio billing must report the real requested duration."""
     config = WaveSpeedAudioConfig()
     video = config.transform_video_create_response(
-        model="minimax/music-2.6",
-        raw_response=httpx.Response(200, json={"id": "task-m1", "status": "created"}),
+        model=model,
+        raw_response=httpx.Response(200, json={"data": {"id": "task-sfx", "status": "created"}}),
         logging_obj=None,
-        custom_llm_provider="wavespeed",
-        request_data={},
+        request_data={"duration": 30},
     )
-    assert video.usage == {"duration_seconds": 1.0}, (
-        "audio models need duration_seconds=1 so cost = output_cost_per_video_per_second * 1"
+    assert video.usage == {"duration_seconds": 30.0}
+
+
+def test_audio_usage_falls_back_to_one_when_request_has_no_duration() -> None:
+    """Flat-priced audio models keep the per-request duration sentinel."""
+    config = WaveSpeedAudioConfig()
+    video = config.transform_video_create_response(
+        model="wavespeed/minimax/music-2.6",
+        raw_response=httpx.Response(200, json={"data": {"id": "task-music", "status": "created"}}),
+        logging_obj=None,
+        request_data={"prompt": "x"},
     )
+    assert video.usage == {"duration_seconds": 1.0}
 
 
 def test_audio_poll_url_is_same_as_video_poll() -> None:
