@@ -105,6 +105,7 @@ from litellm.router_utils.batch_utils import (
 from litellm.router_utils.client_initalization_utils import (
     AsyncSemaphoreLease,
     InitalizeCachedClient,
+    MaxParallelRequestsConfig,
     MaxParallelRequestsLimiter,
     active_max_parallel_request_lease,
 )
@@ -477,6 +478,7 @@ class Router:
         )
         self.default_max_parallel_requests = default_max_parallel_requests
         self._max_parallel_request_semaphores: dict[str, MaxParallelRequestsLimiter] = {}
+        self._max_parallel_request_configurations: dict[str, MaxParallelRequestsConfig] = {}
         self._max_parallel_request_semaphores_lock = threading.Lock()
         self.provider_default_deployment_ids: List[str] = []
         self.pattern_router = PatternMatchRouter()
@@ -4457,14 +4459,16 @@ class Router:
                 )
                 response = await original_generic_function(**response_kwargs)
             finally:
-                if lease_token is not None:
-                    active_max_parallel_request_lease.reset(lease_token)
-                if aggregate_lease is not None:
-                    aggregate_lease.release()
-                if generation_acquired and isinstance(
-                    generation_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)
-                ):
-                    generation_semaphore.release()
+                try:
+                    if lease_token is not None:
+                        active_max_parallel_request_lease.reset(lease_token)
+                    if aggregate_lease is not None:
+                        aggregate_lease.release()
+                finally:
+                    if generation_acquired and isinstance(
+                        generation_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)
+                    ):
+                        generation_semaphore.release()
 
             self.success_calls[model_name] += 1
             verbose_router_logger.info(f"ageneric_api_call_with_fallbacks(model={model_name})\033[32m 200 OK\033[0m")
