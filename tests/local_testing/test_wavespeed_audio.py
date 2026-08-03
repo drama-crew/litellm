@@ -192,6 +192,7 @@ def test_audio_files_is_empty_list() -> None:
 
 _MIRELO_TEXT_MODEL = "wavespeed/mirelo-ai/sfx-1.6/text-to-audio"
 _MIRELO_VIDEO_MODEL = "wavespeed/mirelo-ai/sfx-1.6/video-to-video"
+_ELEVEN_MUSIC_MODEL = "wavespeed/elevenlabs/music"
 
 
 def _usage_duration(model: str, request_data: dict | None) -> float:
@@ -263,8 +264,52 @@ def test_per_second_audio_usage_invalid_duration_uses_safe_default(model: str, d
     assert normalized * 0.01 == pytest.approx(0.10)
 
 
-def test_flat_price_audio_usage_remains_one_even_with_duration() -> None:
-    assert _usage_duration("wavespeed/minimax/music-2.6", {"duration": 30}) == 1.0
+def test_eleven_music_usage_reports_scaled_music_length_ms() -> None:
+    assert _usage_duration(_ELEVEN_MUSIC_MODEL, {"music_length_ms": 5_000}) == 5.0
+    assert _usage_duration(_ELEVEN_MUSIC_MODEL, {"music_length_ms": 10_000}) == 10.0
+    assert _usage_duration(_ELEVEN_MUSIC_MODEL, {"music_length_ms": 300_000}) == 300.0
+
+
+def test_eleven_music_usage_reads_declared_field_not_duration() -> None:
+    assert (
+        _usage_duration(
+            _ELEVEN_MUSIC_MODEL,
+            {"duration": 30, "music_length_ms": 10_000},
+        )
+        == 10.0
+    )
+
+
+@pytest.mark.parametrize(
+    "raw_value",
+    (
+        None,
+        True,
+        "bad",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        10**400,
+        -(10**400),
+        4_999,
+        300_001,
+    ),
+)
+def test_eleven_music_usage_invalid_length_uses_safe_default(raw_value: object) -> None:
+    request_data = {} if raw_value is None else {"music_length_ms": raw_value}
+    normalized = _usage_duration(_ELEVEN_MUSIC_MODEL, request_data)
+    assert normalized == 10.0
+    assert normalized * 0.0083 == pytest.approx(0.083)
+
+
+def test_flat_price_audio_usage_remains_one_even_with_duration_fields() -> None:
+    assert (
+        _usage_duration(
+            "wavespeed/minimax/music-2.6",
+            {"duration": 30, "music_length_ms": 30_000},
+        )
+        == 1.0
+    )
 
 
 def test_audio_poll_url_is_same_as_video_poll() -> None:

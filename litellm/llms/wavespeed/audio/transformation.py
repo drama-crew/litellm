@@ -23,11 +23,12 @@ _AUDIO_MODELS: frozenset[str] = frozenset(
         "minimax/voice-design",
     )
 )
-_PER_SECOND_AUDIO_DURATION_CONSTRAINTS: dict[str, tuple[float, float, float]] = {
-    "mirelo-ai/sfx-1.6/text-to-audio": (0.1, 60.0, 10.0),
-    "mirelo-ai/sfx-1.6/video-to-video": (1.0, 60.0, 10.0),
+_PER_SECOND_AUDIO_DURATION_SPECS: dict[str, tuple[str, float, float, float, float]] = {
+    "mirelo-ai/sfx-1.6/text-to-audio": ("duration", 1.0, 0.1, 60.0, 10.0),
+    "mirelo-ai/sfx-1.6/video-to-video": ("duration", 1.0, 1.0, 60.0, 10.0),
+    "elevenlabs/music": ("music_length_ms", 0.001, 5.0, 300.0, 10.0),
 }
-_PER_SECOND_AUDIO_MODELS: frozenset[str] = frozenset(_PER_SECOND_AUDIO_DURATION_CONSTRAINTS)
+_PER_SECOND_AUDIO_MODELS: frozenset[str] = frozenset(_PER_SECOND_AUDIO_DURATION_SPECS)
 
 
 def _strip_provider_prefix(model: str) -> str:
@@ -36,15 +37,16 @@ def _strip_provider_prefix(model: str) -> str:
     return model
 
 
-def _billable_audio_duration(model: str, raw_duration: object) -> float:
-    constraints = _PER_SECOND_AUDIO_DURATION_CONSTRAINTS.get(_strip_provider_prefix(model))
-    if constraints is None:
+def _billable_audio_duration(model: str, request_data: dict[str, Any] | None) -> float:
+    spec = _PER_SECOND_AUDIO_DURATION_SPECS.get(_strip_provider_prefix(model))
+    if spec is None:
         return 1.0
-    minimum, maximum, default = constraints
+    field, scale, minimum, maximum, default = spec
+    raw_duration = (request_data or {}).get(field)
     if raw_duration is None or isinstance(raw_duration, bool):
         return default
     try:
-        duration = float(raw_duration)
+        duration = float(raw_duration) * scale
     except (OverflowError, TypeError, ValueError):
         return default
     if not math.isfinite(duration) or not minimum <= duration <= maximum:
@@ -139,7 +141,7 @@ class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
         # Coupled to the OpenHands litellm-config*.yaml pricing semantics:
         # models in _PER_SECOND_AUDIO_MODELS must store a per-second rate; all
         # other audio models must store a flat per-request price.
-        duration = _billable_audio_duration(model, (request_data or {}).get("duration"))
+        duration = _billable_audio_duration(model, request_data)
         video.usage = {"duration_seconds": duration}
         return video
 
