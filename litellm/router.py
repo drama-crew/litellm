@@ -8140,12 +8140,12 @@ class Router:
 
         # add to model names
         self._add_model_to_list_and_index_map(model=_deployment, model_id=deployment.model_info.id)
-        self.model_names.add(deployment.model_name)
-        self._sync_deployment_budget_config(deployment=deployment)
         InitalizeCachedClient.update_max_parallel_requests_clients(
             litellm_router_instance=self,
             model=_deployment,
         )
+        self.model_names.add(deployment.model_name)
+        self._sync_deployment_budget_config(deployment=deployment)
         return deployment
 
     def _update_deployment_indices_after_removal(self, model_id: str, removal_idx: int) -> None:

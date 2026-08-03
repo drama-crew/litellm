@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import random
 import time
@@ -77,13 +78,18 @@ class FakeSyncClient:
     def __init__(self, post_by_path=None):
         self.post_by_path = post_by_path or {}
         self.calls = []
+        self.body_bytes = []
 
     def _path(self, url):
         return url.split("xyq.jianying.com", 1)[-1]
 
     def post(self, url, json=None, headers=None, timeout=None, files=None):
         path = self._path(url)
-        self.calls.append((path, json, files))
+        body_snapshot = copy.deepcopy(json)
+        self.calls.append((path, body_snapshot, files))
+        self.body_bytes.append(
+            __import__("json").dumps(body_snapshot, ensure_ascii=False, separators=(",", ":")).encode()
+        )
         queue = self.post_by_path[path]
         item = queue.pop(0) if isinstance(queue, list) else queue
         if isinstance(item, BaseException):
@@ -99,13 +105,18 @@ class FakeAsyncClient:
     def __init__(self, post_by_path=None):
         self.post_by_path = post_by_path or {}
         self.calls = []
+        self.body_bytes = []
 
     def _path(self, url):
         return url.split("xyq.jianying.com", 1)[-1]
 
     async def post(self, url, json=None, headers=None, timeout=None, files=None):
         path = self._path(url)
-        self.calls.append((path, json, files))
+        body_snapshot = copy.deepcopy(json)
+        self.calls.append((path, body_snapshot, files))
+        self.body_bytes.append(
+            __import__("json").dumps(body_snapshot, ensure_ascii=False, separators=(",", ":")).encode()
+        )
         queue = self.post_by_path[path]
         item = queue.pop(0) if isinstance(queue, list) else queue
         if isinstance(item, BaseException):
@@ -1464,16 +1475,49 @@ async def test_avideo_status_16010_does_not_retry():
     assert asleep.calls == []
 
 
-def test_retry_delay_is_at_least_the_upstream_requested_minute():
-    assert _submit_rate_limit_delay(_no_jitter) >= 60.0
+# ---------------------------------------------------------------------------
+# Retry-delay shape. Both of these pin decisions made after an adversarial
+# review, and both would silently regress without a test:
+#   * 30s (the original value) is SHORTER than the upstream's own stated
+#     "请一分钟后再试". If that throttle window is sliding, a sub-60s retry
+#     re-arms it and is guaranteed to fail -- turning an instant 429 into a
+#     60s-latency 429. We could not determine the window semantics for free
+#     (validation-rejected requests are not counted by the limiter, so mapping
+#     it would cost real generations), so the delay must be correct under
+#     EITHER semantics.
+#   * Without jitter, a burst of simultaneously-throttled submits retries in
+#     lockstep and re-collides on exactly the same tick.
+# ---------------------------------------------------------------------------
 
 
-def test_retry_delay_uses_the_injected_jitter():
-    def upper_bound(low: float, high: float) -> float:
-        assert (low, high) == (0.0, 10.0)
-        return high
+@pytest.mark.parametrize(("jitter_value", "expected_delay"), [(0.0, 60.0), (10.0, 70.0)])
+def test_retry_delay_uses_bounded_jitter(
+    jitter_value: float,
+    expected_delay: float,
+) -> None:
+    observed_bounds: list[tuple[float, float]] = []
 
-    assert _submit_rate_limit_delay(upper_bound) == _EXPECTED_RETRY_DELAY + 10.0
+    def jitter(low: float, high: float) -> float:
+        observed_bounds.append((low, high))
+        return jitter_value
+
+    delay = _submit_rate_limit_delay(jitter)
+
+    assert observed_bounds == [(0.0, 10.0)]
+    assert delay == expected_delay
+    assert 60.0 <= delay <= 70.0
+
+
+def test_retry_delay_applies_real_jitter_by_default():
+    """A client built without an injected jitter must NOT produce a constant
+    delay -- otherwise every throttled submit in a burst retries on the same
+    tick and collides again. Uses the production default (random.uniform)."""
+    client = XiaoyunqueClient(token="t")
+    delays = {_submit_rate_limit_delay(client._jitter) for _ in range(50)}
+    assert len(delays) > 1, (
+        f"default jitter produced a constant delay {delays!r} -- a throttled burst would retry in lockstep"
+    )
+    assert all(60.0 <= delay <= 70.0 for delay in delays)
 
 
 def test_client_defaults_to_random_uniform_jitter():
@@ -1481,8 +1525,12 @@ def test_client_defaults_to_random_uniform_jitter():
 
 
 @pytest.mark.asyncio
-async def test_retry_resubmits_a_byte_identical_body():
-    fake = FakeAsyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+async def test_retry_resubmits_a_byte_identical_body() -> None:
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _submit_ok()]
+        }
+    )
     client = XiaoyunqueClient(token="t", async_client=fake, asleep=_RecordingAsleep(), jitter=_no_jitter)
     await client.asubmit_run(
         message="a cat on a windowsill",
@@ -1491,20 +1539,22 @@ async def test_retry_resubmits_a_byte_identical_body():
         thread_id="thread-existing",
     )
 
-    assert len(fake.calls) == 2, "expected exactly one retry"
-    first_body, second_body = fake.calls[0][1], fake.calls[1][1]
-    assert second_body == first_body, (
-        "the retried submit body differs from the original — a retry that "
-        "changes the model, prompt or reference set would generate a "
-        f"different video at full cost.\nfirst:  {first_body!r}\nsecond: {second_body!r}"
-    )
+    assert len(fake.calls) == 3
+    first_body = fake.calls[0][1]
+    assert all(call[1] == first_body for call in fake.calls[1:])
+    assert all(body == fake.body_bytes[0] for body in fake.body_bytes[1:])
     assert first_body["asset_ids"] == ["asset-1", "asset-2"]
     assert first_body["thread_id"] == "thread-existing"
     assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
+    assert first_body["video_part_tool_param"]["prompt"] == "a cat on a windowsill"
 
 
-def test_sync_retry_resubmits_a_byte_identical_body():
-    fake = FakeSyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+def test_sync_retry_resubmits_a_byte_identical_body() -> None:
+    fake = FakeSyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _submit_ok()]
+        }
+    )
     client = XiaoyunqueClient(token="t", sync_client=fake, sleep=_RecordingSleep(), jitter=_no_jitter)
     client.submit_run(
         message="a cat on a windowsill",
@@ -1513,9 +1563,6 @@ def test_sync_retry_resubmits_a_byte_identical_body():
         thread_id="thread-existing",
     )
 
-    assert len(fake.calls) == 2, "expected exactly one retry"
-    first_body, second_body = fake.calls[0][1], fake.calls[1][1]
-    assert second_body == first_body
-    assert first_body["asset_ids"] == ["asset-1", "asset-2"]
-    assert first_body["thread_id"] == "thread-existing"
-    assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
+    assert len(fake.calls) == 3
+    assert all(call[1] == fake.calls[0][1] for call in fake.calls[1:])
+    assert all(body == fake.body_bytes[0] for body in fake.body_bytes[1:])
