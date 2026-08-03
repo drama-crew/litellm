@@ -190,35 +190,77 @@ def test_audio_files_is_empty_list() -> None:
 # ---------------------------------------------------------------------------
 
 
+_MIRELO_TEXT_MODEL = "wavespeed/mirelo-ai/sfx-1.6/text-to-audio"
+_MIRELO_VIDEO_MODEL = "wavespeed/mirelo-ai/sfx-1.6/video-to-video"
+
+
+def _usage_duration(model: str, request_data: dict | None) -> float:
+    video = WaveSpeedAudioConfig().transform_video_create_response(
+        model=model,
+        raw_response=httpx.Response(200, json={"data": {"id": "task-audio", "status": "created"}}),
+        logging_obj=None,
+        request_data=request_data,
+    )
+    assert video.usage is not None
+    return video.usage["duration_seconds"]
+
+
+@pytest.mark.parametrize("model", (_MIRELO_TEXT_MODEL, _MIRELO_VIDEO_MODEL))
+def test_per_second_audio_usage_reports_real_valid_duration(model: str) -> None:
+    assert _usage_duration(model, {"duration": 30}) == 30.0
+
+
 @pytest.mark.parametrize(
-    "model",
+    "model,duration",
     (
-        "wavespeed/mirelo-ai/sfx-1.6/text-to-audio",
-        "wavespeed/mirelo-ai/sfx-1.6/video-to-video",
+        pytest.param(_MIRELO_TEXT_MODEL, 0.1, id="text-lower-bound"),
+        pytest.param(_MIRELO_TEXT_MODEL, 60, id="text-upper-bound"),
+        pytest.param(_MIRELO_VIDEO_MODEL, 1, id="video-lower-bound"),
+        pytest.param(_MIRELO_VIDEO_MODEL, 60, id="video-upper-bound"),
     ),
 )
-def test_audio_usage_reports_real_duration_not_constant_one(model: str) -> None:
-    """Per-second audio billing must report the real requested duration."""
-    config = WaveSpeedAudioConfig()
-    video = config.transform_video_create_response(
-        model=model,
-        raw_response=httpx.Response(200, json={"data": {"id": "task-sfx", "status": "created"}}),
-        logging_obj=None,
-        request_data={"duration": 30},
-    )
-    assert video.usage == {"duration_seconds": 30.0}
+def test_per_second_audio_usage_accepts_model_specific_boundaries(model: str, duration: float) -> None:
+    assert _usage_duration(model, {"duration": duration}) == float(duration)
 
 
-def test_audio_usage_falls_back_to_one_when_request_has_no_duration() -> None:
-    """Flat-priced audio models keep the per-request duration sentinel."""
-    config = WaveSpeedAudioConfig()
-    video = config.transform_video_create_response(
-        model="wavespeed/minimax/music-2.6",
-        raw_response=httpx.Response(200, json={"data": {"id": "task-music", "status": "created"}}),
-        logging_obj=None,
-        request_data={"prompt": "x"},
-    )
-    assert video.usage == {"duration_seconds": 1.0}
+@pytest.mark.parametrize("model", (_MIRELO_TEXT_MODEL, _MIRELO_VIDEO_MODEL))
+def test_per_second_audio_usage_missing_duration_uses_safe_default(model: str) -> None:
+    duration = _usage_duration(model, {})
+    assert duration == 10.0
+    assert duration * 0.01 == pytest.approx(0.10)
+
+
+@pytest.mark.parametrize(
+    "model,duration",
+    (
+        pytest.param(_MIRELO_TEXT_MODEL, "bad", id="text-non-numeric"),
+        pytest.param(_MIRELO_TEXT_MODEL, True, id="text-bool"),
+        pytest.param(_MIRELO_TEXT_MODEL, -1, id="text-negative"),
+        pytest.param(_MIRELO_TEXT_MODEL, 0, id="text-zero"),
+        pytest.param(_MIRELO_TEXT_MODEL, float("nan"), id="text-nan"),
+        pytest.param(_MIRELO_TEXT_MODEL, float("inf"), id="text-inf"),
+        pytest.param(_MIRELO_TEXT_MODEL, float("-inf"), id="text-negative-inf"),
+        pytest.param(_MIRELO_TEXT_MODEL, 0.09, id="text-below-min"),
+        pytest.param(_MIRELO_TEXT_MODEL, 60.01, id="text-above-max"),
+        pytest.param(_MIRELO_VIDEO_MODEL, "bad", id="video-non-numeric"),
+        pytest.param(_MIRELO_VIDEO_MODEL, True, id="video-bool"),
+        pytest.param(_MIRELO_VIDEO_MODEL, -1, id="video-negative"),
+        pytest.param(_MIRELO_VIDEO_MODEL, 0, id="video-zero"),
+        pytest.param(_MIRELO_VIDEO_MODEL, float("nan"), id="video-nan"),
+        pytest.param(_MIRELO_VIDEO_MODEL, float("inf"), id="video-inf"),
+        pytest.param(_MIRELO_VIDEO_MODEL, float("-inf"), id="video-negative-inf"),
+        pytest.param(_MIRELO_VIDEO_MODEL, 0.99, id="video-below-min"),
+        pytest.param(_MIRELO_VIDEO_MODEL, 60.01, id="video-above-max"),
+    ),
+)
+def test_per_second_audio_usage_invalid_duration_uses_safe_default(model: str, duration: object) -> None:
+    normalized = _usage_duration(model, {"duration": duration})
+    assert normalized == 10.0
+    assert normalized * 0.01 == pytest.approx(0.10)
+
+
+def test_flat_price_audio_usage_remains_one_even_with_duration() -> None:
+    assert _usage_duration("wavespeed/minimax/music-2.6", {"duration": 30}) == 1.0
 
 
 def test_audio_poll_url_is_same_as_video_poll() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import httpx
@@ -22,18 +23,33 @@ _AUDIO_MODELS: frozenset[str] = frozenset(
         "minimax/voice-design",
     )
 )
-_PER_SECOND_AUDIO_MODELS: frozenset[str] = frozenset(
-    (
-        "mirelo-ai/sfx-1.6/text-to-audio",
-        "mirelo-ai/sfx-1.6/video-to-video",
-    )
-)
+_PER_SECOND_AUDIO_DURATION_CONSTRAINTS: dict[str, tuple[float, float, float]] = {
+    "mirelo-ai/sfx-1.6/text-to-audio": (0.1, 60.0, 10.0),
+    "mirelo-ai/sfx-1.6/video-to-video": (1.0, 60.0, 10.0),
+}
+_PER_SECOND_AUDIO_MODELS: frozenset[str] = frozenset(_PER_SECOND_AUDIO_DURATION_CONSTRAINTS)
 
 
 def _strip_provider_prefix(model: str) -> str:
     if model.startswith("wavespeed/"):
         return model[len("wavespeed/") :]
     return model
+
+
+def _billable_audio_duration(model: str, raw_duration: object) -> float:
+    constraints = _PER_SECOND_AUDIO_DURATION_CONSTRAINTS.get(_strip_provider_prefix(model))
+    if constraints is None:
+        return 1.0
+    minimum, maximum, default = constraints
+    if raw_duration is None or isinstance(raw_duration, bool):
+        return default
+    try:
+        duration = float(raw_duration)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(duration) or not minimum <= duration <= maximum:
+        return default
+    return duration
 
 
 class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
@@ -123,14 +139,7 @@ class WaveSpeedAudioConfig(WaveSpeedVideoConfig):
         # Coupled to the OpenHands litellm-config*.yaml pricing semantics:
         # models in _PER_SECOND_AUDIO_MODELS must store a per-second rate; all
         # other audio models must store a flat per-request price.
-        duration = 1.0
-        if _strip_provider_prefix(model) in _PER_SECOND_AUDIO_MODELS:
-            raw = (request_data or {}).get("duration")
-            if raw is not None:
-                try:
-                    duration = float(raw)
-                except (TypeError, ValueError):
-                    duration = 1.0
+        duration = _billable_audio_duration(model, (request_data or {}).get("duration"))
         video.usage = {"duration_seconds": duration}
         return video
 
