@@ -45,7 +45,7 @@ def _billable_audio_duration(model: str, raw_duration: object) -> float:
         return default
     try:
         duration = float(raw_duration)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return default
     if not math.isfinite(duration) or not minimum <= duration <= maximum:
         return default
