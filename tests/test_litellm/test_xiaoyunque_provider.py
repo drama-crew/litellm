@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import random
 import time
 from typing import Any, Dict, Optional
 
@@ -171,15 +172,9 @@ def _rate_limited_16010() -> Dict[str, Any]:
 
 
 def _no_jitter(_low: float, _high: float) -> float:
-    """Deterministic jitter for tests: always the low bound, so retry-delay
-    assertions stay exact. Production uses random.uniform -- see
-    client._submit_rate_limit_delay for why jitter exists at all."""
     return 0.0
 
 
-# Derived from the production constant, NOT copied. A test that hardcodes the
-# number stays green when the real delay changes, which is exactly the drift
-# this pins against.
 _EXPECTED_RETRY_DELAY = _submit_rate_limit_delay(_no_jitter)
 
 
@@ -919,17 +914,6 @@ async def test_avideo_generation_keeps_1080p_for_vision_model():
     assert body["video_part_tool_param"]["resolution"] == "1080p"
 
 
-# ---------------------------------------------------------------------------
-# new upstream model slugs (2026-08-02): Seedance_2.0_mini / Seedance_2.5. The
-# provider never validated model slugs against a fixed set -- model is passed
-# through verbatim to video_part_tool_param.model and upstream is the sole
-# source of truth (ret=2 rejects unknown slugs). "Accepting" a new slug is
-# therefore pinned behaviorally: it must reach the wire unmangled, and the
-# 1080p downgrade guard (a single-model check against seedance2.0_vision) must
-# still treat both as non-vision.
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("model", ["Seedance_2.0_mini", "Seedance_2.5"])
 async def test_avideo_generation_accepts_new_model_slug(model):
@@ -1291,29 +1275,20 @@ async def test_avideo_status_malformed_composite_id_raises_bad_request(monkeypat
         await XiaoyunqueLLM().avideo_status(video_id, None, None, {}, None, client=FakeAsyncClient())
 
 
-# ---------------------------------------------------------------------------
-# submit-path bounded retry on ret=16010 (rate limited). 16010 is a rejection --
-# upstream creates nothing -- so retrying submit_run cannot double-bill, unlike
-# a mid-request timeout where a task may already have been accepted. Retry is
-# scoped to ret==16010 exactly: neither the other rate-limit rets (10/15, which
-# still map to RateLimitError but are NOT retried inline) nor any other ret may
-# trigger it.
-# ---------------------------------------------------------------------------
-
-
 def test_client_defaults_sleep_functions_when_not_injected():
     client = XiaoyunqueClient(token="t")
     assert client._sleep is time.sleep
     assert client._asleep is asyncio.sleep
 
 
-def test_make_client_forwards_sleep_and_asleep_injection():
+def test_make_client_forwards_retry_dependencies():
     sleep = _RecordingSleep()
     asleep = _RecordingAsleep()
     llm = XiaoyunqueLLM(sleep=sleep, asleep=asleep, jitter=_no_jitter)
     client = llm._make_client(api_key="tok", optional_params={})
     assert client._sleep is sleep
     assert client._asleep is asleep
+    assert client._jitter is _no_jitter
 
 
 def test_is_submit_rate_limit_retryable():
@@ -1375,7 +1350,7 @@ async def test_asubmit_run_exhausts_retries_then_raises_rate_limit():
         await client.asubmit_run(message="a cat", asset_ids=[], video_part_tool_param={"model": "m"})
     assert exc.value.status_code == 429
     assert exc.value.ret == "16010"
-    assert len(fake.calls) == 3  # initial + 2 retries, never a 4th attempt
+    assert len(fake.calls) == 3
     assert asleep.calls == [_EXPECTED_RETRY_DELAY, _EXPECTED_RETRY_DELAY]
 
 
@@ -1473,11 +1448,6 @@ def test_video_generation_sync_16010_retries_then_succeeds_end_to_end():
 
 @pytest.mark.asyncio
 async def test_avideo_status_16010_does_not_retry():
-    # The submit-only retry rationale (rejection => nothing was created, so retrying
-    # cannot double-bill) does not hold the same way for status polling: the caller
-    # already re-polls on its own cadence, so retrying inline here would just add
-    # unnecessary latency inside a single poll call. Pin that avideo_status does NOT
-    # share submit_run's retry.
     fake = FakeAsyncClient(
         post_by_path={
             "/api/biz/v1/agent/query_generate_video_result": {
@@ -1494,64 +1464,26 @@ async def test_avideo_status_16010_does_not_retry():
     assert asleep.calls == []
 
 
-# ---------------------------------------------------------------------------
-# Retry-delay shape. Both of these pin decisions made after an adversarial
-# review, and both would silently regress without a test:
-#   * 30s (the original value) is SHORTER than the upstream's own stated
-#     "请一分钟后再试". If that throttle window is sliding, a sub-60s retry
-#     re-arms it and is guaranteed to fail -- turning an instant 429 into a
-#     60s-latency 429. We could not determine the window semantics for free
-#     (validation-rejected requests are not counted by the limiter, so mapping
-#     it would cost real generations), so the delay must be correct under
-#     EITHER semantics.
-#   * Without jitter, a burst of simultaneously-throttled submits retries in
-#     lockstep and re-collides on exactly the same tick.
-# ---------------------------------------------------------------------------
-
-
 def test_retry_delay_is_at_least_the_upstream_requested_minute():
-    """Even with zero jitter the wait must clear upstream's stated minimum."""
     assert _submit_rate_limit_delay(_no_jitter) >= 60.0
 
 
-def test_retry_delay_applies_real_jitter_by_default():
-    """A client built without an injected jitter must NOT produce a constant
-    delay -- otherwise every throttled submit in a burst retries on the same
-    tick and collides again. Uses the production default (random.uniform)."""
-    client = XiaoyunqueClient(token="t")
-    delays = {_submit_rate_limit_delay(client._jitter) for _ in range(50)}
-    assert len(delays) > 1, (
-        f'default jitter produced a constant delay {delays!r} -- a throttled '
-        'burst would retry in lockstep'
-    )
-    assert all(d >= 60.0 for d in delays)
+def test_retry_delay_uses_the_injected_jitter():
+    def upper_bound(low: float, high: float) -> float:
+        assert (low, high) == (0.0, 10.0)
+        return high
+
+    assert _submit_rate_limit_delay(upper_bound) == _EXPECTED_RETRY_DELAY + 10.0
 
 
-# ---------------------------------------------------------------------------
-# A retry must resubmit the SAME request.
-#
-# The existing retry tests assert control flow (how many attempts, how long the
-# waits, what the final result is) but never inspect the retried BODY. An
-# adversarial review showed that a retry which silently changed the model and
-# the prompt, and dropped asset_ids/thread_id, left the whole suite green — i.e.
-# it could have generated a different video from a different model and nothing
-# would have noticed.
-#
-# The old fixtures could not have caught it even in principle: they all pass
-# asset_ids=[], and the client only sets body["asset_ids"] when truthy, so the
-# key under test was never present. This uses a NON-EMPTY reference set and a
-# thread_id for that reason.
-# ---------------------------------------------------------------------------
+def test_client_defaults_to_random_uniform_jitter():
+    assert XiaoyunqueClient(token="t")._jitter is random.uniform
 
 
 @pytest.mark.asyncio
 async def test_retry_resubmits_a_byte_identical_body():
-    fake = FakeAsyncClient(
-        post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]}
-    )
-    client = XiaoyunqueClient(
-        token="t", async_client=fake, asleep=_RecordingAsleep(), jitter=_no_jitter
-    )
+    fake = FakeAsyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+    client = XiaoyunqueClient(token="t", async_client=fake, asleep=_RecordingAsleep(), jitter=_no_jitter)
     await client.asubmit_run(
         message="a cat on a windowsill",
         asset_ids=["asset-1", "asset-2"],
@@ -1559,15 +1491,13 @@ async def test_retry_resubmits_a_byte_identical_body():
         thread_id="thread-existing",
     )
 
-    assert len(fake.calls) == 2, 'expected exactly one retry'
+    assert len(fake.calls) == 2, "expected exactly one retry"
     first_body, second_body = fake.calls[0][1], fake.calls[1][1]
     assert second_body == first_body, (
-        'the retried submit body differs from the original — a retry that '
-        'changes the model, prompt or reference set would generate a '
-        f'different video at full cost.\nfirst:  {first_body!r}\nsecond: {second_body!r}'
+        "the retried submit body differs from the original — a retry that "
+        "changes the model, prompt or reference set would generate a "
+        f"different video at full cost.\nfirst:  {first_body!r}\nsecond: {second_body!r}"
     )
-    # Guard the guard: if the fixture ever stopped carrying these, the equality
-    # above would still pass while testing nothing interesting.
     assert first_body["asset_ids"] == ["asset-1", "asset-2"]
     assert first_body["thread_id"] == "thread-existing"
     assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
