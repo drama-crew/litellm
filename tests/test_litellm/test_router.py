@@ -16,7 +16,10 @@ sys.path.insert(0, os.path.abspath("../../.."))  # Adds the parent directory to 
 import litellm
 from litellm.exceptions import MidStreamFallbackError
 from litellm.llms.xiaoyunque.client import XiaoyunqueClient
-from litellm.router_utils.client_initalization_utils import InitalizeCachedClient
+from litellm.router_utils.client_initalization_utils import (
+    InitalizeCachedClient,
+    MaxParallelRequestsLimiter,
+)
 
 
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
@@ -5739,4 +5742,174 @@ def test_max_parallel_request_limiter_coordinates_competing_asyncio_runs():
         first_thread.join(timeout=1)
         if second_thread.ident is not None:
             second_thread.join(timeout=1)
+        router.discard()
+
+
+@pytest.mark.parametrize("operation", [None, "video_generation"])
+@pytest.mark.parametrize(("old_capacity", "new_capacity"), [(7, 1), (1, 7)])
+def test_max_parallel_request_late_stale_getter_uses_latest_capacity(
+    operation: str | None,
+    old_capacity: int,
+    new_capacity: int,
+):
+    router = litellm.Router(model_list=[_max_parallel_deployment(old_capacity)], num_retries=0)
+    stale_deployment = copy.deepcopy(router.model_list[0])
+    with router._max_parallel_request_semaphores_lock:
+        router._max_parallel_request_semaphores.clear()
+    stale_capacity_read = threading.Event()
+    update_complete = threading.Event()
+
+    def calculate(*args, **kwargs):
+        capacity = kwargs["max_parallel_requests"]
+        if capacity == old_capacity and threading.current_thread() is not threading.main_thread():
+            stale_capacity_read.set()
+            assert update_complete.wait(timeout=1)
+        return capacity
+
+    def get_limiter():
+        return InitalizeCachedClient.set_max_parallel_requests_client(
+            litellm_router_instance=router,
+            model=stale_deployment,
+            operation=operation,
+        )
+
+    try:
+        with patch(
+            "litellm.router_utils.client_initalization_utils.calculate_max_parallel_requests",
+            side_effect=calculate,
+        ):
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(get_limiter)
+                assert stale_capacity_read.wait(timeout=1)
+                try:
+                    router.set_model_list([_max_parallel_deployment(new_capacity)])
+                finally:
+                    update_complete.set()
+                limiter = future.result(timeout=1)
+        config = router._max_parallel_request_configurations[stale_deployment["model_info"]["id"]]
+        assert config.capacity == new_capacity
+        assert config.version == 1
+        current = router._get_client(
+            deployment=router.model_list[0],
+            kwargs={},
+            client_type="max_parallel_requests",
+            operation=operation,
+        )
+        assert limiter is current
+        assert current.capacity == new_capacity
+        assert len(router._max_parallel_request_semaphores) == 1
+    finally:
+        update_complete.set()
+        router.discard()
+
+
+def _create_closed_loop_waiter(limiter: MaxParallelRequestsLimiter) -> asyncio.Task[bool]:
+    def create() -> asyncio.Task[bool]:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(limiter.acquire())
+        loop.run_until_complete(asyncio.sleep(0))
+        assert not task.done()
+        task._log_destroy_pending = False
+        loop.close()
+        return task
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(create).result(timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed_waiter_first", [True, False])
+async def test_max_parallel_request_limiter_skips_closed_waiter_loop(closed_waiter_first: bool):
+    limiter = MaxParallelRequestsLimiter(1)
+    await limiter.acquire()
+    healthy_acquired = asyncio.Event()
+
+    async def healthy_waiter():
+        await limiter.acquire()
+        healthy_acquired.set()
+
+    if closed_waiter_first:
+        closed_task = _create_closed_loop_waiter(limiter)
+        healthy_task = asyncio.create_task(healthy_waiter())
+        await asyncio.sleep(0)
+    else:
+        healthy_task = asyncio.create_task(healthy_waiter())
+        await asyncio.sleep(0)
+        closed_task = _create_closed_loop_waiter(limiter)
+
+    try:
+        limiter.release()
+        await asyncio.wait_for(healthy_acquired.wait(), timeout=1)
+        await asyncio.wait_for(healthy_task, timeout=1)
+        limiter.release()
+        await asyncio.wait_for(limiter.acquire(), timeout=1)
+        limiter.release()
+        assert limiter._value == 1
+        assert len(limiter._waiters) == 0
+        assert not closed_task.done()
+    finally:
+        if not healthy_task.done():
+            healthy_task.cancel()
+        await asyncio.wait_for(asyncio.gather(healthy_task, return_exceptions=True), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_request_limiter_removes_cancelled_waiters_and_preserves_fifo():
+    limiter = MaxParallelRequestsLimiter(1)
+    await limiter.acquire()
+    cancelled_tasks = tuple(asyncio.create_task(limiter.acquire()) for _ in range(200))
+    await asyncio.sleep(0)
+    assert len(limiter._waiters) == len(cancelled_tasks)
+
+    for task in cancelled_tasks:
+        task.cancel()
+    await asyncio.wait_for(asyncio.gather(*cancelled_tasks, return_exceptions=True), timeout=1)
+    assert len(limiter._waiters) == 0
+
+    order: list[str] = []
+
+    async def acquire_and_release(name: str):
+        await limiter.acquire()
+        order.append(name)
+        limiter.release()
+
+    first = asyncio.create_task(acquire_and_release("first"))
+    await asyncio.sleep(0)
+    second = asyncio.create_task(acquire_and_release("second"))
+    await asyncio.sleep(0)
+    limiter.release()
+    await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+    assert order == ["first", "second"]
+    assert len(limiter._waiters) == 0
+    assert limiter._value == 1
+
+
+class _ReleaseFailingSemaphore(asyncio.Semaphore):
+    def release(self) -> None:
+        raise RuntimeError("aggregate release failed")
+
+
+@pytest.mark.asyncio
+async def test_video_generation_releases_generation_limiter_when_aggregate_release_fails():
+    aggregate = _ReleaseFailingSemaphore(1)
+    generation = asyncio.Semaphore(1)
+
+    async def provider(**kwargs):
+        return {"id": "video-created"}
+
+    def get_limiter(*args, **kwargs):
+        if kwargs.get("operation") == "video_generation":
+            return generation
+        return aggregate
+
+    router = _video_concurrency_router()
+    routed = router.factory_function(provider, call_type="avideo_generation")
+
+    try:
+        with patch.object(router, "_get_client", side_effect=get_limiter):
+            with pytest.raises(RuntimeError, match="aggregate release failed"):
+                await asyncio.wait_for(routed(model="video-model", prompt="first"), timeout=1)
+        assert generation._value == 1
+    finally:
         router.discard()

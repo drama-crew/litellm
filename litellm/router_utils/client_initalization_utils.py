@@ -3,6 +3,7 @@ import json
 import threading
 from collections import deque
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Iterator, Literal
 
 from litellm.utils import calculate_max_parallel_requests
@@ -24,14 +25,21 @@ class _MaxParallelRequestsWaiter:
         self.state: Literal["queued", "granted", "cancelled"] = "queued"
 
 
-class MaxParallelRequestsLimiter:
-    __slots__ = ("_active", "_capacity", "_lock", "_waiters")
+@dataclass(frozen=True, slots=True)
+class MaxParallelRequestsConfig:
+    capacity: int | None
+    version: int
 
-    def __init__(self, capacity: int):
+
+class MaxParallelRequestsLimiter:
+    __slots__ = ("_active", "_capacity", "_config_version", "_lock", "_waiters")
+
+    def __init__(self, capacity: int, config_version: int = 0):
         if capacity < 1:
             raise ValueError("capacity must be at least 1")
         self._active = 0
         self._capacity = capacity
+        self._config_version = config_version
         self._lock = threading.Lock()
         self._waiters: deque[_MaxParallelRequestsWaiter] = deque()
 
@@ -70,11 +78,14 @@ class MaxParallelRequestsLimiter:
             granted = self._grant_waiters_locked()
         self._notify(granted)
 
-    def update_capacity(self, capacity: int) -> None:
+    def update_capacity(self, capacity: int, config_version: int) -> None:
         if capacity < 1:
             raise ValueError("capacity must be at least 1")
         with self._lock:
+            if config_version < self._config_version:
+                return
             self._capacity = capacity
+            self._config_version = config_version
             granted = self._grant_waiters_locked()
         self._notify(granted)
 
@@ -94,6 +105,7 @@ class MaxParallelRequestsLimiter:
                 return
             if waiter.state == "queued":
                 waiter.state = "cancelled"
+                self._waiters.remove(waiter)
                 return
             waiter.state = "cancelled"
             self._active -= 1
@@ -112,10 +124,26 @@ class MaxParallelRequestsLimiter:
             self._active += 1
             yield waiter
 
-    @staticmethod
-    def _notify(waiters: tuple[_MaxParallelRequestsWaiter, ...]) -> None:
-        for waiter in waiters:
-            waiter.loop.call_soon_threadsafe(MaxParallelRequestsLimiter._resolve_waiter, waiter)
+    def _notify(self, waiters: tuple[_MaxParallelRequestsWaiter, ...]) -> None:
+        pending = waiters
+        while pending:
+            waiter = pending[0]
+            pending = pending[1:]
+            try:
+                waiter.loop.call_soon_threadsafe(MaxParallelRequestsLimiter._resolve_waiter, waiter)
+            except RuntimeError:
+                pending = (*pending, *self._rollback_granted_waiter(waiter))
+
+    def _rollback_granted_waiter(
+        self,
+        waiter: _MaxParallelRequestsWaiter,
+    ) -> tuple[_MaxParallelRequestsWaiter, ...]:
+        with self._lock:
+            if waiter.state != "granted":
+                return ()
+            waiter.state = "cancelled"
+            self._active -= 1
+            return self._grant_waiters_locked()
 
     @staticmethod
     def _resolve_waiter(waiter: _MaxParallelRequestsWaiter) -> None:
@@ -185,15 +213,28 @@ class InitalizeCachedClient:
             tpm=litellm_params.get("tpm"),
             default_max_parallel_requests=litellm_router_instance.default_max_parallel_requests,
         )
-        if not calculated_max_parallel_requests:
-            return None
         with litellm_router_instance._max_parallel_request_semaphores_lock:
+            config = litellm_router_instance._max_parallel_request_configurations.get(model_id)
+            if config is None:
+                config = MaxParallelRequestsConfig(
+                    capacity=calculated_max_parallel_requests,
+                    version=0,
+                )
+                litellm_router_instance._max_parallel_request_configurations[model_id] = config
+            if config.capacity is None:
+                return None
             existing = litellm_router_instance._max_parallel_request_semaphores.get(cache_key)
-            if existing is not None:
-                return existing
-            limiter = MaxParallelRequestsLimiter(calculated_max_parallel_requests)
-            litellm_router_instance._max_parallel_request_semaphores[cache_key] = limiter
-            return limiter
+            if existing is None:
+                existing = MaxParallelRequestsLimiter(
+                    capacity=config.capacity,
+                    config_version=config.version,
+                )
+                litellm_router_instance._max_parallel_request_semaphores[cache_key] = existing
+        existing.update_capacity(
+            capacity=config.capacity,
+            config_version=config.version,
+        )
+        return existing
 
     @staticmethod
     def update_max_parallel_requests_clients(
@@ -208,14 +249,23 @@ class InitalizeCachedClient:
             tpm=litellm_params.get("tpm"),
             default_max_parallel_requests=litellm_router_instance.default_max_parallel_requests,
         )
-        if not calculated_max_parallel_requests:
-            return
         prefix = "max_parallel_requests_client:"
         with litellm_router_instance._max_parallel_request_semaphores_lock:
+            current = litellm_router_instance._max_parallel_request_configurations.get(model_id)
+            config = MaxParallelRequestsConfig(
+                capacity=calculated_max_parallel_requests or None,
+                version=0 if current is None else current.version + 1,
+            )
+            litellm_router_instance._max_parallel_request_configurations[model_id] = config
             limiters = tuple(
                 limiter
                 for key, limiter in litellm_router_instance._max_parallel_request_semaphores.items()
                 if json.loads(key.removeprefix(prefix))[0] == model_id
             )
-            for limiter in limiters:
-                limiter.update_capacity(calculated_max_parallel_requests)
+        if config.capacity is None:
+            return
+        for limiter in limiters:
+            limiter.update_capacity(
+                capacity=config.capacity,
+                config_version=config.version,
+            )
