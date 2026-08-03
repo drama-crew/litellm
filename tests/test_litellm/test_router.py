@@ -14,6 +14,7 @@ sys.path.insert(
 
 import litellm
 from litellm.exceptions import MidStreamFallbackError
+from litellm.router_utils.client_initalization_utils import InitalizeCachedClient
 
 
 def test_update_kwargs_does_not_mutate_defaults_and_merges_metadata():
@@ -5392,3 +5393,91 @@ async def test_video_operations_have_independent_max_parallel_request_limits():
         content_release.set()
         await asyncio.gather(*create_tasks, *status_tasks, *content_tasks)
         router.discard()
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_request_cache_keys_do_not_collide_across_deployments():
+    status_entries: asyncio.Queue[None] = asyncio.Queue()
+    non_video_entries: asyncio.Queue[None] = asyncio.Queue()
+    status_release = asyncio.Event()
+    non_video_release = asyncio.Event()
+
+    async def status_provider(**kwargs):
+        status_entries.put_nowait(None)
+        await status_release.wait()
+        return {"id": kwargs["video_id"], "status": "processing"}
+
+    async def non_video_provider(**kwargs):
+        non_video_entries.put_nowait(None)
+        await non_video_release.wait()
+        return {"output": kwargs["contents"]}
+
+    status_deployment = {
+        "model_name": "video-model",
+        "litellm_params": {
+            "model": "openai/sora-2",
+            "api_key": "test-api-key",
+            "max_parallel_requests": 1,
+        },
+        "model_info": {"id": "collision"},
+    }
+    non_video_deployment = {
+        "model_name": "non-video-model",
+        "litellm_params": {
+            "model": "openai/gpt-5.2",
+            "api_key": "test-api-key",
+            "max_parallel_requests": 7,
+        },
+        "model_info": {"id": "collision_video_status"},
+    }
+    router = litellm.Router(
+        model_list=[status_deployment, non_video_deployment],
+        num_retries=0,
+    )
+    routed_status = router.factory_function(status_provider, call_type="avideo_status")
+    routed_non_video = router.factory_function(
+        non_video_provider, call_type="agenerate_content"
+    )
+
+    status_task = asyncio.create_task(
+        routed_status(model="video-model", video_id="video-id")
+    )
+    await asyncio.wait_for(status_entries.get(), timeout=1)
+    non_video_task = asyncio.create_task(
+        routed_non_video(model="non-video-model", contents="request")
+    )
+
+    try:
+        await asyncio.wait_for(non_video_entries.get(), timeout=0.2)
+
+        status_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(
+            model_id="collision",
+            operation="video_status",
+        )
+        non_video_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(
+            model_id="collision_video_status"
+        )
+        status_semaphore = router._get_client(
+            deployment=status_deployment,
+            kwargs={},
+            client_type="max_parallel_requests",
+            operation="video_status",
+        )
+        non_video_semaphore = router._get_client(
+            deployment=non_video_deployment,
+            kwargs={},
+            client_type="max_parallel_requests",
+        )
+
+        assert status_key != non_video_key
+        assert status_semaphore is not non_video_semaphore
+        assert status_semaphore._value == 0
+        assert non_video_semaphore._value == 6
+    finally:
+        status_release.set()
+        non_video_release.set()
+        await asyncio.gather(status_task, non_video_task)
+        router.discard()
+
+    assert status_semaphore._value == 1
+    assert non_video_semaphore._value == 7

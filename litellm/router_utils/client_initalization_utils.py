@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import TYPE_CHECKING, Any
 
 from litellm.utils import calculate_max_parallel_requests
@@ -14,8 +15,8 @@ else:
 class InitalizeCachedClient:
     @staticmethod
     def get_max_parallel_requests_cache_key(model_id: str, operation: str | None = None) -> str:
-        operation_segment = f"_{operation}" if operation else ""
-        return f"{model_id}{operation_segment}_max_parallel_requests_client"
+        encoded_identity = json.dumps((model_id, operation), separators=(",", ":"))
+        return f"max_parallel_requests_client:{encoded_identity}"
 
     @staticmethod
     def set_max_parallel_requests_client(
