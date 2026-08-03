@@ -5304,3 +5304,91 @@ class TestRouterRequestTimeoutPropagation:
             )
             == 60
         )
+
+
+@pytest.mark.asyncio
+async def test_video_operations_have_independent_max_parallel_request_limits():
+    create_entries: asyncio.Queue[None] = asyncio.Queue()
+    status_entries: asyncio.Queue[None] = asyncio.Queue()
+    content_entries: asyncio.Queue[None] = asyncio.Queue()
+    create_release = asyncio.Event()
+    status_release = asyncio.Event()
+    content_release = asyncio.Event()
+
+    async def create_provider(**kwargs):
+        create_entries.put_nowait(None)
+        await create_release.wait()
+        return {"id": "video-created"}
+
+    async def status_provider(**kwargs):
+        status_entries.put_nowait(None)
+        await status_release.wait()
+        return {"id": kwargs["video_id"], "status": "processing"}
+
+    async def content_provider(**kwargs):
+        content_entries.put_nowait(None)
+        await content_release.wait()
+        return b"video-content"
+
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "video-model",
+                "litellm_params": {
+                    "model": "openai/sora-2",
+                    "api_key": "test-api-key",
+                    "max_parallel_requests": 1,
+                },
+                "model_info": {"id": "video-deployment"},
+            }
+        ],
+        num_retries=0,
+    )
+    router.avideo_generation = router.factory_function(
+        create_provider, call_type="avideo_generation"
+    )
+    router.avideo_status = router.factory_function(
+        status_provider, call_type="avideo_status"
+    )
+    router.avideo_content = router.factory_function(
+        content_provider, call_type="avideo_content"
+    )
+
+    create_tasks = [
+        asyncio.create_task(router.avideo_generation(model="video-model", prompt="first")),
+        asyncio.create_task(router.avideo_generation(model="video-model", prompt="second")),
+    ]
+    await asyncio.wait_for(create_entries.get(), timeout=1)
+    status_tasks = [
+        asyncio.create_task(router.avideo_status(model="video-model", video_id="first")),
+        asyncio.create_task(router.avideo_status(model="video-model", video_id="second")),
+    ]
+    content_tasks = [
+        asyncio.create_task(router.avideo_content(model="video-model", video_id="first")),
+        asyncio.create_task(router.avideo_content(model="video-model", video_id="second")),
+    ]
+
+    try:
+        await asyncio.wait_for(status_entries.get(), timeout=0.2)
+        await asyncio.wait_for(content_entries.get(), timeout=0.2)
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(create_entries.get(), timeout=0.05)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(status_entries.get(), timeout=0.05)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(content_entries.get(), timeout=0.05)
+
+        status_release.set()
+        content_release.set()
+        await asyncio.wait_for(status_entries.get(), timeout=0.2)
+        await asyncio.wait_for(content_entries.get(), timeout=0.2)
+
+        create_release.set()
+        await asyncio.wait_for(create_entries.get(), timeout=0.2)
+    finally:
+        create_release.set()
+        status_release.set()
+        content_release.set()
+        await asyncio.gather(*create_tasks, *status_tasks, *content_tasks)
+        router.discard()

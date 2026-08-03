@@ -47,9 +47,7 @@ _SUBMIT_RATE_LIMIT_RETRY_JITTER_SECONDS = 10.0
 def _submit_rate_limit_delay(jitter: Callable[[float, float], float]) -> float:
     """Delay before re-attempting a 16010-throttled submit. See the constants
     above for why it is 60s rather than the upstream-suggested minimum."""
-    return _SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS + jitter(
-        0.0, _SUBMIT_RATE_LIMIT_RETRY_JITTER_SECONDS
-    )
+    return _SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS + jitter(0.0, _SUBMIT_RATE_LIMIT_RETRY_JITTER_SECONDS)
 
 
 def parse_upload_asset_id(payload: Dict[str, Any]) -> str:

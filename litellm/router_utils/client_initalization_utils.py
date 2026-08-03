@@ -13,7 +13,16 @@ else:
 
 class InitalizeCachedClient:
     @staticmethod
-    def set_max_parallel_requests_client(litellm_router_instance: LitellmRouter, model: dict):
+    def get_max_parallel_requests_cache_key(model_id: str, operation: str | None = None) -> str:
+        operation_segment = f"_{operation}" if operation else ""
+        return f"{model_id}{operation_segment}_max_parallel_requests_client"
+
+    @staticmethod
+    def set_max_parallel_requests_client(
+        litellm_router_instance: LitellmRouter,
+        model: dict,
+        operation: str | None = None,
+    ):
         litellm_params = model.get("litellm_params", {})
         model_id = model["model_info"]["id"]
         rpm = litellm_params.get("rpm", None)
@@ -27,7 +36,10 @@ class InitalizeCachedClient:
         )
         if calculated_max_parallel_requests:
             semaphore = asyncio.Semaphore(calculated_max_parallel_requests)
-            cache_key = f"{model_id}_max_parallel_requests_client"
+            cache_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(
+                model_id=model_id,
+                operation=operation,
+            )
             litellm_router_instance.cache.set_cache(
                 key=cache_key,
                 value=semaphore,

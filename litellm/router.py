@@ -4300,7 +4300,13 @@ class Router:
             ),
         )
 
-    async def _ageneric_api_call_with_fallbacks(self, model: str, original_function: Callable, **kwargs):
+    async def _ageneric_api_call_with_fallbacks(
+        self,
+        model: str,
+        original_function: Callable,
+        max_parallel_requests_operation: str | None = None,
+        **kwargs,
+    ):
         """
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
@@ -4308,6 +4314,7 @@ class Router:
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
             kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
+            kwargs["max_parallel_requests_operation"] = max_parallel_requests_operation
             self._update_kwargs_before_fallbacks(model=model, kwargs=kwargs, metadata_variable_name="litellm_metadata")
             verbose_router_logger.debug(f"Inside ageneric_api_call_with_fallbacks() - model: {model}; kwargs: {kwargs}")
             response = await self.async_function_with_fallbacks(**kwargs)
@@ -4354,7 +4361,13 @@ class Router:
             kwargs["endpoint"] = kwargs["endpoint"].replace(model, replacement_model_name)
         return kwargs
 
-    async def _ageneric_api_call_with_fallbacks_helper(self, model: str, original_generic_function: Callable, **kwargs):
+    async def _ageneric_api_call_with_fallbacks_helper(
+        self,
+        model: str,
+        original_generic_function: Callable,
+        max_parallel_requests_operation: str | None = None,
+        **kwargs,
+    ):
         """
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
@@ -4412,6 +4425,7 @@ class Router:
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
+                operation=max_parallel_requests_operation,
             )
 
             if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
@@ -4457,11 +4471,10 @@ class Router:
         _aresponses_streaming_iterator so MidStreamFallbackError raised
         during iteration triggers the Router's cross-provider fallback chain.
         """
+        from litellm.litellm_core_utils.core_helpers import safe_deep_copy
         from litellm.responses.streaming_iterator import (
             BaseResponsesAPIStreamingIterator,
         )
-
-        from litellm.litellm_core_utils.core_helpers import safe_deep_copy
 
         # Snapshot the request kwargs before _ageneric_api_call_with_fallbacks
         # mutates them. A shallow copy alone is not enough: the primary
@@ -5679,6 +5692,11 @@ class Router:
             ):
                 return await self._ageneric_api_call_with_fallbacks(
                     original_function=original_function,
+                    max_parallel_requests_operation=(
+                        call_type.removeprefix("a")
+                        if call_type in ("avideo_generation", "avideo_status", "avideo_content")
+                        else None
+                    ),
                     **kwargs,
                 )
             elif call_type in (
@@ -9829,7 +9847,7 @@ class Router:
             self._init_routing_groups(self._routing_groups_input)
         verbose_router_logger.debug(f"Updated Router settings: {self.get_settings()}")
 
-    def _get_client(self, deployment, kwargs, client_type=None):
+    def _get_client(self, deployment, kwargs, client_type=None, operation: str | None = None):
         """
         Returns the appropriate client based on the given deployment, kwargs, and client_type.
 
@@ -9844,10 +9862,17 @@ class Router:
         model_id = deployment["model_info"]["id"]
         parent_otel_span: Optional[Span] = _get_parent_otel_span_from_kwargs(kwargs)
         if client_type == "max_parallel_requests":
-            cache_key = "{}_max_parallel_requests_client".format(model_id)
+            cache_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(
+                model_id=model_id,
+                operation=operation,
+            )
             client = self.cache.get_cache(key=cache_key, local_only=True, parent_otel_span=parent_otel_span)
             if client is None:
-                InitalizeCachedClient.set_max_parallel_requests_client(litellm_router_instance=self, model=deployment)
+                InitalizeCachedClient.set_max_parallel_requests_client(
+                    litellm_router_instance=self,
+                    model=deployment,
+                    operation=operation,
+                )
                 client = self.cache.get_cache(key=cache_key, local_only=True, parent_otel_span=parent_otel_span)
             return client
         elif client_type == "async":
