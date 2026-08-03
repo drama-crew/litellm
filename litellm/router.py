@@ -102,7 +102,11 @@ from litellm.router_utils.batch_utils import (
     replace_model_in_jsonl,
     should_replace_model_in_jsonl,
 )
-from litellm.router_utils.client_initalization_utils import InitalizeCachedClient
+from litellm.router_utils.client_initalization_utils import (
+    AsyncSemaphoreLease,
+    InitalizeCachedClient,
+    active_max_parallel_request_lease,
+)
 from litellm.router_utils.clientside_credential_handler import (
     get_dynamic_litellm_params,
     is_clientside_credential,
@@ -471,6 +475,7 @@ class Router:
             None  # use this to track the users default deployment, when they want to use model = *
         )
         self.default_max_parallel_requests = default_max_parallel_requests
+        self._max_parallel_request_semaphores: dict[str, asyncio.Semaphore] = {}
         self.provider_default_deployment_ids: List[str] = []
         self.pattern_router = PatternMatchRouter()
         self.team_pattern_routers: Dict[str, PatternMatchRouter] = {}  # {"TEAM_ID": PatternMatchRouter}
@@ -4419,30 +4424,43 @@ class Router:
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider
 
-            response = original_generic_function(**response_kwargs)
-
-            rpm_semaphore = self._get_client(
+            aggregate_semaphore = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
-                operation=max_parallel_requests_operation,
             )
-
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response  # type: ignore
-            else:
+            generation_semaphore = (
+                self._get_client(
+                    deployment=deployment,
+                    kwargs=kwargs,
+                    client_type="max_parallel_requests",
+                    operation="video_generation",
+                )
+                if max_parallel_requests_operation == "video_generation"
+                else None
+            )
+            generation_acquired = False
+            aggregate_lease = None
+            lease_token = None
+            try:
+                if isinstance(generation_semaphore, asyncio.Semaphore):
+                    await generation_semaphore.acquire()
+                    generation_acquired = True
+                if isinstance(aggregate_semaphore, asyncio.Semaphore):
+                    aggregate_lease = AsyncSemaphoreLease(aggregate_semaphore)
+                    await aggregate_lease.acquire()
+                    lease_token = active_max_parallel_request_lease.set(aggregate_lease)
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
-                response = await response  # type: ignore
+                response = await original_generic_function(**response_kwargs)
+            finally:
+                if lease_token is not None:
+                    active_max_parallel_request_lease.reset(lease_token)
+                if aggregate_lease is not None:
+                    aggregate_lease.release()
+                if generation_acquired and isinstance(generation_semaphore, asyncio.Semaphore):
+                    generation_semaphore.release()
 
             self.success_calls[model_name] += 1
             verbose_router_logger.info(f"ageneric_api_call_with_fallbacks(model={model_name})\033[32m 200 OK\033[0m")
@@ -9862,19 +9880,11 @@ class Router:
         model_id = deployment["model_info"]["id"]
         parent_otel_span: Optional[Span] = _get_parent_otel_span_from_kwargs(kwargs)
         if client_type == "max_parallel_requests":
-            cache_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(
-                model_id=model_id,
+            return InitalizeCachedClient.set_max_parallel_requests_client(
+                litellm_router_instance=self,
+                model=deployment,
                 operation=operation,
             )
-            client = self.cache.get_cache(key=cache_key, local_only=True, parent_otel_span=parent_otel_span)
-            if client is None:
-                InitalizeCachedClient.set_max_parallel_requests_client(
-                    litellm_router_instance=self,
-                    model=deployment,
-                    operation=operation,
-                )
-                client = self.cache.get_cache(key=cache_key, local_only=True, parent_otel_span=parent_otel_span)
-            return client
         elif client_type == "async":
             if kwargs.get("stream") is True:
                 cache_key = f"{model_id}_stream_async_client"
