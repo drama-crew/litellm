@@ -4413,3 +4413,33 @@ async def test_common_checks_personal_user_budget_blocks_in_gather():
                 request=MagicMock(spec=Request),
             )
     assert "User=u1" in str(over.value)
+
+
+@pytest.mark.asyncio
+async def test_get_project_object_check_db_only_bypasses_cache():
+    from litellm.proxy._types import LiteLLM_ProjectTableCachedObj
+    from litellm.proxy.auth.auth_checks import get_project_object
+
+    stale_project = LiteLLM_ProjectTableCachedObj(project_id="project-1", models=["stale-model"])
+    current_row = MagicMock()
+    current_row.model_dump.return_value = {
+        "project_id": "project-1",
+        "models": ["current-model"],
+    }
+    prisma_client = MagicMock()
+    prisma_client.db.litellm_projecttable.find_unique = AsyncMock(return_value=current_row)
+    cache = MagicMock()
+    cache.async_get_cache = AsyncMock(return_value=stale_project)
+    cache.async_set_cache = AsyncMock()
+
+    project = await get_project_object(
+        project_id="project-1",
+        prisma_client=prisma_client,
+        user_api_key_cache=cache,
+        check_db_only=True,
+    )
+
+    assert project is not None
+    assert project.models == ["current-model"]
+    cache.async_get_cache.assert_not_awaited()
+    cache.async_set_cache.assert_not_awaited()

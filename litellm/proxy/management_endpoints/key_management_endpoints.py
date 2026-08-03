@@ -1273,6 +1273,7 @@ async def _check_project_key_limits(
     data: Union[GenerateKeyRequest, UpdateKeyRequest],
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
+    check_db_only: bool = False,
 ) -> None:
     """
     Validate that key's models and budget respect its project's limits.
@@ -1284,6 +1285,7 @@ async def _check_project_key_limits(
         project_id=project_id,
         prisma_client=prisma_client,
         user_api_key_cache=user_api_key_cache,
+        check_db_only=check_db_only,
     )
 
     if project_obj is None:
@@ -2248,6 +2250,7 @@ async def _validate_update_key_data(
     premium_user: bool,
     prisma_client: Any,
     user_api_key_cache: Any,
+    check_db_only: bool = False,
 ) -> None:
     """Validate permissions and constraints for key update."""
     # Reject NaN/±inf spend before it can reach the DB / spend counter.
@@ -2403,6 +2406,7 @@ async def _validate_update_key_data(
             data=data,
             prisma_client=prisma_client,
             user_api_key_cache=user_api_key_cache,
+            check_db_only=check_db_only,
         )
 
     # When the caller asks to change the key's organization_id, require that
@@ -2505,81 +2509,98 @@ async def key_model_add(
         user_custom_key_update,
     )
 
-    existing_key_row = await _get_and_validate_existing_key(
-        token=data.key,
-        prisma_client=prisma_client,
-    )
-    hashed_token = existing_key_row.token
-    update_request = UpdateKeyRequest(key=hashed_token, models=data.models)
-    await _validate_update_key_data(
-        data=update_request,
-        existing_key_row=existing_key_row,
-        user_api_key_dict=user_api_key_dict,
-        llm_router=llm_router,
-        premium_user=premium_user,
-        prisma_client=prisma_client,
-        user_api_key_cache=user_api_key_cache,
-    )
-
-    if existing_key_row.team_id is not None and existing_key_row.models:
-        team_obj = await get_team_object(
-            team_id=existing_key_row.team_id,
-            prisma_client=prisma_client,
-            user_api_key_cache=user_api_key_cache,
-            check_db_only=True,
-        )
-        if team_obj is not None:
-            for model in data.models:
-                if model == SpecialModelNames.all_team_models.value:
-                    continue
-                await can_team_access_model(
-                    model=model,
-                    team_object=team_obj,
-                    llm_router=llm_router,
-                )
-
-    if user_custom_key_update is not None:
-        if not inspect.iscoroutinefunction(user_custom_key_update):
-            raise ValueError("user_custom_key_update must be a coroutine")
-        custom_result = await user_custom_key_update(update_request)
-        if not custom_result.get("decision", True):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=custom_result.get("message", "Authentication Failed - Custom Auth Rule"),
-            )
-
     if prisma_client is None:
         raise HTTPException(status_code=500, detail={"error": "Database not connected"})
 
-    updated_rows = await prisma_client.writer_db.query_raw(
-        'UPDATE "LiteLLM_VerificationToken" '
-        "SET models = CASE "
-        "  WHEN cardinality(COALESCE(models, ARRAY[]::text[])) = 0 "
-        "  THEN COALESCE(models, ARRAY[]::text[]) "
-        "  ELSE ARRAY(SELECT DISTINCT unnest(models || $1::text[])) "
-        "END, updated_at = NOW() "
-        "WHERE token = $2 "
-        "RETURNING models, updated_at",
-        data.models,
-        hashed_token,
-    )
-    if not updated_rows:
-        raise HTTPException(status_code=404, detail={"error": "Key not found."})
+    hashed_token = _hash_token_if_needed(data.key)
+    async with prisma_client.writer_db.tx() as transaction:
+        transaction_prisma_client = copy.copy(prisma_client)
+        transaction_prisma_client.db = transaction
+        locked_rows = await transaction.query_raw(
+            'SELECT * FROM "LiteLLM_VerificationToken" WHERE token = $1 FOR UPDATE',
+            hashed_token,
+        )
+        if not locked_rows:
+            raise HTTPException(status_code=404, detail={"error": "Key not found."})
 
-    response = KeyModelAddResponse.model_validate(
-        {
-            "models": updated_rows[0]["models"],
-            "unrestricted": len(updated_rows[0]["models"]) == 0,
-            "updated_at": updated_rows[0]["updated_at"],
+        locked_row_data = {
+            **locked_rows[0],
+            "models": locked_rows[0].get("models") or [],
         }
-    )
+        existing_key_row = LiteLLM_VerificationToken.model_validate(locked_row_data)
+        final_models = (
+            [] if not existing_key_row.models else list(dict.fromkeys([*existing_key_row.models, *data.models]))
+        )
+        update_request = UpdateKeyRequest(key=hashed_token, models=final_models)
+        await _validate_update_key_data(
+            data=update_request,
+            existing_key_row=existing_key_row,
+            user_api_key_dict=user_api_key_dict,
+            llm_router=llm_router,
+            premium_user=premium_user,
+            prisma_client=transaction_prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            check_db_only=True,
+        )
+
+        if existing_key_row.team_id is not None and final_models:
+            team_obj = await get_team_object(
+                team_id=existing_key_row.team_id,
+                prisma_client=transaction_prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                check_db_only=True,
+            )
+            if team_obj is not None:
+                for model in final_models:
+                    if model == SpecialModelNames.all_team_models.value:
+                        continue
+                    await can_team_access_model(
+                        model=model,
+                        team_object=team_obj,
+                        llm_router=llm_router,
+                    )
+
+        if user_custom_key_update is not None:
+            if not inspect.iscoroutinefunction(user_custom_key_update):
+                raise ValueError("user_custom_key_update must be a coroutine")
+            custom_result = await user_custom_key_update(update_request)
+            if not custom_result.get("decision", True):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=custom_result.get("message", "Authentication Failed - Custom Auth Rule"),
+                )
+
+        updated_rows = await transaction.query_raw(
+            'UPDATE "LiteLLM_VerificationToken" '
+            "SET models = CASE "
+            "  WHEN cardinality(COALESCE(models, ARRAY[]::text[])) = 0 "
+            "  THEN COALESCE(models, ARRAY[]::text[]) "
+            "  ELSE ARRAY(SELECT DISTINCT unnest(models || $1::text[])) "
+            "END, updated_at = NOW() "
+            "WHERE token = $2 "
+            "RETURNING models, updated_at",
+            data.models,
+            hashed_token,
+        )
+        if not updated_rows:
+            raise HTTPException(status_code=404, detail={"error": "Key not found."})
+
+        response = KeyModelAddResponse.model_validate(
+            {
+                "models": updated_rows[0]["models"],
+                "unrestricted": len(updated_rows[0]["models"]) == 0,
+                "updated_at": updated_rows[0]["updated_at"],
+            }
+        )
+        audit_request = UpdateKeyRequest(key=hashed_token, models=response.models)
+
     await _delete_cache_key_object(
         hashed_token=hashed_token,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
     )
     await KeyManagementEventHooks.async_key_updated_hook(
-        data=update_request,
+        data=audit_request,
         existing_key_row=existing_key_row,
         response=response,
         user_api_key_dict=user_api_key_dict,

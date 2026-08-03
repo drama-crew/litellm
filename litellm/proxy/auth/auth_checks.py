@@ -2896,10 +2896,7 @@ def _is_hidden_fallback_deployment(model: str, llm_router: Router) -> bool:
     deployments = llm_router.get_model_list(model_name=model)
     if not deployments:
         return False
-    return all(
-        (deployment.get("model_info") or {}).get("hidden") is True
-        for deployment in deployments
-    )
+    return all((deployment.get("model_info") or {}).get("hidden") is True for deployment in deployments)
 
 
 def _can_object_call_model(
@@ -4170,6 +4167,7 @@ async def get_project_object(
     prisma_client: Optional[PrismaClient],
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: Optional[ProxyLogging] = None,
+    check_db_only: bool = False,
 ) -> Optional[LiteLLM_ProjectTableCachedObj]:
     """
     Fetch project object from cache or DB.
@@ -4181,14 +4179,14 @@ async def get_project_object(
     if prisma_client is None:
         return None
 
-    # Check cache first
     cache_key = "project_id:{}".format(project_id)
-    deserialized_project = await user_api_key_cache.async_get_cache(
-        key=cache_key,
-        model_type=LiteLLM_ProjectTableCachedObj,
-    )
-    if deserialized_project is not None:
-        return deserialized_project
+    if not check_db_only:
+        deserialized_project = await user_api_key_cache.async_get_cache(
+            key=cache_key,
+            model_type=LiteLLM_ProjectTableCachedObj,
+        )
+        if deserialized_project is not None:
+            return deserialized_project
 
     # Fetch from DB
     project_row = await ProjectRepository(prisma_client).table.find_unique(
@@ -4199,8 +4197,9 @@ async def get_project_object(
         return None
 
     project_obj = LiteLLM_ProjectTableCachedObj(**project_row.model_dump())
+    if check_db_only:
+        return project_obj
 
-    # Cache with TTL following _cache_management_object pattern
     project_obj.last_refreshed_at = time.time()
     await _cache_management_object(
         key=cache_key,
