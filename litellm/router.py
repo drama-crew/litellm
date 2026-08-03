@@ -8163,6 +8163,10 @@ class Router:
 
         # add to model names
         self._add_model_to_list_and_index_map(model=_deployment, model_id=deployment.model_info.id)
+        InitalizeCachedClient.update_max_parallel_requests_clients(
+            litellm_router_instance=self,
+            model=_deployment,
+        )
         self.model_names.add(deployment.model_name)
         self._sync_deployment_budget_config(deployment=deployment)
         return deployment
@@ -8311,10 +8315,6 @@ class Router:
 
             # if the model_id is not in router
             self.add_deployment(deployment=deployment)
-            InitalizeCachedClient.update_max_parallel_requests_clients(
-                litellm_router_instance=self,
-                model=deployment.to_json(exclude_none=True),
-            )
             return deployment
         except Exception as e:
             if self.ignore_invalid_deployments:

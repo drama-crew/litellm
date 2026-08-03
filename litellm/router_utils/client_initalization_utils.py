@@ -4,7 +4,7 @@ import threading
 from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Awaitable, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Awaitable, Literal
 
 from litellm.utils import calculate_max_parallel_requests
 
@@ -22,7 +22,7 @@ class _MaxParallelRequestsWaiter:
     def __init__(self, loop: asyncio.AbstractEventLoop, future: asyncio.Future[None]):
         self.loop = loop
         self.future = future
-        self.state: Literal["queued", "granted", "cancelled"] = "queued"
+        self.state: Literal["queued", "scheduled", "granted", "cancelled"] = "queued"
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,8 +75,8 @@ class MaxParallelRequestsLimiter:
             if self._active < 1:
                 raise RuntimeError("cannot release an unacquired limiter")
             self._active -= 1
-            granted = self._grant_waiters_locked()
-        self._notify(granted)
+            scheduled = self._schedule_waiters_locked()
+        self._notify(scheduled)
 
     def update_capacity(self, capacity: int, config_version: int) -> None:
         if capacity < 1:
@@ -86,8 +86,8 @@ class MaxParallelRequestsLimiter:
                 return
             self._capacity = capacity
             self._config_version = config_version
-            granted = self._grant_waiters_locked()
-        self._notify(granted)
+            scheduled = self._schedule_waiters_locked()
+        self._notify(scheduled)
 
     def locked(self) -> bool:
         with self._lock:
@@ -107,22 +107,22 @@ class MaxParallelRequestsLimiter:
                 waiter.state = "cancelled"
                 self._waiters.remove(waiter)
                 return
+            if waiter.state == "scheduled":
+                waiter.state = "cancelled"
+                return
             waiter.state = "cancelled"
             self._active -= 1
-            granted = self._grant_waiters_locked()
-        self._notify(granted)
+            scheduled = self._schedule_waiters_locked()
+        self._notify(scheduled)
 
-    def _grant_waiters_locked(self) -> tuple[_MaxParallelRequestsWaiter, ...]:
-        return tuple(self._iter_granted_waiters_locked())
-
-    def _iter_granted_waiters_locked(self) -> Iterator[_MaxParallelRequestsWaiter]:
-        while self._active < self._capacity and self._waiters:
-            waiter = self._waiters.popleft()
-            if waiter.state != "queued":
-                continue
-            waiter.state = "granted"
-            self._active += 1
-            yield waiter
+    def _schedule_waiters_locked(self) -> tuple[_MaxParallelRequestsWaiter, ...]:
+        if self._active >= self._capacity:
+            return ()
+        scheduled = tuple(waiter for waiter in self._waiters if waiter.state == "queued")
+        self._waiters.clear()
+        for waiter in scheduled:
+            waiter.state = "scheduled"
+        return scheduled
 
     def _notify(self, waiters: tuple[_MaxParallelRequestsWaiter, ...]) -> None:
         pending = waiters
@@ -130,25 +130,37 @@ class MaxParallelRequestsLimiter:
             waiter = pending[0]
             pending = pending[1:]
             try:
-                waiter.loop.call_soon_threadsafe(MaxParallelRequestsLimiter._resolve_waiter, waiter)
+                waiter.loop.call_soon_threadsafe(self._claim_waiter, waiter)
             except RuntimeError:
-                pending = (*pending, *self._rollback_granted_waiter(waiter))
+                pending = (*pending, *self._cancel_scheduled_waiter(waiter))
 
-    def _rollback_granted_waiter(
+    def _cancel_scheduled_waiter(
         self,
         waiter: _MaxParallelRequestsWaiter,
     ) -> tuple[_MaxParallelRequestsWaiter, ...]:
         with self._lock:
-            if waiter.state != "granted":
+            if waiter.state != "scheduled":
                 return ()
             waiter.state = "cancelled"
-            self._active -= 1
-            return self._grant_waiters_locked()
+            return self._schedule_waiters_locked()
 
-    @staticmethod
-    def _resolve_waiter(waiter: _MaxParallelRequestsWaiter) -> None:
-        if not waiter.future.done():
-            waiter.future.set_result(None)
+    def _claim_waiter(self, waiter: _MaxParallelRequestsWaiter) -> None:
+        with self._lock:
+            if waiter.state != "scheduled":
+                return
+            if waiter.future.done():
+                waiter.state = "cancelled"
+                scheduled = self._schedule_waiters_locked()
+            elif self._active >= self._capacity:
+                waiter.state = "queued"
+                self._waiters.append(waiter)
+                return
+            else:
+                waiter.state = "granted"
+                self._active += 1
+                waiter.future.set_result(None)
+                return
+        self._notify(scheduled)
 
 
 MaxParallelRequestsClient = asyncio.Semaphore | MaxParallelRequestsLimiter

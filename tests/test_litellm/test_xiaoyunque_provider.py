@@ -1520,9 +1520,22 @@ async def test_avideo_status_16010_does_not_retry():
 # ---------------------------------------------------------------------------
 
 
-def test_retry_delay_is_at_least_the_upstream_requested_minute():
-    """Even with zero jitter the wait must clear upstream's stated minimum."""
-    assert _submit_rate_limit_delay(_no_jitter) >= 60.0
+@pytest.mark.parametrize(("jitter_value", "expected_delay"), [(0.0, 60.0), (10.0, 70.0)])
+def test_retry_delay_uses_bounded_jitter(
+    jitter_value: float,
+    expected_delay: float,
+) -> None:
+    observed_bounds: list[tuple[float, float]] = []
+
+    def jitter(low: float, high: float) -> float:
+        observed_bounds.append((low, high))
+        return jitter_value
+
+    delay = _submit_rate_limit_delay(jitter)
+
+    assert observed_bounds == [(0.0, 10.0)]
+    assert delay == expected_delay
+    assert 60.0 <= delay <= 70.0
 
 
 def test_retry_delay_applies_real_jitter_by_default():
@@ -1534,7 +1547,7 @@ def test_retry_delay_applies_real_jitter_by_default():
     assert len(delays) > 1, (
         f"default jitter produced a constant delay {delays!r} -- a throttled burst would retry in lockstep"
     )
-    assert all(d >= 60.0 for d in delays)
+    assert all(60.0 <= delay <= 70.0 for delay in delays)
 
 
 # ---------------------------------------------------------------------------
@@ -1555,8 +1568,12 @@ def test_retry_delay_applies_real_jitter_by_default():
 
 
 @pytest.mark.asyncio
-async def test_retry_resubmits_a_byte_identical_body():
-    fake = FakeAsyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+async def test_retry_resubmits_a_byte_identical_body() -> None:
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _submit_ok()]
+        }
+    )
     client = XiaoyunqueClient(token="t", async_client=fake, asleep=_RecordingAsleep(), jitter=_no_jitter)
     await client.asubmit_run(
         message="a cat on a windowsill",
@@ -1565,21 +1582,22 @@ async def test_retry_resubmits_a_byte_identical_body():
         thread_id="thread-existing",
     )
 
-    assert len(fake.calls) == 2, "expected exactly one retry"
-    first_body, second_body = fake.calls[0][1], fake.calls[1][1]
-    assert second_body == first_body, (
-        "the retried submit body differs from the original — a retry that "
-        "changes the model, prompt or reference set would generate a "
-        f"different video at full cost.\nfirst:  {first_body!r}\nsecond: {second_body!r}"
-    )
-    assert fake.body_bytes[1] == fake.body_bytes[0]
+    assert len(fake.calls) == 3
+    first_body = fake.calls[0][1]
+    assert all(call[1] == first_body for call in fake.calls[1:])
+    assert all(body == fake.body_bytes[0] for body in fake.body_bytes[1:])
     assert first_body["asset_ids"] == ["asset-1", "asset-2"]
     assert first_body["thread_id"] == "thread-existing"
     assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
+    assert first_body["video_part_tool_param"]["prompt"] == "a cat on a windowsill"
 
 
-def test_sync_retry_resubmits_a_byte_identical_body():
-    fake = FakeSyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+def test_sync_retry_resubmits_a_byte_identical_body() -> None:
+    fake = FakeSyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _submit_ok()]
+        }
+    )
     client = XiaoyunqueClient(token="t", sync_client=fake, sleep=_RecordingSleep(), jitter=_no_jitter)
     client.submit_run(
         message="a cat on a windowsill",
@@ -1588,6 +1606,6 @@ def test_sync_retry_resubmits_a_byte_identical_body():
         thread_id="thread-existing",
     )
 
-    assert len(fake.calls) == 2
-    assert fake.calls[1][1] == fake.calls[0][1]
-    assert fake.body_bytes[1] == fake.body_bytes[0]
+    assert len(fake.calls) == 3
+    assert all(call[1] == fake.calls[0][1] for call in fake.calls[1:])
+    assert all(body == fake.body_bytes[0] for body in fake.body_bytes[1:])

@@ -5664,6 +5664,41 @@ async def test_max_parallel_request_hot_reload_resizes_one_live_limiter(update_p
         router.discard()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("old_capacity", "new_capacity"), [(1, 7), (7, 1)])
+async def test_max_parallel_request_delete_then_add_same_id_resizes_live_limiter(
+    old_capacity: int,
+    new_capacity: int,
+) -> None:
+    from litellm.types.router import Deployment
+
+    router = litellm.Router(model_list=[_max_parallel_deployment(old_capacity)], num_retries=0)
+    limiter_before = router._get_client(
+        deployment=router.model_list[0],
+        kwargs={},
+        client_type="max_parallel_requests",
+    )
+    await limiter_before.acquire()
+
+    try:
+        assert router.delete_deployment("limited-deployment") is not None
+        replacement = Deployment(**_max_parallel_deployment(new_capacity))
+        assert router.add_deployment(replacement) is replacement
+        limiter_after = router._get_client(
+            deployment=router.model_list[0],
+            kwargs={},
+            client_type="max_parallel_requests",
+        )
+
+        assert limiter_after is limiter_before
+        assert limiter_after.capacity == new_capacity
+        assert limiter_after._value == new_capacity - 1
+    finally:
+        limiter_before.release()
+        assert limiter_before._value == new_capacity
+        router.discard()
+
+
 def test_max_parallel_request_first_initialization_is_atomic_across_threads():
     router = litellm.Router(model_list=[_max_parallel_deployment(1)], num_retries=0)
     deployment = router.model_list[0]
@@ -5818,6 +5853,21 @@ def _create_closed_loop_waiter(limiter: MaxParallelRequestsLimiter) -> asyncio.T
         return executor.submit(create).result(timeout=1)
 
 
+def _create_stopped_loop_waiter(
+    limiter: MaxParallelRequestsLimiter,
+) -> tuple[asyncio.AbstractEventLoop, asyncio.Task[bool]]:
+    def create() -> tuple[asyncio.AbstractEventLoop, asyncio.Task[bool]]:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(limiter.acquire())
+        loop.run_until_complete(asyncio.sleep(0))
+        assert not task.done()
+        return loop, task
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(create).result(timeout=1)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("closed_waiter_first", [True, False])
 async def test_max_parallel_request_limiter_skips_closed_waiter_loop(closed_waiter_first: bool):
@@ -5852,6 +5902,24 @@ async def test_max_parallel_request_limiter_skips_closed_waiter_loop(closed_wait
         if not healthy_task.done():
             healthy_task.cancel()
         await asyncio.wait_for(asyncio.gather(healthy_task, return_exceptions=True), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_request_limiter_does_not_claim_before_stopped_loop_callback_runs() -> None:
+    limiter = MaxParallelRequestsLimiter(1)
+    await limiter.acquire()
+    stopped_loop, stopped_task = _create_stopped_loop_waiter(limiter)
+
+    try:
+        limiter.release()
+        stopped_loop.close()
+        await asyncio.wait_for(limiter.acquire(), timeout=1)
+        limiter.release()
+        assert limiter._value == 1
+        assert len(limiter._waiters) == 0
+        assert not stopped_task.done()
+    finally:
+        stopped_task._log_destroy_pending = False
 
 
 @pytest.mark.asyncio
