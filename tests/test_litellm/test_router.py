@@ -5109,19 +5109,18 @@ def _video_concurrency_router() -> litellm.Router:
 
 
 @pytest.mark.asyncio
-async def test_video_operations_share_one_max_parallel_request_limit():
+async def test_video_operations_have_independent_max_parallel_request_limits():
     entries: asyncio.Queue[str] = asyncio.Queue()
     releases = {operation: asyncio.Event() for operation in ("create", "status", "content")}
-    active = 0
-    max_active = 0
+    active = {operation: 0 for operation in releases}
+    max_active = {operation: 0 for operation in releases}
 
     async def provider(operation: str, result, **kwargs):
-        nonlocal active, max_active
-        active += 1
-        max_active = max(max_active, active)
+        active[operation] += 1
+        max_active[operation] = max(max_active[operation], active[operation])
         entries.put_nowait(operation)
         await releases[operation].wait()
-        active -= 1
+        active[operation] -= 1
         return result
 
     async def create_provider(**kwargs):
@@ -5137,35 +5136,41 @@ async def test_video_operations_share_one_max_parallel_request_limit():
     router.avideo_generation = router.factory_function(create_provider, call_type="avideo_generation")
     router.avideo_status = router.factory_function(status_provider, call_type="avideo_status")
     router.avideo_content = router.factory_function(content_provider, call_type="avideo_content")
-    tasks = [
+    first_tasks = [
         asyncio.create_task(router.avideo_generation(model="video-model", prompt="first")),
         asyncio.create_task(router.avideo_status(model="video-model", video_id="first")),
         asyncio.create_task(router.avideo_content(model="video-model", video_id="first")),
     ]
+    second_tasks = []
 
     try:
-        assert await asyncio.wait_for(entries.get(), timeout=1) == "create"
+        first_entries = {await asyncio.wait_for(entries.get(), timeout=1) for _ in range(3)}
+        assert first_entries == {"create", "status", "content"}
+        second_tasks = [
+            asyncio.create_task(router.avideo_generation(model="video-model", prompt="second")),
+            asyncio.create_task(router.avideo_status(model="video-model", video_id="second")),
+            asyncio.create_task(router.avideo_content(model="video-model", video_id="second")),
+        ]
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(entries.get(), timeout=0.05)
-        releases["create"].set()
-        second = await asyncio.wait_for(entries.get(), timeout=1)
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(entries.get(), timeout=0.05)
-        releases[second].set()
-        third = await asyncio.wait_for(entries.get(), timeout=1)
-        releases[third].set()
-        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1)
-        assert {second, third} == {"status", "content"}
-        assert max_active == 1
+
+        for operation in ("create", "status", "content"):
+            releases[operation].set()
+            assert await asyncio.wait_for(entries.get(), timeout=1) == operation
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(entries.get(), timeout=0.05)
+
+        await asyncio.wait_for(asyncio.gather(*first_tasks, *second_tasks), timeout=1)
+        assert max_active == {"create": 1, "status": 1, "content": 1}
     finally:
         for release in releases.values():
             release.set()
-        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=1)
+        await asyncio.wait_for(asyncio.gather(*first_tasks, *second_tasks, return_exceptions=True), timeout=1)
         router.discard()
 
 
 @pytest.mark.asyncio
-async def test_video_generation_retry_releases_aggregate_but_retains_generation_gate():
+async def test_video_generation_retry_retains_generation_limit_without_blocking_status():
     sleep = _BlockingAsyncSleep()
     http = _VideoConcurrencyAsyncClient(
         [
@@ -5215,7 +5220,7 @@ async def test_video_generation_retry_releases_aggregate_but_retains_generation_
 
 
 @pytest.mark.asyncio
-async def test_video_generation_cancelled_during_retry_sleep_releases_both_limits():
+async def test_video_generation_cancelled_during_retry_sleep_releases_generation_limit():
     sleep = _BlockingAsyncSleep()
     http = _VideoConcurrencyAsyncClient([{"ret": "16010", "errmsg": "rate limited", "data": {}}])
     client = XiaoyunqueClient(token="token", async_client=http, asleep=sleep, jitter=lambda low, high: low)
@@ -5243,85 +5248,15 @@ async def test_video_generation_cancelled_during_retry_sleep_releases_both_limit
     try:
         await asyncio.wait_for(router.avideo_status(model="video-model", video_id="first"), timeout=1)
         await asyncio.wait_for(router.avideo_generation(model="video-model", prompt="second"), timeout=1)
-        aggregate = router._get_client(deployment=router.model_list[0], kwargs={}, client_type="max_parallel_requests")
         generation = router._get_client(
             deployment=router.model_list[0],
             kwargs={},
             client_type="max_parallel_requests",
             operation="video_generation",
         )
-        assert aggregate._value == 1
         assert generation._value == 1
     finally:
         sleep.resume.set()
-        router.discard()
-
-
-@pytest.mark.asyncio
-async def test_video_generation_cancelled_while_reacquiring_does_not_overrelease():
-    sleep = _BlockingAsyncSleep()
-    http = _VideoConcurrencyAsyncClient([{"ret": "16010", "errmsg": "rate limited", "data": {}}])
-    client = XiaoyunqueClient(token="token", async_client=http, asleep=sleep, jitter=lambda low, high: low)
-    status_entered = asyncio.Event()
-    status_release = asyncio.Event()
-    second_create_entered = asyncio.Event()
-    second_create_release = asyncio.Event()
-    content_entered = asyncio.Event()
-    create_entries = 0
-
-    async def create_provider(**kwargs):
-        nonlocal create_entries
-        create_entries += 1
-        if create_entries == 1:
-            return await client.asubmit_run(kwargs["prompt"], [], {"model": "video"})
-        second_create_entered.set()
-        await second_create_release.wait()
-        return {"thread_id": "t2", "run_id": "r2"}
-
-    async def status_provider(**kwargs):
-        status_entered.set()
-        await status_release.wait()
-        return {"id": kwargs["video_id"], "status": "processing"}
-
-    async def content_provider(**kwargs):
-        content_entered.set()
-        return b"video-content"
-
-    router = _video_concurrency_router()
-    router.avideo_generation = router.factory_function(create_provider, call_type="avideo_generation")
-    router.avideo_status = router.factory_function(status_provider, call_type="avideo_status")
-    router.avideo_content = router.factory_function(content_provider, call_type="avideo_content")
-    first = asyncio.create_task(router.avideo_generation(model="video-model", prompt="first"))
-    await asyncio.wait_for(sleep.started.wait(), timeout=1)
-    status = asyncio.create_task(router.avideo_status(model="video-model", video_id="first"))
-    await asyncio.wait_for(status_entered.wait(), timeout=1)
-    sleep.resume.set()
-    await asyncio.sleep(0)
-    first.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await first
-    second = asyncio.create_task(router.avideo_generation(model="video-model", prompt="second"))
-    content = asyncio.create_task(router.avideo_content(model="video-model", video_id="first"))
-
-    try:
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(second_create_entered.wait(), timeout=0.05)
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(content_entered.wait(), timeout=0.05)
-        status_release.set()
-        await asyncio.wait_for(second_create_entered.wait(), timeout=1)
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(content_entered.wait(), timeout=0.05)
-        second_create_release.set()
-        await asyncio.wait_for(content_entered.wait(), timeout=1)
-        await asyncio.wait_for(asyncio.gather(status, second, content), timeout=1)
-    finally:
-        status_release.set()
-        second_create_release.set()
-        for task in (status, second, content):
-            if not task.done():
-                task.cancel()
-        await asyncio.wait_for(asyncio.gather(status, second, content, return_exceptions=True), timeout=1)
         router.discard()
 
 
@@ -5376,12 +5311,14 @@ async def test_max_parallel_request_cache_keys_do_not_collide_across_deployments
 
         status_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(
             model_id="collision",
+            operation="video_status",
         )
         non_video_key = InitalizeCachedClient.get_max_parallel_requests_cache_key(model_id="collision_video_status")
         status_semaphore = router._get_client(
             deployment=status_deployment,
             kwargs={},
             client_type="max_parallel_requests",
+            operation="video_status",
         )
         non_video_semaphore = router._get_client(
             deployment=non_video_deployment,
@@ -5883,33 +5820,3 @@ async def test_max_parallel_request_limiter_removes_cancelled_waiters_and_preser
     assert order == ["first", "second"]
     assert len(limiter._waiters) == 0
     assert limiter._value == 1
-
-
-class _ReleaseFailingSemaphore(asyncio.Semaphore):
-    def release(self) -> None:
-        raise RuntimeError("aggregate release failed")
-
-
-@pytest.mark.asyncio
-async def test_video_generation_releases_generation_limiter_when_aggregate_release_fails():
-    aggregate = _ReleaseFailingSemaphore(1)
-    generation = asyncio.Semaphore(1)
-
-    async def provider(**kwargs):
-        return {"id": "video-created"}
-
-    def get_limiter(*args, **kwargs):
-        if kwargs.get("operation") == "video_generation":
-            return generation
-        return aggregate
-
-    router = _video_concurrency_router()
-    routed = router.factory_function(provider, call_type="avideo_generation")
-
-    try:
-        with patch.object(router, "_get_client", side_effect=get_limiter):
-            with pytest.raises(RuntimeError, match="aggregate release failed"):
-                await asyncio.wait_for(routed(model="video-model", prompt="first"), timeout=1)
-        assert generation._value == 1
-    finally:
-        router.discard()

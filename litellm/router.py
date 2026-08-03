@@ -103,11 +103,9 @@ from litellm.router_utils.batch_utils import (
     should_replace_model_in_jsonl,
 )
 from litellm.router_utils.client_initalization_utils import (
-    AsyncSemaphoreLease,
     InitalizeCachedClient,
     MaxParallelRequestsConfig,
     MaxParallelRequestsLimiter,
-    active_max_parallel_request_lease,
 )
 from litellm.router_utils.clientside_credential_handler import (
     get_dynamic_litellm_params,
@@ -4428,47 +4426,26 @@ class Router:
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider
 
-            aggregate_semaphore = self._get_client(
+            operation_semaphore = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
+                operation=max_parallel_requests_operation,
             )
-            generation_semaphore = (
-                self._get_client(
-                    deployment=deployment,
-                    kwargs=kwargs,
-                    client_type="max_parallel_requests",
-                    operation="video_generation",
-                )
-                if max_parallel_requests_operation == "video_generation"
-                else None
-            )
-            generation_acquired = False
-            aggregate_lease = None
-            lease_token = None
+            operation_acquired = False
             try:
-                if isinstance(generation_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
-                    await generation_semaphore.acquire()
-                    generation_acquired = True
-                if isinstance(aggregate_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
-                    aggregate_lease = AsyncSemaphoreLease(aggregate_semaphore)
-                    await aggregate_lease.acquire()
-                    lease_token = active_max_parallel_request_lease.set(aggregate_lease)
+                if isinstance(operation_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
+                    await operation_semaphore.acquire()
+                    operation_acquired = True
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
                 response = await original_generic_function(**response_kwargs)
             finally:
-                try:
-                    if lease_token is not None:
-                        active_max_parallel_request_lease.reset(lease_token)
-                    if aggregate_lease is not None:
-                        aggregate_lease.release()
-                finally:
-                    if generation_acquired and isinstance(
-                        generation_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)
-                    ):
-                        generation_semaphore.release()
+                if operation_acquired and isinstance(
+                    operation_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)
+                ):
+                    operation_semaphore.release()
 
             self.success_calls[model_name] += 1
             verbose_router_logger.info(f"ageneric_api_call_with_fallbacks(model={model_name})\033[32m 200 OK\033[0m")

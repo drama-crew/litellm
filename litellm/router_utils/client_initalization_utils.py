@@ -2,9 +2,8 @@ import asyncio
 import json
 import threading
 from collections import deque
-from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Awaitable, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Iterator, Literal
 
 from litellm.utils import calculate_max_parallel_requests
 
@@ -149,44 +148,6 @@ class MaxParallelRequestsLimiter:
     def _resolve_waiter(waiter: _MaxParallelRequestsWaiter) -> None:
         if not waiter.future.done():
             waiter.future.set_result(None)
-
-
-MaxParallelRequestsClient = asyncio.Semaphore | MaxParallelRequestsLimiter
-
-
-class AsyncSemaphoreLease:
-    __slots__ = ("_held", "_semaphore")
-
-    def __init__(self, semaphore: MaxParallelRequestsClient):
-        self._semaphore = semaphore
-        self._held = False
-
-    async def acquire(self) -> None:
-        if self._held:
-            return
-        await self._semaphore.acquire()
-        self._held = True
-
-    def release(self) -> None:
-        if not self._held:
-            return
-        self._held = False
-        self._semaphore.release()
-
-
-active_max_parallel_request_lease: ContextVar[AsyncSemaphoreLease | None] = ContextVar(
-    "active_max_parallel_request_lease", default=None
-)
-
-
-async def release_max_parallel_request_lease_during(awaitable: Awaitable[None]) -> None:
-    lease = active_max_parallel_request_lease.get()
-    if lease is None:
-        await awaitable
-        return
-    lease.release()
-    await awaitable
-    await lease.acquire()
 
 
 class InitalizeCachedClient:

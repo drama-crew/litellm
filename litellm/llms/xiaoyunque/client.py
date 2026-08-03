@@ -10,7 +10,6 @@ from typing_extensions import Required, TypeAlias, TypedDict
 
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.libtv.persistence import LibTVPersistence, account_key, get_persistence, normalize_source_key
-from litellm.router_utils.client_initalization_utils import release_max_parallel_request_lease_during
 
 from .common import (
     AGENT_NAME,
@@ -294,7 +293,7 @@ class XiaoyunqueClient:
         except XiaoyunqueError as error:
             if retries_left <= 0 or not is_submit_rate_limit_retryable(error.ret):
                 raise
-            await release_max_parallel_request_lease_during(self._asleep(_submit_rate_limit_delay(self._jitter)))
+            await self._asleep(_submit_rate_limit_delay(self._jitter))
             return await self._asubmit_run_attempt(body, retries_left - 1)
 
     async def aquery_result(self, thread_id: str, run_id: str) -> Dict[str, Any]:
