@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import json
 import time
 from typing import Any, Dict, Optional
@@ -76,13 +77,18 @@ class FakeSyncClient:
     def __init__(self, post_by_path=None):
         self.post_by_path = post_by_path or {}
         self.calls = []
+        self.body_bytes = []
 
     def _path(self, url):
         return url.split("xyq.jianying.com", 1)[-1]
 
     def post(self, url, json=None, headers=None, timeout=None, files=None):
         path = self._path(url)
-        self.calls.append((path, json, files))
+        body_snapshot = copy.deepcopy(json)
+        self.calls.append((path, body_snapshot, files))
+        self.body_bytes.append(
+            __import__("json").dumps(body_snapshot, ensure_ascii=False, separators=(",", ":")).encode()
+        )
         queue = self.post_by_path[path]
         item = queue.pop(0) if isinstance(queue, list) else queue
         if isinstance(item, BaseException):
@@ -98,13 +104,18 @@ class FakeAsyncClient:
     def __init__(self, post_by_path=None):
         self.post_by_path = post_by_path or {}
         self.calls = []
+        self.body_bytes = []
 
     def _path(self, url):
         return url.split("xyq.jianying.com", 1)[-1]
 
     async def post(self, url, json=None, headers=None, timeout=None, files=None):
         path = self._path(url)
-        self.calls.append((path, json, files))
+        body_snapshot = copy.deepcopy(json)
+        self.calls.append((path, body_snapshot, files))
+        self.body_bytes.append(
+            __import__("json").dumps(body_snapshot, ensure_ascii=False, separators=(",", ":")).encode()
+        )
         queue = self.post_by_path[path]
         item = queue.pop(0) if isinstance(queue, list) else queue
         if isinstance(item, BaseException):
@@ -1521,8 +1532,7 @@ def test_retry_delay_applies_real_jitter_by_default():
     client = XiaoyunqueClient(token="t")
     delays = {_submit_rate_limit_delay(client._jitter) for _ in range(50)}
     assert len(delays) > 1, (
-        f'default jitter produced a constant delay {delays!r} -- a throttled '
-        'burst would retry in lockstep'
+        f"default jitter produced a constant delay {delays!r} -- a throttled burst would retry in lockstep"
     )
     assert all(d >= 60.0 for d in delays)
 
@@ -1546,12 +1556,8 @@ def test_retry_delay_applies_real_jitter_by_default():
 
 @pytest.mark.asyncio
 async def test_retry_resubmits_a_byte_identical_body():
-    fake = FakeAsyncClient(
-        post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]}
-    )
-    client = XiaoyunqueClient(
-        token="t", async_client=fake, asleep=_RecordingAsleep(), jitter=_no_jitter
-    )
+    fake = FakeAsyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+    client = XiaoyunqueClient(token="t", async_client=fake, asleep=_RecordingAsleep(), jitter=_no_jitter)
     await client.asubmit_run(
         message="a cat on a windowsill",
         asset_ids=["asset-1", "asset-2"],
@@ -1559,15 +1565,29 @@ async def test_retry_resubmits_a_byte_identical_body():
         thread_id="thread-existing",
     )
 
-    assert len(fake.calls) == 2, 'expected exactly one retry'
+    assert len(fake.calls) == 2, "expected exactly one retry"
     first_body, second_body = fake.calls[0][1], fake.calls[1][1]
     assert second_body == first_body, (
-        'the retried submit body differs from the original — a retry that '
-        'changes the model, prompt or reference set would generate a '
-        f'different video at full cost.\nfirst:  {first_body!r}\nsecond: {second_body!r}'
+        "the retried submit body differs from the original — a retry that "
+        "changes the model, prompt or reference set would generate a "
+        f"different video at full cost.\nfirst:  {first_body!r}\nsecond: {second_body!r}"
     )
-    # Guard the guard: if the fixture ever stopped carrying these, the equality
-    # above would still pass while testing nothing interesting.
+    assert fake.body_bytes[1] == fake.body_bytes[0]
     assert first_body["asset_ids"] == ["asset-1", "asset-2"]
     assert first_body["thread_id"] == "thread-existing"
     assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
+
+
+def test_sync_retry_resubmits_a_byte_identical_body():
+    fake = FakeSyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+    client = XiaoyunqueClient(token="t", sync_client=fake, sleep=_RecordingSleep(), jitter=_no_jitter)
+    client.submit_run(
+        message="a cat on a windowsill",
+        asset_ids=["asset-1", "asset-2"],
+        video_part_tool_param={"model": "Seedance_2.5", "duration_sec": 30, "prompt": "a cat on a windowsill"},
+        thread_id="thread-existing",
+    )
+
+    assert len(fake.calls) == 2
+    assert fake.calls[1][1] == fake.calls[0][1]
+    assert fake.body_bytes[1] == fake.body_bytes[0]
