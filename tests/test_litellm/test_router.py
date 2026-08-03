@@ -5569,6 +5569,17 @@ def _max_parallel_deployment(capacity: int) -> dict:
     }
 
 
+def _unlimited_parallel_deployment() -> dict[str, object]:
+    return {
+        "model_name": "limited-model",
+        "litellm_params": {
+            "model": "openai/gpt-5.2",
+            "api_key": "test-api-key",
+        },
+        "model_info": {"id": "limited-deployment"},
+    }
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("update_path", ["set_model_list", "upsert_deployment"])
 async def test_max_parallel_request_hot_reload_resizes_one_live_limiter(update_path: str):
@@ -5697,6 +5708,119 @@ async def test_max_parallel_request_delete_then_add_same_id_resizes_live_limiter
         limiter_before.release()
         assert limiter_before._value == new_capacity
         router.discard()
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_request_hot_replace_finite_unlimited_finite_updates_live_limiters() -> None:
+    from litellm.types.router import Deployment
+
+    router = litellm.Router(model_list=[_max_parallel_deployment(1)], num_retries=0)
+    deployment = router.model_list[0]
+    aggregate = router._get_client(
+        deployment=deployment,
+        kwargs={},
+        client_type="max_parallel_requests",
+    )
+    operation = router._get_client(
+        deployment=deployment,
+        kwargs={},
+        client_type="max_parallel_requests",
+        operation="video_generation",
+    )
+    assert isinstance(aggregate, MaxParallelRequestsLimiter)
+    assert isinstance(operation, MaxParallelRequestsLimiter)
+    await aggregate.acquire()
+    await operation.acquire()
+    aggregate_waiter_acquired = False
+    operation_waiter_acquired = False
+
+    async def acquire_aggregate() -> None:
+        nonlocal aggregate_waiter_acquired
+        await aggregate.acquire()
+        aggregate_waiter_acquired = True
+
+    async def acquire_operation() -> None:
+        nonlocal operation_waiter_acquired
+        await operation.acquire()
+        operation_waiter_acquired = True
+
+    aggregate_waiter = asyncio.create_task(acquire_aggregate())
+    operation_waiter = asyncio.create_task(acquire_operation())
+    await asyncio.sleep(0)
+
+    try:
+        assert router.delete_deployment("limited-deployment") is not None
+        unlimited = Deployment(**_unlimited_parallel_deployment())
+        assert router.add_deployment(unlimited) is unlimited
+        await asyncio.wait_for(asyncio.gather(aggregate_waiter, operation_waiter), timeout=1)
+
+        config = router._max_parallel_request_configurations["limited-deployment"]
+        assert config.capacity is None
+        assert config.version == 1
+        assert aggregate.capacity is None
+        assert operation.capacity is None
+        assert aggregate._config_version == 1
+        assert operation._config_version == 1
+        assert router._get_client(
+            deployment=router.model_list[0],
+            kwargs={},
+            client_type="max_parallel_requests",
+        ) is None
+        assert router._get_client(
+            deployment=router.model_list[0],
+            kwargs={},
+            client_type="max_parallel_requests",
+            operation="video_generation",
+        ) is None
+
+        assert router.delete_deployment("limited-deployment") is not None
+        finite = Deployment(**_max_parallel_deployment(7))
+        assert router.add_deployment(finite) is finite
+        aggregate_after = router._get_client(
+            deployment=router.model_list[0],
+            kwargs={},
+            client_type="max_parallel_requests",
+        )
+        operation_after = router._get_client(
+            deployment=router.model_list[0],
+            kwargs={},
+            client_type="max_parallel_requests",
+            operation="video_generation",
+        )
+        assert aggregate_after is aggregate
+        assert operation_after is operation
+        assert aggregate.capacity == 7
+        assert operation.capacity == 7
+        assert aggregate._config_version == 2
+        assert operation._config_version == 2
+        assert aggregate._value == 5
+        assert operation._value == 5
+    finally:
+        if not aggregate_waiter.done():
+            aggregate_waiter.cancel()
+        if not operation_waiter.done():
+            operation_waiter.cancel()
+        await asyncio.gather(aggregate_waiter, operation_waiter, return_exceptions=True)
+        if aggregate_waiter_acquired:
+            aggregate.release()
+        if operation_waiter_acquired:
+            operation.release()
+        aggregate.release()
+        operation.release()
+        router.discard()
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_request_limiter_unlimited_version_rejects_stale_finite_update() -> None:
+    limiter = MaxParallelRequestsLimiter(1)
+
+    limiter.update_capacity(None, config_version=2)
+    limiter.update_capacity(7, config_version=1)
+
+    assert limiter.capacity is None
+    assert limiter._config_version == 2
+    await asyncio.wait_for(limiter.acquire(), timeout=1)
+    limiter.release()
 
 
 def test_max_parallel_request_first_initialization_is_atomic_across_threads():
@@ -5920,6 +6044,59 @@ async def test_max_parallel_request_limiter_does_not_claim_before_stopped_loop_c
         assert not stopped_task.done()
     finally:
         stopped_task._log_destroy_pending = False
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_request_limiter_does_not_claim_before_waiting_task_resumes() -> None:
+    limiter = MaxParallelRequestsLimiter(1)
+    await limiter.acquire()
+    stopped_loop, stopped_task = _create_stopped_loop_waiter(limiter)
+    stopped_future = limiter._waiters[0].future
+
+    try:
+        limiter.release()
+        stopped_loop.call_soon_threadsafe(stopped_loop.stop)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            executor.submit(stopped_loop.run_forever).result(timeout=1)
+        assert stopped_future.done()
+        assert not stopped_task.done()
+        stopped_loop.close()
+
+        await asyncio.wait_for(limiter.acquire(), timeout=1)
+        limiter.release()
+        assert limiter._value == 1
+        assert len(limiter._waiters) == 0
+    finally:
+        if not stopped_loop.is_closed():
+            stopped_loop.close()
+        stopped_task._log_destroy_pending = False
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_request_limiter_prevents_release_reacquire_barging() -> None:
+    limiter = MaxParallelRequestsLimiter(1)
+    await limiter.acquire()
+    order: list[str] = []
+
+    async def victim() -> None:
+        await limiter.acquire()
+        order.append("victim")
+        limiter.release()
+
+    victim_task = asyncio.create_task(victim())
+    await asyncio.sleep(0)
+
+    async def release_and_reacquire() -> None:
+        limiter.release()
+        await limiter.acquire()
+        order.append("reacquirer")
+        limiter.release()
+        await victim_task
+
+    await asyncio.wait_for(release_and_reacquire(), timeout=1)
+    assert order == ["victim", "reacquirer"]
+    assert limiter._value == 1
+    assert len(limiter._waiters) == 0
 
 
 @pytest.mark.asyncio
