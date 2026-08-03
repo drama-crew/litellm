@@ -5111,7 +5111,7 @@ def _video_concurrency_router() -> litellm.Router:
 @pytest.mark.asyncio
 async def test_video_operations_have_independent_max_parallel_request_limits():
     entries: asyncio.Queue[str] = asyncio.Queue()
-    releases = {operation: asyncio.Event() for operation in ("create", "status", "content")}
+    releases = {operation: asyncio.Event() for operation in ("create", "status", "content", "general")}
     active = {operation: 0 for operation in releases}
     max_active = {operation: 0 for operation in releases}
 
@@ -5132,36 +5132,42 @@ async def test_video_operations_have_independent_max_parallel_request_limits():
     async def content_provider(**kwargs):
         return await provider("content", b"video-content", **kwargs)
 
+    async def general_provider(**kwargs):
+        return await provider("general", {"output": kwargs["contents"]}, **kwargs)
+
     router = _video_concurrency_router()
     router.avideo_generation = router.factory_function(create_provider, call_type="avideo_generation")
     router.avideo_status = router.factory_function(status_provider, call_type="avideo_status")
     router.avideo_content = router.factory_function(content_provider, call_type="avideo_content")
+    router.agenerate_content = router.factory_function(general_provider, call_type="agenerate_content")
     first_tasks = [
         asyncio.create_task(router.avideo_generation(model="video-model", prompt="first")),
         asyncio.create_task(router.avideo_status(model="video-model", video_id="first")),
         asyncio.create_task(router.avideo_content(model="video-model", video_id="first")),
+        asyncio.create_task(router.agenerate_content(model="video-model", contents="first")),
     ]
     second_tasks = []
 
     try:
-        first_entries = {await asyncio.wait_for(entries.get(), timeout=1) for _ in range(3)}
-        assert first_entries == {"create", "status", "content"}
+        first_entries = {await asyncio.wait_for(entries.get(), timeout=1) for _ in range(4)}
+        assert first_entries == {"create", "status", "content", "general"}
         second_tasks = [
             asyncio.create_task(router.avideo_generation(model="video-model", prompt="second")),
             asyncio.create_task(router.avideo_status(model="video-model", video_id="second")),
             asyncio.create_task(router.avideo_content(model="video-model", video_id="second")),
+            asyncio.create_task(router.agenerate_content(model="video-model", contents="second")),
         ]
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(entries.get(), timeout=0.05)
 
-        for operation in ("create", "status", "content"):
+        for operation in ("create", "status", "content", "general"):
             releases[operation].set()
             assert await asyncio.wait_for(entries.get(), timeout=1) == operation
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(entries.get(), timeout=0.05)
 
         await asyncio.wait_for(asyncio.gather(*first_tasks, *second_tasks), timeout=1)
-        assert max_active == {"create": 1, "status": 1, "content": 1}
+        assert max_active == {"create": 1, "status": 1, "content": 1, "general": 1}
     finally:
         for release in releases.values():
             release.set()
@@ -5457,9 +5463,12 @@ async def test_max_parallel_request_cache_keys_preserve_unicode_code_points(
 def test_max_parallel_request_semaphore_survives_cache_eviction():
     router = _video_concurrency_router()
     deployment = router.model_list[0]
-    key = InitalizeCachedClient.get_max_parallel_requests_cache_key(model_id="video-deployment")
+    model_id = "video-deployment"
+    key = InitalizeCachedClient.get_max_parallel_requests_cache_key(model_id=model_id)
+    legacy_key = f"{model_id}_max_parallel_requests_client"
     first = router._get_client(deployment=deployment, kwargs={}, client_type="max_parallel_requests")
     router.cache.in_memory_cache._remove_key(key)
+    router.cache.in_memory_cache._remove_key(legacy_key)
     second = router._get_client(deployment=deployment, kwargs={}, client_type="max_parallel_requests")
 
     try:
@@ -5507,7 +5516,7 @@ def _max_parallel_deployment(capacity: int) -> dict:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("update_path", ["set_model_list", "upsert_deployment"])
+@pytest.mark.parametrize("update_path", ["set_model_list", "upsert_deployment", "delete_add"])
 async def test_max_parallel_request_hot_reload_resizes_one_live_limiter(update_path: str):
     from litellm.types.router import Deployment
 
@@ -5550,8 +5559,11 @@ async def test_max_parallel_request_hot_reload_resizes_one_live_limiter(update_p
     updated_deployment = _max_parallel_deployment(1)
     if update_path == "set_model_list":
         router.set_model_list([updated_deployment])
-    else:
+    elif update_path == "upsert_deployment":
         router.upsert_deployment(Deployment(**updated_deployment))
+    else:
+        router.delete_deployment("limited-deployment")
+        router.add_deployment(Deployment(**updated_deployment))
     limiter_after = router._get_client(
         deployment=router.model_list[0],
         kwargs={},

@@ -1501,3 +1501,21 @@ async def test_retry_resubmits_a_byte_identical_body():
     assert first_body["asset_ids"] == ["asset-1", "asset-2"]
     assert first_body["thread_id"] == "thread-existing"
     assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
+
+
+def test_sync_retry_resubmits_a_byte_identical_body():
+    fake = FakeSyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+    client = XiaoyunqueClient(token="t", sync_client=fake, sleep=_RecordingSleep(), jitter=_no_jitter)
+    client.submit_run(
+        message="a cat on a windowsill",
+        asset_ids=["asset-1", "asset-2"],
+        video_part_tool_param={"model": "Seedance_2.5", "duration_sec": 30, "prompt": "a cat on a windowsill"},
+        thread_id="thread-existing",
+    )
+
+    assert len(fake.calls) == 2, "expected exactly one retry"
+    first_body, second_body = fake.calls[0][1], fake.calls[1][1]
+    assert second_body == first_body
+    assert first_body["asset_ids"] == ["asset-1", "asset-2"]
+    assert first_body["thread_id"] == "thread-existing"
+    assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
