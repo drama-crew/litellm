@@ -44,6 +44,7 @@ _PROXY_ADMIN_VIEW_ONLY_BLOCKED_ROUTES = frozenset(
         # key management — keep in sync with KeyManagementRoutes write entries
         KeyManagementRoutes.KEY_GENERATE.value,
         KeyManagementRoutes.KEY_UPDATE.value,
+        KeyManagementRoutes.KEY_MODEL_ADD.value,
         KeyManagementRoutes.KEY_DELETE.value,
         KeyManagementRoutes.KEY_REGENERATE.value,
         KeyManagementRoutes.KEY_GENERATE_SERVICE_ACCOUNT.value,
@@ -740,6 +741,7 @@ class RouteChecks:
             "/key/generate",
             "/key/delete",
             "/key/update",
+            "/key/model/add",
             "/key/regenerate",
             "/key/service-account/generate",
             "/key/block",

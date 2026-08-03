@@ -14530,3 +14530,311 @@ def test_generate_key_helper_fn_accepts_per_tag_rate_limits():
         request_type="user",
         tag_rpm_limit={"cell-1": 5},
     )
+
+
+_KEY_MODEL_ADD_PACKAGE = "litellm.proxy.management_endpoints.key_management_endpoints"
+_KEY_MODEL_ADD_SECRET = "sk-key-model-add-super-secret"
+
+
+def _key_model_add_request(models):
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        KeyModelAddRequest,
+    )
+
+    return KeyModelAddRequest(key=_KEY_MODEL_ADD_SECRET, models=models)
+
+
+def _key_model_add_existing(models=None, *, team_id=None, project_id=None):
+    from litellm.proxy._types import hash_token
+
+    return LiteLLM_VerificationToken(
+        token=hash_token(_KEY_MODEL_ADD_SECRET),
+        user_id="key-owner",
+        created_by="key-owner",
+        models=[] if models is None else models,
+        team_id=team_id,
+        project_id=project_id,
+    )
+
+
+def _setup_key_model_add(monkeypatch, *, existing=None, query_result=None):
+    from datetime import datetime, timezone
+
+    existing_row = existing or _key_model_add_existing(["existing-model"])
+    result = query_result
+    if result is None:
+        result = [
+            {
+                "models": ["existing-model", "new-model"],
+                "updated_at": datetime(2026, 8, 4, tzinfo=timezone.utc),
+            }
+        ]
+    writer_db = MagicMock()
+    writer_db.query_raw = AsyncMock(return_value=result)
+    prisma_client = MagicMock()
+    prisma_client.writer_db = writer_db
+    cache = MagicMock()
+    logging_obj = MagicMock()
+    logging_obj.internal_usage_cache.dual_cache.async_delete_cache = AsyncMock()
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", cache)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", logging_obj)
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.premium_user", True)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
+    get_existing = AsyncMock(return_value=existing_row)
+    validate = AsyncMock()
+    cache_delete = AsyncMock()
+    audit = AsyncMock()
+    monkeypatch.setattr(f"{_KEY_MODEL_ADD_PACKAGE}._get_and_validate_existing_key", get_existing)
+    monkeypatch.setattr(f"{_KEY_MODEL_ADD_PACKAGE}._validate_update_key_data", validate)
+    monkeypatch.setattr(f"{_KEY_MODEL_ADD_PACKAGE}._delete_cache_key_object", cache_delete)
+    monkeypatch.setattr(
+        f"{_KEY_MODEL_ADD_PACKAGE}.KeyManagementEventHooks.async_key_updated_hook",
+        audit,
+    )
+    return prisma_client, get_existing, validate, cache_delete, audit
+
+
+def test_key_model_add_request_filters_blanks_and_duplicates():
+    request = _key_model_add_request([" new-model ", "", "new-model", "   ", "other-model"])
+    assert request.models == ["new-model", "other-model"]
+
+
+@pytest.mark.parametrize("models", [[], [""], [" ", "\t"]])
+def test_key_model_add_request_requires_a_model(models):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        _key_model_add_request(models)
+
+
+def test_key_model_add_request_requires_a_key():
+    from pydantic import ValidationError
+
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        KeyModelAddRequest,
+    )
+
+    with pytest.raises(ValidationError):
+        KeyModelAddRequest(key="", models=["new-model"])
+
+
+def test_key_model_add_is_registered_as_management_write_route():
+    from litellm.proxy._types import KeyManagementRoutes, LiteLLMRoutes
+    from litellm.proxy.auth.route_checks import _PROXY_ADMIN_VIEW_ONLY_BLOCKED_ROUTES
+
+    route = KeyManagementRoutes.KEY_MODEL_ADD.value
+    assert route in LiteLLMRoutes.key_management_routes.value
+    assert route in LiteLLMRoutes.management_routes.value
+    assert route in _PROXY_ADMIN_VIEW_ONLY_BLOCKED_ROUTES
+
+
+@pytest.mark.asyncio
+async def test_key_model_add_uses_hashed_token_and_atomic_writer_union(monkeypatch):
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.management_endpoints.key_management_endpoints import key_model_add
+
+    prisma_client, get_existing, validate, cache_delete, audit = _setup_key_model_add(monkeypatch)
+    response = await key_model_add(
+        data=_key_model_add_request(["new-model", "new-model"]),
+        request=MagicMock(),
+        user_api_key_dict=UserAPIKeyAuth(
+            user_id="key-owner",
+            user_role=LitellmUserRoles.INTERNAL_USER,
+        ),
+        litellm_changed_by="admin@example.com",
+    )
+
+    hashed = hash_token(_KEY_MODEL_ADD_SECRET)
+    get_existing.assert_awaited_once_with(token=_KEY_MODEL_ADD_SECRET, prisma_client=prisma_client)
+    validate_request = validate.await_args.kwargs["data"]
+    assert validate_request.key == hashed
+    assert validate_request.models == ["new-model"]
+    query_call = prisma_client.writer_db.query_raw.await_args
+    sql = query_call.args[0]
+    assert sql.count("UPDATE") == 1
+    assert 'UPDATE "LiteLLM_VerificationToken"' in sql
+    assert "cardinality(COALESCE(models, ARRAY[]::text[])) = 0" in sql
+    assert "SELECT DISTINCT" in sql
+    assert "RETURNING models, updated_at" in sql
+    assert query_call.args[1:] == (["new-model"], hashed)
+    assert response.models == ["existing-model", "new-model"]
+    assert response.unrestricted is False
+    assert response.model_dump().get("key") is None
+    cache_delete.assert_awaited_once()
+    assert cache_delete.await_args.kwargs["hashed_token"] == hashed
+    audit_request = audit.await_args.kwargs["data"]
+    assert audit_request.key == hashed
+    assert _KEY_MODEL_ADD_SECRET not in repr(audit.await_args)
+
+
+@pytest.mark.asyncio
+async def test_key_model_add_preserves_unrestricted(monkeypatch):
+    from datetime import datetime, timezone
+
+    from litellm.proxy.management_endpoints.key_management_endpoints import key_model_add
+
+    _setup_key_model_add(
+        monkeypatch,
+        existing=_key_model_add_existing([]),
+        query_result=[{"models": [], "updated_at": datetime(2026, 8, 4, tzinfo=timezone.utc)}],
+    )
+    response = await key_model_add(
+        data=_key_model_add_request(["new-model"]),
+        request=MagicMock(),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+        litellm_changed_by=None,
+    )
+    assert response.models == []
+    assert response.unrestricted is True
+
+
+@pytest.mark.asyncio
+async def test_key_model_add_returns_404_when_atomic_update_finds_no_row(monkeypatch):
+    from litellm.proxy.management_endpoints.key_management_endpoints import key_model_add
+
+    _setup_key_model_add(monkeypatch, query_result=[])
+    with pytest.raises(HTTPException) as exc:
+        await key_model_add(
+            data=_key_model_add_request(["new-model"]),
+            request=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+            litellm_changed_by=None,
+        )
+    assert exc.value.status_code == 404
+    assert _KEY_MODEL_ADD_SECRET not in str(exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_key_model_add_enforces_parent_team_models_before_write(monkeypatch):
+    from litellm.proxy.management_endpoints.key_management_endpoints import key_model_add
+
+    prisma_client, _, _, _, _ = _setup_key_model_add(
+        monkeypatch,
+        existing=_key_model_add_existing(["existing-model"], team_id="team-1"),
+    )
+    team = LiteLLM_TeamTableCachedObj(team_id="team-1", models=["existing-model"])
+    get_team = AsyncMock(return_value=team)
+    check_team_model = AsyncMock(side_effect=HTTPException(status_code=403, detail="team model denied"))
+    monkeypatch.setattr(f"{_KEY_MODEL_ADD_PACKAGE}.get_team_object", get_team)
+    monkeypatch.setattr(f"{_KEY_MODEL_ADD_PACKAGE}.can_team_access_model", check_team_model)
+
+    with pytest.raises(HTTPException) as exc:
+        await key_model_add(
+            data=_key_model_add_request(["new-model"]),
+            request=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+            litellm_changed_by=None,
+        )
+    assert exc.value.status_code == 403
+    get_team.assert_awaited_once()
+    check_team_model.assert_awaited_once_with(
+        model="new-model",
+        team_object=team,
+        llm_router=None,
+    )
+    prisma_client.writer_db.query_raw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_key_model_add_permission_or_scope_rejection_prevents_write(monkeypatch):
+    from litellm.proxy.management_endpoints.key_management_endpoints import key_model_add
+
+    prisma_client, _, validate, cache_delete, audit = _setup_key_model_add(
+        monkeypatch,
+        existing=_key_model_add_existing(team_id="team-1", project_id="project-1"),
+    )
+    validate.side_effect = HTTPException(status_code=403, detail="model not allowed")
+    with pytest.raises(HTTPException) as exc:
+        await key_model_add(
+            data=_key_model_add_request(["new-model"]),
+            request=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(
+                user_id="other-user",
+                user_role=LitellmUserRoles.INTERNAL_USER,
+            ),
+            litellm_changed_by=None,
+        )
+    assert exc.value.status_code == 403
+    prisma_client.writer_db.query_raw.assert_not_awaited()
+    cache_delete.assert_not_awaited()
+    audit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_key_model_add_custom_hook_receives_hash_and_can_deny(monkeypatch):
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.management_endpoints.key_management_endpoints import key_model_add
+
+    prisma_client, _, _, _, _ = _setup_key_model_add(monkeypatch)
+    custom_hook = AsyncMock(return_value={"decision": False, "message": "denied"})
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", custom_hook)
+    with pytest.raises(HTTPException) as exc:
+        await key_model_add(
+            data=_key_model_add_request(["new-model"]),
+            request=MagicMock(),
+            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+            litellm_changed_by=None,
+        )
+    assert exc.value.status_code == 403
+    assert custom_hook.await_args.args[0].key == hash_token(_KEY_MODEL_ADD_SECRET)
+    assert _KEY_MODEL_ADD_SECRET not in repr(custom_hook.await_args)
+    prisma_client.writer_db.query_raw.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_key_model_add_concurrent_grants_keep_both_models(monkeypatch):
+    import asyncio
+    from datetime import datetime, timezone
+
+    from litellm.proxy.management_endpoints.key_management_endpoints import key_model_add
+
+    prisma_client, _, _, _, _ = _setup_key_model_add(monkeypatch)
+    state = ["existing-model"]
+    lock = asyncio.Lock()
+
+    async def atomic_query(sql, models, hashed_token):
+        async with lock:
+            if state:
+                state[:] = list(dict.fromkeys([*state, *models]))
+            return [{"models": list(state), "updated_at": datetime.now(timezone.utc)}]
+
+    prisma_client.writer_db.query_raw.side_effect = atomic_query
+    caller = UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN)
+    responses = await asyncio.gather(
+        key_model_add(
+            data=_key_model_add_request(["model-a"]),
+            request=MagicMock(),
+            user_api_key_dict=caller,
+            litellm_changed_by=None,
+        ),
+        key_model_add(
+            data=_key_model_add_request(["model-b"]),
+            request=MagicMock(),
+            user_api_key_dict=caller,
+            litellm_changed_by=None,
+        ),
+    )
+    assert set(state) == {"existing-model", "model-a", "model-b"}
+    assert set(responses[-1].models) == set(state)
+    assert prisma_client.writer_db.query_raw.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_key_model_add_does_not_expose_secret_on_database_failure(monkeypatch, caplog):
+    import logging
+
+    from litellm.proxy.management_endpoints.key_management_endpoints import key_model_add
+
+    prisma_client, _, _, _, _ = _setup_key_model_add(monkeypatch)
+    prisma_client.writer_db.query_raw.side_effect = RuntimeError("database unavailable")
+    with caplog.at_level(logging.ERROR, logger="LiteLLM Proxy"):
+        with pytest.raises(RuntimeError):
+            await key_model_add(
+                data=_key_model_add_request(["new-model"]),
+                request=MagicMock(),
+                user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+                litellm_changed_by=None,
+            )
+    assert _KEY_MODEL_ADD_SECRET not in "\n".join(record.getMessage() for record in caplog.records)

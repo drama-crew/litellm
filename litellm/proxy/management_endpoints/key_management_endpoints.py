@@ -118,6 +118,8 @@ from litellm.types.proxy.management_endpoints.key_management_endpoints import (
     BulkUpdateKeyResponse,
     BulkUpdateTeamKeysRequest,
     FailedKeyUpdate,
+    KeyModelAddRequest,
+    KeyModelAddResponse,
     SuccessfulKeyUpdate,
 )
 from litellm.types.router import Deployment
@@ -2476,6 +2478,114 @@ async def _validate_update_key_data(
         )
         if normalized_object_permission is not None:
             data.object_permission = LiteLLM_ObjectPermissionBase(**normalized_object_permission)
+
+
+@router.post(
+    "/key/model/add",
+    tags=["key management"],
+    dependencies=[Depends(user_api_key_auth)],
+    response_model=KeyModelAddResponse,
+)
+@management_endpoint_wrapper
+async def key_model_add(
+    request: Request,
+    data: KeyModelAddRequest,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    litellm_changed_by: str | None = Header(
+        None,
+        description="The litellm-changed-by header enables tracking of actions performed by authorized users on behalf of other users, providing an audit trail for accountability",
+    ),
+) -> KeyModelAddResponse:
+    from litellm.proxy.proxy_server import (
+        llm_router,
+        premium_user,
+        prisma_client,
+        proxy_logging_obj,
+        user_api_key_cache,
+        user_custom_key_update,
+    )
+
+    existing_key_row = await _get_and_validate_existing_key(
+        token=data.key,
+        prisma_client=prisma_client,
+    )
+    hashed_token = existing_key_row.token
+    update_request = UpdateKeyRequest(key=hashed_token, models=data.models)
+    await _validate_update_key_data(
+        data=update_request,
+        existing_key_row=existing_key_row,
+        user_api_key_dict=user_api_key_dict,
+        llm_router=llm_router,
+        premium_user=premium_user,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+    )
+
+    if existing_key_row.team_id is not None and existing_key_row.models:
+        team_obj = await get_team_object(
+            team_id=existing_key_row.team_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            check_db_only=True,
+        )
+        if team_obj is not None:
+            for model in data.models:
+                if model == SpecialModelNames.all_team_models.value:
+                    continue
+                await can_team_access_model(
+                    model=model,
+                    team_object=team_obj,
+                    llm_router=llm_router,
+                )
+
+    if user_custom_key_update is not None:
+        if not inspect.iscoroutinefunction(user_custom_key_update):
+            raise ValueError("user_custom_key_update must be a coroutine")
+        custom_result = await user_custom_key_update(update_request)
+        if not custom_result.get("decision", True):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=custom_result.get("message", "Authentication Failed - Custom Auth Rule"),
+            )
+
+    if prisma_client is None:
+        raise HTTPException(status_code=500, detail={"error": "Database not connected"})
+
+    updated_rows = await prisma_client.writer_db.query_raw(
+        'UPDATE "LiteLLM_VerificationToken" '
+        "SET models = CASE "
+        "  WHEN cardinality(COALESCE(models, ARRAY[]::text[])) = 0 "
+        "  THEN COALESCE(models, ARRAY[]::text[]) "
+        "  ELSE ARRAY(SELECT DISTINCT unnest(models || $1::text[])) "
+        "END, updated_at = NOW() "
+        "WHERE token = $2 "
+        "RETURNING models, updated_at",
+        data.models,
+        hashed_token,
+    )
+    if not updated_rows:
+        raise HTTPException(status_code=404, detail={"error": "Key not found."})
+
+    response = KeyModelAddResponse.model_validate(
+        {
+            "models": updated_rows[0]["models"],
+            "unrestricted": len(updated_rows[0]["models"]) == 0,
+            "updated_at": updated_rows[0]["updated_at"],
+        }
+    )
+    await _delete_cache_key_object(
+        hashed_token=hashed_token,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+    await KeyManagementEventHooks.async_key_updated_hook(
+        data=update_request,
+        existing_key_row=existing_key_row,
+        response=response,
+        user_api_key_dict=user_api_key_dict,
+        litellm_changed_by=litellm_changed_by,
+    )
+    return response
 
 
 @router.post("/key/update", tags=["key management"], dependencies=[Depends(user_api_key_auth)])

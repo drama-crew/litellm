@@ -6686,6 +6686,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/key/model/add": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Key Model Add */
+        post: operations["key_model_add_key_model_add_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/key/regenerate": {
         parameters: {
             query?: never;
@@ -24330,7 +24347,7 @@ export interface components {
          * @description Enum for key management routes
          * @enum {string}
          */
-        KeyManagementRoutes: "/key/generate" | "/key/update" | "/key/delete" | "/key/regenerate" | "/key/service-account/generate" | "/key/{key_id}/regenerate" | "/key/block" | "/key/unblock" | "/key/bulk_update" | "/team/key/bulk_update" | "/key/{key_id}/reset_spend" | "/key/access_group_assignment" | "/key/info" | "/key/health" | "/key/list" | "/key/aliases" | "/team/daily/activity" | "/spend/logs" | "/spend/logs/v2";
+        KeyManagementRoutes: "/key/generate" | "/key/update" | "/key/model/add" | "/key/delete" | "/key/regenerate" | "/key/service-account/generate" | "/key/{key_id}/regenerate" | "/key/block" | "/key/unblock" | "/key/bulk_update" | "/team/key/bulk_update" | "/key/{key_id}/reset_spend" | "/key/access_group_assignment" | "/key/info" | "/key/health" | "/key/list" | "/key/aliases" | "/team/daily/activity" | "/spend/logs" | "/spend/logs/v2";
         /**
          * KeyManagementSystem
          * @enum {string}
@@ -24353,6 +24370,25 @@ export interface components {
         KeyMetricWithMetadata: {
             metadata?: components["schemas"]["KeyMetadata"];
             metrics: components["schemas"]["SpendMetrics"];
+        };
+        /** KeyModelAddRequest */
+        KeyModelAddRequest: {
+            /** Key */
+            key: string;
+            /** Models */
+            models: string[];
+        };
+        /** KeyModelAddResponse */
+        KeyModelAddResponse: {
+            /** Models */
+            models: string[];
+            /** Unrestricted */
+            unrestricted: boolean;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at: string;
         };
         /** KeyRequest */
         KeyRequest: {
@@ -42130,6 +42166,42 @@ export interface operations {
             };
         };
     };
+    key_model_add_key_model_add_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description The litellm-changed-by header enables tracking of actions performed by authorized users on behalf of other users, providing an audit trail for accountability */
+                "litellm-changed-by"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KeyModelAddRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KeyModelAddResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     regenerate_key_fn_key_regenerate_post: {
         parameters: {
             query?: {
@@ -48561,6 +48633,8 @@ export interface operations {
                 end_date?: string | null;
                 /** @description When start_date and end_date are provided, summarize=true returns aggregated data by date (legacy behavior), summarize=false returns filtered individual logs */
                 summarize?: boolean;
+                /** @description Interpret start_date/end_date as calendar days in UTC+offset (e.g. 480 = Asia/Shanghai) for both summarize paths; summarize=true additionally buckets the returned days in that timezone. */
+                tz_offset_minutes?: number;
             };
             header?: never;
             path?: never;
