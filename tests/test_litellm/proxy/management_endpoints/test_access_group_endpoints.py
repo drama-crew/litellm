@@ -1231,6 +1231,123 @@ def test_update_access_group_syncs_removed_keys(client_and_mocks):
     assert "ag-update" not in call_kwargs["data"]["access_group_ids"]
 
 
+def test_update_access_group_orders_team_and_key_swaps_across_add_and_remove(client_and_mocks):
+    client, mock_prisma, mock_access_group_table, _, _ = client_and_mocks
+    team_rows = {
+        "team-1": MagicMock(team_id="team-1", access_group_ids=["ag-2"]),
+        "team-2": MagicMock(team_id="team-2", access_group_ids=["ag-1"]),
+    }
+    key_rows = {
+        "key-1": MagicMock(token="key-1", access_group_ids=["ag-2"]),
+        "key-2": MagicMock(token="key-2", access_group_ids=["ag-1"]),
+    }
+    access_group_rows = {
+        "ag-1": _make_access_group_record(
+            access_group_id="ag-1",
+            assigned_team_ids=["team-2"],
+            assigned_key_ids=["key-2"],
+        ),
+        "ag-2": _make_access_group_record(
+            access_group_id="ag-2",
+            assigned_team_ids=["team-1"],
+            assigned_key_ids=["key-1"],
+        ),
+    }
+    operations = []
+
+    mock_access_group_table.find_unique = AsyncMock(
+        side_effect=lambda *, where: access_group_rows[where["access_group_id"]]
+    )
+    mock_prisma.db.litellm_teamtable.find_unique = AsyncMock(
+        side_effect=lambda *, where: team_rows[where["team_id"]]
+    )
+    mock_prisma.db.litellm_verificationtoken.find_unique = AsyncMock(
+        side_effect=lambda *, where: key_rows[where["token"]]
+    )
+
+    def record_team_update(*, where, data):
+        team_id = where["team_id"]
+        before = set(team_rows[team_id].access_group_ids)
+        after = set(data["access_group_ids"])
+        added = after - before
+        removed = before - after
+        action, access_group_id = (
+            ("add", next(iter(added))) if added else ("remove", next(iter(removed)))
+        )
+        operations.append((access_group_id, "team", team_id, action))
+
+    def record_key_update(*, where, data):
+        token = where["token"]
+        before = set(key_rows[token].access_group_ids)
+        after = set(data["access_group_ids"])
+        added = after - before
+        removed = before - after
+        action, access_group_id = (
+            ("add", next(iter(added))) if added else ("remove", next(iter(removed)))
+        )
+        operations.append((access_group_id, "key", token, action))
+
+    mock_prisma.db.litellm_teamtable.update = AsyncMock(side_effect=record_team_update)
+    mock_prisma.db.litellm_verificationtoken.update = AsyncMock(side_effect=record_key_update)
+
+    first_response = client.put(
+        "/v1/access_group/ag-1",
+        json={"assigned_team_ids": ["team-1"], "assigned_key_ids": ["key-1"]},
+    )
+    second_response = client.put(
+        "/v1/access_group/ag-2",
+        json={"assigned_team_ids": ["team-2"], "assigned_key_ids": ["key-2"]},
+    )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert operations == [
+        ("ag-1", "team", "team-1", "add"),
+        ("ag-1", "team", "team-2", "remove"),
+        ("ag-1", "key", "key-1", "add"),
+        ("ag-1", "key", "key-2", "remove"),
+        ("ag-2", "team", "team-1", "remove"),
+        ("ag-2", "team", "team-2", "add"),
+        ("ag-2", "key", "key-1", "remove"),
+        ("ag-2", "key", "key-2", "add"),
+    ]
+
+
+def test_create_access_group_orders_all_team_rows_before_all_key_rows(client_and_mocks):
+    client, mock_prisma, _, _, _ = client_and_mocks
+    operations = []
+
+    async def find_team(*, where):
+        team_id = where["team_id"]
+        operations.append(("team", team_id))
+        return MagicMock(team_id=team_id, access_group_ids=[])
+
+    async def find_key(*, where):
+        token = where["token"]
+        operations.append(("key", token))
+        return MagicMock(token=token, access_group_ids=[])
+
+    mock_prisma.db.litellm_teamtable.find_unique = AsyncMock(side_effect=find_team)
+    mock_prisma.db.litellm_verificationtoken.find_unique = AsyncMock(side_effect=find_key)
+
+    response = client.post(
+        "/v1/access_group",
+        json={
+            "access_group_name": "ordered-create",
+            "assigned_team_ids": ["team-2", "team-1"],
+            "assigned_key_ids": ["key-2", "key-1"],
+        },
+    )
+
+    assert response.status_code == 201
+    assert operations == [
+        ("team", "team-1"),
+        ("team", "team-2"),
+        ("key", "key-1"),
+        ("key", "key-2"),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Sync tests: DELETE (out-of-sync data handling)
 # ---------------------------------------------------------------------------
@@ -1266,6 +1383,56 @@ def test_delete_access_group_locks_group_before_team_and_key_rows(client_and_moc
     lock_sql = mock_prisma.db.query_raw.await_args.args[0]
     assert '"LiteLLM_AccessGroupTable"' in lock_sql
     assert "FOR UPDATE" in lock_sql
+
+
+def test_delete_access_group_orders_find_many_and_out_of_sync_rows(client_and_mocks):
+    client, mock_prisma, mock_access_group_table, _, _ = client_and_mocks
+    existing = _make_access_group_record(
+        access_group_id="ag-to-delete",
+        assigned_team_ids=["team-3", "team-1", "team-2"],
+        assigned_key_ids=["key-3", "key-1", "key-2"],
+    )
+    mock_access_group_table.find_unique = AsyncMock(return_value=existing)
+    team_two = MagicMock(team_id="team-2", access_group_ids=["ag-to-delete"])
+    key_two = MagicMock(token="key-2", access_group_ids=["ag-to-delete"])
+    mock_prisma.db.litellm_teamtable.find_many = AsyncMock(return_value=[team_two])
+    mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[key_two])
+    team_find_order = []
+    key_find_order = []
+    operation_order = []
+
+    async def find_team(*, where):
+        team_id = where["team_id"]
+        team_find_order.append(team_id)
+        return MagicMock(team_id=team_id, access_group_ids=["ag-to-delete"])
+
+    async def find_key(*, where):
+        token = where["token"]
+        key_find_order.append(token)
+        return MagicMock(token=token, access_group_ids=["ag-to-delete"])
+
+    mock_prisma.db.litellm_teamtable.find_unique = AsyncMock(side_effect=find_team)
+    mock_prisma.db.litellm_verificationtoken.find_unique = AsyncMock(side_effect=find_key)
+    mock_prisma.db.litellm_teamtable.update = AsyncMock(
+        side_effect=lambda *, where, data: operation_order.append(("team", where["team_id"]))
+    )
+    mock_prisma.db.litellm_verificationtoken.update = AsyncMock(
+        side_effect=lambda *, where, data: operation_order.append(("key", where["token"]))
+    )
+
+    response = client.delete("/v1/access_group/ag-to-delete")
+
+    assert response.status_code == 204
+    assert team_find_order == ["team-1", "team-3"]
+    assert key_find_order == ["key-1", "key-3"]
+    assert operation_order == [
+        ("team", "team-1"),
+        ("team", "team-2"),
+        ("team", "team-3"),
+        ("key", "key-1"),
+        ("key", "key-2"),
+        ("key", "key-3"),
+    ]
 
 
 def test_delete_access_group_handles_out_of_sync_assigned_teams(client_and_mocks):
