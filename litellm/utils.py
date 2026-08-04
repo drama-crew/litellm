@@ -8934,6 +8934,14 @@ class ProviderConfigManager:
             )
 
             return AWSPollyTextToSpeechConfig()
+        elif litellm.LlmProviders.OPENAI == provider:
+            from litellm.llms.wavespeed.text_to_speech.transformation import (
+                WaveSpeedTextToSpeechConfig,
+                is_wavespeed_speech_model,
+            )
+
+            if is_wavespeed_speech_model(model):
+                return WaveSpeedTextToSpeechConfig()
         return None
 
     @staticmethod
