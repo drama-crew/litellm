@@ -133,6 +133,43 @@ class KeyManagementEventHooks:
             )
 
     @staticmethod
+    async def async_key_models_added_hook(
+        hashed_token: str,
+        models: list[str],
+        existing_key_row: LiteLLM_VerificationToken,
+        user_api_key_dict: UserAPIKeyAuth,
+        litellm_changed_by: str | None = None,
+    ) -> None:
+        from litellm.proxy.management_helpers.audit_logs import (
+            create_audit_log_for_update,
+            get_audit_log_changed_by,
+        )
+        from litellm.proxy.proxy_server import litellm_proxy_admin_name
+
+        if litellm.store_audit_logs is not True:
+            return
+
+        asyncio.create_task(
+            create_audit_log_for_update(
+                request_data=LiteLLM_AuditLogs(
+                    id=str(uuid.uuid4()),
+                    updated_at=datetime.now(timezone.utc),
+                    changed_by=get_audit_log_changed_by(
+                        litellm_changed_by=litellm_changed_by,
+                        user_api_key_dict=user_api_key_dict,
+                        litellm_proxy_admin_name=litellm_proxy_admin_name,
+                    ),
+                    changed_by_api_key=user_api_key_dict.api_key,
+                    table_name=LitellmTableNames.KEY_TABLE_NAME,
+                    object_id=hashed_token,
+                    action="updated",
+                    updated_values=json.dumps({"models": models}, default=str),
+                    before_value=json.dumps(existing_key_row.json(exclude_none=True), default=str),
+                )
+            )
+        )
+
+    @staticmethod
     async def async_key_rotated_hook(
         data: Optional[RegenerateKeyRequest],
         existing_key_row: LiteLLM_VerificationToken,

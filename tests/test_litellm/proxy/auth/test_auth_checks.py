@@ -4443,3 +4443,43 @@ async def test_get_project_object_check_db_only_bypasses_cache():
     assert project.models == ["current-model"]
     cache.async_get_cache.assert_not_awaited()
     cache.async_set_cache.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_can_team_access_model_db_only_does_not_use_stale_access_group_cache():
+    from litellm.proxy._types import LiteLLM_AccessGroupTable, LiteLLM_TeamTable
+    from litellm.proxy.auth.auth_checks import can_team_access_model
+
+    stale_group = LiteLLM_AccessGroupTable(
+        access_group_id="group-1",
+        access_group_name="stale-group",
+        access_model_names=["target-model"],
+    )
+    writer_group = LiteLLM_AccessGroupTable(
+        access_group_id="group-1",
+        access_group_name="writer-group",
+        access_model_names=[],
+    )
+    team = LiteLLM_TeamTable(
+        team_id="team-1",
+        models=["different-model"],
+        access_group_ids=["group-1"],
+    )
+    prisma_client = MagicMock()
+    prisma_client.db.litellm_accessgrouptable.find_unique = AsyncMock(return_value=writer_group)
+    cache = MagicMock()
+    cache.async_get_cache = AsyncMock(return_value=stale_group)
+    cache.async_set_cache = AsyncMock()
+
+    with pytest.raises(ProxyException):
+        await can_team_access_model(
+            model="target-model",
+            team_object=team,
+            llm_router=None,
+            prisma_client=prisma_client,
+            user_api_key_cache=cache,
+            check_db_only=True,
+        )
+
+    cache.async_get_cache.assert_not_awaited()
+    cache.async_set_cache.assert_not_awaited()
