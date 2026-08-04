@@ -109,12 +109,15 @@ def client_and_mocks(monkeypatch):
     mock_key_table.find_unique = AsyncMock(return_value=None)
     mock_key_table.update = AsyncMock(return_value=None)
 
+    mock_query_raw = AsyncMock(return_value=[])
+
     @asynccontextmanager
     async def mock_tx():
         tx = types.SimpleNamespace(
             litellm_accessgrouptable=mock_access_group_table,
             litellm_teamtable=mock_team_table,
             litellm_verificationtoken=mock_key_table,
+            query_raw=mock_query_raw,
         )
         yield tx
 
@@ -122,6 +125,7 @@ def client_and_mocks(monkeypatch):
         litellm_accessgrouptable=mock_access_group_table,
         litellm_teamtable=mock_team_table,
         litellm_verificationtoken=mock_key_table,
+        query_raw=mock_query_raw,
         tx=mock_tx,
     )
     mock_prisma.db = mock_db
@@ -1230,6 +1234,38 @@ def test_update_access_group_syncs_removed_keys(client_and_mocks):
 # ---------------------------------------------------------------------------
 # Sync tests: DELETE (out-of-sync data handling)
 # ---------------------------------------------------------------------------
+
+
+def test_delete_access_group_locks_group_before_team_and_key_rows(client_and_mocks):
+    client, mock_prisma, mock_access_group_table, mock_cache, mock_proxy_logging = (
+        client_and_mocks
+    )
+    order = []
+    existing = _make_access_group_record(
+        access_group_id="ag-to-delete",
+        assigned_team_ids=["team-1"],
+        assigned_key_ids=["token-1"],
+    )
+    mock_access_group_table.find_unique = AsyncMock(return_value=existing)
+    mock_prisma.db.query_raw.side_effect = lambda *args: order.append("access_group") or []
+    team = MagicMock(team_id="team-1", access_group_ids=["ag-to-delete"])
+    mock_prisma.db.litellm_teamtable.find_many = AsyncMock(return_value=[team])
+    mock_prisma.db.litellm_teamtable.update = AsyncMock(
+        side_effect=lambda **kwargs: order.append("team")
+    )
+    key = MagicMock(token="token-1", access_group_ids=["ag-to-delete"])
+    mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(return_value=[key])
+    mock_prisma.db.litellm_verificationtoken.update = AsyncMock(
+        side_effect=lambda **kwargs: order.append("key")
+    )
+
+    response = client.delete("/v1/access_group/ag-to-delete")
+
+    assert response.status_code == 204
+    assert order == ["access_group", "team", "key"]
+    lock_sql = mock_prisma.db.query_raw.await_args.args[0]
+    assert '"LiteLLM_AccessGroupTable"' in lock_sql
+    assert "FOR UPDATE" in lock_sql
 
 
 def test_delete_access_group_handles_out_of_sync_assigned_teams(client_and_mocks):

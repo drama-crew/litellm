@@ -483,6 +483,10 @@ async def delete_access_group(
         affected_key_tokens: List[str] = []
 
         async with prisma_client.db.tx() as tx:
+            await tx.query_raw(
+                'SELECT access_group_id FROM "LiteLLM_AccessGroupTable" WHERE access_group_id = $1 FOR UPDATE',
+                access_group_id,
+            )
             existing = await tx.litellm_accessgrouptable.find_unique(where={"access_group_id": access_group_id})
             if existing is None:
                 raise HTTPException(
