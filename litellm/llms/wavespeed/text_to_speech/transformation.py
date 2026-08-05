@@ -96,7 +96,9 @@ class WaveSpeedTextToSpeechConfig(BaseTextToSpeechConfig):
     ) -> TextToSpeechRequestData:
         params = dict(optional_params)
         extra_body = params.pop("extra_body", None)
-        dict_body = {"model": model, "input": input, "voice": voice}
+        dict_body: dict[str, Any] = {"model": model, "input": input}
+        if voice is not None:
+            dict_body["voice"] = voice
         for key, value in params.items():
             if value is not None:
                 dict_body[key] = value

@@ -205,6 +205,24 @@ def test_transform_text_to_speech_request_omits_none_valued_optional_params():
     }
 
 
+def test_transform_text_to_speech_request_omits_voice_when_none():
+    config = WaveSpeedTextToSpeechConfig()
+    result = config.transform_text_to_speech_request(
+        model="minimax-speech-2.8-turbo",
+        input="hello",
+        voice=None,
+        optional_params={"response_format": "wav"},
+        litellm_params={},
+        headers={},
+    )
+    assert result["dict_body"] == {
+        "model": "minimax-speech-2.8-turbo",
+        "input": "hello",
+        "response_format": "wav",
+    }
+    assert "voice" not in result["dict_body"]
+
+
 def test_transform_text_to_speech_request_flattens_extra_body_into_top_level():
     config = WaveSpeedTextToSpeechConfig()
     result = config.transform_text_to_speech_request(
