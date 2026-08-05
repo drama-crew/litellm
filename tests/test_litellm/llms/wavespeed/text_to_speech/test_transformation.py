@@ -1,3 +1,6 @@
+import httpx
+import pytest
+
 import litellm
 from litellm.llms.wavespeed.text_to_speech.transformation import (
     WaveSpeedTextToSpeechConfig,
@@ -113,3 +116,143 @@ def test_map_openai_params_no_whitelisted_kwargs_leaves_optional_params_untouche
     assert voice == "alloy"
     assert mapped == {"response_format": "wav"}
     assert "extra_body" not in mapped
+
+
+def test_validate_environment_returns_headers_with_bearer_auth():
+    config = WaveSpeedTextToSpeechConfig()
+    result = config.validate_environment(
+        headers={"X-Existing": "kept"},
+        model="minimax-speech-2.8-turbo",
+        api_key="sk-test",
+        api_base="https://shim.example.com/v1",
+    )
+    assert result["X-Existing"] == "kept"
+    assert result["Authorization"] == "Bearer sk-test"
+
+
+def test_validate_environment_without_api_key_leaves_auth_unset():
+    config = WaveSpeedTextToSpeechConfig()
+    result = config.validate_environment(
+        headers={},
+        model="minimax-speech-2.8-turbo",
+        api_key=None,
+        api_base="https://shim.example.com/v1",
+    )
+    assert "Authorization" not in result
+
+
+def test_get_complete_url_appends_audio_speech_path():
+    config = WaveSpeedTextToSpeechConfig()
+    url = config.get_complete_url(
+        model="minimax-speech-2.8-turbo",
+        api_base="https://shim.example.com/v1",
+        litellm_params={},
+    )
+    assert url == "https://shim.example.com/v1/audio/speech"
+
+
+def test_get_complete_url_strips_trailing_slash():
+    config = WaveSpeedTextToSpeechConfig()
+    url = config.get_complete_url(
+        model="minimax-speech-2.8-turbo",
+        api_base="https://shim.example.com/v1/",
+        litellm_params={},
+    )
+    assert url == "https://shim.example.com/v1/audio/speech"
+
+
+def test_get_complete_url_requires_api_base():
+    config = WaveSpeedTextToSpeechConfig()
+    with pytest.raises(ValueError):
+        config.get_complete_url(model="minimax-speech-2.8-turbo", api_base=None, litellm_params={})
+
+
+def test_transform_text_to_speech_request_builds_openai_shaped_json_body():
+    config = WaveSpeedTextToSpeechConfig()
+    result = config.transform_text_to_speech_request(
+        model="minimax-speech-2.8-turbo",
+        input="hello",
+        voice="female-yujie",
+        optional_params={"response_format": "wav", "speed": 1.2},
+        litellm_params={},
+        headers={"Authorization": "Bearer sk-test"},
+    )
+    assert result["dict_body"] == {
+        "model": "minimax-speech-2.8-turbo",
+        "input": "hello",
+        "voice": "female-yujie",
+        "response_format": "wav",
+        "speed": 1.2,
+    }
+    assert result["headers"] == {"Authorization": "Bearer sk-test"}
+
+
+def test_transform_text_to_speech_request_omits_none_valued_optional_params():
+    config = WaveSpeedTextToSpeechConfig()
+    result = config.transform_text_to_speech_request(
+        model="minimax-speech-2.8-turbo",
+        input="hello",
+        voice="female-yujie",
+        optional_params={"response_format": "wav", "speed": None},
+        litellm_params={},
+        headers={},
+    )
+    assert result["dict_body"] == {
+        "model": "minimax-speech-2.8-turbo",
+        "input": "hello",
+        "voice": "female-yujie",
+        "response_format": "wav",
+    }
+
+
+def test_transform_text_to_speech_request_flattens_extra_body_into_top_level():
+    config = WaveSpeedTextToSpeechConfig()
+    result = config.transform_text_to_speech_request(
+        model="minimax-speech-2.8-turbo",
+        input="hello",
+        voice="female-yujie",
+        optional_params={"extra_body": {"voice_id": "female-yujie", "emotion": "happy"}},
+        litellm_params={},
+        headers={},
+    )
+    assert result["dict_body"] == {
+        "model": "minimax-speech-2.8-turbo",
+        "input": "hello",
+        "voice": "female-yujie",
+        "voice_id": "female-yujie",
+        "emotion": "happy",
+    }
+
+
+def test_transform_text_to_speech_request_omits_none_valued_extra_body_keys():
+    config = WaveSpeedTextToSpeechConfig()
+    result = config.transform_text_to_speech_request(
+        model="minimax-speech-2.8-turbo",
+        input="hello",
+        voice="female-yujie",
+        optional_params={"extra_body": {"voice_id": "female-yujie", "emotion": None}},
+        litellm_params={},
+        headers={},
+    )
+    assert result["dict_body"] == {
+        "model": "minimax-speech-2.8-turbo",
+        "input": "hello",
+        "voice": "female-yujie",
+        "voice_id": "female-yujie",
+    }
+
+
+def test_transform_text_to_speech_response_wraps_raw_httpx_response():
+    from litellm.types.llms.openai import HttpxBinaryResponseContent
+
+    config = WaveSpeedTextToSpeechConfig()
+    raw_response = httpx.Response(
+        200, content=b"AUDIOBYTES", request=httpx.Request("POST", "https://shim.example.com/v1/audio/speech")
+    )
+    result = config.transform_text_to_speech_response(
+        model="minimax-speech-2.8-turbo",
+        raw_response=raw_response,
+        logging_obj=None,
+    )
+    assert isinstance(result, HttpxBinaryResponseContent)
+    assert result.response.content == b"AUDIOBYTES"

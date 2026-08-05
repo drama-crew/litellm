@@ -70,11 +70,10 @@ class WaveSpeedTextToSpeechConfig(BaseTextToSpeechConfig):
         api_key: str | None = None,
         api_base: str | None = None,
     ) -> dict:
-        raise NotImplementedError(
-            "WaveSpeedTextToSpeechConfig only participates in the generic openai-provider "
-            "map_openai_params() pre-dispatch step; the openai branch of litellm.speech() "
-            "never calls validate_environment() on the resolved text_to_speech_provider_config."
-        )
+        validated_headers = {**headers, "Content-Type": "application/json"}
+        if api_key:
+            validated_headers["Authorization"] = f"Bearer {api_key}"
+        return validated_headers
 
     def get_complete_url(
         self,
@@ -82,11 +81,9 @@ class WaveSpeedTextToSpeechConfig(BaseTextToSpeechConfig):
         api_base: str | None,
         litellm_params: dict,
     ) -> str:
-        raise NotImplementedError(
-            "WaveSpeedTextToSpeechConfig only participates in the generic openai-provider "
-            "map_openai_params() pre-dispatch step; the openai branch of litellm.speech() "
-            "never calls get_complete_url() on the resolved text_to_speech_provider_config."
-        )
+        if api_base is None:
+            raise ValueError("api_base is required for WaveSpeed text-to-speech requests.")
+        return f"{api_base.rstrip('/')}/audio/speech"
 
     def transform_text_to_speech_request(
         self,
@@ -97,12 +94,17 @@ class WaveSpeedTextToSpeechConfig(BaseTextToSpeechConfig):
         litellm_params: dict,
         headers: dict,
     ) -> TextToSpeechRequestData:
-        raise NotImplementedError(
-            "WaveSpeedTextToSpeechConfig only participates in the generic openai-provider "
-            "map_openai_params() pre-dispatch step; the openai branch of litellm.speech() "
-            "never calls transform_text_to_speech_request() on the resolved "
-            "text_to_speech_provider_config."
-        )
+        params = dict(optional_params)
+        extra_body = params.pop("extra_body", None)
+        dict_body = {"model": model, "input": input, "voice": voice}
+        for key, value in params.items():
+            if value is not None:
+                dict_body[key] = value
+        if isinstance(extra_body, dict):
+            for key, value in extra_body.items():
+                if value is not None:
+                    dict_body[key] = value
+        return TextToSpeechRequestData(dict_body=dict_body, headers=headers)
 
     def transform_text_to_speech_response(
         self,
@@ -110,9 +112,6 @@ class WaveSpeedTextToSpeechConfig(BaseTextToSpeechConfig):
         raw_response: httpx.Response,
         logging_obj: LiteLLMLoggingObj,
     ) -> HttpxBinaryResponseContent:
-        raise NotImplementedError(
-            "WaveSpeedTextToSpeechConfig only participates in the generic openai-provider "
-            "map_openai_params() pre-dispatch step; the openai branch of litellm.speech() "
-            "never calls transform_text_to_speech_response() on the resolved "
-            "text_to_speech_provider_config."
-        )
+        from litellm.types.llms.openai import HttpxBinaryResponseContent
+
+        return HttpxBinaryResponseContent(raw_response)
