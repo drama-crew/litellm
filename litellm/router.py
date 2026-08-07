@@ -102,7 +102,11 @@ from litellm.router_utils.batch_utils import (
     replace_model_in_jsonl,
     should_replace_model_in_jsonl,
 )
-from litellm.router_utils.client_initalization_utils import InitalizeCachedClient
+from litellm.router_utils.client_initalization_utils import (
+    InitalizeCachedClient,
+    MaxParallelRequestsConfig,
+    MaxParallelRequestsLimiter,
+)
 from litellm.router_utils.clientside_credential_handler import (
     get_dynamic_litellm_params,
     is_clientside_credential,
@@ -471,6 +475,9 @@ class Router:
             None  # use this to track the users default deployment, when they want to use model = *
         )
         self.default_max_parallel_requests = default_max_parallel_requests
+        self._max_parallel_request_semaphores: dict[str, MaxParallelRequestsLimiter] = {}
+        self._max_parallel_request_configurations: dict[str, MaxParallelRequestsConfig] = {}
+        self._max_parallel_request_semaphores_lock = threading.Lock()
         self.provider_default_deployment_ids: List[str] = []
         self.pattern_router = PatternMatchRouter()
         self.team_pattern_routers: Dict[str, PatternMatchRouter] = {}  # {"TEAM_ID": PatternMatchRouter}
@@ -2730,7 +2737,7 @@ class Router:
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
             )
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -3654,7 +3661,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -3760,7 +3767,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -3874,7 +3881,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -4066,7 +4073,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -4157,7 +4164,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -4300,7 +4307,13 @@ class Router:
             ),
         )
 
-    async def _ageneric_api_call_with_fallbacks(self, model: str, original_function: Callable, **kwargs):
+    async def _ageneric_api_call_with_fallbacks(
+        self,
+        model: str,
+        original_function: Callable,
+        max_parallel_requests_operation: str | None = None,
+        **kwargs,
+    ):
         """
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
@@ -4308,6 +4321,7 @@ class Router:
             kwargs["model"] = model
             kwargs["original_generic_function"] = original_function
             kwargs["original_function"] = self._ageneric_api_call_with_fallbacks_helper
+            kwargs["max_parallel_requests_operation"] = max_parallel_requests_operation
             self._update_kwargs_before_fallbacks(model=model, kwargs=kwargs, metadata_variable_name="litellm_metadata")
             verbose_router_logger.debug(f"Inside ageneric_api_call_with_fallbacks() - model: {model}; kwargs: {kwargs}")
             response = await self.async_function_with_fallbacks(**kwargs)
@@ -4354,7 +4368,13 @@ class Router:
             kwargs["endpoint"] = kwargs["endpoint"].replace(model, replacement_model_name)
         return kwargs
 
-    async def _ageneric_api_call_with_fallbacks_helper(self, model: str, original_generic_function: Callable, **kwargs):
+    async def _ageneric_api_call_with_fallbacks_helper(
+        self,
+        model: str,
+        original_generic_function: Callable,
+        max_parallel_requests_operation: str | None = None,
+        **kwargs,
+    ):
         """
         Helper function to make a generic LLM API call through the router, this allows you to use retries/fallbacks with litellm router
         """
@@ -4406,29 +4426,26 @@ class Router:
             if custom_llm_provider is not None:
                 response_kwargs["custom_llm_provider"] = custom_llm_provider
 
-            response = original_generic_function(**response_kwargs)
-
-            rpm_semaphore = self._get_client(
+            operation_semaphore = self._get_client(
                 deployment=deployment,
                 kwargs=kwargs,
                 client_type="max_parallel_requests",
+                operation=max_parallel_requests_operation,
             )
-
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
-                async with rpm_semaphore:
-                    """
-                    - Check rpm limits before making the call
-                    - If allowed, increment the rpm limit (allows global value to be updated, concurrency-safe)
-                    """
-                    await self.async_routing_strategy_pre_call_checks(
-                        deployment=deployment, parent_otel_span=parent_otel_span
-                    )
-                    response = await response  # type: ignore
-            else:
+            operation_acquired = False
+            try:
+                if isinstance(operation_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
+                    await operation_semaphore.acquire()
+                    operation_acquired = True
                 await self.async_routing_strategy_pre_call_checks(
                     deployment=deployment, parent_otel_span=parent_otel_span
                 )
-                response = await response  # type: ignore
+                response = await original_generic_function(**response_kwargs)
+            finally:
+                if operation_acquired and isinstance(
+                    operation_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)
+                ):
+                    operation_semaphore.release()
 
             self.success_calls[model_name] += 1
             verbose_router_logger.info(f"ageneric_api_call_with_fallbacks(model={model_name})\033[32m 200 OK\033[0m")
@@ -4457,11 +4474,10 @@ class Router:
         _aresponses_streaming_iterator so MidStreamFallbackError raised
         during iteration triggers the Router's cross-provider fallback chain.
         """
+        from litellm.litellm_core_utils.core_helpers import safe_deep_copy
         from litellm.responses.streaming_iterator import (
             BaseResponsesAPIStreamingIterator,
         )
-
-        from litellm.litellm_core_utils.core_helpers import safe_deep_copy
 
         # Snapshot the request kwargs before _ageneric_api_call_with_fallbacks
         # mutates them. A shallow copy alone is not enough: the primary
@@ -4692,7 +4708,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -4824,7 +4840,7 @@ class Router:
                     client_type="max_parallel_requests",
                 )
 
-                if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+                if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                     async with rpm_semaphore:
                         """
                         - Check rpm limits before making the call
@@ -4944,7 +4960,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     await self.async_routing_strategy_pre_call_checks(
                         deployment=deployment, parent_otel_span=parent_otel_span
@@ -5057,7 +5073,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -5280,7 +5296,7 @@ class Router:
                 client_type="max_parallel_requests",
             )
 
-            if rpm_semaphore is not None and isinstance(rpm_semaphore, asyncio.Semaphore):
+            if isinstance(rpm_semaphore, (asyncio.Semaphore, MaxParallelRequestsLimiter)):
                 async with rpm_semaphore:
                     """
                     - Check rpm limits before making the call
@@ -5679,6 +5695,11 @@ class Router:
             ):
                 return await self._ageneric_api_call_with_fallbacks(
                     original_function=original_function,
+                    max_parallel_requests_operation=(
+                        call_type.removeprefix("a")
+                        if call_type in ("avideo_generation", "avideo_status", "avideo_content")
+                        else None
+                    ),
                     **kwargs,
                 )
             elif call_type in (
@@ -7867,6 +7888,12 @@ class Router:
                     _model_info=_model_info,
                 )
 
+        for deployment in self.model_list:
+            InitalizeCachedClient.update_max_parallel_requests_clients(
+                litellm_router_instance=self,
+                model=deployment,
+            )
+
         verbose_router_logger.debug(f"\nInitialized Model List {self.get_model_names()}")
         self.model_names = {m["model_name"] for m in model_list}
 
@@ -8113,6 +8140,10 @@ class Router:
 
         # add to model names
         self._add_model_to_list_and_index_map(model=_deployment, model_id=deployment.model_info.id)
+        InitalizeCachedClient.update_max_parallel_requests_clients(
+            litellm_router_instance=self,
+            model=_deployment,
+        )
         self.model_names.add(deployment.model_name)
         self._sync_deployment_budget_config(deployment=deployment)
         return deployment
@@ -9829,7 +9860,7 @@ class Router:
             self._init_routing_groups(self._routing_groups_input)
         verbose_router_logger.debug(f"Updated Router settings: {self.get_settings()}")
 
-    def _get_client(self, deployment, kwargs, client_type=None):
+    def _get_client(self, deployment, kwargs, client_type=None, operation: str | None = None):
         """
         Returns the appropriate client based on the given deployment, kwargs, and client_type.
 
@@ -9844,12 +9875,15 @@ class Router:
         model_id = deployment["model_info"]["id"]
         parent_otel_span: Optional[Span] = _get_parent_otel_span_from_kwargs(kwargs)
         if client_type == "max_parallel_requests":
-            cache_key = "{}_max_parallel_requests_client".format(model_id)
-            client = self.cache.get_cache(key=cache_key, local_only=True, parent_otel_span=parent_otel_span)
-            if client is None:
-                InitalizeCachedClient.set_max_parallel_requests_client(litellm_router_instance=self, model=deployment)
-                client = self.cache.get_cache(key=cache_key, local_only=True, parent_otel_span=parent_otel_span)
-            return client
+            current_deployment = self.get_deployment(model_id=model_id)
+            limiter_model = (
+                current_deployment.to_json(exclude_none=True) if current_deployment is not None else deployment
+            )
+            return InitalizeCachedClient.set_max_parallel_requests_client(
+                litellm_router_instance=self,
+                model=limiter_model,
+                operation=operation,
+            )
         elif client_type == "async":
             if kwargs.get("stream") is True:
                 cache_key = f"{model_id}_stream_async_client"

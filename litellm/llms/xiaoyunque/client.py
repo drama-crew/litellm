@@ -1,9 +1,12 @@
 import asyncio
 import logging
+import random
 import os
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
+from typing_extensions import Required, TypeAlias, TypedDict
 
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.libtv.persistence import LibTVPersistence, account_key, get_persistence, normalize_source_key
@@ -20,12 +23,34 @@ from .common import (
     build_xiaoyunque_upload_headers,
     is_compliance_ret,
     is_rate_limit_ret,
+    is_submit_rate_limit_retryable,
 )
 from .common import is_ak_error as _is_ak_error
+from .transform import XiaoyunqueVideoPartToolParam
 
 logger = logging.getLogger(__name__)
 
 _ACCOUNT_KEY_NAMESPACE = "xiaoyunque"
+_SUBMIT_RATE_LIMIT_MAX_RETRIES = 2
+_SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS = 60.0
+_SUBMIT_RATE_LIMIT_RETRY_JITTER_SECONDS = 10.0
+
+XiaoyunqueHTTPGet: TypeAlias = Callable[[str], bytes]
+XiaoyunqueSleep: TypeAlias = Callable[[float], None]
+XiaoyunqueAsyncSleep: TypeAlias = Callable[[float], Awaitable[None]]
+XiaoyunqueJitter: TypeAlias = Callable[[float, float], float]
+
+
+class XiaoyunqueSubmitRunRequest(TypedDict, total=False):
+    message: Required[str]
+    agent_name: Required[str]
+    video_part_tool_param: Required[XiaoyunqueVideoPartToolParam]
+    asset_ids: List[str]
+    thread_id: str
+
+
+def _submit_rate_limit_delay(jitter: XiaoyunqueJitter) -> float:
+    return _SUBMIT_RATE_LIMIT_RETRY_DELAY_SECONDS + jitter(0.0, _SUBMIT_RATE_LIMIT_RETRY_JITTER_SECONDS)
 
 
 def parse_upload_asset_id(payload: Dict[str, Any]) -> str:
@@ -98,8 +123,11 @@ class XiaoyunqueClient:
         async_client: Optional[AsyncHTTPHandler] = None,
         api_base: str = XIAOYUNQUE_API_BASE,
         request_timeout: float = 600.0,
-        http_get=None,
+        http_get: XiaoyunqueHTTPGet | None = None,
         persistence: Optional["LibTVPersistence"] = None,
+        sleep: XiaoyunqueSleep | None = None,
+        asleep: XiaoyunqueAsyncSleep | None = None,
+        jitter: XiaoyunqueJitter | None = None,
     ):
         self.token = token
         self.sync_client = sync_client
@@ -110,6 +138,9 @@ class XiaoyunqueClient:
         # reaches the store. Injectable for tests.
         self._http_get = http_get
         self._persistence = persistence
+        self._sleep = sleep or time.sleep
+        self._asleep = asleep or asyncio.sleep
+        self._jitter = jitter or random.uniform
         # Namespaced so the shared LibTV*-named cache/billing tables (reused rather than
         # duplicated -- see persistence.py) can never collide a xiaoyunque row with a
         # libtv row that happens to hash to the same bare account_key.
@@ -142,7 +173,7 @@ class XiaoyunqueClient:
         message = f"{step} ret={ret} errmsg={errmsg}"
         if is_compliance_ret(ret):
             raise XiaoyunqueContentPolicyError(message=message)
-        raise XiaoyunqueError(status_code=_status_code_for_ret(ret, errmsg), message=message, headers=headers)
+        raise XiaoyunqueError(status_code=_status_code_for_ret(ret, errmsg), message=message, headers=headers, ret=ret)
 
     # ---------- sync ----------
     def _post(self, path: str, body: Dict[str, Any], step: str) -> Dict[str, Any]:
@@ -163,9 +194,13 @@ class XiaoyunqueClient:
         return parse_upload_asset_id(self._check(resp, "upload_file"))
 
     def submit_run(
-        self, message: str, asset_ids: List[str], video_part_tool_param: Dict[str, Any], thread_id: Optional[str] = None
+        self,
+        message: str,
+        asset_ids: List[str],
+        video_part_tool_param: XiaoyunqueVideoPartToolParam,
+        thread_id: Optional[str] = None,
     ) -> Dict[str, str]:
-        body: Dict[str, Any] = {
+        body: XiaoyunqueSubmitRunRequest = {
             "message": message,
             "agent_name": AGENT_NAME,
             "video_part_tool_param": video_part_tool_param,
@@ -174,7 +209,16 @@ class XiaoyunqueClient:
             body["asset_ids"] = asset_ids
         if thread_id:
             body["thread_id"] = thread_id
-        return parse_submit_run(self._post(SUBMIT_RUN_PATH, body, "submit_run"))
+        return self._submit_run_attempt(body, retries_left=_SUBMIT_RATE_LIMIT_MAX_RETRIES)
+
+    def _submit_run_attempt(self, body: XiaoyunqueSubmitRunRequest, retries_left: int) -> Dict[str, str]:
+        try:
+            return parse_submit_run(self._post(SUBMIT_RUN_PATH, dict(body), "submit_run"))
+        except XiaoyunqueError as error:
+            if retries_left <= 0 or not is_submit_rate_limit_retryable(error.ret):
+                raise
+            self._sleep(_submit_rate_limit_delay(self._jitter))
+            return self._submit_run_attempt(body, retries_left - 1)
 
     def query_result(self, thread_id: str, run_id: str) -> Dict[str, Any]:
         body = {"thread_id": thread_id, "run_id": run_id}
@@ -226,9 +270,13 @@ class XiaoyunqueClient:
         return parse_upload_asset_id(self._check(resp, "upload_file"))
 
     async def asubmit_run(
-        self, message: str, asset_ids: List[str], video_part_tool_param: Dict[str, Any], thread_id: Optional[str] = None
+        self,
+        message: str,
+        asset_ids: List[str],
+        video_part_tool_param: XiaoyunqueVideoPartToolParam,
+        thread_id: Optional[str] = None,
     ) -> Dict[str, str]:
-        body: Dict[str, Any] = {
+        body: XiaoyunqueSubmitRunRequest = {
             "message": message,
             "agent_name": AGENT_NAME,
             "video_part_tool_param": video_part_tool_param,
@@ -237,7 +285,16 @@ class XiaoyunqueClient:
             body["asset_ids"] = asset_ids
         if thread_id:
             body["thread_id"] = thread_id
-        return parse_submit_run(await self._apost(SUBMIT_RUN_PATH, body, "submit_run"))
+        return await self._asubmit_run_attempt(body, retries_left=_SUBMIT_RATE_LIMIT_MAX_RETRIES)
+
+    async def _asubmit_run_attempt(self, body: XiaoyunqueSubmitRunRequest, retries_left: int) -> Dict[str, str]:
+        try:
+            return parse_submit_run(await self._apost(SUBMIT_RUN_PATH, dict(body), "submit_run"))
+        except XiaoyunqueError as error:
+            if retries_left <= 0 or not is_submit_rate_limit_retryable(error.ret):
+                raise
+            await self._asleep(_submit_rate_limit_delay(self._jitter))
+            return await self._asubmit_run_attempt(body, retries_left - 1)
 
     async def aquery_result(self, thread_id: str, run_id: str) -> Dict[str, Any]:
         body = {"thread_id": thread_id, "run_id": run_id}

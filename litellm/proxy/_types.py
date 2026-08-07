@@ -232,6 +232,7 @@ class KeyManagementRoutes(str, enum.Enum):
     # write routes
     KEY_GENERATE = "/key/generate"
     KEY_UPDATE = "/key/update"
+    KEY_MODEL_ADD = "/key/model/add"
     KEY_DELETE = "/key/delete"
     KEY_REGENERATE = "/key/regenerate"
     KEY_GENERATE_SERVICE_ACCOUNT = "/key/service-account/generate"
@@ -556,6 +557,7 @@ class LiteLLMRoutes(enum.Enum):
     key_management_routes = [
         KeyManagementRoutes.KEY_GENERATE.value,
         KeyManagementRoutes.KEY_UPDATE.value,
+        KeyManagementRoutes.KEY_MODEL_ADD.value,
         KeyManagementRoutes.KEY_DELETE.value,
         KeyManagementRoutes.KEY_INFO.value,
         KeyManagementRoutes.KEY_REGENERATE.value,

@@ -434,3 +434,44 @@ class TestRotateVirtualKeyInSecretManager:
 
         # Verify async_rotate_secret was NOT called
         mock_secret_manager.async_rotate_secret.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_key_models_added_audit_serializes_only_authoritative_models():
+    import asyncio
+    import json
+
+    import litellm
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    create_audit_log = AsyncMock()
+    pending_coroutines = []
+
+    def capture_task(coroutine):
+        pending_coroutines.append(coroutine)
+        return MagicMock()
+
+    existing = MagicMock()
+    existing.json.return_value = {"token": "hashed-token", "models": ["existing-model"]}
+    caller = UserAPIKeyAuth(user_id="admin-user", api_key="hashed-caller")
+    with (
+        patch.object(litellm, "store_audit_logs", True),
+        patch(
+            "litellm.proxy.management_helpers.audit_logs.create_audit_log_for_update",
+            create_audit_log,
+        ),
+        patch.object(asyncio, "create_task", side_effect=capture_task),
+    ):
+        await KeyManagementEventHooks.async_key_models_added_hook(
+            hashed_token="hashed-token",
+            models=["existing-model", "new-model"],
+            existing_key_row=existing,
+            user_api_key_dict=caller,
+            litellm_changed_by="admin@example.com",
+        )
+
+    assert len(pending_coroutines) == 1
+    await pending_coroutines[0]
+    audit_request = create_audit_log.await_args.kwargs["request_data"]
+    assert json.loads(audit_request.updated_values) == {"models": ["existing-model", "new-model"]}
+    assert audit_request.object_id == "hashed-token"

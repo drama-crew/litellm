@@ -19,12 +19,14 @@ import re
 import secrets
 import traceback
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, cast
 
 import fastapi
 import yaml
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from prisma import Prisma
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -118,6 +120,8 @@ from litellm.types.proxy.management_endpoints.key_management_endpoints import (
     BulkUpdateKeyResponse,
     BulkUpdateTeamKeysRequest,
     FailedKeyUpdate,
+    KeyModelAddRequest,
+    KeyModelAddResponse,
     SuccessfulKeyUpdate,
 )
 from litellm.types.router import Deployment
@@ -1271,6 +1275,7 @@ async def _check_project_key_limits(
     data: Union[GenerateKeyRequest, UpdateKeyRequest],
     prisma_client: PrismaClient,
     user_api_key_cache: UserApiKeyCache,
+    check_db_only: bool = False,
 ) -> None:
     """
     Validate that key's models and budget respect its project's limits.
@@ -1282,6 +1287,7 @@ async def _check_project_key_limits(
         project_id=project_id,
         prisma_client=prisma_client,
         user_api_key_cache=user_api_key_cache,
+        check_db_only=check_db_only,
     )
 
     if project_obj is None:
@@ -2246,6 +2252,7 @@ async def _validate_update_key_data(
     premium_user: bool,
     prisma_client: Any,
     user_api_key_cache: Any,
+    check_db_only: bool = False,
 ) -> None:
     """Validate permissions and constraints for key update."""
     # Reject NaN/±inf spend before it can reach the DB / spend counter.
@@ -2401,6 +2408,7 @@ async def _validate_update_key_data(
             data=data,
             prisma_client=prisma_client,
             user_api_key_cache=user_api_key_cache,
+            check_db_only=check_db_only,
         )
 
     # When the caller asks to change the key's organization_id, require that
@@ -2476,6 +2484,344 @@ async def _validate_update_key_data(
         )
         if normalized_object_permission is not None:
             data.object_permission = LiteLLM_ObjectPermissionBase(**normalized_object_permission)
+
+
+@dataclass(frozen=True, slots=True)
+class _KeyModelAddState:
+    existing_key_row: LiteLLM_VerificationToken
+    final_models: tuple[str, ...]
+    policy_snapshot: str
+    parent_references_stable: bool
+
+
+def _key_model_add_policy_snapshot(
+    key_row: LiteLLM_VerificationToken,
+    team_row: Mapping[str, object] | None,
+    project_row: Mapping[str, object] | None,
+    access_group_rows: tuple[Mapping[str, object], ...],
+) -> str:
+    team_fields = (
+        "team_id",
+        "members",
+        "members_with_roles",
+        "team_member_permissions",
+        "models",
+        "access_group_ids",
+    )
+    project_fields = ("project_id", "team_id", "models")
+    access_group_fields = ("access_group_id", "access_model_names")
+    snapshot = {
+        "key": {
+            "user_id": key_row.user_id,
+            "created_by": key_row.created_by,
+            "team_id": key_row.team_id,
+            "project_id": key_row.project_id,
+            "organization_id": getattr(key_row, "organization_id", None),
+        },
+        "team": None if team_row is None else {field: team_row.get(field) for field in team_fields},
+        "project": None if project_row is None else {field: project_row.get(field) for field in project_fields},
+        "access_groups": tuple({field: row.get(field) for field in access_group_fields} for row in access_group_rows),
+    }
+    return json.dumps(snapshot, default=str, separators=(",", ":"), sort_keys=True)
+
+
+def _key_model_add_union(
+    existing_models: list[str],
+    requested_models: list[str],
+) -> tuple[str, ...]:
+    if not existing_models:
+        return ()
+    return tuple(dict.fromkeys([*existing_models, *requested_models]))
+
+
+async def _read_key_model_add_state(
+    transaction: Prisma,
+    hashed_token: str,
+    requested_models: list[str],
+    lock_policy_rows: bool,
+) -> _KeyModelAddState:
+    initial_key_rows = await transaction.query_raw(
+        'SELECT * FROM "LiteLLM_VerificationToken" WHERE token = $1',
+        hashed_token,
+    )
+    if not initial_key_rows:
+        raise HTTPException(status_code=404, detail={"error": "Key not found."})
+
+    initial_key_data = {
+        **initial_key_rows[0],
+        "models": initial_key_rows[0].get("models") or [],
+    }
+    initial_key_row = LiteLLM_VerificationToken.model_validate(initial_key_data)
+    initial_team_rows = (
+        await transaction.query_raw(
+            'SELECT * FROM "LiteLLM_TeamTable" WHERE team_id = $1',
+            initial_key_row.team_id,
+        )
+        if initial_key_row.team_id is not None
+        else []
+    )
+    initial_project_rows = (
+        await transaction.query_raw(
+            'SELECT * FROM "LiteLLM_ProjectTable" WHERE project_id = $1',
+            initial_key_row.project_id,
+        )
+        if initial_key_row.project_id is not None
+        else []
+    )
+    initial_team_row = initial_team_rows[0] if initial_team_rows else None
+    initial_project_row = initial_project_rows[0] if initial_project_rows else None
+    access_group_ids = (
+        tuple(sorted(initial_team_row.get("access_group_ids") or ())) if initial_team_row is not None else ()
+    )
+    initial_access_group_rows = (
+        await transaction.query_raw(
+            'SELECT * FROM "LiteLLM_AccessGroupTable" WHERE access_group_id = ANY($1::text[]) ORDER BY access_group_id',
+            list(access_group_ids),
+        )
+        if access_group_ids
+        else []
+    )
+    initial_policy_snapshot = _key_model_add_policy_snapshot(
+        key_row=initial_key_row,
+        team_row=initial_team_row,
+        project_row=initial_project_row,
+        access_group_rows=tuple(initial_access_group_rows),
+    )
+    if not lock_policy_rows:
+        return _KeyModelAddState(
+            existing_key_row=initial_key_row,
+            final_models=_key_model_add_union(initial_key_row.models, requested_models),
+            policy_snapshot=initial_policy_snapshot,
+            parent_references_stable=True,
+        )
+
+    access_group_rows = (
+        await transaction.query_raw(
+            'SELECT * FROM "LiteLLM_AccessGroupTable" '
+            "WHERE access_group_id = ANY($1::text[]) ORDER BY access_group_id FOR SHARE",
+            list(access_group_ids),
+        )
+        if access_group_ids
+        else []
+    )
+    team_rows = (
+        await transaction.query_raw(
+            'SELECT * FROM "LiteLLM_TeamTable" WHERE team_id = $1 FOR SHARE',
+            initial_key_row.team_id,
+        )
+        if initial_key_row.team_id is not None
+        else []
+    )
+    project_rows = (
+        await transaction.query_raw(
+            'SELECT * FROM "LiteLLM_ProjectTable" WHERE project_id = $1 FOR SHARE',
+            initial_key_row.project_id,
+        )
+        if initial_key_row.project_id is not None
+        else []
+    )
+    final_key_rows = await transaction.query_raw(
+        'SELECT * FROM "LiteLLM_VerificationToken" WHERE token = $1 FOR UPDATE',
+        hashed_token,
+    )
+    if not final_key_rows:
+        raise HTTPException(status_code=404, detail={"error": "Key not found."})
+
+    final_key_data = {
+        **final_key_rows[0],
+        "models": final_key_rows[0].get("models") or [],
+    }
+    final_key_row = LiteLLM_VerificationToken.model_validate(final_key_data)
+    team_row = team_rows[0] if team_rows else None
+    project_row = project_rows[0] if project_rows else None
+    policy_snapshot = _key_model_add_policy_snapshot(
+        key_row=final_key_row,
+        team_row=team_row,
+        project_row=project_row,
+        access_group_rows=tuple(access_group_rows),
+    )
+    return _KeyModelAddState(
+        existing_key_row=final_key_row,
+        final_models=_key_model_add_union(final_key_row.models, requested_models),
+        policy_snapshot=policy_snapshot,
+        parent_references_stable=initial_policy_snapshot == policy_snapshot,
+    )
+
+
+async def _validate_key_model_add_state(
+    state: _KeyModelAddState,
+    hashed_token: str,
+    user_api_key_dict: UserAPIKeyAuth,
+    llm_router: Router | None,
+    premium_user: bool,
+    prisma_client: PrismaClient,
+    user_api_key_cache: UserApiKeyCache,
+) -> UpdateKeyRequest:
+    update_request = UpdateKeyRequest(
+        key=hashed_token,
+        models=list(state.final_models),
+    )
+    await _validate_update_key_data(
+        data=update_request,
+        existing_key_row=state.existing_key_row,
+        user_api_key_dict=user_api_key_dict,
+        llm_router=llm_router,
+        premium_user=premium_user,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        check_db_only=True,
+    )
+    if state.existing_key_row.team_id is None or not state.final_models:
+        return update_request
+
+    team_obj = await get_team_object(
+        team_id=state.existing_key_row.team_id,
+        prisma_client=prisma_client,
+        user_api_key_cache=user_api_key_cache,
+        check_db_only=True,
+    )
+    if team_obj is None:
+        return update_request
+
+    for model in state.final_models:
+        if model == SpecialModelNames.all_team_models.value:
+            continue
+        await can_team_access_model(
+            model=model,
+            team_object=team_obj,
+            llm_router=llm_router,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            check_db_only=True,
+        )
+    return update_request
+
+
+@router.post(
+    "/key/model/add",
+    tags=["key management"],
+    dependencies=[Depends(user_api_key_auth)],
+    response_model=KeyModelAddResponse,
+)
+@management_endpoint_wrapper
+async def key_model_add(
+    request: Request,
+    data: KeyModelAddRequest,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+    litellm_changed_by: str | None = Header(
+        None,
+        description="The litellm-changed-by header enables tracking of actions performed by authorized users on behalf of other users, providing an audit trail for accountability",
+    ),
+) -> KeyModelAddResponse:
+    from litellm.proxy.proxy_server import (
+        llm_router,
+        premium_user,
+        prisma_client,
+        proxy_logging_obj,
+        user_api_key_cache,
+        user_custom_key_update,
+    )
+
+    if prisma_client is None:
+        raise HTTPException(status_code=500, detail={"error": "Database not connected"})
+
+    hashed_token = _hash_token_if_needed(data.key)
+    if user_custom_key_update is not None and not inspect.iscoroutinefunction(user_custom_key_update):
+        raise ValueError("user_custom_key_update must be a coroutine")
+
+    proposal_state: _KeyModelAddState | None = None
+    if user_custom_key_update is not None:
+        async with prisma_client.writer_db.tx() as proposal_transaction:
+            await proposal_transaction.execute_raw("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            proposal_prisma_client = copy.copy(prisma_client)
+            proposal_prisma_client.db = proposal_transaction
+            proposal_state = await _read_key_model_add_state(
+                transaction=proposal_transaction,
+                hashed_token=hashed_token,
+                requested_models=data.models,
+                lock_policy_rows=False,
+            )
+            proposal_request = await _validate_key_model_add_state(
+                state=proposal_state,
+                hashed_token=hashed_token,
+                user_api_key_dict=user_api_key_dict,
+                llm_router=llm_router,
+                premium_user=premium_user,
+                prisma_client=proposal_prisma_client,
+                user_api_key_cache=user_api_key_cache,
+            )
+
+        custom_result = await user_custom_key_update(proposal_request)
+        if not custom_result.get("decision", True):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=custom_result.get("message", "Authentication Failed - Custom Auth Rule"),
+            )
+
+    async with prisma_client.writer_db.tx() as transaction:
+        transaction_prisma_client = copy.copy(prisma_client)
+        transaction_prisma_client.db = transaction
+        final_state = await _read_key_model_add_state(
+            transaction=transaction,
+            hashed_token=hashed_token,
+            requested_models=data.models,
+            lock_policy_rows=True,
+        )
+        proposal_changed = proposal_state is not None and (
+            final_state.final_models != proposal_state.final_models
+            or final_state.policy_snapshot != proposal_state.policy_snapshot
+        )
+        if not final_state.parent_references_stable or proposal_changed:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"error": "Key or authorization policy changed during model grant. Retry the request."},
+            )
+
+        await _validate_key_model_add_state(
+            state=final_state,
+            hashed_token=hashed_token,
+            user_api_key_dict=user_api_key_dict,
+            llm_router=llm_router,
+            premium_user=premium_user,
+            prisma_client=transaction_prisma_client,
+            user_api_key_cache=user_api_key_cache,
+        )
+        updated_rows = await transaction.query_raw(
+            'UPDATE "LiteLLM_VerificationToken" '
+            "SET models = CASE "
+            "  WHEN cardinality(COALESCE(models, ARRAY[]::text[])) = 0 "
+            "  THEN COALESCE(models, ARRAY[]::text[]) "
+            "  ELSE ARRAY(SELECT DISTINCT unnest(models || $1::text[])) "
+            "END, updated_at = NOW() "
+            "WHERE token = $2 "
+            "RETURNING models, updated_at",
+            data.models,
+            hashed_token,
+        )
+        if not updated_rows:
+            raise HTTPException(status_code=404, detail={"error": "Key not found."})
+
+        response = KeyModelAddResponse.model_validate(
+            {
+                "models": updated_rows[0]["models"],
+                "unrestricted": len(updated_rows[0]["models"]) == 0,
+                "updated_at": updated_rows[0]["updated_at"],
+            }
+        )
+
+    await _delete_cache_key_object(
+        hashed_token=hashed_token,
+        user_api_key_cache=user_api_key_cache,
+        proxy_logging_obj=proxy_logging_obj,
+    )
+    await KeyManagementEventHooks.async_key_models_added_hook(
+        hashed_token=hashed_token,
+        models=response.models,
+        existing_key_row=final_state.existing_key_row,
+        user_api_key_dict=user_api_key_dict,
+        litellm_changed_by=litellm_changed_by,
+    )
+    return response
 
 
 @router.post("/key/update", tags=["key management"], dependencies=[Depends(user_api_key_auth)])

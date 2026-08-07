@@ -26,7 +26,15 @@ from litellm.llms.openai.cost_calculation import _video_output_cost_per_second
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
 
-from .client import XiaoyunqueClient, decode_composite_task_id, encode_composite_task_id
+from .client import (
+    XiaoyunqueAsyncSleep,
+    XiaoyunqueClient,
+    XiaoyunqueHTTPGet,
+    XiaoyunqueJitter,
+    XiaoyunqueSleep,
+    decode_composite_task_id,
+    encode_composite_task_id,
+)
 from .common import XiaoyunqueContentPolicyError, XiaoyunqueError, resolve_xiaoyunque_credentials
 from .transform import build_video_part_tool_param, resolution_from_size
 
@@ -246,9 +254,18 @@ def _video_completion_cost(optional_params: dict, usage: dict) -> Optional[float
 
 
 class XiaoyunqueLLM(CustomLLM):
-    def __init__(self, http_get=None):
+    def __init__(
+        self,
+        http_get: XiaoyunqueHTTPGet | None = None,
+        sleep: XiaoyunqueSleep | None = None,
+        asleep: XiaoyunqueAsyncSleep | None = None,
+        jitter: XiaoyunqueJitter | None = None,
+    ):
         super().__init__()
         self._http_get = http_get
+        self._sleep = sleep
+        self._asleep = asleep
+        self._jitter = jitter
 
     def _make_client(
         self,
@@ -261,7 +278,13 @@ class XiaoyunqueLLM(CustomLLM):
         token = api_key if api_key is not None or not require_explicit else ""
         token = resolve_xiaoyunque_credentials(token=token)
         return XiaoyunqueClient(
-            token=token, sync_client=sync_client, async_client=async_client, http_get=self._http_get
+            token=token,
+            sync_client=sync_client,
+            async_client=async_client,
+            http_get=self._http_get,
+            sleep=self._sleep,
+            asleep=self._asleep,
+            jitter=self._jitter,
         )
 
     def _build_video_object(

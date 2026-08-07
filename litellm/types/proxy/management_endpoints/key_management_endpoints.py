@@ -1,7 +1,33 @@
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+
+
+class KeyModelAddRequest(BaseModel):
+    key: str
+    models: List[str]
+
+    @field_validator("key")
+    @classmethod
+    def validate_key(cls, key: str) -> str:
+        if not key:
+            raise ValueError("key must not be empty")
+        return key
+
+    @field_validator("models")
+    @classmethod
+    def normalize_models(cls, models: List[str]) -> List[str]:
+        normalized = list(dict.fromkeys(model.strip() for model in models if model.strip()))
+        if not normalized:
+            raise ValueError("models must contain at least one non-empty model")
+        return normalized
+
+
+class KeyModelAddResponse(BaseModel):
+    models: List[str]
+    unrestricted: bool
+    updated_at: datetime
 
 
 class BulkUpdateKeyRequestItem(BaseModel):

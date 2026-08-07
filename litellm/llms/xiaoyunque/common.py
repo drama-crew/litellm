@@ -15,10 +15,12 @@ class XiaoyunqueError(Exception):
         status_code: int,
         message: str,
         headers: Optional[Mapping[str, str]] = None,
+        ret: str | None = None,
     ):
         self.status_code = status_code
         self.message = message
         self.headers = dict(headers or {})
+        self.ret = ret
         super().__init__(message)
 
 
@@ -34,6 +36,7 @@ class XiaoyunqueContentPolicyError(XiaoyunqueError):
 _AK_ERROR_TOKENS = ("Ak无效", "Ak为空", "Ak明细", "该Ak未启用", "Ak已过期", "未查询到有效的Ak")
 _COMPLIANCE_RETS = frozenset({"12004", "12005", "12006", "12015"})
 _RATE_LIMIT_RETS = frozenset({"10", "15", "16010"})
+_SUBMIT_RETRYABLE_RET = "16010"
 
 
 def is_ak_error(errmsg: Optional[str]) -> bool:
@@ -54,6 +57,10 @@ def is_compliance_ret(ret: str) -> bool:
 
 def is_rate_limit_ret(ret: str) -> bool:
     return ret in _RATE_LIMIT_RETS
+
+
+def is_submit_rate_limit_retryable(ret: str | None) -> bool:
+    return ret == _SUBMIT_RETRYABLE_RET
 
 
 def resolve_xiaoyunque_credentials(token: Optional[str] = None) -> str:

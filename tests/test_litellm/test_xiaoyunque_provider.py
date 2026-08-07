@@ -1,5 +1,9 @@
+import asyncio
 import base64
+import copy
 import json
+import random
+import time
 from typing import Any, Dict, Optional
 
 import pytest
@@ -15,6 +19,7 @@ from litellm.exceptions import (
 )
 from litellm.llms.xiaoyunque.client import (
     XiaoyunqueClient,
+    _submit_rate_limit_delay,
     decode_composite_task_id,
     encode_composite_task_id,
     parse_query_result,
@@ -29,6 +34,7 @@ from litellm.llms.xiaoyunque.common import (
     build_xiaoyunque_upload_headers,
     is_ak_error,
     is_compliance_ret,
+    is_submit_rate_limit_retryable,
     resolve_xiaoyunque_credentials,
 )
 from litellm.llms.xiaoyunque.handler import (
@@ -72,13 +78,18 @@ class FakeSyncClient:
     def __init__(self, post_by_path=None):
         self.post_by_path = post_by_path or {}
         self.calls = []
+        self.body_bytes = []
 
     def _path(self, url):
         return url.split("xyq.jianying.com", 1)[-1]
 
     def post(self, url, json=None, headers=None, timeout=None, files=None):
         path = self._path(url)
-        self.calls.append((path, json, files))
+        body_snapshot = copy.deepcopy(json)
+        self.calls.append((path, body_snapshot, files))
+        self.body_bytes.append(
+            __import__("json").dumps(body_snapshot, ensure_ascii=False, separators=(",", ":")).encode()
+        )
         queue = self.post_by_path[path]
         item = queue.pop(0) if isinstance(queue, list) else queue
         if isinstance(item, BaseException):
@@ -94,13 +105,18 @@ class FakeAsyncClient:
     def __init__(self, post_by_path=None):
         self.post_by_path = post_by_path or {}
         self.calls = []
+        self.body_bytes = []
 
     def _path(self, url):
         return url.split("xyq.jianying.com", 1)[-1]
 
     async def post(self, url, json=None, headers=None, timeout=None, files=None):
         path = self._path(url)
-        self.calls.append((path, json, files))
+        body_snapshot = copy.deepcopy(json)
+        self.calls.append((path, body_snapshot, files))
+        self.body_bytes.append(
+            __import__("json").dumps(body_snapshot, ensure_ascii=False, separators=(",", ":")).encode()
+        )
         queue = self.post_by_path[path]
         item = queue.pop(0) if isinstance(queue, list) else queue
         if isinstance(item, BaseException):
@@ -160,6 +176,33 @@ def _upload_ok(asset_id: str) -> Dict[str, Any]:
 
 def _submit_ok(run_id: str = "run-1", thread_id: str = "thread-1") -> Dict[str, Any]:
     return {"ret": "0", "errmsg": "", "data": {"run": {"run_id": run_id, "thread_id": thread_id, "state": 1}}}
+
+
+def _rate_limited_16010() -> Dict[str, Any]:
+    return {"ret": "16010", "errmsg": "操作过于频繁，请一分钟后再试", "data": {}}
+
+
+def _no_jitter(_low: float, _high: float) -> float:
+    return 0.0
+
+
+_EXPECTED_RETRY_DELAY = _submit_rate_limit_delay(_no_jitter)
+
+
+class _RecordingSleep:
+    def __init__(self):
+        self.calls: list = []
+
+    def __call__(self, seconds):
+        self.calls.append(seconds)
+
+
+class _RecordingAsleep:
+    def __init__(self):
+        self.calls: list = []
+
+    async def __call__(self, seconds):
+        self.calls.append(seconds)
 
 
 def _query_result_route(run_state, video_urls=None, image_urls=None, fail_reason=None) -> Dict[str, Any]:
@@ -882,6 +925,35 @@ async def test_avideo_generation_keeps_1080p_for_vision_model():
     assert body["video_part_tool_param"]["resolution"] == "1080p"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["Seedance_2.0_mini", "Seedance_2.5"])
+async def test_avideo_generation_accepts_new_model_slug(model):
+    fake = FakeAsyncClient(post_by_path={"/api/biz/v1/skill/submit_run": _submit_ok()})
+    vo = await XiaoyunqueLLM().avideo_generation(model, "a cat", "tok", None, {"seconds": 5}, None, client=fake)
+    assert vo.status == "queued"
+    assert vo.model == model
+    _, body, _ = fake.calls[0]
+    assert body["video_part_tool_param"]["model"] == model
+
+
+@pytest.mark.parametrize("model", ["Seedance_2.0_mini", "Seedance_2.5"])
+def test_resolve_resolution_downgrades_new_slugs_at_1080p(model):
+    warnings = []
+    assert resolve_resolution(model, "1080p", warn=lambda *a: warnings.append(a)) == "720p"
+    assert warnings
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["Seedance_2.0_mini", "Seedance_2.5"])
+async def test_avideo_generation_downgrades_1080p_for_new_slugs(model):
+    fake = FakeAsyncClient(post_by_path={"/api/biz/v1/skill/submit_run": _submit_ok()})
+    await XiaoyunqueLLM().avideo_generation(
+        model, "a cat", "tok", None, {"seconds": 5, "resolution": "1080p"}, None, client=fake
+    )
+    _, body, _ = fake.calls[0]
+    assert body["video_part_tool_param"]["resolution"] == "720p"
+
+
 # ---------------------------------------------------------------------------
 # transform.py pure functions
 # ---------------------------------------------------------------------------
@@ -1212,3 +1284,285 @@ async def test_avideo_status_malformed_composite_id_raises_bad_request(monkeypat
     video_id = encode_video_id_with_provider("no-tilde-here", FB3_PROVIDER, "some-model")
     with pytest.raises(BadRequestError):
         await XiaoyunqueLLM().avideo_status(video_id, None, None, {}, None, client=FakeAsyncClient())
+
+
+def test_client_defaults_sleep_functions_when_not_injected():
+    client = XiaoyunqueClient(token="t")
+    assert client._sleep is time.sleep
+    assert client._asleep is asyncio.sleep
+
+
+def test_make_client_forwards_retry_dependencies():
+    sleep = _RecordingSleep()
+    asleep = _RecordingAsleep()
+    llm = XiaoyunqueLLM(sleep=sleep, asleep=asleep, jitter=_no_jitter)
+    client = llm._make_client(api_key="tok", optional_params={})
+    assert client._sleep is sleep
+    assert client._asleep is asleep
+    assert client._jitter is _no_jitter
+
+
+def test_is_submit_rate_limit_retryable():
+    assert is_submit_rate_limit_retryable("16010") is True
+    assert is_submit_rate_limit_retryable("10") is False
+    assert is_submit_rate_limit_retryable("15") is False
+    assert is_submit_rate_limit_retryable("2") is False
+    assert is_submit_rate_limit_retryable(None) is False
+
+
+def test_check_sets_ret_on_nonzero_ret_error():
+    client = XiaoyunqueClient(token="t")
+    with pytest.raises(XiaoyunqueError) as exc:
+        client._check(FakeResponse({"ret": "16010", "errmsg": "操作过于频繁，请一分钟后再试"}), "submit_run")
+    assert exc.value.ret == "16010"
+
+
+def test_check_leaves_ret_none_for_non_200_http_status():
+    client = XiaoyunqueClient(token="t")
+    with pytest.raises(XiaoyunqueError) as exc:
+        client._check(FakeResponse({}, status_code=503), "submit_run")
+    assert exc.value.ret is None
+
+
+@pytest.mark.asyncio
+async def test_asubmit_run_succeeds_first_try_never_sleeps():
+    fake = FakeAsyncClient(post_by_path={"/api/biz/v1/skill/submit_run": _submit_ok()})
+    asleep = _RecordingAsleep()
+    client = XiaoyunqueClient(token="t", async_client=fake, asleep=asleep, jitter=_no_jitter)
+    result = await client.asubmit_run(message="a cat", asset_ids=[], video_part_tool_param={"model": "m"})
+    assert result == {"thread_id": "thread-1", "run_id": "run-1"}
+    assert len(fake.calls) == 1
+    assert asleep.calls == []
+
+
+@pytest.mark.asyncio
+async def test_asubmit_run_retries_on_16010_then_succeeds():
+    fake = FakeAsyncClient(
+        post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _submit_ok()]}
+    )
+    asleep = _RecordingAsleep()
+    client = XiaoyunqueClient(token="t", async_client=fake, asleep=asleep, jitter=_no_jitter)
+    result = await client.asubmit_run(message="a cat", asset_ids=[], video_part_tool_param={"model": "m"})
+    assert result == {"thread_id": "thread-1", "run_id": "run-1"}
+    assert len(fake.calls) == 3
+    assert asleep.calls == [_EXPECTED_RETRY_DELAY, _EXPECTED_RETRY_DELAY]
+
+
+@pytest.mark.asyncio
+async def test_asubmit_run_exhausts_retries_then_raises_rate_limit():
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _rate_limited_16010()]
+        }
+    )
+    asleep = _RecordingAsleep()
+    client = XiaoyunqueClient(token="t", async_client=fake, asleep=asleep, jitter=_no_jitter)
+    with pytest.raises(XiaoyunqueError) as exc:
+        await client.asubmit_run(message="a cat", asset_ids=[], video_part_tool_param={"model": "m"})
+    assert exc.value.status_code == 429
+    assert exc.value.ret == "16010"
+    assert len(fake.calls) == 3
+    assert asleep.calls == [_EXPECTED_RETRY_DELAY, _EXPECTED_RETRY_DELAY]
+
+
+@pytest.mark.asyncio
+async def test_asubmit_run_does_not_retry_other_rate_limit_ret():
+    fake = FakeAsyncClient(
+        post_by_path={"/api/biz/v1/skill/submit_run": {"ret": "10", "errmsg": "服务器太火爆了，请稍后再试", "data": {}}}
+    )
+    asleep = _RecordingAsleep()
+    client = XiaoyunqueClient(token="t", async_client=fake, asleep=asleep, jitter=_no_jitter)
+    with pytest.raises(XiaoyunqueError) as exc:
+        await client.asubmit_run(message="a cat", asset_ids=[], video_part_tool_param={"model": "m"})
+    assert exc.value.status_code == 429
+    assert len(fake.calls) == 1
+    assert asleep.calls == []
+
+
+@pytest.mark.asyncio
+async def test_asubmit_run_does_not_retry_bad_request_ret():
+    fake = FakeAsyncClient(
+        post_by_path={"/api/biz/v1/skill/submit_run": {"ret": "2", "errmsg": "unrecognized param error", "data": {}}}
+    )
+    asleep = _RecordingAsleep()
+    client = XiaoyunqueClient(token="t", async_client=fake, asleep=asleep, jitter=_no_jitter)
+    with pytest.raises(XiaoyunqueError) as exc:
+        await client.asubmit_run(message="a cat", asset_ids=[], video_part_tool_param={"model": "m"})
+    assert exc.value.status_code == 400
+    assert len(fake.calls) == 1
+    assert asleep.calls == []
+
+
+def test_submit_run_sync_retries_on_16010_then_succeeds():
+    fake = FakeSyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+    sleep = _RecordingSleep()
+    client = XiaoyunqueClient(token="t", sync_client=fake, sleep=sleep, jitter=_no_jitter)
+    result = client.submit_run(message="a cat", asset_ids=[], video_part_tool_param={"model": "m"})
+    assert result == {"thread_id": "thread-1", "run_id": "run-1"}
+    assert len(fake.calls) == 2
+    assert sleep.calls == [_EXPECTED_RETRY_DELAY]
+
+
+def test_submit_run_sync_exhausts_retries_then_raises():
+    fake = FakeSyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _rate_limited_16010()]
+        }
+    )
+    sleep = _RecordingSleep()
+    client = XiaoyunqueClient(token="t", sync_client=fake, sleep=sleep, jitter=_no_jitter)
+    with pytest.raises(XiaoyunqueError) as exc:
+        client.submit_run(message="a cat", asset_ids=[], video_part_tool_param={"model": "m"})
+    assert exc.value.status_code == 429
+    assert len(fake.calls) == 3
+    assert sleep.calls == [_EXPECTED_RETRY_DELAY, _EXPECTED_RETRY_DELAY]
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_16010_retries_then_succeeds_end_to_end():
+    fake = FakeAsyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+    asleep = _RecordingAsleep()
+    vo = await XiaoyunqueLLM(asleep=asleep, jitter=_no_jitter).avideo_generation(
+        "seedance2.0_vision", "a cat", "tok", None, {"seconds": 5}, None, client=fake
+    )
+    assert vo.status == "queued"
+    assert len(fake.calls) == 2
+    assert asleep.calls == [_EXPECTED_RETRY_DELAY]
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_16010_exhausted_raises_existing_rate_limit_mapping():
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _rate_limited_16010()]
+        }
+    )
+    asleep = _RecordingAsleep()
+    with pytest.raises(RateLimitError):
+        await XiaoyunqueLLM(asleep=asleep, jitter=_no_jitter).avideo_generation(
+            "seedance2.0_vision", "a cat", "tok", None, {"seconds": 5}, None, client=fake
+        )
+    assert len(fake.calls) == 3
+    assert asleep.calls == [_EXPECTED_RETRY_DELAY, _EXPECTED_RETRY_DELAY]
+
+
+def test_video_generation_sync_16010_retries_then_succeeds_end_to_end():
+    fake = FakeSyncClient(post_by_path={"/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _submit_ok()]})
+    sleep = _RecordingSleep()
+    vo = XiaoyunqueLLM(sleep=sleep, jitter=_no_jitter).video_generation(
+        "seedance2.0_vision", "a cat", "tok", None, {"seconds": 5}, None, client=fake
+    )
+    assert vo.status == "queued"
+    assert len(fake.calls) == 2
+    assert sleep.calls == [_EXPECTED_RETRY_DELAY]
+
+
+@pytest.mark.asyncio
+async def test_avideo_status_16010_does_not_retry():
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/biz/v1/agent/query_generate_video_result": {
+                "ret": "16010",
+                "errmsg": "操作过于频繁，请一分钟后再试",
+                "data": {},
+            }
+        }
+    )
+    asleep = _RecordingAsleep()
+    with pytest.raises(RateLimitError):
+        await XiaoyunqueLLM(asleep=asleep, jitter=_no_jitter).avideo_status(_vid(), "tok", None, {}, None, client=fake)
+    assert len(fake.calls) == 1
+    assert asleep.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Retry-delay shape. Both of these pin decisions made after an adversarial
+# review, and both would silently regress without a test:
+#   * 30s (the original value) is SHORTER than the upstream's own stated
+#     "请一分钟后再试". If that throttle window is sliding, a sub-60s retry
+#     re-arms it and is guaranteed to fail -- turning an instant 429 into a
+#     60s-latency 429. We could not determine the window semantics for free
+#     (validation-rejected requests are not counted by the limiter, so mapping
+#     it would cost real generations), so the delay must be correct under
+#     EITHER semantics.
+#   * Without jitter, a burst of simultaneously-throttled submits retries in
+#     lockstep and re-collides on exactly the same tick.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("jitter_value", "expected_delay"), [(0.0, 60.0), (10.0, 70.0)])
+def test_retry_delay_uses_bounded_jitter(
+    jitter_value: float,
+    expected_delay: float,
+) -> None:
+    observed_bounds: list[tuple[float, float]] = []
+
+    def jitter(low: float, high: float) -> float:
+        observed_bounds.append((low, high))
+        return jitter_value
+
+    delay = _submit_rate_limit_delay(jitter)
+
+    assert observed_bounds == [(0.0, 10.0)]
+    assert delay == expected_delay
+    assert 60.0 <= delay <= 70.0
+
+
+def test_retry_delay_applies_real_jitter_by_default():
+    """A client built without an injected jitter must NOT produce a constant
+    delay -- otherwise every throttled submit in a burst retries on the same
+    tick and collides again. Uses the production default (random.uniform)."""
+    client = XiaoyunqueClient(token="t")
+    delays = {_submit_rate_limit_delay(client._jitter) for _ in range(50)}
+    assert len(delays) > 1, (
+        f"default jitter produced a constant delay {delays!r} -- a throttled burst would retry in lockstep"
+    )
+    assert all(60.0 <= delay <= 70.0 for delay in delays)
+
+
+def test_client_defaults_to_random_uniform_jitter():
+    assert XiaoyunqueClient(token="t")._jitter is random.uniform
+
+
+@pytest.mark.asyncio
+async def test_retry_resubmits_a_byte_identical_body() -> None:
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _submit_ok()]
+        }
+    )
+    client = XiaoyunqueClient(token="t", async_client=fake, asleep=_RecordingAsleep(), jitter=_no_jitter)
+    await client.asubmit_run(
+        message="a cat on a windowsill",
+        asset_ids=["asset-1", "asset-2"],
+        video_part_tool_param={"model": "Seedance_2.5", "duration_sec": 30, "prompt": "a cat on a windowsill"},
+        thread_id="thread-existing",
+    )
+
+    assert len(fake.calls) == 3
+    first_body = fake.calls[0][1]
+    assert all(call[1] == first_body for call in fake.calls[1:])
+    assert all(body == fake.body_bytes[0] for body in fake.body_bytes[1:])
+    assert first_body["asset_ids"] == ["asset-1", "asset-2"]
+    assert first_body["thread_id"] == "thread-existing"
+    assert first_body["video_part_tool_param"]["model"] == "Seedance_2.5"
+    assert first_body["video_part_tool_param"]["prompt"] == "a cat on a windowsill"
+
+
+def test_sync_retry_resubmits_a_byte_identical_body() -> None:
+    fake = FakeSyncClient(
+        post_by_path={
+            "/api/biz/v1/skill/submit_run": [_rate_limited_16010(), _rate_limited_16010(), _submit_ok()]
+        }
+    )
+    client = XiaoyunqueClient(token="t", sync_client=fake, sleep=_RecordingSleep(), jitter=_no_jitter)
+    client.submit_run(
+        message="a cat on a windowsill",
+        asset_ids=["asset-1", "asset-2"],
+        video_part_tool_param={"model": "Seedance_2.5", "duration_sec": 30, "prompt": "a cat on a windowsill"},
+        thread_id="thread-existing",
+    )
+
+    assert len(fake.calls) == 3
+    assert all(call[1] == fake.calls[0][1] for call in fake.calls[1:])
+    assert all(body == fake.body_bytes[0] for body in fake.body_bytes[1:])

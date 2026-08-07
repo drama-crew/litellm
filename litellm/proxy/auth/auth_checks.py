@@ -59,12 +59,11 @@ from litellm.proxy._types import (
     SpecialModelNames,
     UserAPIKeyAuth,
 )
-from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.auth.budget_throttle import (
     budget_throttle_percentage,
     should_throttle_budget_exceeded,
 )
-from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
+from litellm.proxy.auth.route_checks import RouteChecks
 from litellm.proxy.common_utils.cache_pydantic_utils import CacheCodec
 from litellm.proxy.common_utils.http_parsing_utils import (
     _safe_get_request_headers,
@@ -80,6 +79,7 @@ from litellm.proxy.guardrails.tool_name_extraction import (
     extract_request_tool_names,
 )
 from litellm.proxy.route_llm_request import route_request
+from litellm.proxy.spend_tracking.budget_reservation import get_budget_window_start
 from litellm.proxy.utils import PrismaClient, ProxyLogging, log_db_metrics
 from litellm.repositories.budget_repository import BudgetRepository
 from litellm.repositories.object_permission_repository import ObjectPermissionRepository
@@ -2010,15 +2010,13 @@ async def get_access_object(
     prisma_client: Optional[PrismaClient],
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: Optional[ProxyLogging] = None,
+    check_db_only: bool = False,
 ) -> LiteLLM_AccessGroupTable:
     """
     - Check if access_group_id in proxy AccessGroupTable
     - Always checks cache first, then DB only when not found in cache
     - if valid, return LiteLLM_AccessGroupTable object
     - if not, then raise an error
-
-    Unlike get_team_object, this has no check_cache_only or check_db_only flags;
-    it always follows cache-first-then-db semantics.
 
     Raises:
         - HTTPException: If access group doesn't exist in db or cache (status_code=404)
@@ -2028,14 +2026,14 @@ async def get_access_object(
 
     key = "access_group_id:{}".format(access_group_id)
 
-    cached_access_obj = await user_api_key_cache.async_get_cache(
-        key=key,
-        model_type=LiteLLM_AccessGroupTable,
-    )
-    if cached_access_obj is not None:
-        return cached_access_obj
+    if not check_db_only:
+        cached_access_obj = await user_api_key_cache.async_get_cache(
+            key=key,
+            model_type=LiteLLM_AccessGroupTable,
+        )
+        if cached_access_obj is not None:
+            return cached_access_obj
 
-    # Not in cache - fetch from DB
     try:
         response = await AccessGroupRepository(prisma_client).table.find_unique(
             where={"access_group_id": access_group_id}
@@ -2049,13 +2047,13 @@ async def get_access_object(
 
         _response = LiteLLM_AccessGroupTable(**response.dict())
 
-        # Save to cache
-        await _cache_access_object(
-            access_group_id=access_group_id,
-            access_group_table=_response,
-            user_api_key_cache=user_api_key_cache,
-            proxy_logging_obj=proxy_logging_obj,
-        )
+        if not check_db_only:
+            await _cache_access_object(
+                access_group_id=access_group_id,
+                access_group_table=_response,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
 
         return _response
     except HTTPException:
@@ -2712,6 +2710,7 @@ async def _get_resources_from_access_groups(
     prisma_client: Optional[PrismaClient] = None,
     user_api_key_cache: Optional[UserApiKeyCache] = None,
     proxy_logging_obj: Optional[ProxyLogging] = None,
+    check_db_only: bool = False,
 ) -> List[str]:
     """
     Fetch access groups by their IDs (from cache or DB) and collect
@@ -2732,6 +2731,9 @@ async def _get_resources_from_access_groups(
     """
     if not access_group_ids:
         return []
+
+    if check_db_only and (prisma_client is None or user_api_key_cache is None):
+        raise ValueError("DB-only access-group reads require explicit database and cache dependencies")
 
     # Lazy import to avoid circular imports
     if prisma_client is None or user_api_key_cache is None:
@@ -2754,6 +2756,7 @@ async def _get_resources_from_access_groups(
                 prisma_client=prisma_client,
                 user_api_key_cache=user_api_key_cache,
                 proxy_logging_obj=proxy_logging_obj,
+                check_db_only=check_db_only,
             )
             resources.extend(getattr(ag, resource_field, []))
         except Exception:
@@ -2770,6 +2773,7 @@ async def _get_models_from_access_groups(
     prisma_client: Optional[PrismaClient] = None,
     user_api_key_cache: Optional[UserApiKeyCache] = None,
     proxy_logging_obj: Optional[ProxyLogging] = None,
+    check_db_only: bool = False,
 ) -> List[str]:
     """
     Collect model names from unified access groups.
@@ -2781,6 +2785,7 @@ async def _get_models_from_access_groups(
         prisma_client=prisma_client,
         user_api_key_cache=user_api_key_cache,
         proxy_logging_obj=proxy_logging_obj,
+        check_db_only=check_db_only,
     )
 
 
@@ -2896,10 +2901,7 @@ def _is_hidden_fallback_deployment(model: str, llm_router: Router) -> bool:
     deployments = llm_router.get_model_list(model_name=model)
     if not deployments:
         return False
-    return all(
-        (deployment.get("model_info") or {}).get("hidden") is True
-        for deployment in deployments
-    )
+    return all((deployment.get("model_info") or {}).get("hidden") is True for deployment in deployments)
 
 
 def _can_object_call_model(
@@ -3190,6 +3192,9 @@ async def can_team_access_model(
     team_object: Optional[LiteLLM_TeamTable],
     llm_router: Optional[Router],
     team_model_aliases: Optional[Dict[str, str]] = None,
+    prisma_client: PrismaClient | None = None,
+    user_api_key_cache: UserApiKeyCache | None = None,
+    check_db_only: bool = False,
 ) -> Literal[True]:
     """
     Returns True if the team can access a specific model.
@@ -3212,6 +3217,9 @@ async def can_team_access_model(
         if team_access_group_ids:
             models_from_groups = await _get_models_from_access_groups(
                 access_group_ids=team_access_group_ids,
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                check_db_only=check_db_only,
             )
             if models_from_groups:
                 return _can_object_call_model(
@@ -4170,6 +4178,7 @@ async def get_project_object(
     prisma_client: Optional[PrismaClient],
     user_api_key_cache: UserApiKeyCache,
     proxy_logging_obj: Optional[ProxyLogging] = None,
+    check_db_only: bool = False,
 ) -> Optional[LiteLLM_ProjectTableCachedObj]:
     """
     Fetch project object from cache or DB.
@@ -4181,14 +4190,14 @@ async def get_project_object(
     if prisma_client is None:
         return None
 
-    # Check cache first
     cache_key = "project_id:{}".format(project_id)
-    deserialized_project = await user_api_key_cache.async_get_cache(
-        key=cache_key,
-        model_type=LiteLLM_ProjectTableCachedObj,
-    )
-    if deserialized_project is not None:
-        return deserialized_project
+    if not check_db_only:
+        deserialized_project = await user_api_key_cache.async_get_cache(
+            key=cache_key,
+            model_type=LiteLLM_ProjectTableCachedObj,
+        )
+        if deserialized_project is not None:
+            return deserialized_project
 
     # Fetch from DB
     project_row = await ProjectRepository(prisma_client).table.find_unique(
@@ -4199,8 +4208,9 @@ async def get_project_object(
         return None
 
     project_obj = LiteLLM_ProjectTableCachedObj(**project_row.model_dump())
+    if check_db_only:
+        return project_obj
 
-    # Cache with TTL following _cache_management_object pattern
     project_obj.last_refreshed_at = time.time()
     await _cache_management_object(
         key=cache_key,
