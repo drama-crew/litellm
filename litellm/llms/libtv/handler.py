@@ -1,4 +1,5 @@
 import asyncio
+import binascii
 import base64
 import logging
 import os
@@ -281,7 +282,7 @@ def _reference_payload(ref: Any) -> Optional[Tuple[str, str, Optional[bytes]]]:
             mime_type, encoded = matched.groups()
             try:
                 data = base64.b64decode(encoded, validate=True)
-            except (ValueError, base64.binascii.Error) as exc:
+            except (ValueError, binascii.Error) as exc:
                 raise LibTVError(status_code=400, message="invalid base64 data URL input_reference") from exc
             extension = {
                 "image/jpeg": "jpg",
