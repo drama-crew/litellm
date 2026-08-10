@@ -179,8 +179,35 @@ def generate_hash_from_response(response_obj: Any) -> str:
 # nothing sets it today.
 _VIDEO_STATUS_CALL_TYPES = frozenset({"avideo_status", "video_status", "video_retrieve", "avideo_retrieve"})
 
+_LIBTV_IMAGE_BILLING_CALL_TYPES = frozenset(
+    {
+        "image_upscale_poll",
+        "image_upscale_finalize",
+        "libtv_image_upscale_poll",
+        "libtv_image_upscale_finalize",
+        "apoll_image_upscale",
+        "afinalize_image_upscale",
+    }
+)
+
+
+def is_libtv_image_billing_call(kwargs: dict | None) -> bool:
+    """Return whether a custom libtv image poll/finalize owns its billing."""
+    if not isinstance(kwargs, dict):
+        return False
+    call_type = str(kwargs.get("call_type") or "").lower()
+    if kwargs.get("libtv_image_billing") is True or kwargs.get("custom_image_billing") is True:
+        return True
+    provider = kwargs.get("custom_llm_provider")
+    if provider is None:
+        params = kwargs.get("litellm_params")
+        provider = params.get("custom_llm_provider") if isinstance(params, dict) else None
+    return str(provider or "").lower() == "libtv" and call_type in _LIBTV_IMAGE_BILLING_CALL_TYPES
+
 
 def get_spend_logs_id(call_type: str, response_obj: dict, kwargs: dict) -> Optional[str]:
+    if is_libtv_image_billing_call(kwargs):
+        return None
     if call_type == "aretrieve_batch" or call_type == "acreate_file":
         # Generate a hash from the response object
         id: Optional[str] = generate_hash_from_response(response_obj)

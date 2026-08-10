@@ -66,6 +66,9 @@ if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2]
 end
 redis.call('SET', KEYS[3], ARGV[3])
 redis.call('SET', KEYS[2], ARGV[4])
+if ARGV[5] ~= '' then
+  redis.call('XADD', KEYS[4], '*', 'payload', ARGV[5])
+end
 return {'ok', ARGV[3]}
 """
 
@@ -216,6 +219,7 @@ class LibTVReceiptStore:
         provider_code: str | None = None,
         message: str | None = None,
         expected_state: ReceiptState = "submitting",
+        billing_event: Mapping[str, object] | object | None = None,
     ) -> StoredReceipt:
         updated = StoredReceipt(
             team_id=receipt.team_id,
@@ -231,17 +235,32 @@ class LibTVReceiptStore:
         )
         index_key = self._index_key(receipt.team_id, receipt.model, receipt.request_id)
         pool_key = self._pool_key(receipt.team_id, receipt.model, receipt.request_id)
-        try:
-            result = await self.redis.eval(
-                _TRANSITION_SCRIPT,
-                3,
-                index_key,
-                pool_key,
-                receipt_key,
+        event_json = ""
+        if billing_event is not None:
+            if hasattr(billing_event, "to_dict"):
+                event_value = billing_event.to_dict()
+            elif isinstance(billing_event, Mapping):
+                event_value = dict(billing_event)
+            else:
+                raise TypeError("billing_event must be a mapping or provide to_dict()")
+            event_json = json.dumps(event_value, separators=(",", ":"), sort_keys=True)
+        eval_args = [index_key, pool_key, receipt_key]
+        if event_json:
+            eval_args.append("libtv:billing:outbox")
+        eval_args.extend(
+            [
                 expected_state,
                 receipt.deployment_id or "",
                 updated.to_json(),
                 self._pool_record(updated, receipt_key),
+                event_json,
+            ]
+        )
+        try:
+            result = await self.redis.eval(
+                _TRANSITION_SCRIPT,
+                4 if event_json else 3,
+                *eval_args,
             )
         except ResponseError as error:
             raise RedisError("receipt store Lua CAS is unavailable") from error
