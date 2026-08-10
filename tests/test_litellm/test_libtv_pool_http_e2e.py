@@ -16,6 +16,7 @@ from litellm.types.videos.utils import (
     decode_video_id_with_provider,
     encode_video_id_with_provider,
 )
+from litellm.llms.libtv.image_upscale import ImageUpscaleReceipt
 
 
 PUBLIC_MODELS = (
@@ -275,3 +276,22 @@ def test_http_legacy_video_ids_keep_original_account(legacy_model_id, expected_s
             status, result = request_json(base, f"/v1/videos/{legacy_id}{suffix}")
             assert status == 200
             assert result["slot"] == expected_slot
+
+
+def test_image_upscale_receipt_wire_shape_is_stable():
+    receipt = ImageUpscaleReceipt(
+        request_id="generation-1",
+        submission_state="submitted",
+        deployment_id="topaz-account-1",
+        provider_task_id="provider-task-1",
+        resume_token="v1.topaz-account-1.provider-task-1",
+    )
+    assert receipt.to_dict() == {
+        "request_id": "generation-1",
+        "submission_state": "submitted",
+        "deployment_id": "topaz-account-1",
+        "provider_task_id": "provider-task-1",
+        "resume_token": "v1.topaz-account-1.provider-task-1",
+        "provider_code": None,
+        "message": None,
+    }

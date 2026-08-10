@@ -16205,6 +16205,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/libtv/image-upscale/submit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Libtv Image Upscale Submit */
+        post: operations["libtv_image_upscale_submit_v1_libtv_image_upscale_submit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/mcp/access_groups": {
         parameters: {
             query?: never;
@@ -53646,6 +53663,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    libtv_image_upscale_submit_v1_libtv_image_upscale_submit_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
         };

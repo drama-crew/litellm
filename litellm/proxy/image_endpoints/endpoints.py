@@ -11,6 +11,7 @@ from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_str_from_messages,
 )
+from litellm.llms.libtv.image_upscale import ImageUpscaleReceipt
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
@@ -18,6 +19,69 @@ from litellm.proxy.route_llm_request import route_request
 from litellm.types.llms.openai import ChatCompletionUserMessage
 
 router = APIRouter()
+
+
+def _image_upscale_response(receipt: dict) -> ORJSONResponse:
+    state = receipt.get("submission_state")
+    if state == "submitted":
+        return ORJSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"receipt": receipt})
+    if state == "unknown":
+        return ORJSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"error": {"code": "libtv_submission_unknown", "metadata": {"submission_receipt": receipt}}},
+        )
+    if state == "rejected":
+        return ORJSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"error": {"code": "libtv_submission_rejected", "metadata": {"submission_receipt": receipt}}},
+        )
+    return ORJSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"error": {"code": "libtv_submission_not_submitted", "metadata": {"submission_receipt": receipt}}},
+    )
+
+
+@router.post(
+    "/v1/libtv/image-upscale/submit",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["images"],
+    include_in_schema=False,
+)
+async def libtv_image_upscale_submit(
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    from litellm.proxy.proxy_server import llm_router, user_model
+
+    data = dict(orjson.loads(await request.body()))
+    data["model"] = data.get("model") or user_model or "topaz-image-upscaler"
+    data["libtv_image_upscale_submit"] = True
+    data["user_api_key_dict"] = user_api_key_dict
+    try:
+        llm_call = await route_request(
+            data=data,
+            route_type="aimage_generation",
+            llm_router=llm_router,
+            user_model=user_model,
+        )
+        response = await llm_call
+        receipt = (getattr(response, "_hidden_params", {}) or {}).get("submission_receipt")
+        if not isinstance(receipt, dict):
+            receipt = ImageUpscaleReceipt(
+                request_id=str(data.get("request_id") or "unknown"),
+                submission_state="unknown",
+                message="submit response did not include a receipt",
+            ).to_dict()
+        return _image_upscale_response(receipt)
+    except Exception:  # noqa: BLE001  # an ambiguous submit outcome must return an unknown receipt
+        receipt = ImageUpscaleReceipt(
+            request_id=str(data.get("request_id") or "unknown"),
+            submission_state="unknown",
+            message="provider submit result is unknown",
+        ).to_dict()
+        return _image_upscale_response(receipt)
+
 
 import io
 

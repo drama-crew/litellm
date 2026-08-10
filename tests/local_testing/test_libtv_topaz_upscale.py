@@ -4,6 +4,12 @@ import pytest
 
 from litellm.exceptions import BadRequestError
 from litellm.llms.libtv.handler import LibTVLLM
+from litellm.llms.libtv.image_upscale import (
+    ImageUpscaleSubmitter,
+    ProviderRejected,
+    ProviderTransportError,
+    TopazImageUpscaleBuilder,
+)
 from litellm.llms.libtv.transform import build_topaz_upscale_params
 
 _TOPAZ_SOURCE_URL = "https://libtv-res.liblib.art/upload-images/uid/source.mp4"
@@ -71,6 +77,89 @@ _CREATE_ROUTES = {
     "/api/canvas/nodes/batch": {"code": 0, "data": {}},
     "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
 }
+
+
+@pytest.fixture
+def topaz_builder():
+    return TopazImageUpscaleBuilder()
+
+
+def submit_body():
+    return {
+        "request_id": "generation-1",
+        "source_url": "https://source.example/input.png",
+        "style": "Standard V2",
+        "scale": 2,
+    }
+
+
+def test_topaz_image_payload_is_flat_and_has_no_mode_type(topaz_builder):
+    payload = topaz_builder.build(
+        source_url="https://source.example/input.png",
+        style="CGI",
+        scale=4,
+    )
+    assert payload["style"] == "CGI"
+    assert payload["scale"] == 4
+    assert payload["imageList"] == ["https://source.example/input.png"]
+    assert "modeType" not in payload
+
+
+@pytest.mark.parametrize("sources", [[], ["a.png", "b.png"]])
+def test_topaz_image_rejects_zero_or_multiple_sources(topaz_builder, sources):
+    with pytest.raises(ValueError, match="exactly one source image"):
+        topaz_builder.build(source_urls=sources, style="Standard V2", scale=2)
+
+
+@pytest.mark.asyncio
+async def test_submit_returns_submitted_receipt():
+    class Provider:
+        async def create(self, payload):
+            return {"task_id": "provider-task-1"}
+
+    receipt = await ImageUpscaleSubmitter(("primary", Provider())).submit(submit_body())
+    assert receipt.submission_state == "submitted"
+    assert receipt.provider_task_id == "provider-task-1"
+
+
+@pytest.mark.asyncio
+async def test_post_create_transport_error_returns_unknown_without_failover():
+    class Provider:
+        def __init__(self):
+            self.calls = 0
+
+        async def create(self, payload):
+            self.calls += 1
+            raise ProviderTransportError(crossed_create_boundary=True)
+
+    primary = Provider()
+    secondary = Provider()
+    receipt = await ImageUpscaleSubmitter(("primary", primary), ("secondary", secondary)).submit(submit_body())
+    assert receipt.submission_state == "unknown"
+    assert secondary.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_explicit_capacity_rejection_can_try_second_deployment():
+    class RejectedProvider:
+        async def create(self, payload):
+            raise ProviderRejected("capacity")
+
+    class AcceptedProvider:
+        def __init__(self):
+            self.calls = 0
+
+        async def create(self, payload):
+            self.calls += 1
+            return {"task_id": "provider-task-2"}
+
+    secondary = AcceptedProvider()
+    receipt = await ImageUpscaleSubmitter(
+        ("primary", RejectedProvider()), ("secondary", secondary)
+    ).submit(submit_body())
+    assert receipt.submission_state == "submitted"
+    assert receipt.deployment_id == "secondary"
+    assert secondary.calls == 1
 
 
 def _gen_params(calls):

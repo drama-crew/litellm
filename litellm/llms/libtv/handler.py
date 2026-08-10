@@ -3,14 +3,13 @@ import logging
 import os
 import random
 import time
+import uuid
 from functools import wraps
 from inspect import iscoroutinefunction
 from typing import Any, Optional, Tuple, Union
 
 import httpx
 
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
-from litellm.llms.custom_llm import CustomLLM
 from litellm.exceptions import (
     APIError,
     AuthenticationError,
@@ -23,6 +22,8 @@ from litellm.exceptions import (
     ServiceUnavailableError,
     Timeout,
 )
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+from litellm.llms.custom_llm import CustomLLM
 from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import (
@@ -73,6 +74,7 @@ from litellm.llms.openai.cost_calculation import _video_output_cost_per_second
 
 from .client import LibTVClient
 from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
+from .image_upscale import ImageUpscaleReceipt
 from .persistence import get_persistence
 from .transform import _resolution_from_size, build_generation_params, build_topaz_upscale_params
 
@@ -350,6 +352,19 @@ def _is_topaz_upscale(spec: dict) -> bool:
     return spec.get("vendor") == _TOPAZ_VENDOR
 
 
+def _is_topaz_image_upscale(spec: dict) -> bool:
+    return (
+        spec.get("vendor") == _TOPAZ_VENDOR
+        and spec.get("task_type") == "image"
+        and spec.get("model_key") == "topaz-image-upscaler"
+    )
+
+
+def _topaz_source_images(optional_params: dict) -> list:
+    images, _, _ = _collect_reference_groups(optional_params)
+    return images
+
+
 def _topaz_source_videos(optional_params: dict) -> list:
     return _as_list(optional_params.get("video_references")) + _as_list(optional_params.get("input_reference"))
 
@@ -551,6 +566,7 @@ class LibTVLLM(CustomLLM):
             poll_max_attempts=self.poll_max_attempts,
             http_get=self._http_get,
             http_put=self._http_put,
+            redis_client=optional_params.get("media_transfer_redis"),
         )
 
     def _build_video_object(self, model: str, created: dict, optional_params: Optional[dict] = None) -> VideoObject:
@@ -809,12 +825,12 @@ class LibTVLLM(CustomLLM):
     def video_status(
         self,
         video_id: str,
-        api_key: Optional[str],
-        api_base: Optional[str],
+        api_key: str | None,
+        api_base: str | None,
         optional_params: dict,
         logging_obj: Any,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
-        client: Optional[HTTPHandler] = None,
+        client: HTTPHandler | None = None,
     ) -> VideoObject:
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         return self._video_status(video_id, lt.poll_once(_decode_task_id(video_id), "video"))
@@ -823,12 +839,12 @@ class LibTVLLM(CustomLLM):
     async def avideo_status(
         self,
         video_id: str,
-        api_key: Optional[str],
-        api_base: Optional[str],
+        api_key: str | None,
+        api_base: str | None,
         optional_params: dict,
         logging_obj: Any,
         timeout: Optional[Union[float, httpx.Timeout]] = None,
-        client: Optional[AsyncHTTPHandler] = None,
+        client: AsyncHTTPHandler | None = None,
     ) -> VideoObject:
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         task_id = _decode_task_id(video_id)
@@ -944,6 +960,78 @@ class LibTVLLM(CustomLLM):
                 ]
         return params
 
+    def submit_image_upscale(
+        self,
+        model: str,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        client: Optional[HTTPHandler] = None,
+    ) -> ImageUpscaleReceipt:
+        lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
+        spec = lt.resolve_model_spec(model)
+        if not _is_topaz_image_upscale(spec):
+            raise LibTVError(status_code=400, message="image upscale requires topaz-image-upscaler")
+        images = _topaz_source_images(optional_params)
+        if len(images) != 1:
+            raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
+        source = _reference_payload(images[0])
+        if source is None:
+            raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
+        source_url = lt.ensure_libtv_url(*source, _REF_DEFAULT_NAME["image"], require_delegated=True)
+        request_id = str(
+            optional_params.get("provider_request_id") or optional_params.get("request_id") or uuid.uuid4()
+        )
+        model_info = optional_params.get("model_info") or {}
+        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+        return lt.submit_image_upscale(
+            model,
+            spec["vendor"],
+            source_url,
+            str(optional_params.get("style", "Standard V2")),
+            int(optional_params.get("scale", 2)),
+            _project_name(model),
+            request_id,
+            str(deployment_id) if deployment_id is not None else None,
+        )
+
+    async def asubmit_image_upscale(
+        self,
+        model: str,
+        api_key: Optional[str],
+        api_base: Optional[str],
+        optional_params: dict,
+        logging_obj: Any,
+        client: Optional[AsyncHTTPHandler] = None,
+    ) -> ImageUpscaleReceipt:
+        lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
+        spec = await lt.aresolve_model_spec(model)
+        if not _is_topaz_image_upscale(spec):
+            raise LibTVError(status_code=400, message="image upscale requires topaz-image-upscaler")
+        images = _topaz_source_images(optional_params)
+        if len(images) != 1:
+            raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
+        source = _reference_payload(images[0])
+        if source is None:
+            raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
+        source_url = await lt.aensure_libtv_url(*source, _REF_DEFAULT_NAME["image"], require_delegated=True)
+        request_id = str(
+            optional_params.get("provider_request_id") or optional_params.get("request_id") or uuid.uuid4()
+        )
+        model_info = optional_params.get("model_info") or {}
+        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+        return await lt.asubmit_image_upscale(
+            model,
+            spec["vendor"],
+            source_url,
+            str(optional_params.get("style", "Standard V2")),
+            int(optional_params.get("scale", 2)),
+            _project_name(model),
+            request_id,
+            str(deployment_id) if deployment_id is not None else None,
+        )
+
     @normalize_libtv_errors
     def image_generation(
         self,
@@ -959,6 +1047,11 @@ class LibTVLLM(CustomLLM):
     ) -> ImageResponse:
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
+        if optional_params.get("libtv_image_upscale_submit") is True:
+            receipt = self.submit_image_upscale(model, api_key, api_base, optional_params, logging_obj, client)
+            model_response.data = []
+            model_response._hidden_params = {"submission_receipt": receipt.to_dict()}
+            return model_response
         images, _, _ = _collect_reference_groups(optional_params)
         params = self._resolved_image_params(lt, prompt, spec, images, optional_params)
         result = lt.generate(model, spec["vendor"], "image", params, _project_name(model))
@@ -979,6 +1072,11 @@ class LibTVLLM(CustomLLM):
     ) -> ImageResponse:
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
+        if optional_params.get("libtv_image_upscale_submit") is True:
+            receipt = await self.asubmit_image_upscale(model, api_key, api_base, optional_params, logging_obj, client)
+            model_response.data = []
+            model_response._hidden_params = {"submission_receipt": receipt.to_dict()}
+            return model_response
         images, _, _ = _collect_reference_groups(optional_params)
         params = await self._aresolved_image_params(lt, prompt, spec, images, optional_params)
         result = await lt.agenerate(model, spec["vendor"], "image", params, _project_name(model))
