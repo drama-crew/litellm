@@ -287,11 +287,17 @@ def _reference_payload(ref: Any) -> Optional[Tuple[str, str, Optional[bytes]]]:
                 "image/jpeg": "jpg",
                 "image/png": "png",
                 "image/webp": "webp",
+                "image/gif": "gif",
+                "image/heic": "heic",
+                "image/heif": "heif",
                 "video/mp4": "mp4",
                 "video/quicktime": "mov",
                 "audio/mpeg": "mp3",
                 "audio/wav": "wav",
                 "audio/mp4": "m4a",
+                "audio/flac": "flac",
+                "audio/aac": "aac",
+                "audio/ogg": "ogg",
             }.get(mime_type.lower(), "bin")
             return ("bytes", f"reference.{extension}", data)
         with open(ref, "rb") as f:

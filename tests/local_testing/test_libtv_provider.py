@@ -587,8 +587,19 @@ def test_reference_payload_bytes_and_tuple():
     ("mime", "filename"),
     [
         ("image/png", "reference.png"),
+        ("image/jpeg", "reference.jpg"),
+        ("image/webp", "reference.webp"),
+        ("image/gif", "reference.gif"),
+        ("image/heic", "reference.heic"),
+        ("image/heif", "reference.heif"),
         ("video/mp4", "reference.mp4"),
+        ("video/quicktime", "reference.mov"),
         ("audio/mpeg", "reference.mp3"),
+        ("audio/wav", "reference.wav"),
+        ("audio/flac", "reference.flac"),
+        ("audio/mp4", "reference.m4a"),
+        ("audio/aac", "reference.aac"),
+        ("audio/ogg", "reference.ogg"),
     ],
 )
 def test_reference_payload_data_url_decodes_bytes(mime, filename):
@@ -3741,6 +3752,67 @@ class _FullAsyncFake(_FullSyncFake):
 
     async def get(self, url, headers=None, params=None):
         return _FullSyncFake.get(self, url, headers, None, params)
+
+
+class _FullSyncUploadFake(_FullSyncFake):
+    def __init__(self, api_routes, get_payload=None):
+        super().__init__(api_routes, get_payload=get_payload)
+        self.uploaded = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        if "getUserInfo" in url:
+            self.calls.append((url, json))
+            return FakeResponse({"code": 0, "data": {"uuid": "user-1"}})
+        if url.endswith("/init/4"):
+            self.calls.append((url, json))
+            return FakeResponse(
+                {"code": 0, "data": {"uploadId": "up", "parts": [{"partNumber": 1, "url": "https://oss/put/1"}]}}
+            )
+        if url.endswith("/complete/4"):
+            self.calls.append((url, json))
+            return FakeResponse({"code": 0, "data": {"cdnUrl": f"https://libtv-res/uploaded-{len(self.uploaded)}.bin"}})
+        return super().post(url, json, headers, timeout)
+
+
+def test_video_generation_uploads_data_url_references_with_mime_extensions():
+    routes = _submit_routes()
+    fake = _FullSyncUploadFake(routes, get_payload=_tool_spec_payload(auto_compliance=False))
+    uploaded_bytes = []
+
+    def put_bytes(_url, data):
+        uploaded_bytes.append(bytes(data))
+        fake.uploaded.append(bytes(data))
+        return 200
+
+    llm = LibTVLLM(poll_interval=0, http_put=put_bytes)
+    vo = llm.video_generation(
+        "star-video2",
+        "combine",
+        "tok",
+        None,
+        {
+            "webid": "w",
+            "reference_images": ["data:image/heic;base64,aGVpYw=="],
+            "reference_videos": ["data:video/quicktime;base64,bW92"],
+            "reference_audios": ["data:audio/flac;base64,ZmxhYw=="],
+            "modeType": "mixed2video",
+        },
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    assert uploaded_bytes == [b"heic", b"mov", b"flac"]
+    init_paths = [j["path"] for u, j in fake.calls if u.endswith("/init/4")]
+    assert [p.rsplit(".", 1)[-1] for p in init_paths] == ["heic", "mov", "flac"]
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["imageList"] == ["https://libtv-res/uploaded-1.bin"]
+    assert gen_params["videoList"] == ["https://libtv-res/uploaded-2.bin"]
+    assert gen_params["audioList"] == ["https://libtv-res/uploaded-3.bin"]
+    assert gen_params["mixedList"] == [
+        {"url": "https://libtv-res/uploaded-1.bin", "type": "image"},
+        {"url": "https://libtv-res/uploaded-2.bin", "type": "video"},
+        {"url": "https://libtv-res/uploaded-3.bin", "type": "audio"},
+    ]
 
 
 def _gen_params(calls):
