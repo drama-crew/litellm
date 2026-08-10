@@ -8,6 +8,10 @@ import secrets
 from dataclasses import asdict, dataclass
 from typing import Awaitable, Literal, Mapping, Protocol, Sequence
 
+from redis.exceptions import RedisError
+
+from litellm.llms.libtv.receipts import LibTVReceiptStore, ReceiptClaim, StoredReceipt, request_fingerprint
+
 SubmissionState = Literal["not_submitted", "rejected", "unknown", "submitted"]
 
 
@@ -62,6 +66,11 @@ class ImageUpscaleReceipt:
 
     def to_dict(self) -> dict[str, str | None]:
         return asdict(self)
+
+
+class IdempotencyFingerprintMismatch(Exception):
+    status_code = 409
+    code = "idempotency_fingerprint_mismatch"
 
 
 def normalize_image_upscale_receipt(
@@ -151,18 +160,143 @@ class TopazImageUpscaleBuilder:
 
 
 class ImageUpscaleSubmitter:
-    def __init__(self, *deployments: tuple[str, ImageUpscaleProvider], resume_secret: str | None = None):
+    def __init__(
+        self,
+        *deployments: tuple[str, ImageUpscaleProvider],
+        resume_secret: str | None = None,
+        receipt_store: LibTVReceiptStore | None = None,
+        team_id: str | None = None,
+        model: str = "topaz-image-upscaler",
+    ):
         if not deployments:
             raise ValueError("at least one image upscale deployment is required")
         self._deployments = tuple(deployments)
         self._resume_secret = (
             resume_secret or os.getenv("LIBTV_IMAGE_UPSCALE_RESUME_SECRET") or secrets.token_urlsafe(32)
         )
+        if receipt_store is None and os.getenv("LIBTV_RECEIPTS_REDIS_URL"):
+            from litellm.llms.libtv.persistence import get_receipt_store
+
+            receipt_store = get_receipt_store()
+        self._receipt_store = receipt_store
+        self._team_id = team_id
+        self._model = model
+
+    @staticmethod
+    def _from_stored(receipt: StoredReceipt | None, request_id: str, message: str | None = None) -> ImageUpscaleReceipt:
+        if receipt is None:
+            return ImageUpscaleReceipt(request_id=request_id, submission_state="unknown", message=message)
+        state = receipt.submission_state
+        public_state = "unknown" if state == "submitting" else state
+        return ImageUpscaleReceipt(
+            request_id=request_id,
+            submission_state=public_state,
+            deployment_id=receipt.deployment_id,
+            provider_task_id=receipt.provider_task_id,
+            resume_token=receipt.resume_token,
+            provider_code=receipt.provider_code,
+            message=message or receipt.message,
+        )
+
+    async def _claim(
+        self, team_id: str, request_id: str, fingerprint: str, deployment_id: str
+    ) -> tuple[ReceiptClaim, ImageUpscaleReceipt | None]:
+        if self._receipt_store is None:
+            raise RuntimeError("receipt store is not configured")
+        claim = await self._receipt_store.claim(team_id, self._model, request_id, fingerprint, deployment_id)
+        if claim.outcome == "mismatch":
+            raise IdempotencyFingerprintMismatch("request_id was already used with a different fingerprint")
+        if claim.outcome == "missing":
+            return claim, self._from_stored(None, request_id, "receipt missing after pending claim")
+        if claim.outcome in {"existing", "rejected", "not_submitted"}:
+            if claim.receipt is not None and claim.receipt.submission_state == "submitting":
+                resolved = await self._receipt_store.wait(claim)
+                return claim, self._from_stored(resolved or claim.receipt, request_id)
+            return claim, self._from_stored(claim.receipt, request_id)
+        return claim, None
+
+    async def _submit_deployment(
+        self,
+        request_id: str,
+        deployment_id: str,
+        provider: ImageUpscaleProvider,
+        claim: ReceiptClaim | None,
+        payload: Mapping[str, object],
+    ) -> tuple[ImageUpscaleReceipt | None, ProviderRejected | None]:
+        try:
+            response = await provider.create(payload)
+        except ProviderRejected as error:
+            if self._receipt_store is not None and claim is not None and claim.receipt is not None:
+                await self._receipt_store.transition(
+                    claim.receipt,
+                    claim.receipt_key,
+                    "rejected",
+                    provider_code=error.provider_code,
+                    message=str(error),
+                )
+            return None, error
+        except ProviderTransportError as error:
+            if self._receipt_store is not None and claim is not None and claim.receipt is not None:
+                state = "unknown" if error.crossed_create_boundary else "not_submitted"
+                stored = await self._receipt_store.transition(
+                    claim.receipt, claim.receipt_key, state, message=str(error)
+                )
+                if error.crossed_create_boundary:
+                    return self._from_stored(stored, request_id), None
+                return None, None
+            if error.crossed_create_boundary:
+                return (
+                    ImageUpscaleReceipt(
+                        request_id=request_id,
+                        submission_state="unknown",
+                        deployment_id=deployment_id,
+                        message=str(error),
+                    ),
+                    None,
+                )
+            return None, None
+        task_id = response.get("task_id") or response.get("taskId")
+        if not isinstance(task_id, str) or not task_id:
+            if self._receipt_store is not None and claim is not None and claim.receipt is not None:
+                stored = await self._receipt_store.transition(
+                    claim.receipt,
+                    claim.receipt_key,
+                    "unknown",
+                    message="provider create returned no task id",
+                )
+                return self._from_stored(stored, request_id), None
+            return (
+                ImageUpscaleReceipt(
+                    request_id=request_id,
+                    submission_state="unknown",
+                    deployment_id=deployment_id,
+                    message="provider create returned no task id",
+                ),
+                None,
+            )
+        receipt = ImageUpscaleReceipt(
+            request_id=request_id,
+            submission_state="submitted",
+            deployment_id=deployment_id,
+            provider_task_id=task_id,
+            resume_token=make_resume_token(deployment_id, task_id, self._resume_secret),
+        )
+        if self._receipt_store is None or claim is None or claim.receipt is None:
+            return receipt, None
+        stored = await self._receipt_store.transition(
+            claim.receipt,
+            claim.receipt_key,
+            "submitted",
+            provider_task_id=task_id,
+            resume_token=receipt.resume_token,
+        )
+        return self._from_stored(stored, request_id), None
 
     async def submit(self, payload: Mapping[str, object]) -> ImageUpscaleReceipt:
         request_id = payload.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("image upscale request_id is required")
+        team_id = self._team_id or (payload.get("team_id") if isinstance(payload.get("team_id"), str) else "default")
         TopazImageUpscaleBuilder().build(
             source_url=payload.get("source_url") if isinstance(payload.get("source_url"), str) else None,
             source_urls=payload.get("source_urls") if isinstance(payload.get("source_urls"), Sequence) else None,
@@ -170,36 +304,34 @@ class ImageUpscaleSubmitter:
             scale=payload.get("scale", 2) if isinstance(payload.get("scale", 2), int) else -1,
         )
         last_rejection: ProviderRejected | None = None
+        fingerprint = request_fingerprint(payload, self._model)
         for deployment_id, provider in self._deployments:
-            try:
-                response = await provider.create(payload)
-            except ProviderRejected as error:
-                last_rejection = error
-                continue
-            except ProviderTransportError as error:
-                if error.crossed_create_boundary:
+            claim = None
+            if self._receipt_store is not None:
+                try:
+                    claim, existing = await self._claim(team_id, request_id, fingerprint, deployment_id)
+                except RedisError:
                     return ImageUpscaleReceipt(
                         request_id=request_id,
-                        submission_state="unknown",
-                        deployment_id=deployment_id,
-                        message=str(error),
+                        submission_state="not_submitted",
+                        message="receipt store unavailable",
                     )
+                if existing is not None:
+                    if existing.submission_state in {"unknown", "submitted"}:
+                        return existing
+                    if existing.submission_state == "rejected":
+                        last_rejection = ProviderRejected(
+                            existing.message or "provider rejected", existing.provider_code
+                        )
+                        continue
+                    if existing.submission_state == "not_submitted":
+                        continue
+            result, rejection = await self._submit_deployment(request_id, deployment_id, provider, claim, payload)
+            if result is not None:
+                return result
+            if rejection is not None:
+                last_rejection = rejection
                 continue
-            task_id = response.get("task_id") or response.get("taskId")
-            if not isinstance(task_id, str) or not task_id:
-                return ImageUpscaleReceipt(
-                    request_id=request_id,
-                    submission_state="unknown",
-                    deployment_id=deployment_id,
-                    message="provider create returned no task id",
-                )
-            return ImageUpscaleReceipt(
-                request_id=request_id,
-                submission_state="submitted",
-                deployment_id=deployment_id,
-                provider_task_id=task_id,
-                resume_token=make_resume_token(deployment_id, task_id, self._resume_secret),
-            )
         if last_rejection is not None:
             return ImageUpscaleReceipt(
                 request_id=request_id,

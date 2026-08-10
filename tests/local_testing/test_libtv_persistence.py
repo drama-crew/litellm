@@ -9,6 +9,7 @@ from litellm.llms.libtv.persistence import (
     LibTVPersistence,
     account_key,
     get_persistence,
+    get_receipt_store,
     normalize_source_key,
     url_alive,
 )
@@ -75,6 +76,23 @@ def test_account_key_stable_and_16_chars():
     assert k1 != k3
     assert len(k1) == 16
     assert k1 == hashlib.sha1(b"token-abc").hexdigest()[:16]
+
+
+def test_get_receipt_store_uses_dedicated_redis_url(monkeypatch):
+    monkeypatch.setenv("LIBTV_RECEIPTS_REDIS_URL", "redis://receipt-host:6380/4")
+
+    store = get_receipt_store()
+
+    assert store is not None
+    assert store.redis.connection_pool.connection_kwargs["host"] == "receipt-host"
+    assert store.redis.connection_pool.connection_kwargs["port"] == 6380
+    assert store.redis.connection_pool.connection_kwargs["db"] == 4
+
+
+def test_get_receipt_store_is_disabled_without_dedicated_url(monkeypatch):
+    monkeypatch.delenv("LIBTV_RECEIPTS_REDIS_URL", raising=False)
+
+    assert get_receipt_store() is None
 
 
 @pytest.mark.asyncio

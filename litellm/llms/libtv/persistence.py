@@ -1,10 +1,14 @@
 import hashlib
 import logging
+import os
 import time
 from typing import Any, TypedDict
 from urllib.parse import urlsplit
 
 import httpx
+from redis.asyncio import Redis
+
+from litellm.llms.libtv.receipts import LibTVReceiptStore
 
 WARN_INTERVAL_SECONDS = 300.0
 
@@ -283,3 +287,10 @@ def get_persistence() -> LibTVPersistence | None:
     if pc is None or getattr(pc, "db", None) is None:
         return None
     return LibTVPersistence(pc.db)
+
+
+def get_receipt_store(redis_url: str | None = None) -> LibTVReceiptStore | None:
+    url = redis_url or os.getenv("LIBTV_RECEIPTS_REDIS_URL")
+    if not url:
+        return None
+    return LibTVReceiptStore(Redis.from_url(url, decode_responses=True))
