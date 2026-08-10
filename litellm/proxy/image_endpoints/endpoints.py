@@ -31,7 +31,7 @@ router = APIRouter()
 
 class ImageUpscaleSubmitRequest(BaseModel):
     model: str | None = None
-    request_id: str | None = None
+    request_id: str = Field(min_length=1)
     source_url: str | None = None
     input_reference: str | None = None
     source_bytes: int = Field(gt=0)
@@ -117,6 +117,9 @@ def _image_upscale_response(receipt: dict) -> ORJSONResponse:
             "model": ImageUpscaleErrorResponse,
             "description": "Provider explicitly rejected submission",
         },
+        422: {
+            "description": "A stable request_id is required before a paid submission",
+        },
         503: {
             "model": ImageUpscaleErrorResponse,
             "description": "Submission was not sent",
@@ -197,7 +200,9 @@ async def libtv_image_upscale_submit(
                 )
             )
         return _image_upscale_response(normalized.to_dict())
-    except (orjson.JSONDecodeError, ValidationError, ValueError) as error:
+    except ValidationError as error:
+        return ORJSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": error.errors()})
+    except (orjson.JSONDecodeError, ValueError) as error:
         receipt = ImageUpscaleReceipt(
             request_id=str(data.get("request_id") or "unknown"),
             submission_state="unknown" if crossed_create_boundary else "not_submitted",

@@ -533,3 +533,30 @@ def test_image_upscale_openapi_contract_requires_source_digest_and_exposes_recei
     error_schema = route.responses[409]["model"].model_json_schema()
     receipt_schema = error_schema["$defs"]["ImageUpscaleReceiptResponse"]
     assert "submission_state" in receipt_schema["properties"]
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_submit_requires_stable_request_id_with_422():
+    result = await endpoints.libtv_image_upscale_submit(
+        request=_request(
+            orjson.dumps(
+                {
+                    "source_url": "https://source.example/input.png",
+                    "source_bytes": 3,
+                    "source_sha256": "a" * 64,
+                }
+            )
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert result.status_code == 422
+    assert "request_id" in json.dumps(json.loads(result.body)["detail"])
+
+
+def test_image_upscale_openapi_requires_request_id():
+    route = next(
+        route for route in endpoints.router.routes if getattr(route, "path", None) == "/v1/libtv/image-upscale/submit"
+    )
+    schema = route.openapi_extra["requestBody"]["content"]["application/json"]["schema"]
+    assert "request_id" in schema["required"]

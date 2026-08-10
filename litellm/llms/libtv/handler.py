@@ -3,7 +3,6 @@ import logging
 import os
 import random
 import time
-import uuid
 from functools import wraps
 from inspect import iscoroutinefunction
 from typing import Any, Optional, Tuple, Union
@@ -995,9 +994,10 @@ class LibTVLLM(CustomLLM):
             raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
         source = _topaz_source_payload(images[0])
         source_url = lt.ensure_libtv_url(*source, _REF_DEFAULT_NAME["image"], require_delegated=True)
-        request_id = str(
-            optional_params.get("provider_request_id") or optional_params.get("request_id") or uuid.uuid4()
-        )
+        request_id_value = optional_params.get("provider_request_id") or optional_params.get("request_id")
+        if not isinstance(request_id_value, str) or not request_id_value.strip():
+            raise LibTVError(status_code=422, message="paid image upscale requires request_id")
+        request_id = request_id_value.strip()
         model_info = optional_params.get("model_info") or {}
         deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
         return lt.submit_image_upscale(
@@ -1028,9 +1028,10 @@ class LibTVLLM(CustomLLM):
         if len(images) != 1:
             raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
         source = _topaz_source_payload(images[0])
-        request_id = str(
-            optional_params.get("provider_request_id") or optional_params.get("request_id") or uuid.uuid4()
-        )
+        request_id_value = optional_params.get("provider_request_id") or optional_params.get("request_id")
+        if not isinstance(request_id_value, str) or not request_id_value.strip():
+            raise LibTVError(status_code=422, message="paid image upscale requires request_id")
+        request_id = request_id_value.strip()
         model_info = optional_params.get("model_info") or {}
         deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
         try:
