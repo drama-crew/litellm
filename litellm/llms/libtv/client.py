@@ -974,7 +974,7 @@ class LibTVClient:
                 if not isinstance(entry_id, str) or not entry_id:
                     continue
                 if entry_id == str(deployment_id):
-                    providers.append((entry_id, _Provider(self)))
+                    providers.append((entry_id, _Provider(self), self.token))
                     continue
                 token = _resolve_pool_credential(entry.get("api_key"))
                 webid = _resolve_pool_credential(entry.get("webid"))
@@ -990,12 +990,12 @@ class LibTVClient:
                                 async_client=AsyncHTTPHandler(),
                             )
                         ),
+                        token,
                     )
                 )
-            selected_providers = providers or ((deployment_id or "unknown", _Provider(self)),)
+            selected_providers = providers or ((deployment_id or "unknown", _Provider(self), self.token),)
             return await ImageUpscaleSubmitter(
                 *selected_providers,
-                resume_secret=self.token,
                 receipt_store=receipt_store,
                 team_id=team_id or "default",
                 model=model_key,

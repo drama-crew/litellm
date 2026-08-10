@@ -318,7 +318,28 @@ def _image_upscale_deployment_pool(llm_router: Any, model: str) -> list[dict[str
     return pool
 
 
+def _resolve_receipt_credential(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    if value.startswith("os.environ/"):
+        return os.getenv(value.removeprefix("os.environ/"), "")
+    return value
+
+
 def _client_for_receipt(receipt: StoredReceipt) -> LibTVClient:
+    from litellm.proxy.proxy_server import llm_router
+
+    pool = _image_upscale_deployment_pool(llm_router, receipt.model)
+    if pool:
+        deployment = next((entry for entry in pool if entry["id"] == receipt.deployment_id), None)
+        if deployment is None:
+            raise LibTVError(status_code=503, message="LibTV deployment credential is unavailable for receipt")
+        token = _resolve_receipt_credential(deployment.get("api_key"))
+        webid = _resolve_receipt_credential(deployment.get("webid"))
+        if not token or not webid:
+            raise LibTVError(status_code=503, message="LibTV deployment credential is unavailable for receipt")
+        return LibTVClient(token=token, webid=webid, async_client=AsyncHTTPHandler())
+
     suffix = "_2" if receipt.deployment_id and receipt.deployment_id.endswith("account-2") else ""
     token = os.getenv(f"LIBTV_TOKEN{suffix}")
     webid = os.getenv(f"LIBTV_WEBID{suffix}")

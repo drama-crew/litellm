@@ -556,6 +556,17 @@ async def test_client_pool_resolves_each_deployment_credential_for_failover(monk
     assert calls == ["primary-token", "secondary-token"]
     assert receipt.submission_state == "submitted"
     assert receipt.deployment_id == "secondary"
+    assert verify_resume_token(
+        receipt.resume_token or "",
+        "secondary-token",
+        deployment_id="secondary",
+        provider_task_id="secondary-task",
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint=store.receipt.fingerprint,
+    )
+    assert not verify_resume_token(receipt.resume_token or "", "primary-token")
     assert store.receipt.response_cost == 0.42
 
 

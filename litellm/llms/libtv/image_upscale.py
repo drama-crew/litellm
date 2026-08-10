@@ -199,7 +199,7 @@ class TopazImageUpscaleBuilder:
 class ImageUpscaleSubmitter:
     def __init__(
         self,
-        *deployments: tuple[str, ImageUpscaleProvider],
+        *deployments: tuple[str, ImageUpscaleProvider] | tuple[str, ImageUpscaleProvider, str],
         resume_secret: str | None = None,
         receipt_store: LibTVReceiptStore | None = None,
         team_id: str | None = None,
@@ -282,6 +282,7 @@ class ImageUpscaleSubmitter:
         request_id: str,
         deployment_id: str,
         provider: ImageUpscaleProvider,
+        resume_secret: str,
         claim: ReceiptClaim | None,
         payload: Mapping[str, object],
         team_id: str,
@@ -346,7 +347,7 @@ class ImageUpscaleSubmitter:
             resume_token=make_resume_token(
                 deployment_id,
                 task_id,
-                self._resume_secret,
+                resume_secret,
                 team_id=team_id,
                 model=self._model,
                 request_id=request_id,
@@ -377,7 +378,9 @@ class ImageUpscaleSubmitter:
         )
         last_rejection: ProviderRejected | None = None
         fingerprint = request_fingerprint(payload, self._model)
-        for deployment_id, provider in self._deployments:
+        for deployment in self._deployments:
+            deployment_id, provider = deployment[:2]
+            resume_secret = deployment[2] if len(deployment) > 2 else self._resume_secret
             claim = None
             if self._receipt_store is not None:
                 try:
@@ -405,7 +408,7 @@ class ImageUpscaleSubmitter:
                     if existing.submission_state == "not_submitted":
                         continue
             result, rejection = await self._submit_deployment(
-                request_id, deployment_id, provider, claim, payload, team_id, fingerprint
+                request_id, deployment_id, provider, resume_secret, claim, payload, team_id, fingerprint
             )
             if result is not None:
                 return result

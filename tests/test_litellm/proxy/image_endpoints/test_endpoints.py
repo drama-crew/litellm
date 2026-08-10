@@ -589,6 +589,51 @@ def test_image_upscale_submit_collects_all_libtv_deployments_for_pool_failover()
     assert [entry["id"] for entry in pool] == ["primary", "secondary"]
 
 
+def test_image_upscale_recovery_resolves_exact_deployment_credential(monkeypatch):
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+        submission_state="submitted",
+        deployment_id="secondary",
+        provider_task_id="task-1",
+        resume_token="signed",
+    )
+    router = SimpleNamespace(
+        get_model_list=lambda **kwargs: [
+            {
+                "model_info": {"id": "primary"},
+                "litellm_params": {
+                    "custom_llm_provider": "libtv",
+                    "model": "libtv/topaz-image-upscaler",
+                    "api_key": "os.environ/LIBTV_TOKEN",
+                    "webid": "os.environ/LIBTV_WEBID",
+                },
+            },
+            {
+                "model_info": {"id": "secondary"},
+                "litellm_params": {
+                    "custom_llm_provider": "libtv",
+                    "model": "libtv/topaz-image-upscaler",
+                    "api_key": "os.environ/LIBTV_TOKEN_2",
+                    "webid": "os.environ/LIBTV_WEBID_2",
+                },
+            },
+        ]
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", router)
+    monkeypatch.setenv("LIBTV_TOKEN", "primary-token")
+    monkeypatch.setenv("LIBTV_WEBID", "primary-webid")
+    monkeypatch.setenv("LIBTV_TOKEN_2", "secondary-token")
+    monkeypatch.setenv("LIBTV_WEBID_2", "secondary-webid")
+
+    client = endpoints._client_for_receipt(receipt)
+
+    assert client.token == "secondary-token"
+    assert client.webid == "secondary-webid"
+
+
 @pytest.mark.asyncio
 async def test_image_upscale_receipt_lookup_is_authenticated_and_team_scoped(monkeypatch):
     receipt = StoredReceipt(
