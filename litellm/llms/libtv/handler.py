@@ -1,7 +1,9 @@
 import asyncio
+import base64
 import logging
 import os
 import random
+import re
 import time
 from functools import wraps
 from inspect import iscoroutinefunction
@@ -269,6 +271,29 @@ def _reference_payload(ref: Any) -> Optional[Tuple[str, str, Optional[bytes]]]:
     if isinstance(ref, str):
         if ref.startswith(("http://", "https://")):
             return ("url", ref, None)
+        if ref.startswith("data:"):
+            matched = re.fullmatch(
+                r"data:([a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*/[a-zA-Z0-9][a-zA-Z0-9!#$&^_.+-]*);base64,([A-Za-z0-9+/]*={0,2})",
+                ref,
+            )
+            if matched is None:
+                raise LibTVError(status_code=400, message="invalid base64 data URL input_reference")
+            mime_type, encoded = matched.groups()
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except (ValueError, base64.binascii.Error) as exc:
+                raise LibTVError(status_code=400, message="invalid base64 data URL input_reference") from exc
+            extension = {
+                "image/jpeg": "jpg",
+                "image/png": "png",
+                "image/webp": "webp",
+                "video/mp4": "mp4",
+                "video/quicktime": "mov",
+                "audio/mpeg": "mp3",
+                "audio/wav": "wav",
+                "audio/mp4": "m4a",
+            }.get(mime_type.lower(), "bin")
+            return ("bytes", f"reference.{extension}", data)
         with open(ref, "rb") as f:
             return ("bytes", os.path.basename(ref) or "reference.png", f.read())
     if isinstance(ref, (bytes, bytearray)):

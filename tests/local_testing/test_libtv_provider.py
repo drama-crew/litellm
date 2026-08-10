@@ -583,6 +583,25 @@ def test_reference_payload_bytes_and_tuple():
     assert _reference_payload(("my.png", b"data")) == ("bytes", "my.png", b"data")
 
 
+@pytest.mark.parametrize(
+    ("mime", "filename"),
+    [
+        ("image/png", "reference.png"),
+        ("video/mp4", "reference.mp4"),
+        ("audio/mpeg", "reference.mp3"),
+    ],
+)
+def test_reference_payload_data_url_decodes_bytes(mime, filename):
+    assert _reference_payload(f"data:{mime};base64,YWJj") == ("bytes", filename, b"abc")
+
+
+@pytest.mark.parametrize("value", ["data:image/png,abc", "data:image/png;base64,***", "data:;base64,YWJj"])
+def test_reference_payload_invalid_data_url_is_bad_request(value):
+    with pytest.raises(LibTVError) as exc_info:
+        _reference_payload(value)
+    assert exc_info.value.status_code == 400
+
+
 def test_reference_payload_none():
     assert _reference_payload(None) is None
 
