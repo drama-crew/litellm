@@ -186,7 +186,16 @@ async def test_image_upscale_submit_maps_source_url_and_runs_proxy_pipeline(monk
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.route_request", fake_route_request)
 
     result = await endpoints.libtv_image_upscale_submit(
-        request=_request(orjson.dumps({"request_id": "r1", "source_url": "https://source.example/input.png"})),
+        request=_request(
+            orjson.dumps(
+                {
+                    "request_id": "r1",
+                    "source_url": "https://source.example/input.png",
+                    "source_bytes": 3,
+                    "source_sha256": "a" * 64,
+                }
+            )
+        ),
         user_api_key_dict=UserAPIKeyAuth(),
     )
 
@@ -194,12 +203,13 @@ async def test_image_upscale_submit_maps_source_url_and_runs_proxy_pipeline(monk
     assert captured["added"] is True
     assert captured["route"]["prompt"] == "sanitized"
     assert captured["route"]["input_reference"] == "https://source.example/input.png"
+    assert "source_url" not in captured["route"]
     assert captured["route"]["injected_budget"] == "budget-1"
     assert hooks == ["image_generation", "success"]
 
 
 @pytest.mark.asyncio
-async def test_image_upscale_submit_malformed_json_returns_unknown_receipt(monkeypatch):
+async def test_image_upscale_submit_malformed_json_returns_not_submitted_receipt(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
     monkeypatch.setattr("litellm.proxy.proxy_server.user_model", None)
 
@@ -209,5 +219,42 @@ async def test_image_upscale_submit_malformed_json_returns_unknown_receipt(monke
     )
 
     body = json.loads(result.body)
-    assert result.status_code == 409
-    assert body["error"]["metadata"]["submission_receipt"]["submission_state"] == "unknown"
+    assert result.status_code == 503
+    assert body["error"]["metadata"]["submission_receipt"]["submission_state"] == "not_submitted"
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_submit_rejects_conflicting_source_aliases(monkeypatch):
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_model", None)
+
+    result = await endpoints.libtv_image_upscale_submit(
+        request=_request(
+            orjson.dumps(
+                {
+                    "request_id": "r1",
+                    "source_url": "https://source.example/one.png",
+                    "input_reference": "https://source.example/two.png",
+                    "source_bytes": 3,
+                    "source_sha256": "a" * 64,
+                }
+            )
+        ),
+        user_api_key_dict=UserAPIKeyAuth(),
+    )
+
+    body = json.loads(result.body)
+    assert result.status_code == 503
+    assert body["error"]["metadata"]["submission_receipt"]["submission_state"] == "not_submitted"
+
+
+def test_image_upscale_openapi_contract_requires_source_digest_and_exposes_receipt_schema():
+    route = next(
+        route for route in endpoints.router.routes if getattr(route, "path", None) == "/v1/libtv/image-upscale/submit"
+    )
+    request_schema = route.openapi_extra["requestBody"]["content"]["application/json"]["schema"]
+    assert {"source_bytes", "source_sha256"}.issubset(set(request_schema["required"]))
+
+    error_schema = route.responses[409]["model"].model_json_schema()
+    receipt_schema = error_schema["$defs"]["ImageUpscaleReceiptResponse"]
+    assert "submission_state" in receipt_schema["properties"]

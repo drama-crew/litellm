@@ -1,10 +1,13 @@
 import json
 
+import httpx
 import pytest
 
-from litellm.exceptions import BadRequestError
-from litellm.llms.libtv.handler import LibTVLLM
+from litellm.exceptions import BadRequestError, Timeout
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, MaskedHTTPStatusError
+from litellm.llms.libtv.client import LibTVClient
 from litellm.llms.libtv.common import LibTVError
+from litellm.llms.libtv.handler import LibTVLLM
 from litellm.llms.libtv.image_upscale import (
     ImageUpscaleSubmitter,
     ProviderRejected,
@@ -13,6 +16,7 @@ from litellm.llms.libtv.image_upscale import (
     make_resume_token,
     verify_resume_token,
 )
+from litellm.llms.libtv.transfer import ValidatedDelegatedTransfer
 from litellm.llms.libtv.transform import build_topaz_upscale_params
 
 _TOPAZ_SOURCE_URL = "https://libtv-res.liblib.art/upload-images/uid/source.mp4"
@@ -154,8 +158,122 @@ def test_topaz_image_rejects_non_http_source_before_opening_local_file(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_validated_transfer_uses_dedicated_stream_and_validates_result_shape():
-    from litellm.llms.libtv.transfer import ValidatedDelegatedTransfer
+async def test_async_http_handler_post_once_does_not_retry_connection_error():
+    class Client:
+        def __init__(self):
+            self.calls = 0
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, request, stream=False):
+            self.calls += 1
+            raise httpx.RemoteProtocolError("connection closed after submit")
+
+        async def aclose(self):
+            return None
+
+    handler = object.__new__(AsyncHTTPHandler)
+    handler.client = Client()
+    handler.timeout = None
+    handler.event_hooks = None
+
+    with pytest.raises(httpx.RemoteProtocolError):
+        await handler.post_once("https://api.liblib.tv/api/task/generation/create", json={})
+
+    assert handler.client.calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        Timeout("generation timed out", "m", "libtv"),
+        MaskedHTTPStatusError(
+            httpx.HTTPStatusError(
+                "server error",
+                request=httpx.Request("POST", "https://api.liblib.tv/api/task/generation/create"),
+                response=httpx.Response(503),
+            )
+        ),
+    ],
+)
+async def test_paid_create_http_errors_return_unknown_receipt_without_retry(error):
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "project-1"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": error,
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=None, poll_interval=0)
+
+    receipt = await lt.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://libtv-res/source.png",
+        "Standard V2",
+        2,
+        "proj-name",
+        "request-1",
+        "dep-1",
+    )
+
+    assert receipt.submission_state == "unknown"
+    assert len([path for path, _ in fake.calls if path == "/api/task/generation/create"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_paid_create_response_without_task_id_is_unknown_receipt():
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "project-1"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {}},
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=None, poll_interval=0)
+
+    receipt = await lt.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://libtv-res/source.png",
+        "Standard V2",
+        2,
+        "proj-name",
+        "request-1",
+        "dep-1",
+    )
+
+    assert receipt.submission_state == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_paid_pre_create_timeout_returns_not_submitted_receipt():
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": Timeout("project timed out", "m", "libtv"),
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=None, poll_interval=0)
+
+    receipt = await lt.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://libtv-res/source.png",
+        "Standard V2",
+        2,
+        "proj-name",
+        "request-1",
+        "dep-1",
+    )
+
+    assert receipt.submission_state == "not_submitted"
+
+
+@pytest.mark.asyncio
+async def test_validated_transfer_uses_dedicated_stream_and_validates_result_shape(monkeypatch):
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "source.platform.example")
 
     class Redis:
         def __init__(self):
@@ -179,7 +297,7 @@ async def test_validated_transfer_uses_dedicated_stream_and_validates_result_sha
     redis = Redis()
     transfer = ValidatedDelegatedTransfer(redis=redis, wait_timeout=0.1)
     result = await transfer.transfer(
-        "https://source.example/input.png",
+        "https://source.platform.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
         3,
         [{"n": 1, "url": "https://bridge.example/part-1"}],
         source_sha256="a" * 64,
@@ -190,8 +308,73 @@ async def test_validated_transfer_uses_dedicated_stream_and_validates_result_sha
     stream, payload = redis.payload
     assert stream.endswith("validated_media_transfer")
     assert payload["mode"] == "source_transfer"
-    assert payload["source"] == {"url": "https://source.example/input.png", "bytes": 3, "sha256": "a" * 64}
+    assert payload["source"] == {
+        "url": "https://source.platform.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+        "bytes": 3,
+        "sha256": "a" * 64,
+    }
     assert payload["hard_cap"] == 64
+
+
+@pytest.mark.asyncio
+async def test_validated_transfer_rejects_untrusted_source_host(monkeypatch):
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+
+    class Redis:
+        async def zcount(self, *args):
+            return 1
+
+        async def set(self, *args, **kwargs):
+            return True
+
+        async def xadd(self, *args, **kwargs):
+            return "stream-id"
+
+        async def brpop(self, *args, **kwargs):
+            return None
+
+    with pytest.raises(LibTVError, match="platform-signed"):
+        await ValidatedDelegatedTransfer(Redis()).transfer(
+            "https://attacker.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+            3,
+            [{"n": 1, "url": "https://bridge.example/part-1"}],
+            source_sha256="a" * 64,
+            hard_cap=64,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validated_transfer_accepts_platform_signed_source_url(monkeypatch):
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+
+    class Redis:
+        def __init__(self):
+            self.payload = None
+
+        async def zcount(self, *args):
+            return 1
+
+        async def set(self, *args, **kwargs):
+            return True
+
+        async def xadd(self, stream, fields):
+            self.payload = (stream, json.loads(fields["payload"]))
+
+        async def brpop(self, *args, **kwargs):
+            return (
+                "result",
+                json.dumps({"ok": True, "result": {"bytes": 3, "sha256": "a" * 64, "etags": [{"n": 1, "etag": "e1"}]}}),
+            )
+
+    result = await ValidatedDelegatedTransfer(Redis(), wait_timeout=0.1).transfer(
+        "https://assets.platform.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+        3,
+        [{"n": 1, "url": "https://bridge.example/part-1"}],
+        source_sha256="a" * 64,
+        hard_cap=64,
+    )
+
+    assert result == [{"n": 1, "etag": "e1"}]
 
 
 @pytest.mark.asyncio

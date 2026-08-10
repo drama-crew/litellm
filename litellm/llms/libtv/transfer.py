@@ -6,7 +6,7 @@ import re
 import time
 import uuid
 from typing import Any, Awaitable, Callable, List, Optional, Protocol, Tuple, TypedDict
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import redis.exceptions as redis_exceptions
@@ -35,6 +35,8 @@ WARN_INTERVAL_SECONDS = 300.0
 # A worker's heartbeat key/zset entry is refreshed every ~15s; anything older than
 # 2x that interval is treated as dead so a stalled worker doesn't win task claims.
 WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
+PLATFORM_SOURCE_HOSTS_ENV = "LIBTV_PLATFORM_SOURCE_HOSTS"
+PLATFORM_SOURCE_MAX_TTL_SECONDS = 3600
 # httpx's 5s default read/write timeout leaves no margin on the bandwidth-constrained
 # egress DirectTransfer runs on (a 5.4MB part at ~0.5MiB/s takes ~11s); the caller
 # already enforces the overall budget, so per-operation timeouts only need to catch
@@ -314,8 +316,30 @@ class ValidatedDelegatedTransfer:
         part_size: int = BRIDGE_PART_SIZE,
     ) -> List[PartEtag]:
         parsed = urlsplit(source_url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.fragment:
-            raise LibTVError(status_code=503, message="validated source transfer requires an HTTP(S) source URL")
+        allowed_hosts = {
+            host.strip().lower() for host in os.getenv(PLATFORM_SOURCE_HOSTS_ENV, "").split(",") if host.strip()
+        }
+        query = parse_qs(parsed.query)
+        expires = query.get("X-Amz-Expires", [""])[0]
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.hostname.lower() not in allowed_hosts
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not query.get("X-Amz-Signature")
+            or not query.get("X-Amz-Expires")
+            or not expires.isdigit()
+            or not 0 < int(expires) <= PLATFORM_SOURCE_MAX_TTL_SECONDS
+        ):
+            raise LibTVError(
+                status_code=503,
+                message=(
+                    "validated source transfer requires a platform-signed HTTPS source URL "
+                    f"from an allowlisted host ({PLATFORM_SOURCE_HOSTS_ENV})"
+                ),
+            )
         if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
             raise LibTVError(status_code=503, message="validated source transfer requires a positive source size")
         if not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", source_sha256):

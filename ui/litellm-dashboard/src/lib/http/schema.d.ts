@@ -24222,6 +24222,40 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** ImageUpscaleErrorBody */
+        ImageUpscaleErrorBody: {
+            /** Code */
+            code: string;
+            metadata: components["schemas"]["ImageUpscaleErrorMetadata"];
+        };
+        /** ImageUpscaleErrorMetadata */
+        ImageUpscaleErrorMetadata: {
+            submission_receipt: components["schemas"]["ImageUpscaleReceiptResponse"];
+        };
+        /** ImageUpscaleErrorResponse */
+        ImageUpscaleErrorResponse: {
+            error: components["schemas"]["ImageUpscaleErrorBody"];
+        };
+        /** ImageUpscaleReceiptResponse */
+        ImageUpscaleReceiptResponse: {
+            /** Deployment Id */
+            deployment_id?: string | null;
+            /** Message */
+            message?: string | null;
+            /** Provider Code */
+            provider_code?: string | null;
+            /** Provider Task Id */
+            provider_task_id?: string | null;
+            /** Request Id */
+            request_id: string;
+            /** Resume Token */
+            resume_token?: string | null;
+            /**
+             * Submission State
+             * @enum {string}
+             */
+            submission_state: "not_submitted" | "rejected" | "unknown" | "submitted";
+        };
         /** IndexCreateLiteLLMParams */
         IndexCreateLiteLLMParams: {
             /** Vector Store Index */
@@ -53697,11 +53731,11 @@ export interface operations {
                      */
                     scale?: 2 | 4 | 6;
                     /** Source Bytes */
-                    source_bytes?: number | null;
+                    source_bytes: number;
                     /** Source Hard Cap */
                     source_hard_cap?: number | null;
                     /** Source Sha256 */
-                    source_sha256?: string | null;
+                    source_sha256: string;
                     /** Source Url */
                     source_url?: string | null;
                     /**
@@ -53730,12 +53764,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        error: {
-                            code: string;
-                            metadata: Record<string, never>;
-                        };
-                    };
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
                 };
             };
             /** @description Provider explicitly rejected submission */
@@ -53744,12 +53773,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        error: {
-                            code: string;
-                            metadata: Record<string, never>;
-                        };
-                    };
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
                 };
             };
             /** @description Submission was not sent */
@@ -53758,12 +53782,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": {
-                        error: {
-                            code: string;
-                            metadata: Record<string, never>;
-                        };
-                    };
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
                 };
             };
         };

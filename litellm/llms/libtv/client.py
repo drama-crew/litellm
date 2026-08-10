@@ -666,11 +666,12 @@ class LibTVClient:
         ]
 
     # ---------- async ----------
-    async def _apost(self, path: str, body: Dict[str, Any], step: str) -> Dict[str, Any]:
+    async def _apost(self, path: str, body: Dict[str, Any], step: str, *, submit_once: bool = False) -> Dict[str, Any]:
         assert self.async_client is not None, "async_client required for async calls"
-        resp = await self.async_client.post(
-            url=f"{self.api_base}{path}", json=body, headers=self.headers, timeout=self.request_timeout
-        )
+        post = getattr(self.async_client, "post_once", None) if submit_once else None
+        if post is None:
+            post = self.async_client.post
+        resp = await post(url=f"{self.api_base}{path}", json=body, headers=self.headers, timeout=self.request_timeout)
         return self._check(resp, step)
 
     async def _acreate_fresh_project(
@@ -686,6 +687,23 @@ class LibTVClient:
             await self._project_cache_store(persistence, day, project_uuid, team_id)
         return project_uuid, team_id
 
+    async def _acreate_fresh_project_for_submission(
+        self,
+        project_name: str,
+        persistence: Optional["LibTVPersistence"] = None,
+        day: str | None = None,
+        *,
+        paid_submission: bool,
+    ) -> tuple[str, int | None]:
+        try:
+            return await self._acreate_fresh_project(project_name, persistence, day)
+        except ProviderTransportError:
+            raise
+        except Exception as error:
+            if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=False) from error
+            raise
+
     async def _acreate_nodes_and_generation(
         self,
         project_uuid: str,
@@ -697,21 +715,39 @@ class LibTVClient:
         paid_submission: bool = False,
     ) -> tuple[dict[str, Any], str]:
         node_key = str(uuid.uuid4())
-        await self._apost(
-            "/api/canvas/nodes/batch",
-            build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params),
-            "nodes/batch",
-        )
+        try:
+            await self._apost(
+                "/api/canvas/nodes/batch",
+                build_node_batch_body(
+                    project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params
+                ),
+                "nodes/batch",
+            )
+        except ProviderTransportError:
+            raise
+        except Exception as error:
+            if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=False) from error
+            raise
         try:
             created = await self._apost(
                 "/api/task/generation/create",
                 build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
                 "generation/create",
+                submit_once=paid_submission,
             )
+        except ProviderTransportError:
+            raise
         except LibTVError as error:
             if paid_submission and error.status_code == 429:
                 raise ProviderRejected(str(error), provider_code=str(error.status_code)) from error
             if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
+            raise
+        except Exception as error:
+            if paid_submission:
+                if getattr(error, "status_code", None) == 429:
+                    raise ProviderRejected(str(error), provider_code="429") from error
                 raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
             raise
         return created, node_key
@@ -755,7 +791,9 @@ class LibTVClient:
     ) -> dict[str, Any]:
         persistence = self._get_persistence()
         if persistence is None or os.getenv("LIBTV_PROJECT_REUSE_DISABLED") == "1":
-            project_uuid, team_id = await self._acreate_fresh_project(project_name)
+            project_uuid, team_id = await self._acreate_fresh_project_for_submission(
+                project_name, paid_submission=paid_submission
+            )
             created, node_key = await self._acreate_nodes_and_generation(
                 project_uuid,
                 team_id,
@@ -765,7 +803,13 @@ class LibTVClient:
                 params,
                 paid_submission=paid_submission,
             )
-            return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+            try:
+                task_id = parse_task_id(created)
+            except LibTVError as error:
+                if paid_submission:
+                    raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
+                raise
+            return {"task_id": task_id, "project_uuid": project_uuid, "node_key": node_key}
 
         day = time.strftime("%Y-%m-%d")
         cached = await self._project_cache_lookup(persistence, day)
@@ -773,7 +817,9 @@ class LibTVClient:
         if cached is not None:
             project_uuid, team_id = cached
         else:
-            project_uuid, team_id = await self._acreate_fresh_project(project_name, persistence, day)
+            project_uuid, team_id = await self._acreate_fresh_project_for_submission(
+                project_name, persistence, day, paid_submission=paid_submission
+            )
 
         try:
             created, node_key = await self._acreate_nodes_and_generation(
@@ -789,7 +835,9 @@ class LibTVClient:
             if not from_cache or not allow_cached_project_retry:
                 raise
             await self._project_cache_invalidate(persistence, day)
-            project_uuid, team_id = await self._acreate_fresh_project(project_name, persistence, day)
+            project_uuid, team_id = await self._acreate_fresh_project_for_submission(
+                project_name, persistence, day, paid_submission=paid_submission
+            )
             created, node_key = await self._acreate_nodes_and_generation(
                 project_uuid,
                 team_id,
@@ -800,7 +848,13 @@ class LibTVClient:
                 paid_submission=paid_submission,
             )
 
-        return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+        try:
+            task_id = parse_task_id(created)
+        except LibTVError as error:
+            if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
+            raise
+        return {"task_id": task_id, "project_uuid": project_uuid, "node_key": node_key}
 
     async def apoll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
         progress = await self._apost("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")

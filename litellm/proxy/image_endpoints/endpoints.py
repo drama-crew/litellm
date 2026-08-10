@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Literal
 import orjson
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, status
 from fastapi.responses import ORJSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -33,32 +33,50 @@ class ImageUpscaleSubmitRequest(BaseModel):
     request_id: str | None = None
     source_url: str | None = None
     input_reference: str | None = None
-    source_bytes: int | None = Field(default=None, gt=0)
-    source_sha256: str | None = None
+    source_bytes: int = Field(gt=0)
+    source_sha256: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$")
     source_hard_cap: int | None = Field(default=None, gt=0)
     style: str = "Standard V2"
     scale: Literal[2, 4, 6] = 2
     model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="after")
+    def validate_source(self):
+        if self.source_url is None and self.input_reference is None:
+            raise ValueError("one of source_url or input_reference is required")
+        if self.source_url is not None and self.input_reference is not None and self.source_url != self.input_reference:
+            raise ValueError("source_url and input_reference must refer to the same source")
+        source = self.input_reference or self.source_url
+        if not isinstance(source, str) or not source.startswith(("http://", "https://")):
+            raise ValueError("image upscale source must be an HTTP(S) URL")
+        return self
 
 
 class ImageUpscaleAcceptedResponse(BaseModel):
     receipt: Dict[str, Any]
 
 
-_IMAGE_UPSCALE_ERROR_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "error": {
-            "type": "object",
-            "properties": {
-                "code": {"type": "string"},
-                "metadata": {"type": "object"},
-            },
-            "required": ["code", "metadata"],
-        }
-    },
-    "required": ["error"],
-}
+class ImageUpscaleReceiptResponse(BaseModel):
+    request_id: str
+    submission_state: Literal["not_submitted", "rejected", "unknown", "submitted"]
+    deployment_id: str | None = None
+    provider_task_id: str | None = None
+    resume_token: str | None = None
+    provider_code: str | None = None
+    message: str | None = None
+
+
+class ImageUpscaleErrorMetadata(BaseModel):
+    submission_receipt: ImageUpscaleReceiptResponse
+
+
+class ImageUpscaleErrorBody(BaseModel):
+    code: str
+    metadata: ImageUpscaleErrorMetadata
+
+
+class ImageUpscaleErrorResponse(BaseModel):
+    error: ImageUpscaleErrorBody
 
 
 def _image_upscale_response(receipt: dict) -> ORJSONResponse:
@@ -91,16 +109,16 @@ def _image_upscale_response(receipt: dict) -> ORJSONResponse:
     responses={
         202: {"model": ImageUpscaleAcceptedResponse, "description": "Provider task submitted"},
         409: {
+            "model": ImageUpscaleErrorResponse,
             "description": "Submission outcome is unknown",
-            "content": {"application/json": {"schema": _IMAGE_UPSCALE_ERROR_SCHEMA}},
         },
         429: {
+            "model": ImageUpscaleErrorResponse,
             "description": "Provider explicitly rejected submission",
-            "content": {"application/json": {"schema": _IMAGE_UPSCALE_ERROR_SCHEMA}},
         },
         503: {
+            "model": ImageUpscaleErrorResponse,
             "description": "Submission was not sent",
-            "content": {"application/json": {"schema": _IMAGE_UPSCALE_ERROR_SCHEMA}},
         },
     },
     openapi_extra={
@@ -130,6 +148,7 @@ async def libtv_image_upscale_submit(
         data = ImageUpscaleSubmitRequest.model_validate(raw).model_dump(exclude_none=True)
         if data.get("source_url") and not data.get("input_reference"):
             data["input_reference"] = data["source_url"]
+        data.pop("source_url", None)
         data.setdefault("prompt", "")
         data["model"] = data.get("model") or user_model or "topaz-image-upscaler"
         data["libtv_image_upscale_submit"] = True
@@ -175,6 +194,13 @@ async def libtv_image_upscale_submit(
                 )
             )
         return _image_upscale_response(normalized.to_dict())
+    except (orjson.JSONDecodeError, ValidationError, ValueError) as error:
+        receipt = ImageUpscaleReceipt(
+            request_id=str(data.get("request_id") or "unknown"),
+            submission_state="not_submitted",
+            message=str(error),
+        ).to_dict()
+        return _image_upscale_response(receipt)
     except Exception as error:  # noqa: BLE001  # receipt classification is handled below
         from litellm.proxy.proxy_server import proxy_logging_obj
 
