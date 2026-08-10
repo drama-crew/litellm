@@ -1,4 +1,6 @@
 import asyncio
+import math
+import os
 import traceback
 from typing import Any, Dict, List, Literal
 
@@ -6,6 +8,7 @@ import orjson
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, status
 from fastapi.responses import ORJSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from redis.exceptions import RedisError
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -18,8 +21,14 @@ from litellm.llms.libtv.image_upscale import (
     IdempotencyFingerprintMismatch,
     ProviderRejected,
     ProviderTransportError,
+    verify_resume_token,
     normalize_image_upscale_receipt,
 )
+from litellm.llms.libtv.billing_outbox import ImageBillingEvent
+from litellm.llms.libtv.client import LibTVClient
+from litellm.llms.libtv.persistence import get_receipt_store
+from litellm.llms.libtv.receipts import LibTVReceiptStore, StoredReceipt
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
@@ -65,6 +74,8 @@ class ImageUpscaleReceiptResponse(BaseModel):
     resume_token: str | None = None
     provider_code: str | None = None
     message: str | None = None
+    response_cost: float | None = None
+    billing_event_id: str | None = None
 
 
 class ImageUpscaleErrorMetadata(BaseModel):
@@ -78,6 +89,12 @@ class ImageUpscaleErrorBody(BaseModel):
 
 class ImageUpscaleErrorResponse(BaseModel):
     error: ImageUpscaleErrorBody
+
+
+class ImageUpscaleActionRequest(BaseModel):
+    request_id: str = Field(min_length=1)
+    model: str = Field(default="topaz-image-upscaler", min_length=1)
+    resume_token: str = Field(min_length=1)
 
 
 def _image_upscale_response(receipt: dict) -> ORJSONResponse:
@@ -147,6 +164,7 @@ async def libtv_image_upscale_submit(
     )
 
     data: dict[str, Any] = {}
+    raw: object = {}
     crossed_create_boundary = False
     try:
         raw = orjson.loads(await request.body())
@@ -156,6 +174,7 @@ async def libtv_image_upscale_submit(
         data.pop("source_url", None)
         data.setdefault("prompt", "")
         data["model"] = data.get("model") or user_model or "topaz-image-upscaler"
+        data["image_upscale_deployment_pool"] = _image_upscale_deployment_pool(llm_router, data["model"])
         data["libtv_image_upscale_submit"] = True
         data["user_api_key_dict"] = user_api_key_dict
         data = await add_litellm_data_to_request(
@@ -201,7 +220,20 @@ async def libtv_image_upscale_submit(
             )
         return _image_upscale_response(normalized.to_dict())
     except ValidationError as error:
-        return ORJSONResponse(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, content={"detail": error.errors()})
+        errors = error.errors(include_context=False)
+        request_id = raw.get("request_id") if isinstance(raw, dict) else None
+        request_id_error = any(tuple(item.get("loc") or ()) == ("request_id",) for item in errors)
+        if request_id_error:
+            return ORJSONResponse(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                content={"detail": errors},
+            )
+        receipt = ImageUpscaleReceipt(
+            request_id=str(request_id or "unknown"),
+            submission_state="not_submitted",
+            message="invalid image upscale request",
+        ).to_dict()
+        return _image_upscale_response(receipt)
     except (orjson.JSONDecodeError, ValueError) as error:
         receipt = ImageUpscaleReceipt(
             request_id=str(data.get("request_id") or "unknown"),
@@ -209,6 +241,7 @@ async def libtv_image_upscale_submit(
             message=str(error),
         ).to_dict()
         return _image_upscale_response(receipt)
+
     except IdempotencyFingerprintMismatch as error:
         receipt = (
             error.receipt
@@ -261,6 +294,195 @@ async def libtv_image_upscale_submit(
             message=message,
         ).to_dict()
         return _image_upscale_response(receipt)
+
+
+def _team_id(user_api_key_dict: UserAPIKeyAuth) -> str | None:
+    value = getattr(user_api_key_dict, "team_id", None)
+    return value if isinstance(value, str) and value else None
+
+
+def _image_upscale_deployment_pool(llm_router: Any, model: str) -> list[dict[str, Any]]:
+    if llm_router is None or not hasattr(llm_router, "get_model_list"):
+        return []
+    pool = []
+    for deployment in llm_router.get_model_list(model_name=model) or []:
+        model_info = deployment.get("model_info") or {}
+        params = deployment.get("litellm_params") or {}
+        deployment_id = model_info.get("id")
+        provider_model = str(params.get("model") or model).split("/", 1)[-1]
+        if not isinstance(deployment_id, str) or not deployment_id:
+            continue
+        if params.get("custom_llm_provider") != "libtv" or provider_model != model:
+            continue
+        pool.append({"id": deployment_id, "api_key": params.get("api_key"), "webid": params.get("webid")})
+    return pool
+
+
+def _client_for_receipt(receipt: StoredReceipt) -> LibTVClient:
+    suffix = "_2" if receipt.deployment_id and receipt.deployment_id.endswith("account-2") else ""
+    token = os.getenv(f"LIBTV_TOKEN{suffix}")
+    webid = os.getenv(f"LIBTV_WEBID{suffix}")
+    if not token or not webid:
+        raise LibTVError(status_code=503, message="LibTV credentials are not configured for receipt recovery")
+    return LibTVClient(token=token, webid=webid, async_client=AsyncHTTPHandler())
+
+
+async def _load_action_receipt(action: ImageUpscaleActionRequest, user_api_key_dict: UserAPIKeyAuth):
+    team_id = _team_id(user_api_key_dict)
+    if team_id is None:
+        return ORJSONResponse(status_code=403, content={"error": "team-scoped authentication is required"})
+    store = get_receipt_store()
+    if store is None:
+        return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})
+    try:
+        receipt = await store.get(team_id, action.model, action.request_id)
+    except RedisError:
+        return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})
+    if receipt is None:
+        return ORJSONResponse(status_code=404, content={"error": "image upscale receipt not found"})
+    try:
+        client = _client_for_receipt(receipt)
+    except LibTVError:
+        return ORJSONResponse(status_code=503, content={"error": "LibTV credentials unavailable"})
+    secret = getattr(client, "token", None) or os.getenv("LIBTV_IMAGE_UPSCALE_RESUME_SECRET", "")
+    if not verify_resume_token(
+        action.resume_token,
+        secret,
+        deployment_id=receipt.deployment_id,
+        provider_task_id=receipt.provider_task_id,
+        team_id=receipt.team_id,
+        model=receipt.model,
+        request_id=receipt.request_id,
+        fingerprint=receipt.fingerprint,
+    ):
+        return ORJSONResponse(status_code=403, content={"error": "invalid image upscale resume token"})
+    key = LibTVReceiptStore.receipt_key(team_id, action.model, action.request_id, receipt.fingerprint)
+    return store, receipt, key, client
+
+
+def _receipt_body(receipt: StoredReceipt) -> dict[str, object]:
+    return {
+        "request_id": receipt.request_id,
+        "submission_state": "unknown" if receipt.submission_state == "submitting" else receipt.submission_state,
+        "deployment_id": receipt.deployment_id,
+        "provider_task_id": receipt.provider_task_id,
+        "resume_token": receipt.resume_token,
+        "provider_code": receipt.provider_code,
+        "message": receipt.message,
+        "response_cost": receipt.response_cost,
+        "billing_event_id": receipt.billing_event_id,
+    }
+
+
+@router.get(
+    "/v1/libtv/image-upscale/receipt/{request_id}",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["images"],
+)
+async def libtv_image_upscale_receipt(
+    request_id: str, model: str = "topaz-image-upscaler", user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
+):
+    team_id = _team_id(user_api_key_dict)
+    if team_id is None:
+        return ORJSONResponse(status_code=403, content={"error": "team-scoped authentication is required"})
+    store = get_receipt_store()
+    if store is None:
+        return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})
+    try:
+        receipt = await store.get(team_id, model, request_id)
+    except RedisError:
+        return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})
+    if receipt is None:
+        return ORJSONResponse(status_code=404, content={"error": "image upscale receipt not found"})
+    return ORJSONResponse(status_code=200, content={"receipt": _receipt_body(receipt)})
+
+
+async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_dict: UserAPIKeyAuth, finalize: bool):
+    loaded = await _load_action_receipt(action, user_api_key_dict)
+    if isinstance(loaded, ORJSONResponse):
+        return loaded
+    store, receipt, receipt_key, client = loaded
+    if receipt.submission_state != "submitted" or not receipt.provider_task_id:
+        return ORJSONResponse(status_code=409, content={"receipt": _receipt_body(receipt)})
+    try:
+        state = await client.apoll_image_upscale(receipt.provider_task_id)
+    except LibTVError:
+        return ORJSONResponse(
+            status_code=503,
+            content={"error": "LibTV poll unavailable", "receipt": _receipt_body(receipt)},
+        )
+    if state.get("status") != 2:
+        return ORJSONResponse(
+            status_code=409 if finalize else 200, content={"receipt": _receipt_body(receipt), "provider": state}
+        )
+    urls = state.get("urls") or []
+    if not isinstance(urls, list) or not all(isinstance(url, str) and url for url in urls):
+        return ORJSONResponse(status_code=502, content={"error": "provider completed without valid result urls"})
+    if receipt.response_cost is None or not math.isfinite(receipt.response_cost) or receipt.response_cost <= 0:
+        return ORJSONResponse(
+            status_code=503,
+            content={"error": "authoritative image upscale cost unavailable", "receipt": _receipt_body(receipt)},
+        )
+    event = ImageBillingEvent(
+        deployment_id=receipt.deployment_id or "unknown",
+        provider_task_id=receipt.provider_task_id,
+        response_cost=receipt.response_cost,
+        team_id=receipt.team_id,
+        model=receipt.model,
+    )
+    try:
+        updated = await store.transition(
+            receipt,
+            receipt_key,
+            "submitted",
+            expected_state="submitted",
+            billing_event=event,
+        )
+    except RedisError:
+        return ORJSONResponse(
+            status_code=503,
+            content={"error": "receipt store unavailable", "receipt": _receipt_body(receipt)},
+        )
+    return ORJSONResponse(
+        status_code=200,
+        content={
+            "receipt": _receipt_body(updated),
+            "result": {"urls": urls, "provider_task_id": receipt.provider_task_id},
+        },
+    )
+
+
+@router.post(
+    "/v1/libtv/image-upscale/poll",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["images"],
+)
+async def libtv_image_upscale_poll(request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)):
+    try:
+        action = ImageUpscaleActionRequest.model_validate(orjson.loads(await request.body()))
+    except (orjson.JSONDecodeError, ValidationError) as error:
+        detail = error.errors(include_context=False) if isinstance(error, ValidationError) else str(error)
+        return ORJSONResponse(status_code=422, content={"detail": detail})
+    return await _poll_image_upscale(action, user_api_key_dict, False)
+
+
+@router.post(
+    "/v1/libtv/image-upscale/finalize",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["images"],
+)
+async def libtv_image_upscale_finalize(
+    request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
+):
+    try:
+        action = ImageUpscaleActionRequest.model_validate(orjson.loads(await request.body()))
+    except (orjson.JSONDecodeError, ValidationError) as error:
+        detail = error.errors(include_context=False) if isinstance(error, ValidationError) else str(error)
+        return ORJSONResponse(status_code=422, content={"detail": detail})
+    return await _poll_image_upscale(action, user_api_key_dict, True)
 
 
 import io

@@ -381,6 +381,14 @@ def _receipt_team_id(optional_params: dict) -> str:
     return "default"
 
 
+def _image_upscale_response_cost(optional_params: dict, scale: int) -> float | None:
+    value = optional_params.get(f"output_cost_per_image_{scale}x")
+    try:
+        return float(value) if value is not None and float(value) >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _topaz_source_videos(optional_params: dict) -> list:
     return _as_list(optional_params.get("video_references")) + _as_list(optional_params.get("input_reference"))
 
@@ -1062,6 +1070,8 @@ class LibTVLLM(CustomLLM):
             team_id=_receipt_team_id(optional_params),
             source_sha256=optional_params.get("source_sha256") or optional_params.get("input_reference_sha256"),
             durable_receipts=True,
+            response_cost=_image_upscale_response_cost(optional_params, int(optional_params.get("scale", 2))),
+            deployment_pool=optional_params.get("image_upscale_deployment_pool"),
         )
 
     @normalize_libtv_errors

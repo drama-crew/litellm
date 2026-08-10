@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict
 from urllib.parse import urlsplit
 
 import httpx
@@ -57,6 +57,14 @@ def _raise_generation_failed(failed_reason: Optional[str]) -> None:
 THIRD_ASSET_POLL_ATTEMPTS = 30
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_pool_credential(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    if value.startswith("os.environ/"):
+        return os.getenv(value.removeprefix("os.environ/"), "")
+    return value
 
 
 def probe_size_via_ranged_get(url: str, timeout: float, client: Optional[httpx.Client] = None) -> int:
@@ -905,6 +913,8 @@ class LibTVClient:
         team_id: str | None = None,
         source_sha256: str | None = None,
         durable_receipts: bool = False,
+        response_cost: float | None = None,
+        deployment_pool: Sequence[Mapping[str, object]] | None = None,
     ) -> ImageUpscaleReceipt:
         params = TopazImageUpscaleBuilder().build(source_url=source_url, style=style, scale=scale)
         if durable_receipts:
@@ -933,6 +943,9 @@ class LibTVClient:
                 )
 
             class _Provider:
+                def __init__(inner_self, target_client: "LibTVClient"):
+                    inner_self.target_client = target_client
+
                 async def create(inner_self, payload):
                     provider_params = TopazImageUpscaleBuilder().build(
                         source_url=str(payload["source_url"]),
@@ -940,7 +953,7 @@ class LibTVClient:
                         scale=int(payload.get("scale", 2)),
                     )
                     try:
-                        return await self.acreate(
+                        return await inner_self.target_client.acreate(
                             model_key,
                             vendor,
                             "image",
@@ -954,8 +967,34 @@ class LibTVClient:
                     except LibTVError as error:
                         raise ProviderTransportError(str(error), crossed_create_boundary=False) from error
 
+            pool = tuple(deployment_pool or ())
+            providers = []
+            for entry in pool:
+                entry_id = entry.get("id")
+                if not isinstance(entry_id, str) or not entry_id:
+                    continue
+                if entry_id == str(deployment_id):
+                    providers.append((entry_id, _Provider(self)))
+                    continue
+                token = _resolve_pool_credential(entry.get("api_key"))
+                webid = _resolve_pool_credential(entry.get("webid"))
+                if not token or not webid:
+                    continue
+                providers.append(
+                    (
+                        entry_id,
+                        _Provider(
+                            LibTVClient(
+                                token=token,
+                                webid=webid,
+                                async_client=AsyncHTTPHandler(),
+                            )
+                        ),
+                    )
+                )
+            selected_providers = providers or ((deployment_id or "unknown", _Provider(self)),)
             return await ImageUpscaleSubmitter(
-                (deployment_id or "unknown", _Provider()),
+                *selected_providers,
                 resume_secret=self.token,
                 receipt_store=receipt_store,
                 team_id=team_id or "default",
@@ -969,6 +1008,7 @@ class LibTVClient:
                     "source_sha256": source_sha256 or "",
                     "style": style,
                     "scale": scale,
+                    "response_cost": response_cost,
                 }
             )
         try:

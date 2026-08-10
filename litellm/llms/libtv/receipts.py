@@ -66,7 +66,7 @@ if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2]
 end
 redis.call('SET', KEYS[3], ARGV[3])
 redis.call('SET', KEYS[2], ARGV[4])
-if ARGV[5] ~= '' then
+if ARGV[5] ~= '' and (not current['billing_event_id'] or current['billing_event_id'] == '') then
   redis.call('XADD', KEYS[4], '*', 'payload', ARGV[5])
 end
 return {'ok', ARGV[3]}
@@ -85,6 +85,8 @@ class StoredReceipt:
     resume_token: str | None = None
     provider_code: str | None = None
     message: str | None = None
+    response_cost: float | None = None
+    billing_event_id: str | None = None
 
     @classmethod
     def from_json(cls, raw: str) -> "StoredReceipt":
@@ -103,6 +105,8 @@ class StoredReceipt:
             resume_token=value.get("resume_token"),
             provider_code=value.get("provider_code"),
             message=value.get("message"),
+            response_cost=float(value["response_cost"]) if value.get("response_cost") is not None else None,
+            billing_event_id=value.get("billing_event_id"),
         )
 
     def to_json(self) -> str:
@@ -118,6 +122,8 @@ class StoredReceipt:
                 "resume_token": self.resume_token,
                 "provider_code": self.provider_code,
                 "message": self.message,
+                "response_cost": self.response_cost,
+                "billing_event_id": self.billing_event_id,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -176,7 +182,14 @@ class LibTVReceiptStore:
         )
 
     async def claim(
-        self, team_id: str, model: str, request_id: str, fingerprint: str, deployment_id: str
+        self,
+        team_id: str,
+        model: str,
+        request_id: str,
+        fingerprint: str,
+        deployment_id: str,
+        *,
+        response_cost: float | None = None,
     ) -> ReceiptClaim:
         index_key = self._index_key(team_id, model, request_id)
         pool_key = self._pool_key(team_id, model, request_id)
@@ -188,6 +201,7 @@ class LibTVReceiptStore:
             fingerprint=fingerprint,
             submission_state="submitting",
             deployment_id=deployment_id,
+            response_cost=response_cost,
         )
         pool = self._pool_record(receipt, receipt_key)
         try:
@@ -218,6 +232,7 @@ class LibTVReceiptStore:
         resume_token: str | None = None,
         provider_code: str | None = None,
         message: str | None = None,
+        response_cost: float | None = None,
         expected_state: ReceiptState = "submitting",
         billing_event: Mapping[str, object] | object | None = None,
     ) -> StoredReceipt:
@@ -232,6 +247,16 @@ class LibTVReceiptStore:
             resume_token=resume_token or receipt.resume_token,
             provider_code=provider_code or receipt.provider_code,
             message=message or receipt.message,
+            response_cost=response_cost if response_cost is not None else getattr(receipt, "response_cost", None),
+            billing_event_id=(
+                str(billing_event.get("event_id") or billing_event.get("billing_key"))
+                if isinstance(billing_event, Mapping) and billing_event.get("event_id")
+                else (
+                    billing_event.event_id
+                    if billing_event is not None and hasattr(billing_event, "event_id")
+                    else getattr(receipt, "billing_event_id", None)
+                )
+            ),
         )
         index_key = self._index_key(receipt.team_id, receipt.model, receipt.request_id)
         pool_key = self._pool_key(receipt.team_id, receipt.model, receipt.request_id)

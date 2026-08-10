@@ -8,7 +8,7 @@ from litellm.llms.libtv.billing_outbox import (
     ImageBillingEvent,
     LibTVBillingReconciler,
 )
-from litellm.llms.libtv.receipts import LibTVReceiptStore, request_fingerprint
+from litellm.llms.libtv.receipts import LibTVReceiptStore, _TRANSITION_SCRIPT, request_fingerprint
 
 
 class RecordingRedis:
@@ -55,6 +55,10 @@ async def test_terminal_receipt_transition_appends_one_billing_event():
     assert args[3] == BILLING_STREAM_KEY
     assert json.loads(args[8])["provider_task_id"] == "task-1"
     assert script.count("XADD") == 1
+
+
+def test_terminal_transition_script_deduplicates_billing_event_on_repeated_poll():
+    assert "current['billing_event_id']" in _TRANSITION_SCRIPT
 
 
 class FakeTransaction:

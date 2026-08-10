@@ -87,6 +87,8 @@ class ImageUpscaleReceipt:
     resume_token: str | None = None
     provider_code: str | None = None
     message: str | None = None
+    response_cost: float | None = None
+    billing_event_id: str | None = None
 
     def to_dict(self) -> dict[str, str | None]:
         return asdict(self)
@@ -152,6 +154,13 @@ class ProviderRejected(Exception):
 
 class ImageUpscaleProvider(Protocol):
     def create(self, payload: Mapping[str, object]) -> Awaitable[Mapping[str, object]]: ...
+
+
+def _response_cost(payload: Mapping[str, object]) -> float | None:
+    value = payload.get("response_cost")
+    if isinstance(value, (int, float)) and value >= 0:
+        return float(value)
+    return None
 
 
 _STYLES = frozenset(
@@ -224,14 +233,31 @@ class ImageUpscaleSubmitter:
             resume_token=receipt.resume_token,
             provider_code=receipt.provider_code,
             message=message or receipt.message,
+            response_cost=receipt.response_cost,
+            billing_event_id=receipt.billing_event_id,
         )
 
     async def _claim(
-        self, team_id: str, request_id: str, fingerprint: str, deployment_id: str
+        self,
+        team_id: str,
+        request_id: str,
+        fingerprint: str,
+        deployment_id: str,
+        response_cost: float | None = None,
     ) -> tuple[ReceiptClaim, ImageUpscaleReceipt | None]:
         if self._receipt_store is None:
             raise RuntimeError("receipt store is not configured")
-        claim = await self._receipt_store.claim(team_id, self._model, request_id, fingerprint, deployment_id)
+        if response_cost is None:
+            claim = await self._receipt_store.claim(team_id, self._model, request_id, fingerprint, deployment_id)
+        else:
+            claim = await self._receipt_store.claim(
+                team_id,
+                self._model,
+                request_id,
+                fingerprint,
+                deployment_id,
+                response_cost=response_cost,
+            )
         if claim.outcome == "mismatch":
             raise IdempotencyFingerprintMismatch(
                 "request_id was already used with a different fingerprint",
@@ -355,7 +381,13 @@ class ImageUpscaleSubmitter:
             claim = None
             if self._receipt_store is not None:
                 try:
-                    claim, existing = await self._claim(team_id, request_id, fingerprint, deployment_id)
+                    claim, existing = await self._claim(
+                        team_id,
+                        request_id,
+                        fingerprint,
+                        deployment_id,
+                        _response_cost(payload),
+                    )
                 except RedisError:
                     return ImageUpscaleReceipt(
                         request_id=request_id,

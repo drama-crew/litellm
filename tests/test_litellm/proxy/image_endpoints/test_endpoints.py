@@ -12,8 +12,9 @@ from starlette.responses import Response
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.image_endpoints import endpoints
 from litellm.llms.libtv.handler import LibTVLLM
+from litellm.llms.libtv.common import LibTVError
 from litellm.llms.libtv.receipts import ReceiptClaim, StoredReceipt, request_fingerprint
-from litellm.llms.libtv.image_upscale import verify_resume_token
+from litellm.llms.libtv.image_upscale import make_resume_token, verify_resume_token
 from litellm.types.utils import ImageResponse
 
 
@@ -24,6 +25,15 @@ def _request(body: bytes) -> Request:
         "path": "/v1/libtv/image-upscale/submit",
         "headers": [],
     }
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(scope, receive)
+
+
+def _action_request(path: str, body: bytes) -> Request:
+    scope = {"type": "http", "method": "POST", "path": path, "headers": []}
 
     async def receive():
         return {"type": "http.request", "body": body, "more_body": False}
@@ -560,3 +570,214 @@ def test_image_upscale_openapi_requires_request_id():
     )
     schema = route.openapi_extra["requestBody"]["content"]["application/json"]["schema"]
     assert "request_id" in schema["required"]
+
+
+def test_image_upscale_submit_collects_all_libtv_deployments_for_pool_failover():
+    router = SimpleNamespace(
+        get_model_list=lambda **kwargs: [
+            {
+                "model_info": {"id": "primary"},
+                "litellm_params": {"custom_llm_provider": "libtv", "model": "libtv/topaz-image-upscaler"},
+            },
+            {
+                "model_info": {"id": "secondary"},
+                "litellm_params": {"custom_llm_provider": "libtv", "model": "libtv/topaz-image-upscaler"},
+            },
+        ]
+    )
+    pool = endpoints._image_upscale_deployment_pool(router, "topaz-image-upscaler")
+    assert [entry["id"] for entry in pool] == ["primary", "secondary"]
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_receipt_lookup_is_authenticated_and_team_scoped(monkeypatch):
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+        submission_state="submitted",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        resume_token="signed",
+    )
+
+    class Store:
+        async def get(self, team_id, model, request_id):
+            return receipt if (team_id, model, request_id) == ("team-1", "topaz-image-upscaler", "request-1") else None
+
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: Store())
+
+    response = await endpoints.libtv_image_upscale_receipt(
+        request_id="request-1",
+        model="topaz-image-upscaler",
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+    assert response.status_code == 200
+    assert json.loads(response.body)["receipt"]["provider_task_id"] == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_poll_terminal_transition_appends_billing_event(monkeypatch):
+    fingerprint = "f" * 64
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint=fingerprint,
+        submission_state="submitted",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        resume_token=make_resume_token(
+            "dep-1",
+            "task-1",
+            "secret",
+            team_id="team-1",
+            model="topaz-image-upscaler",
+            request_id="request-1",
+            fingerprint=fingerprint,
+        ),
+        response_cost=0.25,
+    )
+
+    class Store:
+        def __init__(self):
+            self.transition_calls = []
+
+        async def get(self, team_id, model, request_id):
+            return receipt
+
+        async def transition(self, *args, **kwargs):
+            self.transition_calls.append(kwargs)
+            return receipt
+
+    store = Store()
+
+    class Client:
+        async def apoll_image_upscale(self, provider_task_id):
+            assert provider_task_id == "task-1"
+            return {"status": 2, "urls": ["https://libtv.example/result.png"]}
+
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints._client_for_receipt", lambda _: Client())
+    monkeypatch.setenv("LIBTV_IMAGE_UPSCALE_RESUME_SECRET", "secret")
+
+    response = await endpoints.libtv_image_upscale_poll(
+        request=_action_request(
+            "/v1/libtv/image-upscale/poll",
+            orjson.dumps(
+                {
+                    "request_id": "request-1",
+                    "model": "topaz-image-upscaler",
+                    "resume_token": receipt.resume_token,
+                }
+            ),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["result"]["urls"] == ["https://libtv.example/result.png"]
+    event = store.transition_calls[0]["billing_event"]
+    assert event.provider_task_id == "task-1"
+    assert event.response_cost == 0.25
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_poll_without_authoritative_cost_does_not_bill_zero(monkeypatch):
+    fingerprint = "f" * 64
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint=fingerprint,
+        submission_state="submitted",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        resume_token=make_resume_token(
+            "dep-1",
+            "task-1",
+            "secret",
+            team_id="team-1",
+            model="topaz-image-upscaler",
+            request_id="request-1",
+            fingerprint=fingerprint,
+        ),
+    )
+
+    class Store:
+        def __init__(self):
+            self.transition_calls = []
+
+        async def get(self, team_id, model, request_id):
+            return receipt
+
+        async def transition(self, *args, **kwargs):
+            self.transition_calls.append(kwargs)
+            return receipt
+
+    class Client:
+        async def apoll_image_upscale(self, provider_task_id):
+            return {"status": 2, "urls": ["https://libtv.example/result.png"]}
+
+    store = Store()
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints._client_for_receipt", lambda _: Client())
+    monkeypatch.setenv("LIBTV_IMAGE_UPSCALE_RESUME_SECRET", "secret")
+
+    response = await endpoints.libtv_image_upscale_poll(
+        request=_action_request(
+            "/v1/libtv/image-upscale/poll",
+            orjson.dumps(
+                {
+                    "request_id": "request-1",
+                    "model": "topaz-image-upscaler",
+                    "resume_token": receipt.resume_token,
+                }
+            ),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert response.status_code == 503
+    assert store.transition_calls == []
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_poll_maps_receipt_credential_failure_to_503(monkeypatch):
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+        submission_state="submitted",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        resume_token="not-used",
+    )
+
+    class Store:
+        async def get(self, team_id, model, request_id):
+            return receipt
+
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: Store())
+    monkeypatch.setattr(
+        "litellm.proxy.image_endpoints.endpoints._client_for_receipt",
+        lambda _: (_ for _ in ()).throw(LibTVError(status_code=503, message="credentials unavailable")),
+    )
+
+    response = await endpoints.libtv_image_upscale_poll(
+        request=_action_request(
+            "/v1/libtv/image-upscale/poll",
+            orjson.dumps(
+                {
+                    "request_id": "request-1",
+                    "model": "topaz-image-upscaler",
+                    "resume_token": "not-used",
+                }
+            ),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert response.status_code == 503

@@ -16,6 +16,7 @@ from litellm.llms.libtv.image_upscale import (
     make_resume_token,
     verify_resume_token,
 )
+from litellm.llms.libtv.receipts import ReceiptClaim, StoredReceipt
 from litellm.llms.libtv.transfer import ValidatedDelegatedTransfer
 from litellm.llms.libtv.transform import build_topaz_upscale_params
 
@@ -462,6 +463,102 @@ async def test_explicit_capacity_rejection_can_try_second_deployment():
     assert secondary.calls == 1
 
 
+@pytest.mark.asyncio
+async def test_client_pool_resolves_each_deployment_credential_for_failover(monkeypatch):
+    class Store:
+        def __init__(self):
+            self.receipt = None
+
+        async def readiness(self):
+            return True
+
+        async def claim(
+            self,
+            team_id,
+            model,
+            request_id,
+            fingerprint,
+            deployment_id,
+            *,
+            response_cost=None,
+        ):
+            self.receipt = StoredReceipt(
+                team_id=team_id,
+                model=model,
+                request_id=request_id,
+                fingerprint=fingerprint,
+                submission_state="submitting",
+                deployment_id=deployment_id,
+                response_cost=response_cost,
+            )
+            return ReceiptClaim("owner", f"receipt-{deployment_id}", self.receipt)
+
+        async def transition(self, receipt, receipt_key, submission_state, **kwargs):
+            self.receipt = StoredReceipt(
+                team_id=receipt.team_id,
+                model=receipt.model,
+                request_id=receipt.request_id,
+                fingerprint=receipt.fingerprint,
+                submission_state=submission_state,
+                deployment_id=receipt.deployment_id,
+                provider_task_id=kwargs.get("provider_task_id"),
+                resume_token=kwargs.get("resume_token"),
+                provider_code=kwargs.get("provider_code"),
+                message=kwargs.get("message"),
+                response_cost=receipt.response_cost,
+            )
+            return self.receipt
+
+    store = Store()
+    monkeypatch.setattr("litellm.llms.libtv.client.get_receipt_store", lambda: store)
+    monkeypatch.setenv("LIBTV_TOKEN", "primary-token")
+    monkeypatch.setenv("LIBTV_WEBID", "primary-webid")
+    monkeypatch.setenv("LIBTV_TOKEN_2", "secondary-token")
+    monkeypatch.setenv("LIBTV_WEBID_2", "secondary-webid")
+    calls = []
+
+    async def fake_acreate(self, *args, **kwargs):
+        calls.append(self.token)
+        if self.token == "primary-token":
+            raise ProviderRejected("capacity")
+        return {"task_id": "secondary-task"}
+
+    monkeypatch.setattr(LibTVClient, "acreate", fake_acreate)
+    client = LibTVClient(token="primary-token", webid="primary-webid")
+
+    receipt = await client.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://source.example/input.png",
+        "Standard V2",
+        2,
+        "project",
+        "request-1",
+        "primary",
+        team_id="team-1",
+        source_sha256="f" * 64,
+        durable_receipts=True,
+        response_cost=0.42,
+        deployment_pool=[
+            {
+                "id": "primary",
+                "api_key": "os.environ/LIBTV_TOKEN",
+                "webid": "os.environ/LIBTV_WEBID",
+            },
+            {
+                "id": "secondary",
+                "api_key": "os.environ/LIBTV_TOKEN_2",
+                "webid": "os.environ/LIBTV_WEBID_2",
+            },
+        ],
+    )
+
+    assert calls == ["primary-token", "secondary-token"]
+    assert receipt.submission_state == "submitted"
+    assert receipt.deployment_id == "secondary"
+    assert store.receipt.response_cost == 0.42
+
+
 def _gen_params(calls):
     return next(j["params"] for path, j in calls if path == "/api/task/generation/create")
 
@@ -576,9 +673,7 @@ def test_video_generation_topaz_upscale_missing_source_video_raises_bad_request(
     fake = FakeSyncClient(post_by_path=_CREATE_ROUTES, get_payload=_topaz_tool_spec_payload())
     llm = LibTVLLM(poll_interval=0)
     with pytest.raises(BadRequestError):
-        llm.video_generation(
-            "topaz-video-upscaler", "upscale this", "tok", None, {"webid": "w"}, None, client=fake
-        )
+        llm.video_generation("topaz-video-upscaler", "upscale this", "tok", None, {"webid": "w"}, None, client=fake)
 
 
 def test_video_generation_topaz_upscale_omitted_resolution_bills_at_1080p_default():
