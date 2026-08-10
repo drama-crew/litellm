@@ -361,8 +361,16 @@ def _is_topaz_image_upscale(spec: dict) -> bool:
 
 
 def _topaz_source_images(optional_params: dict) -> list:
+    if optional_params.get("source_url") is not None:
+        return [optional_params["source_url"]]
     images, _, _ = _collect_reference_groups(optional_params)
     return images
+
+
+def _topaz_source_payload(ref: Any) -> Tuple[str, str, Optional[bytes]]:
+    if not isinstance(ref, str) or not ref.startswith(("http://", "https://")):
+        raise LibTVError(status_code=400, message="Topaz image source must be an HTTP(S) URL")
+    return ("url", ref, None)
 
 
 def _topaz_source_videos(optional_params: dict) -> list:
@@ -976,9 +984,7 @@ class LibTVLLM(CustomLLM):
         images = _topaz_source_images(optional_params)
         if len(images) != 1:
             raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
-        source = _reference_payload(images[0])
-        if source is None:
-            raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
+        source = _topaz_source_payload(images[0])
         source_url = lt.ensure_libtv_url(*source, _REF_DEFAULT_NAME["image"], require_delegated=True)
         request_id = str(
             optional_params.get("provider_request_id") or optional_params.get("request_id") or uuid.uuid4()
@@ -1012,15 +1018,28 @@ class LibTVLLM(CustomLLM):
         images = _topaz_source_images(optional_params)
         if len(images) != 1:
             raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
-        source = _reference_payload(images[0])
-        if source is None:
-            raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
-        source_url = await lt.aensure_libtv_url(*source, _REF_DEFAULT_NAME["image"], require_delegated=True)
+        source = _topaz_source_payload(images[0])
         request_id = str(
             optional_params.get("provider_request_id") or optional_params.get("request_id") or uuid.uuid4()
         )
         model_info = optional_params.get("model_info") or {}
         deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+        try:
+            source_url = await lt.aensure_libtv_url(
+                *source,
+                _REF_DEFAULT_NAME["image"],
+                require_delegated=True,
+                source_bytes=optional_params.get("source_bytes") or optional_params.get("input_reference_bytes"),
+                source_sha256=optional_params.get("source_sha256") or optional_params.get("input_reference_sha256"),
+                source_hard_cap=optional_params.get("source_hard_cap"),
+            )
+        except LibTVError as error:
+            return ImageUpscaleReceipt(
+                request_id=request_id,
+                submission_state="not_submitted",
+                deployment_id=str(deployment_id) if deployment_id is not None else None,
+                message=str(error),
+            )
         return await lt.asubmit_image_upscale(
             model,
             spec["vendor"],

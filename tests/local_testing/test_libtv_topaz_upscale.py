@@ -4,11 +4,14 @@ import pytest
 
 from litellm.exceptions import BadRequestError
 from litellm.llms.libtv.handler import LibTVLLM
+from litellm.llms.libtv.common import LibTVError
 from litellm.llms.libtv.image_upscale import (
     ImageUpscaleSubmitter,
     ProviderRejected,
     ProviderTransportError,
     TopazImageUpscaleBuilder,
+    make_resume_token,
+    verify_resume_token,
 )
 from litellm.llms.libtv.transform import build_topaz_upscale_params
 
@@ -111,6 +114,86 @@ def test_topaz_image_rejects_zero_or_multiple_sources(topaz_builder, sources):
         topaz_builder.build(source_urls=sources, style="Standard V2", scale=2)
 
 
+def test_resume_token_is_signed_and_bound_to_task():
+    token = make_resume_token("dep-1", "task-1", "secret")
+    assert token.startswith("v2.")
+    assert verify_resume_token(token, "secret", deployment_id="dep-1", provider_task_id="task-1")
+    assert not verify_resume_token(token, "wrong", deployment_id="dep-1", provider_task_id="task-1")
+    assert not verify_resume_token(token, "secret", deployment_id="dep-2", provider_task_id="task-1")
+
+
+def test_topaz_image_rejects_non_http_source_before_opening_local_file(monkeypatch):
+    llm = LibTVLLM()
+    monkeypatch.setattr(
+        llm,
+        "_make_client",
+        lambda *args, **kwargs: type(
+            "Client",
+            (),
+            {
+                "resolve_model_spec": lambda self, model: {
+                    "vendor": "topazlabs",
+                    "task_type": "image",
+                    "model_key": "topaz-image-upscaler",
+                }
+            },
+        )(),
+    )
+    monkeypatch.setattr(
+        "builtins.open", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("opened local source"))
+    )
+
+    with pytest.raises(LibTVError, match="HTTP"):
+        llm.submit_image_upscale(
+            "topaz-image-upscaler",
+            "tok",
+            None,
+            {"input_reference": "/tmp/source.png"},
+            None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_validated_transfer_uses_dedicated_stream_and_validates_result_shape():
+    from litellm.llms.libtv.transfer import ValidatedDelegatedTransfer
+
+    class Redis:
+        def __init__(self):
+            self.payload = None
+
+        async def zcount(self, *args):
+            return 1
+
+        async def set(self, *args, **kwargs):
+            return True
+
+        async def xadd(self, stream, fields):
+            self.payload = (stream, json.loads(fields["payload"]))
+
+        async def brpop(self, *args, **kwargs):
+            return (
+                "result",
+                json.dumps({"ok": True, "result": {"bytes": 3, "sha256": "a" * 64, "etags": [{"n": 1, "etag": "e1"}]}}),
+            )
+
+    redis = Redis()
+    transfer = ValidatedDelegatedTransfer(redis=redis, wait_timeout=0.1)
+    result = await transfer.transfer(
+        "https://source.example/input.png",
+        3,
+        [{"n": 1, "url": "https://bridge.example/part-1"}],
+        source_sha256="a" * 64,
+        hard_cap=64,
+    )
+
+    assert result == [{"n": 1, "etag": "e1"}]
+    stream, payload = redis.payload
+    assert stream.endswith("validated_media_transfer")
+    assert payload["mode"] == "source_transfer"
+    assert payload["source"] == {"url": "https://source.example/input.png", "bytes": 3, "sha256": "a" * 64}
+    assert payload["hard_cap"] == 64
+
+
 @pytest.mark.asyncio
 async def test_submit_returns_submitted_receipt():
     class Provider:
@@ -154,9 +237,9 @@ async def test_explicit_capacity_rejection_can_try_second_deployment():
             return {"task_id": "provider-task-2"}
 
     secondary = AcceptedProvider()
-    receipt = await ImageUpscaleSubmitter(
-        ("primary", RejectedProvider()), ("secondary", secondary)
-    ).submit(submit_body())
+    receipt = await ImageUpscaleSubmitter(("primary", RejectedProvider()), ("secondary", secondary)).submit(
+        submit_body()
+    )
     assert receipt.submission_state == "submitted"
     assert receipt.deployment_id == "secondary"
     assert secondary.calls == 1

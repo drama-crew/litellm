@@ -4031,6 +4031,33 @@ async def test_aensure_libtv_url_cache_hit_alive_returns_cached_url_without_uplo
 
 
 @pytest.mark.asyncio
+async def test_aensure_libtv_url_strict_topaz_transfer_bypasses_upload_cache():
+    persistence = FakePersistence(cached="https://libtv-res/cached.png")
+    lt = LibTVClient(token="t", webid="w", async_client=AsyncUploadFake(), persistence=persistence)
+    called = False
+
+    async def strict_upload(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise LibTVError(status_code=503, message="validated worker unavailable")
+
+    lt._aensure_uploaded = strict_upload
+    with pytest.raises(LibTVError, match="validated worker"):
+        await lt.aensure_libtv_url(
+            "url",
+            "https://source.example/input.png",
+            None,
+            "reference.png",
+            require_delegated=True,
+            source_bytes=3,
+            source_sha256="a" * 64,
+        )
+
+    assert called is True
+    assert persistence.cached_upload_calls == []
+
+
+@pytest.mark.asyncio
 async def test_aensure_libtv_url_cache_hit_alive_skips_size_probe_in_delegated_mode(monkeypatch):
     monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
 
@@ -5263,6 +5290,35 @@ async def test_acreate_cached_project_generation_create_failure_invalidates_and_
     nodes_bodies = [b for p, b in fake.calls if p == "/api/canvas/nodes/batch"]
     assert len(nodes_bodies) == 2
     assert len(persistence.invalidate_project_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_asubmit_image_upscale_does_not_retry_after_paid_create_boundary():
+    persistence = FakeProjectPersistence(cached={"project_uuid": "stale-proj", "team_id": "3"})
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": [
+                LibTVError(status_code=500, message="ambiguous generation create"),
+                LibTVError(status_code=500, message="would duplicate paid create"),
+            ],
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    receipt = await lt.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://libtv-res/source.png",
+        "Standard V2",
+        2,
+        "proj-name",
+        "request-1",
+        "dep-1",
+    )
+
+    assert receipt.submission_state == "unknown"
+    assert len([path for path, _ in fake.calls if path == "/api/task/generation/create"]) == 1
 
 
 @pytest.mark.asyncio

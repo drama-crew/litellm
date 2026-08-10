@@ -24215,6 +24215,13 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** ImageUpscaleAcceptedResponse */
+        ImageUpscaleAcceptedResponse: {
+            /** Receipt */
+            receipt: {
+                [key: string]: unknown;
+            };
+        };
         /** IndexCreateLiteLLMParams */
         IndexCreateLiteLLMParams: {
             /** Vector Store Index */
@@ -53674,15 +53681,89 @@ export interface operations {
             path?: never;
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** Input Reference */
+                    input_reference?: string | null;
+                    /** Model */
+                    model?: string | null;
+                    /** Request Id */
+                    request_id?: string | null;
+                    /**
+                     * Scale
+                     * @default 2
+                     * @enum {integer}
+                     */
+                    scale?: 2 | 4 | 6;
+                    /** Source Bytes */
+                    source_bytes?: number | null;
+                    /** Source Hard Cap */
+                    source_hard_cap?: number | null;
+                    /** Source Sha256 */
+                    source_sha256?: string | null;
+                    /** Source Url */
+                    source_url?: string | null;
+                    /**
+                     * Style
+                     * @default Standard V2
+                     */
+                    style?: string;
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
         responses: {
-            /** @description Successful Response */
-            200: {
+            /** @description Provider task submitted */
+            202: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": unknown;
+                    "application/json": components["schemas"]["ImageUpscaleAcceptedResponse"];
+                };
+            };
+            /** @description Submission outcome is unknown */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error: {
+                            code: string;
+                            metadata: Record<string, never>;
+                        };
+                    };
+                };
+            };
+            /** @description Provider explicitly rejected submission */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error: {
+                            code: string;
+                            metadata: Record<string, never>;
+                        };
+                    };
+                };
+            };
+            /** @description Submission was not sent */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        error: {
+                            code: string;
+                            metadata: Record<string, never>;
+                        };
+                    };
                 };
             };
         };

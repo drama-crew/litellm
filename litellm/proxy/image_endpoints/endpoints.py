@@ -1,17 +1,24 @@
 import asyncio
 import traceback
-from typing import List
+from typing import Any, Dict, List, Literal
 
 import orjson
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, status
 from fastapi.responses import ORJSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_str_from_messages,
 )
-from litellm.llms.libtv.image_upscale import ImageUpscaleReceipt
+from litellm.llms.libtv.common import LibTVError
+from litellm.llms.libtv.image_upscale import (
+    ImageUpscaleReceipt,
+    ProviderRejected,
+    ProviderTransportError,
+    normalize_image_upscale_receipt,
+)
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
@@ -19,6 +26,39 @@ from litellm.proxy.route_llm_request import route_request
 from litellm.types.llms.openai import ChatCompletionUserMessage
 
 router = APIRouter()
+
+
+class ImageUpscaleSubmitRequest(BaseModel):
+    model: str | None = None
+    request_id: str | None = None
+    source_url: str | None = None
+    input_reference: str | None = None
+    source_bytes: int | None = Field(default=None, gt=0)
+    source_sha256: str | None = None
+    source_hard_cap: int | None = Field(default=None, gt=0)
+    style: str = "Standard V2"
+    scale: Literal[2, 4, 6] = 2
+    model_config = ConfigDict(extra="allow")
+
+
+class ImageUpscaleAcceptedResponse(BaseModel):
+    receipt: Dict[str, Any]
+
+
+_IMAGE_UPSCALE_ERROR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "error": {
+            "type": "object",
+            "properties": {
+                "code": {"type": "string"},
+                "metadata": {"type": "object"},
+            },
+            "required": ["code", "metadata"],
+        }
+    },
+    "required": ["error"],
+}
 
 
 def _image_upscale_response(receipt: dict) -> ORJSONResponse:
@@ -45,20 +85,72 @@ def _image_upscale_response(receipt: dict) -> ORJSONResponse:
     "/v1/libtv/image-upscale/submit",
     dependencies=[Depends(user_api_key_auth)],
     response_class=ORJSONResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     tags=["images"],
-    include_in_schema=False,
+    response_model=ImageUpscaleAcceptedResponse,
+    responses={
+        202: {"model": ImageUpscaleAcceptedResponse, "description": "Provider task submitted"},
+        409: {
+            "description": "Submission outcome is unknown",
+            "content": {"application/json": {"schema": _IMAGE_UPSCALE_ERROR_SCHEMA}},
+        },
+        429: {
+            "description": "Provider explicitly rejected submission",
+            "content": {"application/json": {"schema": _IMAGE_UPSCALE_ERROR_SCHEMA}},
+        },
+        503: {
+            "description": "Submission was not sent",
+            "content": {"application/json": {"schema": _IMAGE_UPSCALE_ERROR_SCHEMA}},
+        },
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": ImageUpscaleSubmitRequest.model_json_schema()}},
+        }
+    },
 )
 async def libtv_image_upscale_submit(
     request: Request,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
 ):
-    from litellm.proxy.proxy_server import llm_router, user_model
+    from litellm.proxy.proxy_server import (
+        add_litellm_data_to_request,
+        general_settings,
+        llm_router,
+        proxy_config,
+        proxy_logging_obj,
+        user_model,
+        version,
+    )
 
-    data = dict(orjson.loads(await request.body()))
-    data["model"] = data.get("model") or user_model or "topaz-image-upscaler"
-    data["libtv_image_upscale_submit"] = True
-    data["user_api_key_dict"] = user_api_key_dict
+    data: dict[str, Any] = {}
     try:
+        raw = orjson.loads(await request.body())
+        data = ImageUpscaleSubmitRequest.model_validate(raw).model_dump(exclude_none=True)
+        if data.get("source_url") and not data.get("input_reference"):
+            data["input_reference"] = data["source_url"]
+        data.setdefault("prompt", "")
+        data["model"] = data.get("model") or user_model or "topaz-image-upscaler"
+        data["libtv_image_upscale_submit"] = True
+        data["user_api_key_dict"] = user_api_key_dict
+        data = await add_litellm_data_to_request(
+            data=data,
+            request=request,
+            general_settings=general_settings,
+            user_api_key_dict=user_api_key_dict,
+            version=version,
+            proxy_config=proxy_config,
+        )
+        prompt_value = data.get("prompt", "")
+        data["messages"] = [{"role": "user", "content": prompt_value}]
+        data = await proxy_logging_obj.pre_call_hook(
+            user_api_key_dict=user_api_key_dict, data=data, call_type="image_generation"
+        )
+        messages = data.get("messages")
+        if isinstance(messages, list) and messages:
+            data["prompt"] = get_str_from_messages(messages)
+        data.pop("messages", None)
         llm_call = await route_request(
             data=data,
             route_type="aimage_generation",
@@ -67,18 +159,54 @@ async def libtv_image_upscale_submit(
         )
         response = await llm_call
         receipt = (getattr(response, "_hidden_params", {}) or {}).get("submission_receipt")
-        if not isinstance(receipt, dict):
-            receipt = ImageUpscaleReceipt(
-                request_id=str(data.get("request_id") or "unknown"),
-                submission_state="unknown",
-                message="submit response did not include a receipt",
-            ).to_dict()
-        return _image_upscale_response(receipt)
-    except Exception:  # noqa: BLE001  # an ambiguous submit outcome must return an unknown receipt
+        normalized = normalize_image_upscale_receipt(
+            {"receipt": receipt} if isinstance(receipt, dict) else None,
+            str(data.get("request_id") or "unknown"),
+            crossed_create_boundary=True,
+        )
+        if hasattr(proxy_logging_obj, "post_call_success_hook"):
+            response = await proxy_logging_obj.post_call_success_hook(
+                data=data, user_api_key_dict=user_api_key_dict, response=response
+            )
+        if hasattr(proxy_logging_obj, "update_request_status"):
+            asyncio.create_task(
+                proxy_logging_obj.update_request_status(
+                    litellm_call_id=data.get("litellm_call_id", ""), status="success"
+                )
+            )
+        return _image_upscale_response(normalized.to_dict())
+    except Exception as error:  # noqa: BLE001  # receipt classification is handled below
+        from litellm.proxy.proxy_server import proxy_logging_obj
+
+        if hasattr(proxy_logging_obj, "post_call_failure_hook"):
+            await proxy_logging_obj.post_call_failure_hook(
+                user_api_key_dict=user_api_key_dict, original_exception=error, request_data=data
+            )
+        if isinstance(error, ProviderRejected):
+            state = "rejected"
+            provider_code = error.provider_code
+            message = str(error)
+        elif isinstance(error, ProviderTransportError):
+            state = "unknown" if error.crossed_create_boundary else "not_submitted"
+            provider_code = None
+            message = str(error)
+        elif isinstance(error, LibTVError) and error.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+            state = "rejected"
+            provider_code = str(error.status_code)
+            message = str(error)
+        elif isinstance(error, LibTVError):
+            state = "not_submitted"
+            provider_code = None
+            message = str(error)
+        else:
+            state = "unknown"
+            provider_code = None
+            message = "provider submit result is unknown"
         receipt = ImageUpscaleReceipt(
             request_id=str(data.get("request_id") or "unknown"),
-            submission_state="unknown",
-            message="provider submit result is unknown",
+            submission_state=state,
+            provider_code=provider_code,
+            message=message,
         ).to_dict()
         return _image_upscale_response(receipt)
 

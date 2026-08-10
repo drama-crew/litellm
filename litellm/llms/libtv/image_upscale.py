@@ -1,7 +1,53 @@
+import base64
+import binascii
+import hashlib
+import hmac
+import json
+import os
+import secrets
 from dataclasses import asdict, dataclass
 from typing import Awaitable, Literal, Mapping, Protocol, Sequence
 
 SubmissionState = Literal["not_submitted", "rejected", "unknown", "submitted"]
+
+
+def make_resume_token(deployment_id: str, provider_task_id: str, secret: str) -> str:
+    if not secret:
+        raise ValueError("resume token secret is required")
+    payload = json.dumps(
+        {"deployment_id": deployment_id, "provider_task_id": provider_task_id},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    encoded = base64.urlsafe_b64encode(payload).rstrip(b"=").decode()
+    signature = hmac.new(secret.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+    return f"v2.{encoded}.{signature}"
+
+
+def verify_resume_token(
+    token: str,
+    secret: str,
+    *,
+    deployment_id: str | None = None,
+    provider_task_id: str | None = None,
+) -> bool:
+    if not secret:
+        return False
+    try:
+        version, encoded, signature = token.split(".", 2)
+        if version != "v2":
+            return False
+        expected = hmac.new(secret.encode(), encoded.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return False
+        payload = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError, binascii.Error):
+        return False
+    return (
+        isinstance(payload, dict)
+        and (deployment_id is None or payload.get("deployment_id") == deployment_id)
+        and (provider_task_id is None or payload.get("provider_task_id") == provider_task_id)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,10 +151,13 @@ class TopazImageUpscaleBuilder:
 
 
 class ImageUpscaleSubmitter:
-    def __init__(self, *deployments: tuple[str, ImageUpscaleProvider]):
+    def __init__(self, *deployments: tuple[str, ImageUpscaleProvider], resume_secret: str | None = None):
         if not deployments:
             raise ValueError("at least one image upscale deployment is required")
         self._deployments = tuple(deployments)
+        self._resume_secret = (
+            resume_secret or os.getenv("LIBTV_IMAGE_UPSCALE_RESUME_SECRET") or secrets.token_urlsafe(32)
+        )
 
     async def submit(self, payload: Mapping[str, object]) -> ImageUpscaleReceipt:
         request_id = payload.get("request_id")
@@ -149,7 +198,7 @@ class ImageUpscaleSubmitter:
                 submission_state="submitted",
                 deployment_id=deployment_id,
                 provider_task_id=task_id,
-                resume_token=f"v1:{deployment_id}:{task_id}",
+                resume_token=make_resume_token(deployment_id, task_id, self._resume_secret),
             )
         if last_rejection is not None:
             return ImageUpscaleReceipt(

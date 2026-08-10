@@ -16,7 +16,7 @@ from litellm.types.videos.utils import (
     decode_video_id_with_provider,
     encode_video_id_with_provider,
 )
-from litellm.llms.libtv.image_upscale import ImageUpscaleReceipt
+from litellm.llms.libtv.image_upscale import ImageUpscaleReceipt, make_resume_token
 
 
 PUBLIC_MODELS = (
@@ -284,14 +284,14 @@ def test_image_upscale_receipt_wire_shape_is_stable():
         submission_state="submitted",
         deployment_id="topaz-account-1",
         provider_task_id="provider-task-1",
-        resume_token="v1.topaz-account-1.provider-task-1",
+        resume_token=make_resume_token("topaz-account-1", "provider-task-1", "test-secret"),
     )
     assert receipt.to_dict() == {
         "request_id": "generation-1",
         "submission_state": "submitted",
         "deployment_id": "topaz-account-1",
         "provider_task_id": "provider-task-1",
-        "resume_token": "v1.topaz-account-1.provider-task-1",
+        "resume_token": make_resume_token("topaz-account-1", "provider-task-1", "test-secret"),
         "provider_code": None,
         "message": None,
     }

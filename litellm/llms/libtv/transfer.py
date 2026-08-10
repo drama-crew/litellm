@@ -2,9 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, Awaitable, Callable, List, Optional, Protocol, Tuple, TypedDict
+from urllib.parse import urlsplit
 
 import httpx
 import redis.exceptions as redis_exceptions
@@ -14,8 +16,10 @@ from .common import BRIDGE_PART_SIZE, LibTVError
 # Generic worker-task protocol namespace (workers are general task executors;
 # media transfer is one task type). Keep all key names here for cross-repo reference.
 TASK_TYPE = "media_transfer"
+VALIDATED_TASK_TYPE = "validated_media_transfer"
 TASKS_STREAM = f"worker:tasks:{TASK_TYPE}"
 WORKERS_ZSET = f"worker:alive:{TASK_TYPE}"
+VALIDATED_WORKERS_ZSET = f"worker:alive:{VALIDATED_TASK_TYPE}"
 STATUS_KEY_PREFIX = "worker:task:status:"
 RESULT_KEY_PREFIX = "worker:task:result:"
 STATUS_TTL_SECONDS = 24 * 3600
@@ -275,6 +279,98 @@ class DelegatedTransfer:
             inner = result.get("result") or {}
             return [{"n": e["n"], "etag": e.get("etag", "")} for e in inner.get("etags", [])]
         return await self.fallback.transfer(source_url, size, parts)
+
+
+class ValidatedDelegatedTransfer:
+    """Fail-closed source transfer for paid Topaz image submissions."""
+
+    def __init__(self, redis: Any, *, wait_timeout: float = DEFAULT_WAIT_TIMEOUT, hard_cap: int = 64 * 1024 * 1024):
+        self.redis = redis
+        self.wait_timeout = wait_timeout
+        self.hard_cap = hard_cap
+
+    async def _has_active_worker(self) -> bool:
+        now = time.time()
+        return await self.redis.zcount(VALIDATED_WORKERS_ZSET, now - WORKER_HEARTBEAT_WINDOW_SECONDS, "+inf") > 0
+
+    @staticmethod
+    def _validate_parts(size: int, parts: List[PartTarget], part_size: int) -> None:
+        expected = max(1, (size + part_size - 1) // part_size)
+        numbers = [part.get("n") for part in parts]
+        if numbers != list(range(1, expected + 1)) or any(
+            not isinstance(part.get("url"), str) or not part["url"].startswith(("http://", "https://"))
+            for part in parts
+        ):
+            raise LibTVError(status_code=503, message="validated source transfer returned incomplete parts")
+
+    async def transfer(
+        self,
+        source_url: str,
+        size: int,
+        parts: List[PartTarget],
+        *,
+        source_sha256: str,
+        hard_cap: int | None = None,
+        part_size: int = BRIDGE_PART_SIZE,
+    ) -> List[PartEtag]:
+        parsed = urlsplit(source_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.fragment:
+            raise LibTVError(status_code=503, message="validated source transfer requires an HTTP(S) source URL")
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise LibTVError(status_code=503, message="validated source transfer requires a positive source size")
+        if not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", source_sha256):
+            raise LibTVError(status_code=503, message="validated source transfer requires a SHA-256 digest")
+        cap = self.hard_cap if hard_cap is None else hard_cap
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0 or size > cap or cap > self.hard_cap:
+            raise LibTVError(status_code=503, message="validated source transfer exceeds hard cap")
+        self._validate_parts(size, parts, part_size)
+        if not await self._has_active_worker():
+            raise LibTVError(status_code=503, message="validated source transfer worker is unavailable")
+
+        task_id = str(uuid.uuid4())
+        now = time.time()
+        payload = {
+            "type": VALIDATED_TASK_TYPE,
+            "task_id": task_id,
+            "source": {"url": source_url, "bytes": size, "sha256": source_sha256.lower()},
+            "expected": {},
+            "target": {"kind": "presigned_parts", "parts": parts, "part_size": part_size},
+            "mode": "source_transfer",
+            "hard_cap": cap,
+            "deadline_ts": now + self.wait_timeout,
+            "created_ts": now,
+        }
+        await self.redis.set(status_key(task_id), "queued", ex=STATUS_TTL_SECONDS)
+        await self.redis.xadd(f"worker:tasks:{VALIDATED_TASK_TYPE}", {"payload": json.dumps(payload)})
+        raw_result = await self.redis.brpop(result_key(task_id), timeout=self.wait_timeout)
+        if raw_result is None:
+            raise LibTVError(status_code=503, message="validated source transfer timed out")
+        try:
+            _, body = raw_result
+            result = json.loads(body)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise LibTVError(status_code=503, message="validated source transfer returned malformed result") from exc
+        inner = result.get("result") if isinstance(result, dict) else None
+        if not isinstance(result, dict) or not result.get("ok") or not isinstance(inner, dict):
+            raise LibTVError(status_code=503, message="validated source transfer failed")
+        if inner.get("bytes") != size or str(inner.get("sha256", "")).lower() != source_sha256.lower():
+            raise LibTVError(status_code=503, message="validated source transfer size or digest mismatch")
+        etags = inner.get("etags")
+        if not isinstance(etags, list) or len(etags) != len(parts):
+            raise LibTVError(status_code=503, message="validated source transfer returned incomplete parts")
+        normalized = []
+        for item in etags:
+            if (
+                not isinstance(item, dict)
+                or set(item) != {"n", "etag"}
+                or not isinstance(item["n"], int)
+                or not item["etag"]
+            ):
+                raise LibTVError(status_code=503, message="validated source transfer returned invalid parts")
+            normalized.append({"n": item["n"], "etag": item["etag"]})
+        if [item["n"] for item in normalized] != list(range(1, len(parts) + 1)):
+            raise LibTVError(status_code=503, message="validated source transfer returned incomplete parts")
+        return normalized
 
 
 def build_transfer_strategy(
