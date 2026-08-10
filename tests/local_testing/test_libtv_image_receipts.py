@@ -108,6 +108,33 @@ async def test_concurrent_submitters_create_once_and_share_receipt(redis_url):
 
 
 @pytest.mark.asyncio
+async def test_receipt_persists_authenticated_identity_snapshot(redis_url):
+    store = await _store(redis_url)
+
+    class Provider:
+        async def create(self, payload):
+            return {"task_id": "task-identity"}
+
+    receipt = await ImageUpscaleSubmitter(
+        ("primary", Provider()),
+        receipt_store=store,
+        team_id="team-1",
+        api_key="hashed-key-id",
+        user_id="user-1",
+        organization_id="org-1",
+        model="topaz-image-upscaler",
+    ).submit(_payload())
+
+    stored = await store.get("team-1", "topaz-image-upscaler", "request-1")
+
+    assert receipt.submission_state == "submitted"
+    assert stored is not None
+    assert stored.api_key == "hashed-key-id"
+    assert stored.user_id == "user-1"
+    assert stored.organization_id == "org-1"
+
+
+@pytest.mark.asyncio
 async def test_same_request_with_different_fingerprint_returns_conflict(redis_url):
     store = await _store(redis_url)
 

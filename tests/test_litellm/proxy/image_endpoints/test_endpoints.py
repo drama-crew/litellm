@@ -683,6 +683,9 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
             fingerprint=fingerprint,
         ),
         response_cost=0.25,
+        api_key="hashed-key-id",
+        user_id="receipt-user",
+        organization_id="receipt-org",
     )
 
     class Store:
@@ -718,7 +721,9 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
                 }
             ),
         ),
-        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+        user_api_key_dict=UserAPIKeyAuth(
+            team_id="team-1", api_key="sk-request-key", user_id="request-user", org_id="request-org"
+        ),
     )
 
     assert response.status_code == 200
@@ -726,6 +731,72 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
     event = store.transition_calls[0]["billing_event"]
     assert event.provider_task_id == "task-1"
     assert event.response_cost == 0.25
+    assert event.api_key == "hashed-key-id"
+    assert event.user_id == "receipt-user"
+    assert event.organization_id == "receipt-org"
+    assert event.team_id == "team-1"
+    assert event.model == "topaz-image-upscaler"
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_poll_without_durable_identity_does_not_bill(monkeypatch):
+    fingerprint = "f" * 64
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint=fingerprint,
+        submission_state="submitted",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        resume_token=make_resume_token(
+            "dep-1",
+            "task-1",
+            "secret",
+            team_id="team-1",
+            model="topaz-image-upscaler",
+            request_id="request-1",
+            fingerprint=fingerprint,
+        ),
+        response_cost=0.25,
+    )
+
+    class Store:
+        def __init__(self):
+            self.transition_calls = []
+
+        async def get(self, team_id, model, request_id):
+            return receipt
+
+        async def transition(self, *args, **kwargs):
+            self.transition_calls.append(kwargs)
+            return receipt
+
+    class Client:
+        async def apoll_image_upscale(self, provider_task_id):
+            return {"status": 2, "urls": ["https://libtv.example/result.png"]}
+
+    store = Store()
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints._client_for_receipt", lambda _: Client())
+    monkeypatch.setenv("LIBTV_IMAGE_UPSCALE_RESUME_SECRET", "secret")
+
+    response = await endpoints.libtv_image_upscale_poll(
+        request=_action_request(
+            "/v1/libtv/image-upscale/poll",
+            orjson.dumps(
+                {
+                    "request_id": "request-1",
+                    "model": "topaz-image-upscaler",
+                    "resume_token": receipt.resume_token,
+                }
+            ),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert response.status_code == 503
+    assert store.transition_calls == []
 
 
 @pytest.mark.asyncio

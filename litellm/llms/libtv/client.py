@@ -915,6 +915,9 @@ class LibTVClient:
         durable_receipts: bool = False,
         response_cost: float | None = None,
         deployment_pool: Sequence[Mapping[str, object]] | None = None,
+        receipt_api_key: str | None = None,
+        receipt_user_id: str | None = None,
+        receipt_organization_id: str | None = None,
     ) -> ImageUpscaleReceipt:
         params = TopazImageUpscaleBuilder().build(source_url=source_url, style=style, scale=scale)
         if durable_receipts:
@@ -998,6 +1001,9 @@ class LibTVClient:
                 *selected_providers,
                 receipt_store=receipt_store,
                 team_id=team_id or "default",
+                api_key=receipt_api_key,
+                user_id=receipt_user_id,
+                organization_id=receipt_organization_id,
                 model=model_key,
             ).submit(
                 {

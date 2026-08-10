@@ -87,6 +87,9 @@ class StoredReceipt:
     message: str | None = None
     response_cost: float | None = None
     billing_event_id: str | None = None
+    api_key: str | None = None
+    user_id: str | None = None
+    organization_id: str | None = None
 
     @classmethod
     def from_json(cls, raw: str) -> "StoredReceipt":
@@ -107,6 +110,9 @@ class StoredReceipt:
             message=value.get("message"),
             response_cost=float(value["response_cost"]) if value.get("response_cost") is not None else None,
             billing_event_id=value.get("billing_event_id"),
+            api_key=value.get("api_key"),
+            user_id=value.get("user_id"),
+            organization_id=value.get("organization_id"),
         )
 
     def to_json(self) -> str:
@@ -124,6 +130,9 @@ class StoredReceipt:
                 "message": self.message,
                 "response_cost": self.response_cost,
                 "billing_event_id": self.billing_event_id,
+                "api_key": self.api_key,
+                "user_id": self.user_id,
+                "organization_id": self.organization_id,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -190,6 +199,9 @@ class LibTVReceiptStore:
         deployment_id: str,
         *,
         response_cost: float | None = None,
+        api_key: str | None = None,
+        user_id: str | None = None,
+        organization_id: str | None = None,
     ) -> ReceiptClaim:
         index_key = self._index_key(team_id, model, request_id)
         pool_key = self._pool_key(team_id, model, request_id)
@@ -202,6 +214,9 @@ class LibTVReceiptStore:
             submission_state="submitting",
             deployment_id=deployment_id,
             response_cost=response_cost,
+            api_key=api_key,
+            user_id=user_id,
+            organization_id=organization_id,
         )
         pool = self._pool_record(receipt, receipt_key)
         try:
@@ -257,6 +272,9 @@ class LibTVReceiptStore:
                     else getattr(receipt, "billing_event_id", None)
                 )
             ),
+            api_key=getattr(receipt, "api_key", None),
+            user_id=getattr(receipt, "user_id", None),
+            organization_id=getattr(receipt, "organization_id", None),
         )
         index_key = self._index_key(receipt.team_id, receipt.model, receipt.request_id)
         pool_key = self._pool_key(receipt.team_id, receipt.model, receipt.request_id)
@@ -299,6 +317,9 @@ class LibTVReceiptStore:
                 submission_state="unknown",
                 deployment_id=receipt.deployment_id,
                 message="receipt missing after pending claim",
+                api_key=getattr(receipt, "api_key", None),
+                user_id=getattr(receipt, "user_id", None),
+                organization_id=getattr(receipt, "organization_id", None),
             )
         if outcome == "conflict":
             raise RedisError("receipt deployment transition conflict")

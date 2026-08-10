@@ -203,6 +203,9 @@ class ImageUpscaleSubmitter:
         resume_secret: str | None = None,
         receipt_store: LibTVReceiptStore | None = None,
         team_id: str | None = None,
+        api_key: str | None = None,
+        user_id: str | None = None,
+        organization_id: str | None = None,
         model: str = "topaz-image-upscaler",
     ):
         if not deployments:
@@ -217,6 +220,9 @@ class ImageUpscaleSubmitter:
             receipt_store = get_receipt_store()
         self._receipt_store = receipt_store
         self._team_id = team_id
+        self._api_key = api_key
+        self._user_id = user_id
+        self._organization_id = organization_id
         self._model = model
 
     @staticmethod
@@ -248,8 +254,12 @@ class ImageUpscaleSubmitter:
         if self._receipt_store is None:
             raise RuntimeError("receipt store is not configured")
         if response_cost is None:
-            claim = await self._receipt_store.claim(team_id, self._model, request_id, fingerprint, deployment_id)
+            claim_kwargs = self._identity_claim_kwargs()
+            claim = await self._receipt_store.claim(
+                team_id, self._model, request_id, fingerprint, deployment_id, **claim_kwargs
+            )
         else:
+            claim_kwargs = self._identity_claim_kwargs()
             claim = await self._receipt_store.claim(
                 team_id,
                 self._model,
@@ -257,6 +267,7 @@ class ImageUpscaleSubmitter:
                 fingerprint,
                 deployment_id,
                 response_cost=response_cost,
+                **claim_kwargs,
             )
         if claim.outcome == "mismatch":
             raise IdempotencyFingerprintMismatch(
@@ -276,6 +287,17 @@ class ImageUpscaleSubmitter:
                 return claim, self._from_stored(resolved or claim.receipt, request_id)
             return claim, self._from_stored(claim.receipt, request_id)
         return claim, None
+
+    def _identity_claim_kwargs(self) -> dict[str, str]:
+        return {
+            key: value
+            for key, value in {
+                "api_key": self._api_key,
+                "user_id": self._user_id,
+                "organization_id": self._organization_id,
+            }.items()
+            if isinstance(value, str) and value
+        }
 
     async def _submit_deployment(
         self,

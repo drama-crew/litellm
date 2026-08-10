@@ -381,6 +381,15 @@ def _receipt_team_id(optional_params: dict) -> str:
     return "default"
 
 
+def _receipt_identity(optional_params: dict) -> dict[str, str | None]:
+    auth = optional_params.get("user_api_key_dict")
+    return {
+        "receipt_api_key": getattr(auth, "api_key", None),
+        "receipt_user_id": getattr(auth, "user_id", None),
+        "receipt_organization_id": getattr(auth, "org_id", None),
+    }
+
+
 def _image_upscale_response_cost(optional_params: dict, scale: int) -> float | None:
     value = optional_params.get(f"output_cost_per_image_{scale}x")
     try:
@@ -1071,6 +1080,7 @@ class LibTVLLM(CustomLLM):
             source_sha256=optional_params.get("source_sha256") or optional_params.get("input_reference_sha256"),
             durable_receipts=True,
             response_cost=_image_upscale_response_cost(optional_params, int(optional_params.get("scale", 2))),
+            **_receipt_identity(optional_params),
             deployment_pool=optional_params.get("image_upscale_deployment_pool"),
         )
 

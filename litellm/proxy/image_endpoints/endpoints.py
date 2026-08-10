@@ -445,11 +445,19 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
             status_code=503,
             content={"error": "authoritative image upscale cost unavailable", "receipt": _receipt_body(receipt)},
         )
+    if not receipt.api_key or not receipt.user_id or not receipt.organization_id:
+        return ORJSONResponse(
+            status_code=503,
+            content={"error": "durable image upscale identity unavailable", "receipt": _receipt_body(receipt)},
+        )
     event = ImageBillingEvent(
         deployment_id=receipt.deployment_id or "unknown",
         provider_task_id=receipt.provider_task_id,
         response_cost=receipt.response_cost,
         team_id=receipt.team_id,
+        api_key=receipt.api_key,
+        user_id=receipt.user_id,
+        organization_id=receipt.organization_id,
         model=receipt.model,
     )
     try:
