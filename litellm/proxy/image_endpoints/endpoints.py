@@ -143,6 +143,7 @@ async def libtv_image_upscale_submit(
     )
 
     data: dict[str, Any] = {}
+    crossed_create_boundary = False
     try:
         raw = orjson.loads(await request.body())
         data = ImageUpscaleSubmitRequest.model_validate(raw).model_dump(exclude_none=True)
@@ -177,6 +178,7 @@ async def libtv_image_upscale_submit(
             user_model=user_model,
         )
         response = await llm_call
+        crossed_create_boundary = True
         receipt = (getattr(response, "_hidden_params", {}) or {}).get("submission_receipt")
         normalized = normalize_image_upscale_receipt(
             {"receipt": receipt} if isinstance(receipt, dict) else None,
@@ -197,7 +199,7 @@ async def libtv_image_upscale_submit(
     except (orjson.JSONDecodeError, ValidationError, ValueError) as error:
         receipt = ImageUpscaleReceipt(
             request_id=str(data.get("request_id") or "unknown"),
-            submission_state="not_submitted",
+            submission_state="unknown" if crossed_create_boundary else "not_submitted",
             message=str(error),
         ).to_dict()
         return _image_upscale_response(receipt)

@@ -75,6 +75,9 @@ class FakeAsyncClient(FakeSyncClient):
     async def post(self, url, json=None, headers=None, timeout=None):
         return FakeSyncClient.post(self, url, json, headers, timeout)
 
+    async def post_once(self, url, json=None, headers=None, timeout=None):
+        return FakeSyncClient.post(self, url, json, headers, timeout)
+
     async def get(self, url, headers=None, timeout=None, params=None):
         return FakeSyncClient.get(self, url, headers, timeout, params)
 
@@ -246,6 +249,37 @@ async def test_paid_create_response_without_task_id_is_unknown_receipt():
     )
 
     assert receipt.submission_state == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_paid_create_fails_closed_without_post_once():
+    class AsyncClientWithoutPostOnce:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, json=None, headers=None, timeout=None):
+            path = url.split("api.liblib.tv", 1)[-1]
+            self.calls.append(path)
+            if path == "/api/task/generation/create":
+                raise AssertionError("paid create must not fall back to post")
+            return FakeResponse({"code": 0, "data": {"projectMeta": {"uuid": "project-1"}}})
+
+    fake = AsyncClientWithoutPostOnce()
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=None, poll_interval=0)
+
+    receipt = await lt.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://libtv-res/source.png",
+        "Standard V2",
+        2,
+        "proj-name",
+        "request-1",
+        "dep-1",
+    )
+
+    assert receipt.submission_state == "not_submitted"
+    assert "/api/task/generation/create" not in fake.calls
 
 
 @pytest.mark.asyncio

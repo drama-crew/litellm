@@ -173,6 +173,9 @@ class FakeAsyncClient:
             raise item
         return FakeResponse(item)
 
+    async def post_once(self, url, json=None, headers=None, timeout=None):
+        return await self.post(url, json, headers, timeout)
+
     async def get(self, url, headers=None, params=None):
         self.calls.append((self._path(url), None))
         return FakeResponse(self.get_payload)

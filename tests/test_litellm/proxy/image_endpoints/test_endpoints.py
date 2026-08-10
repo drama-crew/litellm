@@ -209,6 +209,63 @@ async def test_image_upscale_submit_maps_source_url_and_runs_proxy_pipeline(monk
 
 
 @pytest.mark.asyncio
+async def test_image_upscale_submit_hook_error_preserves_unknown_submission_state(monkeypatch):
+    async def fake_add_litellm_data_to_request(**kwargs):
+        return kwargs["data"]
+
+    async def fake_pre_call_hook(**kwargs):
+        return kwargs["data"]
+
+    async def fake_route_request(*, data, **kwargs):
+        async def _inner():
+            class FakeResponse:
+                _hidden_params = {
+                    "submission_receipt": {
+                        "request_id": "r1",
+                        "submission_state": "submitted",
+                        "deployment_id": "dep-1",
+                        "provider_task_id": "task-1",
+                        "resume_token": "opaque",
+                    }
+                }
+
+            return FakeResponse()
+
+        return _inner()
+
+    async def fake_post_call_success_hook(**kwargs):
+        raise ValueError("success hook failed after provider submission")
+
+    fake_proxy_logger = SimpleNamespace(
+        pre_call_hook=fake_pre_call_hook,
+        post_call_success_hook=fake_post_call_success_hook,
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.add_litellm_data_to_request", fake_add_litellm_data_to_request)
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", fake_proxy_logger)
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_model", None)
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.route_request", fake_route_request)
+
+    result = await endpoints.libtv_image_upscale_submit(
+        request=_request(
+            orjson.dumps(
+                {
+                    "request_id": "r1",
+                    "source_url": "https://source.example/input.png",
+                    "source_bytes": 3,
+                    "source_sha256": "a" * 64,
+                }
+            )
+        ),
+        user_api_key_dict=UserAPIKeyAuth(),
+    )
+
+    body = json.loads(result.body)
+    assert result.status_code == 409
+    assert body["error"]["metadata"]["submission_receipt"]["submission_state"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_image_upscale_submit_malformed_json_returns_not_submitted_receipt(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
     monkeypatch.setattr("litellm.proxy.proxy_server.user_model", None)

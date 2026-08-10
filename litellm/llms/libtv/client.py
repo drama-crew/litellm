@@ -668,8 +668,13 @@ class LibTVClient:
     # ---------- async ----------
     async def _apost(self, path: str, body: Dict[str, Any], step: str, *, submit_once: bool = False) -> Dict[str, Any]:
         assert self.async_client is not None, "async_client required for async calls"
-        post = getattr(self.async_client, "post_once", None) if submit_once else None
-        if post is None:
+        if submit_once:
+            post = getattr(self.async_client, "post_once", None)
+            if not callable(post):
+                raise ProviderTransportError(
+                    "paid create requires an async client with post_once", crossed_create_boundary=False
+                )
+        else:
             post = self.async_client.post
         resp = await post(url=f"{self.api_base}{path}", json=body, headers=self.headers, timeout=self.request_timeout)
         return self._check(resp, step)
