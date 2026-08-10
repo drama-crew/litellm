@@ -15,6 +15,7 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
 from litellm.llms.libtv.common import LibTVError
 from litellm.llms.libtv.image_upscale import (
     ImageUpscaleReceipt,
+    IdempotencyFingerprintMismatch,
     ProviderRejected,
     ProviderTransportError,
     normalize_image_upscale_receipt,
@@ -203,6 +204,24 @@ async def libtv_image_upscale_submit(
             message=str(error),
         ).to_dict()
         return _image_upscale_response(receipt)
+    except IdempotencyFingerprintMismatch as error:
+        receipt = (
+            error.receipt
+            or ImageUpscaleReceipt(
+                request_id=str(data.get("request_id") or "unknown"),
+                submission_state="unknown",
+                message=str(error),
+            )
+        ).to_dict()
+        return ORJSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={
+                "error": {
+                    "code": error.code,
+                    "metadata": {"submission_receipt": receipt},
+                }
+            },
+        )
     except Exception as error:  # noqa: BLE001  # receipt classification is handled below
         from litellm.proxy.proxy_server import proxy_logging_obj
 

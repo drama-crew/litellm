@@ -1,17 +1,25 @@
 import asyncio
+import shutil
+import socket
+import subprocess
+import time
+from pathlib import Path
 
 import pytest
 
-fakeredis = pytest.importorskip("fakeredis")
-from fakeredis import aioredis as fakeredis_aioredis
-from redis.exceptions import RedisError
+from redis import Redis as SyncRedis
+from redis.asyncio import Redis
+from redis.exceptions import RedisError, ResponseError
 
 from litellm.llms.libtv.image_upscale import (
     ImageUpscaleSubmitter,
     IdempotencyFingerprintMismatch,
     ProviderRejected,
     ProviderTransportError,
+    make_resume_token,
+    verify_resume_token,
 )
+from litellm.llms.libtv.client import LibTVClient
 from litellm.llms.libtv.receipts import LibTVReceiptStore, request_fingerprint
 
 
@@ -27,13 +35,56 @@ def _payload(request_id: str = "request-1", style: str = "Standard V2") -> dict[
     }
 
 
-def _store():
-    return LibTVReceiptStore(fakeredis_aioredis.FakeRedis(decode_responses=True))
+@pytest.fixture(scope="module")
+def redis_url(tmp_path_factory):
+    data_dir = Path(tmp_path_factory.mktemp("libtv-receipts-redis"))
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    process = subprocess.Popen(
+        [
+            "redis-server",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--dir",
+            str(data_dir),
+            "--appendonly",
+            "yes",
+            "--appendfsync",
+            "always",
+            "--save",
+            "",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    client = SyncRedis(host="127.0.0.1", port=port, decode_responses=True)
+    for _ in range(100):
+        try:
+            if client.ping():
+                break
+        except Exception:
+            time.sleep(0.01)
+    else:
+        process.terminate()
+        raise RuntimeError("redis-server did not become ready")
+    yield f"redis://127.0.0.1:{port}/0"
+    client.close()
+    process.terminate()
+    process.wait(timeout=5)
+
+
+async def _store(redis_url: str) -> LibTVReceiptStore:
+    store = LibTVReceiptStore(Redis.from_url(redis_url, decode_responses=True))
+    await store.redis.flushdb()
+    return store
 
 
 @pytest.mark.asyncio
-async def test_concurrent_submitters_create_once_and_share_receipt():
-    store = _store()
+async def test_concurrent_submitters_create_once_and_share_receipt(redis_url):
+    store = await _store(redis_url)
 
     class Provider:
         def __init__(self):
@@ -57,8 +108,8 @@ async def test_concurrent_submitters_create_once_and_share_receipt():
 
 
 @pytest.mark.asyncio
-async def test_same_request_with_different_fingerprint_returns_conflict():
-    store = _store()
+async def test_same_request_with_different_fingerprint_returns_conflict(redis_url):
+    store = await _store(redis_url)
 
     class Provider:
         async def create(self, payload):
@@ -76,8 +127,8 @@ async def test_same_request_with_different_fingerprint_returns_conflict():
 
 
 @pytest.mark.asyncio
-async def test_explicit_rejection_allows_secondary_claim():
-    store = _store()
+async def test_explicit_rejection_allows_secondary_claim(redis_url):
+    store = await _store(redis_url)
     calls = []
 
     class Rejected:
@@ -104,8 +155,8 @@ async def test_explicit_rejection_allows_secondary_claim():
 
 
 @pytest.mark.asyncio
-async def test_unknown_transport_locks_pool_for_secondary_submitter():
-    store = _store()
+async def test_unknown_transport_locks_pool_for_secondary_submitter(redis_url):
+    store = await _store(redis_url)
     primary_calls = []
     secondary_calls = []
 
@@ -141,9 +192,9 @@ async def test_unknown_transport_locks_pool_for_secondary_submitter():
 
 
 @pytest.mark.asyncio
-async def test_missing_receipt_after_pending_is_unknown_and_not_resubmittable():
-    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
-    store = LibTVReceiptStore(redis)
+async def test_missing_receipt_after_pending_is_unknown_and_not_resubmittable(redis_url):
+    store = await _store(redis_url)
+    redis = store.redis
     claim = await store.claim(
         "team-1",
         "topaz-image-upscaler",
@@ -170,9 +221,9 @@ async def test_missing_receipt_after_pending_is_unknown_and_not_resubmittable():
 
 
 @pytest.mark.asyncio
-async def test_missing_receipt_still_rejects_a_different_fingerprint():
-    redis = fakeredis_aioredis.FakeRedis(decode_responses=True)
-    store = LibTVReceiptStore(redis)
+async def test_missing_receipt_still_rejects_a_different_fingerprint(redis_url):
+    store = await _store(redis_url)
+    redis = store.redis
     claim = await store.claim("team-1", "topaz-image-upscaler", "request-1", "f" * 64, "primary")
     await redis.delete(claim.receipt_key)
 
@@ -205,6 +256,106 @@ async def test_receipt_store_redis_error_fails_closed_before_provider_create():
 
 
 @pytest.mark.asyncio
+async def test_durable_client_fails_closed_when_receipt_redis_is_not_ready(monkeypatch):
+    class NotReadyStore:
+        async def readiness(self):
+            return False
+
+    provider_calls = []
+
+    async def unexpected_create(*args, **kwargs):
+        provider_calls.append(1)
+        return {"task_id": "task-1"}
+
+    monkeypatch.setattr("litellm.llms.libtv.client.get_receipt_store", lambda: NotReadyStore())
+    client = LibTVClient(token="token", webid="webid")
+    monkeypatch.setattr(client, "acreate", unexpected_create)
+
+    receipt = await client.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://source.example/input.png",
+        "Standard V2",
+        2,
+        "project",
+        "request-not-ready",
+        "primary",
+        team_id="team-1",
+        source_sha256="a" * 64,
+        durable_receipts=True,
+    )
+
+    assert provider_calls == []
+    assert receipt.submission_state == "not_submitted"
+    assert receipt.message == "receipt store is not durable"
+
+
+@pytest.mark.asyncio
+async def test_unknown_eval_command_fails_closed_without_provider_create():
+    class NoLuaRedis:
+        async def eval(self, *args):
+            raise ResponseError("unknown command 'eval'")
+
+    calls = []
+
+    class Provider:
+        async def create(self, payload):
+            calls.append(1)
+            return {"task_id": "task-1"}
+
+    receipt = await ImageUpscaleSubmitter(
+        ("primary", Provider()),
+        receipt_store=LibTVReceiptStore(NoLuaRedis()),
+        team_id="team-1",
+        model="topaz-image-upscaler",
+    ).submit(_payload())
+
+    assert calls == []
+    assert receipt.submission_state == "not_submitted"
+    assert receipt.message == "receipt store unavailable"
+
+
+@pytest.mark.asyncio
+async def test_transition_requires_expected_state_and_cannot_overwrite_submitted(redis_url):
+    store = await _store(redis_url)
+    claim = await store.claim("team-1", "topaz-image-upscaler", "request-1", "f" * 64, "primary")
+    submitted = await store.transition(
+        claim.receipt, claim.receipt_key, "submitted", provider_task_id="task-1", resume_token="token"
+    )
+
+    with pytest.raises(RedisError):
+        await store.transition(submitted, claim.receipt_key, "unknown", expected_state="submitting")
+
+    current = await store.get("team-1", "topaz-image-upscaler", "request-1")
+    assert current is not None
+    assert current.submission_state == "submitted"
+
+
+def test_durable_resume_token_binds_receipt_identity():
+    token = make_resume_token(
+        "dep-1",
+        "task-1",
+        "secret",
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+    )
+
+    assert verify_resume_token(
+        token,
+        "secret",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+    )
+    assert not verify_resume_token(token, "secret", team_id="other-team")
+
+
+@pytest.mark.asyncio
 async def test_receipt_store_readiness_requires_durable_aof_and_write_read():
     class Redis:
         def __init__(self, config):
@@ -226,3 +377,78 @@ async def test_receipt_store_readiness_requires_durable_aof_and_write_read():
 
     assert await LibTVReceiptStore(Redis({"appendonly": "yes", "appendfsync": "always"})).readiness()
     assert not await LibTVReceiptStore(Redis({"appendonly": "yes", "appendfsync": "everysec"})).readiness()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(shutil.which("redis-server") is None, reason="redis-server is required for the AOF restart proof")
+async def test_real_redis_aof_restart_preserves_submitted_receipt(tmp_path):
+    data_dir = tmp_path / "redis-data"
+    data_dir.mkdir()
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    def start_server():
+        process = subprocess.Popen(
+            [
+                "redis-server",
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                str(port),
+                "--dir",
+                str(data_dir),
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                "always",
+                "--save",
+                "",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        client = SyncRedis(host="127.0.0.1", port=port, decode_responses=True)
+        for _ in range(100):
+            try:
+                if client.ping():
+                    return process, client
+            except Exception:
+                time.sleep(0.01)
+        process.terminate()
+        process.wait(timeout=5)
+        raise RuntimeError("redis-server did not become ready")
+
+    process, sync_client = start_server()
+    redis_url = f"redis://127.0.0.1:{port}/0"
+    try:
+        async_store = LibTVReceiptStore(Redis.from_url(redis_url, decode_responses=True))
+        claim = await async_store.claim("team-1", "topaz-image-upscaler", "restart-request", "f" * 64, "primary")
+        await async_store.transition(
+            claim.receipt,
+            claim.receipt_key,
+            "submitted",
+            provider_task_id="task-restart-1",
+            resume_token="resume-restart-1",
+        )
+        config = sync_client.config_get("appendonly", "appendfsync")
+        assert config["appendonly"] == "yes"
+        assert config["appendfsync"] == "always"
+        await async_store.redis.aclose()
+        sync_client.close()
+        process.terminate()
+        process.wait(timeout=5)
+
+        process, sync_client = start_server()
+        restarted = LibTVReceiptStore(Redis.from_url(redis_url, decode_responses=True))
+        receipt = await restarted.get_receipt("team-1", "topaz-image-upscaler", "restart-request")
+        assert receipt is not None
+        assert receipt.submission_state == "submitted"
+        assert receipt.provider_task_id == "task-restart-1"
+        assert receipt.resume_token == "resume-restart-1"
+        await restarted.redis.aclose()
+    finally:
+        sync_client.close()
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)

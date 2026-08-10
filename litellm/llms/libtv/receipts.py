@@ -61,15 +61,13 @@ if not stored then
   return {'missing'}
 end
 local current = cjson.decode(stored)
-if current['deployment_id'] ~= ARGV[1] then
+if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2] then
   return {'conflict', stored}
 end
-redis.call('SET', KEYS[3], ARGV[2])
-redis.call('SET', KEYS[2], ARGV[3])
-return {'ok', ARGV[2]}
+redis.call('SET', KEYS[3], ARGV[3])
+redis.call('SET', KEYS[2], ARGV[4])
+return {'ok', ARGV[3]}
 """
-
-_FALLBACK_LOCK = asyncio.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,51 +200,10 @@ class LibTVReceiptStore:
                 pool,
             )
         except ResponseError as error:
-            if "unknown command 'eval'" not in str(error):
-                raise
-            result = await self._claim_without_lua(index_key, pool_key, receipt_key, receipt, pool)
+            raise RedisError("receipt store Lua CAS is unavailable") from error
         outcome = self._text(result[0])
         stored = StoredReceipt.from_json(self._text(result[2])) if len(result) > 2 and outcome != "mismatch" else None
         return ReceiptClaim(outcome=outcome, receipt_key=self._text(result[1]), receipt=stored)
-
-    async def _claim_without_lua(
-        self, index_key: str, pool_key: str, receipt_key: str, receipt: StoredReceipt, pool: str
-    ) -> list[str]:
-        async with _FALLBACK_LOCK:
-            indexed = await self.redis.get(index_key)
-            if indexed is not None:
-                indexed = self._text(indexed)
-                stored = await self.redis.get(indexed)
-                if stored is None:
-                    pool_raw = await self.redis.get(pool_key)
-                    if pool_raw is not None:
-                        pool_value = json.loads(self._text(pool_raw))
-                        if pool_value["fingerprint"] != receipt.fingerprint:
-                            return ["mismatch", indexed, self._text(pool_raw)]
-                    return ["missing", indexed]
-                stored_text = self._text(stored)
-                current = StoredReceipt.from_json(stored_text)
-                if current.fingerprint != receipt.fingerprint:
-                    return ["mismatch", indexed, stored_text]
-                if current.submission_state in {"submitting", "unknown", "submitted"}:
-                    return ["existing", indexed, stored_text]
-                if current.deployment_id == receipt.deployment_id:
-                    return [current.submission_state, indexed, stored_text]
-            pool_raw = await self.redis.get(pool_key)
-            if pool_raw is not None:
-                pool_value = json.loads(self._text(pool_raw))
-                if pool_value["fingerprint"] != receipt.fingerprint:
-                    return ["mismatch", receipt_key, self._text(pool_raw)]
-                if pool_value["submission_state"] in {"submitting", "unknown", "submitted"}:
-                    pool_receipt_key = pool_value["receipt_key"]
-                    pool_stored = await self.redis.get(pool_receipt_key)
-                    if pool_stored is None:
-                        return ["missing", pool_receipt_key]
-                    return ["existing", pool_receipt_key, self._text(pool_stored)]
-            await self.redis.set(index_key, receipt_key)
-            await self.redis.set(pool_key, pool)
-            await self.redis.set(receipt_key, receipt.to_json())
-            return ["owner", receipt_key, receipt.to_json()]
 
     async def transition(
         self,
@@ -258,6 +215,7 @@ class LibTVReceiptStore:
         resume_token: str | None = None,
         provider_code: str | None = None,
         message: str | None = None,
+        expected_state: ReceiptState = "submitting",
     ) -> StoredReceipt:
         updated = StoredReceipt(
             team_id=receipt.team_id,
@@ -280,14 +238,13 @@ class LibTVReceiptStore:
                 index_key,
                 pool_key,
                 receipt_key,
+                expected_state,
                 receipt.deployment_id or "",
                 updated.to_json(),
                 self._pool_record(updated, receipt_key),
             )
         except ResponseError as error:
-            if "unknown command 'eval'" not in str(error):
-                raise
-            result = await self._transition_without_lua(index_key, pool_key, receipt_key, receipt, updated)
+            raise RedisError("receipt store Lua CAS is unavailable") from error
         outcome = self._text(result[0])
         if outcome == "missing":
             return StoredReceipt(
@@ -302,25 +259,6 @@ class LibTVReceiptStore:
         if outcome == "conflict":
             raise RedisError("receipt deployment transition conflict")
         return updated
-
-    async def _transition_without_lua(
-        self,
-        index_key: str,
-        pool_key: str,
-        receipt_key: str,
-        receipt: StoredReceipt,
-        updated: StoredReceipt,
-    ) -> list[str]:
-        async with _FALLBACK_LOCK:
-            stored = await self.redis.get(receipt_key)
-            if stored is None:
-                return ["missing"]
-            current = StoredReceipt.from_json(self._text(stored))
-            if current.deployment_id != receipt.deployment_id:
-                return ["conflict", self._text(stored)]
-            await self.redis.set(receipt_key, updated.to_json())
-            await self.redis.set(pool_key, self._pool_record(updated, receipt_key))
-            return ["ok", updated.to_json()]
 
     async def get(self, team_id: str, model: str, request_id: str) -> StoredReceipt | None:
         index_key = self._index_key(team_id, model, request_id)

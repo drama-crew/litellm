@@ -15,11 +15,27 @@ from litellm.llms.libtv.receipts import LibTVReceiptStore, ReceiptClaim, StoredR
 SubmissionState = Literal["not_submitted", "rejected", "unknown", "submitted"]
 
 
-def make_resume_token(deployment_id: str, provider_task_id: str, secret: str) -> str:
+def make_resume_token(
+    deployment_id: str,
+    provider_task_id: str,
+    secret: str,
+    *,
+    team_id: str | None = None,
+    model: str | None = None,
+    request_id: str | None = None,
+    fingerprint: str | None = None,
+) -> str:
     if not secret:
         raise ValueError("resume token secret is required")
     payload = json.dumps(
-        {"deployment_id": deployment_id, "provider_task_id": provider_task_id},
+        {
+            "deployment_id": deployment_id,
+            "provider_task_id": provider_task_id,
+            "team_id": team_id,
+            "model": model,
+            "request_id": request_id,
+            "fingerprint": fingerprint,
+        },
         separators=(",", ":"),
         sort_keys=True,
     ).encode()
@@ -34,6 +50,10 @@ def verify_resume_token(
     *,
     deployment_id: str | None = None,
     provider_task_id: str | None = None,
+    team_id: str | None = None,
+    model: str | None = None,
+    request_id: str | None = None,
+    fingerprint: str | None = None,
 ) -> bool:
     if not secret:
         return False
@@ -51,6 +71,10 @@ def verify_resume_token(
         isinstance(payload, dict)
         and (deployment_id is None or payload.get("deployment_id") == deployment_id)
         and (provider_task_id is None or payload.get("provider_task_id") == provider_task_id)
+        and (team_id is None or payload.get("team_id") == team_id)
+        and (model is None or payload.get("model") == model)
+        and (request_id is None or payload.get("request_id") == request_id)
+        and (fingerprint is None or payload.get("fingerprint") == fingerprint)
     )
 
 
@@ -71,6 +95,10 @@ class ImageUpscaleReceipt:
 class IdempotencyFingerprintMismatch(Exception):
     status_code = 409
     code = "idempotency_fingerprint_mismatch"
+
+    def __init__(self, message: str, *, receipt: ImageUpscaleReceipt | None = None):
+        super().__init__(message)
+        self.receipt = receipt
 
 
 def normalize_image_upscale_receipt(
@@ -205,7 +233,15 @@ class ImageUpscaleSubmitter:
             raise RuntimeError("receipt store is not configured")
         claim = await self._receipt_store.claim(team_id, self._model, request_id, fingerprint, deployment_id)
         if claim.outcome == "mismatch":
-            raise IdempotencyFingerprintMismatch("request_id was already used with a different fingerprint")
+            raise IdempotencyFingerprintMismatch(
+                "request_id was already used with a different fingerprint",
+                receipt=ImageUpscaleReceipt(
+                    request_id=request_id,
+                    submission_state="unknown",
+                    deployment_id=deployment_id,
+                    message="request_id was already used with a different fingerprint",
+                ),
+            )
         if claim.outcome == "missing":
             return claim, self._from_stored(None, request_id, "receipt missing after pending claim")
         if claim.outcome in {"existing", "rejected", "not_submitted"}:
@@ -222,6 +258,8 @@ class ImageUpscaleSubmitter:
         provider: ImageUpscaleProvider,
         claim: ReceiptClaim | None,
         payload: Mapping[str, object],
+        team_id: str,
+        fingerprint: str,
     ) -> tuple[ImageUpscaleReceipt | None, ProviderRejected | None]:
         try:
             response = await provider.create(payload)
@@ -279,7 +317,15 @@ class ImageUpscaleSubmitter:
             submission_state="submitted",
             deployment_id=deployment_id,
             provider_task_id=task_id,
-            resume_token=make_resume_token(deployment_id, task_id, self._resume_secret),
+            resume_token=make_resume_token(
+                deployment_id,
+                task_id,
+                self._resume_secret,
+                team_id=team_id,
+                model=self._model,
+                request_id=request_id,
+                fingerprint=fingerprint,
+            ),
         )
         if self._receipt_store is None or claim is None or claim.receipt is None:
             return receipt, None
@@ -326,7 +372,9 @@ class ImageUpscaleSubmitter:
                         continue
                     if existing.submission_state == "not_submitted":
                         continue
-            result, rejection = await self._submit_deployment(request_id, deployment_id, provider, claim, payload)
+            result, rejection = await self._submit_deployment(
+                request_id, deployment_id, provider, claim, payload, team_id, fingerprint
+            )
             if result is not None:
                 return result
             if rejection is not None:

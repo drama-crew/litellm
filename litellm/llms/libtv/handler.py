@@ -373,6 +373,15 @@ def _topaz_source_payload(ref: Any) -> Tuple[str, str, Optional[bytes]]:
     return ("url", ref, None)
 
 
+def _receipt_team_id(optional_params: dict) -> str:
+    auth = optional_params.get("user_api_key_dict")
+    for field in ("team_id", "org_id", "user_id"):
+        value = getattr(auth, field, None)
+        if isinstance(value, str) and value:
+            return value
+    return "default"
+
+
 def _topaz_source_videos(optional_params: dict) -> list:
     return _as_list(optional_params.get("video_references")) + _as_list(optional_params.get("input_reference"))
 
@@ -1049,6 +1058,9 @@ class LibTVLLM(CustomLLM):
             _project_name(model),
             request_id,
             str(deployment_id) if deployment_id is not None else None,
+            team_id=_receipt_team_id(optional_params),
+            source_sha256=optional_params.get("source_sha256") or optional_params.get("input_reference_sha256"),
+            durable_receipts=True,
         )
 
     @normalize_libtv_errors

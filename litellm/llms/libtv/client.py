@@ -29,13 +29,21 @@ from .common import (
     is_compliance_failure,
 )
 from .image_upscale import (
+    ImageUpscaleSubmitter,
     ImageUpscaleReceipt,
     ProviderRejected,
     ProviderTransportError,
     TopazImageUpscaleBuilder,
     make_resume_token,
 )
-from .persistence import LibTVPersistence, account_key, get_persistence, normalize_source_key, url_alive
+from .persistence import (
+    LibTVPersistence,
+    account_key,
+    get_persistence,
+    get_receipt_store,
+    normalize_source_key,
+    url_alive,
+)
 from .transfer import PartTarget, ValidatedDelegatedTransfer, build_transfer_strategy, get_transfer_redis
 
 
@@ -893,8 +901,76 @@ class LibTVClient:
         project_name: str,
         request_id: str,
         deployment_id: str | None = None,
+        *,
+        team_id: str | None = None,
+        source_sha256: str | None = None,
+        durable_receipts: bool = False,
     ) -> ImageUpscaleReceipt:
         params = TopazImageUpscaleBuilder().build(source_url=source_url, style=style, scale=scale)
+        if durable_receipts:
+            receipt_store = get_receipt_store()
+            if receipt_store is None:
+                return ImageUpscaleReceipt(
+                    request_id=request_id,
+                    submission_state="not_submitted",
+                    deployment_id=deployment_id,
+                    message="receipt store unavailable",
+                )
+            try:
+                if not await receipt_store.readiness():
+                    return ImageUpscaleReceipt(
+                        request_id=request_id,
+                        submission_state="not_submitted",
+                        deployment_id=deployment_id,
+                        message="receipt store is not durable",
+                    )
+            except Exception as error:
+                return ImageUpscaleReceipt(
+                    request_id=request_id,
+                    submission_state="not_submitted",
+                    deployment_id=deployment_id,
+                    message=f"receipt store unavailable: {error}",
+                )
+
+            class _Provider:
+                async def create(inner_self, payload):
+                    provider_params = TopazImageUpscaleBuilder().build(
+                        source_url=str(payload["source_url"]),
+                        style=str(payload.get("style", "Standard V2")),
+                        scale=int(payload.get("scale", 2)),
+                    )
+                    try:
+                        return await self.acreate(
+                            model_key,
+                            vendor,
+                            "image",
+                            provider_params,
+                            project_name,
+                            allow_cached_project_retry=False,
+                            paid_submission=True,
+                        )
+                    except (ProviderRejected, ProviderTransportError):
+                        raise
+                    except LibTVError as error:
+                        raise ProviderTransportError(str(error), crossed_create_boundary=False) from error
+
+            return await ImageUpscaleSubmitter(
+                (deployment_id or "unknown", _Provider()),
+                resume_secret=self.token,
+                receipt_store=receipt_store,
+                team_id=team_id or "default",
+                model=model_key,
+            ).submit(
+                {
+                    "request_id": request_id,
+                    "team_id": team_id or "default",
+                    "model": model_key,
+                    "source_url": source_url,
+                    "source_sha256": source_sha256 or "",
+                    "style": style,
+                    "scale": scale,
+                }
+            )
         try:
             created = await self.acreate(
                 model_key,
