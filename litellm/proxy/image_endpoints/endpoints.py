@@ -3,6 +3,7 @@ import math
 import os
 import traceback
 from typing import Any, Dict, List, Literal
+from urllib.parse import urlsplit
 
 import orjson
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, status
@@ -76,6 +77,7 @@ class ImageUpscaleReceiptResponse(BaseModel):
     message: str | None = None
     response_cost: float | None = None
     billing_event_id: str | None = None
+    resolution_tombstone: dict[str, Any] | None = None
 
 
 class ImageUpscaleErrorMetadata(BaseModel):
@@ -95,6 +97,10 @@ class ImageUpscaleActionRequest(BaseModel):
     request_id: str = Field(min_length=1)
     model: str = Field(default="topaz-image-upscaler", min_length=1)
     resume_token: str = Field(min_length=1)
+
+
+class ImageUpscaleResolutionRequest(ImageUpscaleActionRequest):
+    tombstone: Dict[str, Any]
 
 
 def _image_upscale_response(receipt: dict) -> ORJSONResponse:
@@ -392,6 +398,7 @@ def _receipt_body(receipt: StoredReceipt) -> dict[str, object]:
         "message": receipt.message,
         "response_cost": receipt.response_cost,
         "billing_event_id": receipt.billing_event_id,
+        "resolution_tombstone": receipt.resolution_tombstone,
     }
 
 
@@ -438,7 +445,16 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
             status_code=409 if finalize else 200, content={"receipt": _receipt_body(receipt), "provider": state}
         )
     urls = state.get("urls") or []
-    if not isinstance(urls, list) or not all(isinstance(url, str) and url for url in urls):
+    if (
+        not isinstance(urls, list)
+        or len(urls) != 1
+        or not all(
+            isinstance(url, str)
+            and urlsplit(url).scheme in {"http", "https"}
+            and bool(urlsplit(url).netloc)
+            for url in urls
+        )
+    ):
         return ORJSONResponse(status_code=502, content={"error": "provider completed without valid result urls"})
     if receipt.response_cost is None or not math.isfinite(receipt.response_cost) or receipt.response_cost <= 0:
         return ORJSONResponse(
@@ -512,6 +528,45 @@ async def libtv_image_upscale_finalize(
         detail = error.errors(include_context=False) if isinstance(error, ValidationError) else str(error)
         return ORJSONResponse(status_code=422, content={"detail": detail})
     return await _poll_image_upscale(action, user_api_key_dict, True)
+
+
+@router.post(
+    "/v1/libtv/image-upscale/resolve",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["images"],
+)
+async def libtv_image_upscale_resolve(
+    request: Request,
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    try:
+        action = ImageUpscaleResolutionRequest.model_validate(orjson.loads(await request.body()))
+    except (orjson.JSONDecodeError, ValidationError) as error:
+        detail = error.errors(include_context=False) if isinstance(error, ValidationError) else str(error)
+        return ORJSONResponse(status_code=422, content={"detail": detail})
+    loaded = await _load_action_receipt(action, user_api_key_dict)
+    if isinstance(loaded, ORJSONResponse):
+        return loaded
+    store, receipt, receipt_key, _client = loaded
+    if receipt.resolution_tombstone is not None:
+        return ORJSONResponse(status_code=200, content={"receipt": _receipt_body(receipt)})
+    if receipt.submission_state != "unknown":
+        return ORJSONResponse(status_code=409, content={"error": "receipt is not unknown"})
+    tombstone = dict(action.tombstone)
+    tombstone.setdefault("request_id", receipt.request_id)
+    tombstone.setdefault("operator_id", "authenticated")
+    try:
+        updated = await store.transition(
+            receipt,
+            receipt_key,
+            "unknown",
+            expected_state="unknown",
+            resolution_tombstone=tombstone,
+        )
+    except RedisError:
+        return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})
+    return ORJSONResponse(status_code=200, content={"receipt": _receipt_body(updated)})
 
 
 import io

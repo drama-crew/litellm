@@ -61,6 +61,9 @@ if not stored then
   return {'missing'}
 end
 local current = cjson.decode(stored)
+if current['resolution_tombstone'] then
+  return {'resolved', stored}
+end
 if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2] then
   return {'conflict', stored}
 end
@@ -90,6 +93,7 @@ class StoredReceipt:
     api_key: str | None = None
     user_id: str | None = None
     organization_id: str | None = None
+    resolution_tombstone: dict | None = None
 
     @classmethod
     def from_json(cls, raw: str) -> "StoredReceipt":
@@ -113,6 +117,7 @@ class StoredReceipt:
             api_key=value.get("api_key"),
             user_id=value.get("user_id"),
             organization_id=value.get("organization_id"),
+            resolution_tombstone=value.get("resolution_tombstone"),
         )
 
     def to_json(self) -> str:
@@ -133,6 +138,7 @@ class StoredReceipt:
                 "api_key": self.api_key,
                 "user_id": self.user_id,
                 "organization_id": self.organization_id,
+                "resolution_tombstone": self.resolution_tombstone,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -250,6 +256,7 @@ class LibTVReceiptStore:
         response_cost: float | None = None,
         expected_state: ReceiptState = "submitting",
         billing_event: Mapping[str, object] | object | None = None,
+        resolution_tombstone: dict | None = None,
     ) -> StoredReceipt:
         updated = StoredReceipt(
             team_id=receipt.team_id,
@@ -275,6 +282,7 @@ class LibTVReceiptStore:
             api_key=getattr(receipt, "api_key", None),
             user_id=getattr(receipt, "user_id", None),
             organization_id=getattr(receipt, "organization_id", None),
+            resolution_tombstone=resolution_tombstone or getattr(receipt, "resolution_tombstone", None),
         )
         index_key = self._index_key(receipt.team_id, receipt.model, receipt.request_id)
         pool_key = self._pool_key(receipt.team_id, receipt.model, receipt.request_id)
@@ -323,6 +331,8 @@ class LibTVReceiptStore:
             )
         if outcome == "conflict":
             raise RedisError("receipt deployment transition conflict")
+        if outcome == "resolved":
+            return StoredReceipt.from_json(self._text(result[1]))
         return updated
 
     async def get(self, team_id: str, model: str, request_id: str) -> StoredReceipt | None:
