@@ -200,7 +200,8 @@ async def test_invalid_billing_contract_blocks_provider_create(cost):
 
 
 @pytest.mark.asyncio
-async def test_missing_billing_identity_blocks_provider_create():
+@pytest.mark.parametrize("identity_field", ["team_id", "api_key", "user_id", "organization_id"])
+async def test_missing_billing_identity_blocks_provider_create(identity_field):
     calls = []
 
     class Provider:
@@ -208,12 +209,35 @@ async def test_missing_billing_identity_blocks_provider_create():
             calls.append(payload)
             return {"task_id": "task-1"}
 
-    receipt = await ImageUpscaleSubmitter(("primary", Provider()), team_id="team-1").submit(
-        {**_payload(), "response_cost": 0.25}
-    )
+    constructor_identity = {
+        "team_id": "team-1",
+        "api_key": "key-1",
+        "user_id": "user-1",
+        "organization_id": "org-1",
+    }
+    constructor_identity[identity_field] = None
+    payload = _payload()
+    payload.pop(identity_field)
+
+    receipt = await ImageUpscaleSubmitter(("primary", Provider()), **constructor_identity).submit(payload)
 
     assert calls == []
     assert receipt.submission_state == "not_submitted"
+
+
+@pytest.mark.asyncio
+async def test_payload_billing_identity_allows_provider_create():
+    calls = []
+
+    class Provider:
+        async def create(self, payload):
+            calls.append(payload)
+            return {"task_id": "task-1"}
+
+    receipt = await ImageUpscaleSubmitter(("primary", Provider())).submit(_payload())
+
+    assert len(calls) == 1
+    assert receipt.submission_state == "submitted"
 
 
 @pytest.mark.asyncio

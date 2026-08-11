@@ -51,8 +51,9 @@ async def test_terminal_receipt_transition_appends_one_billing_event():
 
     assert len(redis.eval_calls) == 1
     script, numkeys, args = redis.eval_calls[0]
-    assert numkeys == 4
+    assert numkeys == 5
     assert args[3] == BILLING_STREAM_KEY
+    assert args[4] == f"{BILLING_STREAM_KEY}:delivered:{event.event_id}"
     assert json.loads(args[-1])["provider_task_id"] == "task-1"
     assert script.count("XADD") == 1
 
