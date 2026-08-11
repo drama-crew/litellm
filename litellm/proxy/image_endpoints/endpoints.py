@@ -49,7 +49,8 @@ class ImageUpscaleSubmitRequest(BaseModel):
     source_hard_cap: int | None = Field(default=None, gt=0)
     style: str = "Standard V2"
     scale: Literal[2, 4, 6] = 2
-    model_config = ConfigDict(extra="allow")
+    model_info: Dict[str, Any] | None = None
+    model_config = ConfigDict(extra="forbid")
 
     @model_validator(mode="before")
     @classmethod
@@ -242,7 +243,8 @@ async def libtv_image_upscale_submit(
         errors = error.errors(include_context=False)
         request_id = raw.get("request_id") if isinstance(raw, dict) else None
         request_id_error = any(tuple(item.get("loc") or ()) == ("request_id",) for item in errors)
-        if request_id_error:
+        extra_field_error = any(item.get("type") == "extra_forbidden" for item in errors)
+        if request_id_error or extra_field_error:
             return ORJSONResponse(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 content={"detail": errors},

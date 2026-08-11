@@ -6,6 +6,7 @@ from typing import Any, Dict
 
 import orjson
 import pytest
+from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -564,6 +565,74 @@ async def test_image_upscale_submit_rejects_inline_media_body():
 
     assert result.status_code == 503
     assert "source_body" not in result.body.decode()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("image", "data:image/png;base64,not-allowed"),
+        ("data", {"image": "not-allowed"}),
+        ("source_base64", "not-allowed"),
+        ("unexpected", "not-allowed"),
+    ],
+)
+def test_image_upscale_submit_request_forbids_unknown_top_level_fields(field, value):
+    payload = {
+        "request_id": "r1",
+        "source_url": "https://source.example/input.png",
+        "source_bytes": 3,
+        "source_sha256": "a" * 64,
+        field: value,
+    }
+
+    with pytest.raises(ValidationError) as error:
+        endpoints.ImageUpscaleSubmitRequest.model_validate(payload)
+
+    assert any(item["type"] == "extra_forbidden" and item["loc"] == (field,) for item in error.value.errors())
+
+
+def test_image_upscale_submit_request_accepts_declared_receipt_and_source_metadata():
+    request = endpoints.ImageUpscaleSubmitRequest.model_validate(
+        {
+            "model": "topaz-image-upscaler",
+            "request_id": "receipt-r1",
+            "input_reference": "https://source.example/input.png",
+            "source_bytes": 3,
+            "source_sha256": "a" * 64,
+            "source_hard_cap": 64,
+            "style": "Standard V2",
+            "scale": 2,
+            "model_info": {"id": "primary"},
+        }
+    )
+
+    assert request.request_id == "receipt-r1"
+    assert request.input_reference == "https://source.example/input.png"
+    assert request.source_sha256 == "a" * 64
+    assert request.model_info == {"id": "primary"}
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_submit_returns_422_for_unknown_top_level_field():
+    result = await endpoints.libtv_image_upscale_submit(
+        request=_request(
+            orjson.dumps(
+                {
+                    "request_id": "r1",
+                    "source_url": "https://source.example/input.png",
+                    "source_bytes": 3,
+                    "source_sha256": "a" * 64,
+                    "image": "data:image/png;base64,not-allowed",
+                }
+            )
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert result.status_code == 422
+    assert any(
+        item["type"] == "extra_forbidden" and item["loc"] == ["image"] for item in json.loads(result.body)["detail"]
+    )
 
 
 @pytest.mark.asyncio
