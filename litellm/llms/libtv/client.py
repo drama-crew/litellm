@@ -253,6 +253,18 @@ def _extract_urls(task_result: Dict[str, Any], kind: str) -> List[str]:
     return collect(task_result.get("images"))
 
 
+def _extract_verified_image_metadata(task_result: Dict[str, Any]) -> Dict[str, Any] | None:
+    """Read provider scalar metadata without fetching the media body."""
+    images = task_result.get("images")
+    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
+        return None
+    item = images[0]
+    fields = ("bytes", "mime", "width", "height", "sha256")
+    if any(field not in item for field in fields):
+        return None
+    return {field: item[field] for field in fields}
+
+
 _UNKNOWN_TASK_REASON_MARKER = "任务数据异常"
 
 
@@ -308,6 +320,10 @@ def parse_progress(payload: Dict[str, Any], kind: str, task_id: Optional[str] = 
         elif isinstance(raw, dict):
             parsed = raw
         urls = _extract_urls(parsed, kind)
+        result = {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
+        if kind == "image":
+            result["result_metadata"] = _extract_verified_image_metadata(parsed)
+        return result
     return {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
 
 

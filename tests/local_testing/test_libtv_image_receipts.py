@@ -358,6 +358,25 @@ async def test_transition_requires_expected_state_and_cannot_overwrite_submitted
     assert current.submission_state == "submitted"
 
 
+@pytest.mark.asyncio
+async def test_transition_with_null_resolution_tombstone_performs_cas(redis_url):
+    """JSON null is not a resolved receipt in Redis Lua/cjson."""
+    store = await _store(redis_url)
+    claim = await store.claim("team-1", "topaz-image-upscaler", "request-1", "f" * 64, "primary")
+
+    submitted = await store.transition(
+        claim.receipt,
+        claim.receipt_key,
+        "submitted",
+        provider_task_id="task-1",
+        resume_token="token-1",
+    )
+
+    assert submitted.submission_state == "submitted"
+    assert submitted.provider_task_id == "task-1"
+    assert submitted.resolution_tombstone is None
+
+
 def test_durable_resume_token_binds_receipt_identity():
     token = make_resume_token(
         "dep-1",

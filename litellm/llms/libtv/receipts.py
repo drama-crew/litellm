@@ -61,7 +61,8 @@ if not stored then
   return {'missing'}
 end
 local current = cjson.decode(stored)
-if current['resolution_tombstone'] then
+-- cjson represents explicit JSON null with a truthy sentinel.
+if current['resolution_tombstone'] and current['resolution_tombstone'] ~= cjson.null then
   return {'resolved', stored}
 end
 if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2] then

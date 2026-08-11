@@ -285,6 +285,8 @@ def test_image_upscale_receipt_wire_shape_is_stable():
         deployment_id="topaz-account-1",
         provider_task_id="provider-task-1",
         resume_token=make_resume_token("topaz-account-1", "provider-task-1", "test-secret"),
+        response_cost=1.25,
+        billing_event_id="billing-event-1",
     )
     assert receipt.to_dict() == {
         "request_id": "generation-1",
@@ -294,4 +296,17 @@ def test_image_upscale_receipt_wire_shape_is_stable():
         "resume_token": make_resume_token("topaz-account-1", "provider-task-1", "test-secret"),
         "provider_code": None,
         "message": None,
+        "response_cost": 1.25,
+        "billing_event_id": "billing-event-1",
     }
+
+
+def test_image_upscale_resolution_request_uses_dedicated_auth_contract():
+    from litellm.proxy.image_endpoints.endpoints import ImageUpscaleResolutionRequest
+
+    request = ImageUpscaleResolutionRequest(
+        request_id="generation-1",
+        tombstone={"operator_id": "operator-1", "reason": "duplicate risk"},
+    )
+
+    assert "resume_token" not in request.model_dump()

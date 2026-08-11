@@ -6,6 +6,7 @@ import pytest
 from litellm.exceptions import BadRequestError, Timeout
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, MaskedHTTPStatusError
 from litellm.llms.libtv.client import LibTVClient
+from litellm.llms.libtv.client import parse_progress
 from litellm.llms.libtv.common import LibTVError
 from litellm.llms.libtv.handler import LibTVLLM
 from litellm.llms.libtv.image_upscale import (
@@ -114,6 +115,45 @@ def test_topaz_image_payload_is_flat_and_has_no_mode_type(topaz_builder):
     assert payload["scale"] == 4
     assert payload["imageList"] == ["https://source.example/input.png"]
     assert "modeType" not in payload
+
+
+def test_completed_image_progress_exposes_verified_result_metadata():
+    result = parse_progress(
+        {
+            "data": {
+                "progresses": [
+                    {
+                        "taskId": "task-1",
+                        "status": 2,
+                        "taskResult": json.dumps(
+                            {
+                                "images": [
+                                    {
+                                        "imageUrl": "https://provider.example/result.png",
+                                        "bytes": 42,
+                                        "mime": "image/png",
+                                        "width": 8,
+                                        "height": 8,
+                                        "sha256": "a" * 64,
+                                    }
+                                ]
+                            }
+                        ),
+                    }
+                ]
+            }
+        },
+        "image",
+        "task-1",
+    )
+
+    assert result["result_metadata"] == {
+        "bytes": 42,
+        "mime": "image/png",
+        "width": 8,
+        "height": 8,
+        "sha256": "a" * 64,
+    }
 
 
 @pytest.mark.parametrize("sources", [[], ["a.png", "b.png"]])

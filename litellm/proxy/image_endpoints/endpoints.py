@@ -99,7 +99,11 @@ class ImageUpscaleActionRequest(BaseModel):
     resume_token: str = Field(min_length=1)
 
 
-class ImageUpscaleResolutionRequest(ImageUpscaleActionRequest):
+class ImageUpscaleResolutionRequest(BaseModel):
+    """Team-authenticated receipt resolution does not use a task resume token."""
+
+    request_id: str = Field(min_length=1)
+    model: str = Field(default="topaz-image-upscaler", min_length=1)
     tombstone: Dict[str, Any]
 
 
@@ -387,6 +391,26 @@ async def _load_action_receipt(action: ImageUpscaleActionRequest, user_api_key_d
     return store, receipt, key, client
 
 
+async def _load_resolution_receipt(
+    action: ImageUpscaleResolutionRequest, user_api_key_dict: UserAPIKeyAuth
+):
+    """Load by team/request ownership for the dedicated resolution contract."""
+    team_id = _team_id(user_api_key_dict)
+    if team_id is None:
+        return ORJSONResponse(status_code=403, content={"error": "team-scoped authentication is required"})
+    store = get_receipt_store()
+    if store is None:
+        return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})
+    try:
+        receipt = await store.get(team_id, action.model, action.request_id)
+    except RedisError:
+        return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})
+    if receipt is None:
+        return ORJSONResponse(status_code=404, content={"error": "image upscale receipt not found"})
+    key = LibTVReceiptStore.receipt_key(team_id, action.model, action.request_id, receipt.fingerprint)
+    return store, receipt, key
+
+
 def _receipt_body(receipt: StoredReceipt) -> dict[str, object]:
     return {
         "request_id": receipt.request_id,
@@ -456,6 +480,27 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         )
     ):
         return ORJSONResponse(status_code=502, content={"error": "provider completed without valid result urls"})
+    metadata = state.get("result_metadata")
+    required_metadata = {"bytes", "mime", "width", "height", "sha256"}
+    if (
+        not isinstance(metadata, dict)
+        or set(metadata) != required_metadata
+        or type(metadata["bytes"]) is not int
+        or metadata["bytes"] <= 0
+        or not isinstance(metadata["mime"], str)
+        or not metadata["mime"].startswith("image/")
+        or type(metadata["width"]) is not int
+        or metadata["width"] <= 0
+        or type(metadata["height"]) is not int
+        or metadata["height"] <= 0
+        or not isinstance(metadata["sha256"], str)
+        or len(metadata["sha256"]) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in metadata["sha256"])
+    ):
+        return ORJSONResponse(
+            status_code=502,
+            content={"error": "provider completed without verified result metadata"},
+        )
     if receipt.response_cost is None or not math.isfinite(receipt.response_cost) or receipt.response_cost <= 0:
         return ORJSONResponse(
             status_code=503,
@@ -493,7 +538,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         status_code=200,
         content={
             "receipt": _receipt_body(updated),
-            "result": {"urls": urls, "provider_task_id": receipt.provider_task_id},
+            "result": {"urls": urls, **metadata, "provider_task_id": receipt.provider_task_id},
         },
     )
 
@@ -545,10 +590,10 @@ async def libtv_image_upscale_resolve(
     except (orjson.JSONDecodeError, ValidationError) as error:
         detail = error.errors(include_context=False) if isinstance(error, ValidationError) else str(error)
         return ORJSONResponse(status_code=422, content={"detail": detail})
-    loaded = await _load_action_receipt(action, user_api_key_dict)
+    loaded = await _load_resolution_receipt(action, user_api_key_dict)
     if isinstance(loaded, ORJSONResponse):
         return loaded
-    store, receipt, receipt_key, _client = loaded
+    store, receipt, receipt_key = loaded
     if receipt.resolution_tombstone is not None:
         return ORJSONResponse(status_code=200, content={"receipt": _receipt_body(receipt)})
     if receipt.submission_state != "unknown":
