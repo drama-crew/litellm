@@ -89,6 +89,7 @@ class ImageUpscaleReceiptResponse(BaseModel):
     response_cost: float | None = None
     billing_event_id: str | None = None
     resolution_tombstone: dict[str, Any] | None = None
+    task_state: Literal["active", "succeeded", "failed", "resolved"] = "active"
 
 
 class ImageUpscaleErrorMetadata(BaseModel):
@@ -441,6 +442,7 @@ def _receipt_body(receipt: StoredReceipt) -> dict[str, object]:
         "response_cost": receipt.response_cost,
         "billing_event_id": receipt.billing_event_id,
         "resolution_tombstone": receipt.resolution_tombstone,
+        "task_state": receipt.task_state,
     }
 
 
@@ -473,7 +475,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
     if isinstance(loaded, ORJSONResponse):
         return loaded
     store, receipt, receipt_key, client = loaded
-    if receipt.submission_state != "submitted" or not receipt.provider_task_id:
+    if receipt.submission_state != "submitted" or receipt.task_state != "active" or not receipt.provider_task_id:
         return ORJSONResponse(status_code=409, content={"receipt": _receipt_body(receipt)})
     try:
         state = await client.apoll_image_upscale(receipt.provider_task_id)
@@ -481,6 +483,25 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         return ORJSONResponse(
             status_code=503,
             content={"error": "LibTV poll unavailable", "receipt": _receipt_body(receipt)},
+        )
+    if state.get("status") == 3:
+        try:
+            updated = await store.transition(
+                receipt,
+                receipt_key,
+                "submitted",
+                expected_state="submitted",
+                message=str(state.get("failed_reason") or "provider task failed"),
+                task_state="failed",
+            )
+        except RedisError:
+            return ORJSONResponse(
+                status_code=503,
+                content={"error": "receipt store unavailable", "receipt": _receipt_body(receipt)},
+            )
+        return ORJSONResponse(
+            status_code=409 if finalize else 200,
+            content={"receipt": _receipt_body(updated), "provider": state},
         )
     if state.get("status") != 2:
         return ORJSONResponse(
@@ -544,6 +565,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
             "submitted",
             expected_state="submitted",
             billing_event=event,
+            task_state="succeeded",
         )
     except RedisError:
         return ORJSONResponse(
@@ -635,6 +657,7 @@ async def libtv_image_upscale_resolve(
             "unknown",
             expected_state="unknown",
             resolution_tombstone=tombstone,
+            task_state="resolved",
         )
     except RedisError:
         return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})

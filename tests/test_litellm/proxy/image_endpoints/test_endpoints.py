@@ -1,5 +1,6 @@
 import asyncio
 import copy
+from dataclasses import replace
 import json
 from types import SimpleNamespace
 from typing import Any, Dict
@@ -554,6 +555,7 @@ def test_image_upscale_openapi_contract_requires_source_digest_and_exposes_recei
     error_schema = route.responses[409]["model"].model_json_schema()
     receipt_schema = error_schema["$defs"]["ImageUpscaleReceiptResponse"]
     assert "submission_state" in receipt_schema["properties"]
+    assert "task_state" in receipt_schema["properties"]
 
 
 @pytest.mark.asyncio
@@ -828,6 +830,7 @@ async def test_image_upscale_resolution_records_authenticated_operator_only(monk
                 submission_state=state,
                 deployment_id=stored.deployment_id,
                 resolution_tombstone=kwargs["resolution_tombstone"],
+                task_state=kwargs["task_state"],
             )
 
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: Store())
@@ -852,6 +855,7 @@ async def test_image_upscale_resolution_records_authenticated_operator_only(monk
     assert tombstone["reason"] == "duplicate risk"
     assert tombstone["confirmed_submission_risk"] is True
     assert "resolved_at" in tombstone
+    assert json.loads(response.body)["receipt"]["task_state"] == "resolved"
 
 
 @pytest.mark.asyncio
@@ -952,6 +956,164 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
     assert event.organization_id == "receipt-org"
     assert event.team_id == "team-1"
     assert event.model == "topaz-image-upscaler"
+    assert store.transition_calls[0]["task_state"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_poll_provider_terminal_failure_marks_failed_without_billing(monkeypatch):
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+        submission_state="submitted",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        resume_token="token",
+    )
+
+    class Store:
+        def __init__(self):
+            self.transition_calls = []
+
+        async def get(self, team_id, model, request_id):
+            return receipt
+
+        async def transition(self, *args, **kwargs):
+            self.transition_calls.append(kwargs)
+            return receipt
+
+    class Client:
+        async def apoll_image_upscale(self, provider_task_id):
+            return {"status": 3, "failed_reason": "provider failed", "urls": []}
+
+    store = Store()
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints._client_for_receipt", lambda _: Client())
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.verify_resume_token", lambda *args, **kwargs: True)
+
+    response = await endpoints.libtv_image_upscale_poll(
+        request=_action_request(
+            "/v1/libtv/image-upscale/poll",
+            orjson.dumps({"request_id": "request-1", "model": "topaz-image-upscaler", "resume_token": "token"}),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert response.status_code == 200
+    assert store.transition_calls[0]["task_state"] == "failed"
+    assert "billing_event" not in store.transition_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_poll_transient_provider_state_remains_active(monkeypatch):
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+        submission_state="submitted",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        resume_token="token",
+    )
+
+    class Store:
+        async def get(self, team_id, model, request_id):
+            return receipt
+
+        async def transition(self, *args, **kwargs):
+            raise AssertionError("transient poll must not transition the receipt")
+
+    class Client:
+        async def apoll_image_upscale(self, provider_task_id):
+            return {"status": 1, "urls": []}
+
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: Store())
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints._client_for_receipt", lambda _: Client())
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.verify_resume_token", lambda *args, **kwargs: True)
+
+    response = await endpoints.libtv_image_upscale_poll(
+        request=_action_request(
+            "/v1/libtv/image-upscale/poll",
+            orjson.dumps({"request_id": "request-1", "model": "topaz-image-upscaler", "resume_token": "token"}),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["receipt"]["task_state"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_poll_is_idempotent_after_terminal_success(monkeypatch):
+    initial = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+        submission_state="submitted",
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        resume_token="token",
+        response_cost=0.25,
+        api_key="key-1",
+        user_id="user-1",
+        organization_id="org-1",
+    )
+
+    class Store:
+        def __init__(self):
+            self.receipt = initial
+            self.transition_calls = []
+
+        async def get(self, team_id, model, request_id):
+            return self.receipt
+
+        async def transition(self, receipt, receipt_key, submission_state, **kwargs):
+            self.transition_calls.append(kwargs)
+            self.receipt = replace(receipt, task_state=kwargs["task_state"], billing_event_id="event-1")
+            return self.receipt
+
+    class Client:
+        def __init__(self):
+            self.poll_calls = 0
+
+        async def apoll_image_upscale(self, provider_task_id):
+            self.poll_calls += 1
+            return {
+                "status": 2,
+                "urls": ["https://libtv.example/result.png"],
+                "result_metadata": {"bytes": 3, "mime": "image/png", "width": 1, "height": 1, "sha256": "a" * 64},
+            }
+
+    store = Store()
+    client = Client()
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints._client_for_receipt", lambda _: client)
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.verify_resume_token", lambda *args, **kwargs: True)
+    request = _action_request(
+        "/v1/libtv/image-upscale/poll",
+        orjson.dumps({"request_id": "request-1", "model": "topaz-image-upscaler", "resume_token": "token"}),
+    )
+
+    first = await endpoints.libtv_image_upscale_poll(
+        request=request, user_api_key_dict=UserAPIKeyAuth(team_id="team-1")
+    )
+    second = await endpoints.libtv_image_upscale_poll(
+        request=_action_request(
+            "/v1/libtv/image-upscale/poll",
+            orjson.dumps({"request_id": "request-1", "model": "topaz-image-upscaler", "resume_token": "token"}),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert client.poll_calls == 1
+    assert len(store.transition_calls) == 1
+    assert store.transition_calls[0]["task_state"] == "succeeded"
+    assert "billing_event" in store.transition_calls[0]
 
 
 @pytest.mark.asyncio

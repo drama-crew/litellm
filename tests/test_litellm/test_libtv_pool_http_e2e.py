@@ -298,6 +298,7 @@ def test_image_upscale_receipt_wire_shape_is_stable():
         "message": None,
         "response_cost": 1.25,
         "billing_event_id": "billing-event-1",
+        "task_state": "active",
     }
 
 

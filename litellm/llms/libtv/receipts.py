@@ -7,6 +7,7 @@ from typing import Literal, Mapping
 from redis.exceptions import RedisError, ResponseError
 
 ReceiptState = Literal["not_submitted", "rejected", "unknown", "submitted", "submitting"]
+TaskState = Literal["active", "succeeded", "failed", "resolved"]
 ClaimOutcome = Literal["owner", "existing", "rejected", "missing", "mismatch"]
 
 _CLAIM_SCRIPT = """
@@ -120,6 +121,9 @@ local current = cjson.decode(stored)
 if current['resolution_tombstone'] and current['resolution_tombstone'] ~= cjson.null then
   return {'resolved', stored}
 end
+if current['task_state'] and current['task_state'] ~= cjson.null and current['task_state'] ~= 'active' then
+  return {'terminal', stored}
+end
 if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2] then
   return {'conflict', stored}
 end
@@ -153,6 +157,7 @@ class StoredReceipt:
     user_id: str | None = None
     organization_id: str | None = None
     resolution_tombstone: dict | None = None
+    task_state: TaskState = "active"
 
     @classmethod
     def from_json(cls, raw: str) -> "StoredReceipt":
@@ -160,6 +165,9 @@ class StoredReceipt:
         state = value["submission_state"]
         if state not in {"not_submitted", "rejected", "unknown", "submitted", "submitting"}:
             raise ValueError("invalid receipt state")
+        task_state = value.get("task_state") or "active"
+        if task_state not in {"active", "succeeded", "failed", "resolved"}:
+            raise ValueError("invalid task state")
         return cls(
             team_id=value["team_id"],
             model=value["model"],
@@ -177,6 +185,7 @@ class StoredReceipt:
             user_id=value.get("user_id"),
             organization_id=value.get("organization_id"),
             resolution_tombstone=value.get("resolution_tombstone"),
+            task_state=task_state,
         )
 
     def to_json(self) -> str:
@@ -198,6 +207,7 @@ class StoredReceipt:
                 "user_id": self.user_id,
                 "organization_id": self.organization_id,
                 "resolution_tombstone": self.resolution_tombstone,
+                "task_state": self.task_state,
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -324,6 +334,7 @@ class LibTVReceiptStore:
         expected_state: ReceiptState = "submitting",
         billing_event: Mapping[str, object] | object | None = None,
         resolution_tombstone: dict | None = None,
+        task_state: TaskState | None = None,
     ) -> StoredReceipt:
         updated = StoredReceipt(
             team_id=receipt.team_id,
@@ -350,6 +361,7 @@ class LibTVReceiptStore:
             user_id=getattr(receipt, "user_id", None),
             organization_id=getattr(receipt, "organization_id", None),
             resolution_tombstone=resolution_tombstone or getattr(receipt, "resolution_tombstone", None),
+            task_state=task_state or receipt.task_state,
         )
         index_key = self._index_key(receipt.team_id, receipt.model, receipt.request_id)
         pool_key = self._pool_key(receipt.team_id, receipt.model, receipt.request_id)
@@ -402,6 +414,8 @@ class LibTVReceiptStore:
         if outcome == "conflict":
             raise RedisError("receipt deployment transition conflict")
         if outcome == "resolved":
+            return StoredReceipt.from_json(self._text(result[1]))
+        if outcome == "terminal":
             return StoredReceipt.from_json(self._text(result[1]))
         return updated
 

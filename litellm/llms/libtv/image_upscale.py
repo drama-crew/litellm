@@ -14,6 +14,7 @@ from redis.exceptions import RedisError
 from litellm.llms.libtv.receipts import LibTVReceiptStore, ReceiptClaim, StoredReceipt, request_fingerprint
 
 SubmissionState = Literal["not_submitted", "rejected", "unknown", "submitted"]
+TaskState = Literal["active", "succeeded", "failed", "resolved"]
 
 
 def make_resume_token(
@@ -90,6 +91,7 @@ class ImageUpscaleReceipt:
     message: str | None = None
     response_cost: float | None = None
     billing_event_id: str | None = None
+    task_state: TaskState = "active"
 
     def to_dict(self) -> dict[str, str | None]:
         return asdict(self)
@@ -126,6 +128,7 @@ def normalize_image_upscale_receipt(
     task_id = candidate.get("provider_task_id")
     deployment_id = candidate.get("deployment_id")
     resume_token = candidate.get("resume_token")
+    task_state = candidate.get("task_state") or "active"
     if candidate.get("request_id") not in (None, request_id):
         return ImageUpscaleReceipt(request_id=request_id, submission_state="unknown")
     if state == "submitted" and not all(
@@ -133,6 +136,8 @@ def normalize_image_upscale_receipt(
     ):
         state = "unknown"
     if state != "submitted" and any(value is not None for value in (task_id, resume_token)):
+        return ImageUpscaleReceipt(request_id=request_id, submission_state="unknown")
+    if task_state not in {"active", "succeeded", "failed", "resolved"}:
         return ImageUpscaleReceipt(request_id=request_id, submission_state="unknown")
     return ImageUpscaleReceipt(
         request_id=request_id,
@@ -142,6 +147,7 @@ def normalize_image_upscale_receipt(
         resume_token=resume_token if isinstance(resume_token, str) else None,
         provider_code=candidate.get("provider_code") if isinstance(candidate.get("provider_code"), str) else None,
         message=candidate.get("message") if isinstance(candidate.get("message"), str) else None,
+        task_state=task_state,
     )
 
 
@@ -242,6 +248,7 @@ class ImageUpscaleSubmitter:
             message=message or receipt.message,
             response_cost=receipt.response_cost,
             billing_event_id=receipt.billing_event_id,
+            task_state=receipt.task_state,
         )
 
     async def _claim(

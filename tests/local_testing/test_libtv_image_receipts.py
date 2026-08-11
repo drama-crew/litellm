@@ -22,7 +22,7 @@ from litellm.llms.libtv.image_upscale import (
     normalize_image_upscale_receipt,
 )
 from litellm.llms.libtv.client import LibTVClient
-from litellm.llms.libtv.receipts import LibTVReceiptStore, request_fingerprint
+from litellm.llms.libtv.receipts import LibTVReceiptStore, StoredReceipt, request_fingerprint
 
 
 def _payload(request_id: str = "request-1", style: str = "Standard V2") -> dict[str, object]:
@@ -506,6 +506,53 @@ async def test_transition_with_null_resolution_tombstone_performs_cas(redis_url)
     assert submitted.submission_state == "submitted"
     assert submitted.provider_task_id == "task-1"
     assert submitted.resolution_tombstone is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_state_cannot_be_overwritten(redis_url):
+    store = await _store(redis_url)
+    claim = await store.claim("team-1", "topaz-image-upscaler", "request-1", "f" * 64, "primary")
+    submitted = await store.transition(
+        claim.receipt,
+        claim.receipt_key,
+        "submitted",
+        provider_task_id="task-1",
+        resume_token="token-1",
+    )
+    succeeded = await store.transition(
+        submitted,
+        claim.receipt_key,
+        "submitted",
+        expected_state="submitted",
+        task_state="succeeded",
+    )
+    repeated = await store.transition(
+        succeeded,
+        claim.receipt_key,
+        "submitted",
+        expected_state="submitted",
+        task_state="failed",
+    )
+
+    assert repeated.task_state == "succeeded"
+
+
+def test_legacy_receipt_defaults_to_active_provider_task_state():
+    receipt = StoredReceipt.from_json(
+        json.dumps(
+            {
+                "team_id": "team-1",
+                "model": "topaz-image-upscaler",
+                "request_id": "request-1",
+                "fingerprint": "f" * 64,
+                "submission_state": "submitted",
+                "deployment_id": "primary",
+                "provider_task_id": "task-1",
+            }
+        )
+    )
+
+    assert receipt.task_state == "active"
 
 
 def test_durable_resume_token_binds_receipt_identity():
