@@ -131,9 +131,7 @@ def normalize_image_upscale_receipt(
         isinstance(value, str) and value for value in (task_id, deployment_id, resume_token)
     ):
         state = "unknown"
-    if state != "submitted" and any(
-        value is not None for value in (task_id, deployment_id, resume_token)
-    ):
+    if state != "submitted" and any(value is not None for value in (task_id, deployment_id, resume_token)):
         return ImageUpscaleReceipt(request_id=request_id, submission_state="unknown")
     return ImageUpscaleReceipt(
         request_id=request_id,
