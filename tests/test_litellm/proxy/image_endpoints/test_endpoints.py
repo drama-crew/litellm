@@ -174,9 +174,7 @@ async def test_image_upscale_endpoint_replay_returns_durable_receipt_without_sec
             "model_info": {"id": "primary"},
         }
     )
-    user_api_key = UserAPIKeyAuth(
-        team_id="team-1", api_key="key-1", user_id="user-1", org_id="org-1"
-    )
+    user_api_key = UserAPIKeyAuth(team_id="team-1", api_key="key-1", user_id="user-1", org_id="org-1")
     first = await endpoints.libtv_image_upscale_submit(request=_request(request_body), user_api_key_dict=user_api_key)
     second = await endpoints.libtv_image_upscale_submit(request=_request(request_body), user_api_key_dict=user_api_key)
 
@@ -256,9 +254,7 @@ async def test_image_upscale_endpoint_fingerprint_mismatch_returns_stable_confli
             }
         )
 
-    user_api_key = UserAPIKeyAuth(
-        team_id="team-1", api_key="key-1", user_id="user-1", org_id="org-1"
-    )
+    user_api_key = UserAPIKeyAuth(team_id="team-1", api_key="key-1", user_id="user-1", org_id="org-1")
     first = await endpoints.libtv_image_upscale_submit(
         request=_request(body("Standard V2")), user_api_key_dict=user_api_key
     )
@@ -784,9 +780,7 @@ def test_not_submitted_receipt_serialization_round_trip_retains_deployment():
 @pytest.mark.asyncio
 async def test_image_upscale_resolution_rejects_non_operator_before_store_lookup(monkeypatch):
     calls = []
-    monkeypatch.setattr(
-        "litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: calls.append(True) or None
-    )
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: calls.append(True) or None)
 
     response = await endpoints.libtv_image_upscale_resolve(
         request=_action_request(

@@ -248,9 +248,7 @@ class LibTVReceiptStore:
         return f"libtv:receipt:pool:{cls._identity(team_id, model, request_id)}"
 
     @classmethod
-    def receipt_key(
-        cls, team_id: str, model: str, request_id: str, fingerprint: str, deployment_id: str
-    ) -> str:
+    def receipt_key(cls, team_id: str, model: str, request_id: str, fingerprint: str, deployment_id: str) -> str:
         identity = "\0".join((team_id, model, request_id, fingerprint, deployment_id))
         return f"libtv:receipt:{hashlib.sha256(identity.encode()).hexdigest()}"
 
