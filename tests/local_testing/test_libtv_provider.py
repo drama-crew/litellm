@@ -3769,7 +3769,7 @@ async def test_aensure_libtv_url_uploads_external_url():
 
 @pytest.mark.asyncio
 async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monkeypatch):
-    fakeredis = pytest.importorskip("fakeredis")
+    pytest.importorskip("fakeredis")
     from fakeredis import aioredis as fakeredis_aioredis
 
     from litellm.llms.libtv.transfer import WORKERS_ZSET, result_key
