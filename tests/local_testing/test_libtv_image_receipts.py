@@ -609,9 +609,7 @@ async def test_terminal_receipt_persists_replayable_result(redis_url):
 
 
 @pytest.mark.asyncio
-async def test_repeated_finalize_replays_terminal_result_without_provider_or_duplicate_billing(
-    redis_url, monkeypatch
-):
+async def test_repeated_finalize_replays_terminal_result_without_provider_or_duplicate_billing(redis_url, monkeypatch):
     from litellm.proxy.image_endpoints import endpoints
 
     store = await _store(redis_url)
@@ -656,10 +654,14 @@ async def test_repeated_finalize_replays_terminal_result_without_provider_or_dup
     second = await endpoints._poll_image_upscale(action, object(), True)
 
     assert first.status_code == second.status_code == 200
-    assert json.loads(first.body)["result"] == json.loads(second.body)["result"] == {
-        "url": "https://provider.example/result.png",
-        "provider_task_id": "task-1",
-    }
+    assert (
+        json.loads(first.body)["result"]
+        == json.loads(second.body)["result"]
+        == {
+            "urls": ["https://provider.example/result.png"],
+            "provider_task_id": "task-1",
+        }
+    )
     assert provider.calls == 1
     current = await store.get("team-1", "topaz-image-upscaler", "request-1")
     assert await store.redis.xlen("libtv:billing:outbox") == 1, current.billing_event_id

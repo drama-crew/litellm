@@ -467,6 +467,17 @@ def _receipt_body(receipt: StoredReceipt) -> dict[str, object]:
     }
 
 
+def _terminal_result_body(receipt: StoredReceipt) -> dict[str, object] | None:
+    """Expose the persisted single URL through the public poll wire contract."""
+    result = receipt.terminal_result
+    if result is None:
+        return None
+    return {
+        "urls": [result["url"]],
+        "provider_task_id": result["provider_task_id"],
+    }
+
+
 @router.get(
     "/v1/libtv/image-upscale/receipt/{request_id}",
     dependencies=[Depends(user_api_key_auth)],
@@ -499,7 +510,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
     if receipt.task_state == "succeeded" and receipt.terminal_result is not None:
         return ORJSONResponse(
             status_code=200,
-            content={"receipt": _receipt_body(receipt), "result": receipt.terminal_result},
+            content={"receipt": _receipt_body(receipt), "result": _terminal_result_body(receipt)},
         )
     if receipt.submission_state != "submitted" or receipt.task_state != "active" or not receipt.provider_task_id:
         return ORJSONResponse(status_code=409, content={"receipt": _receipt_body(receipt)})
@@ -538,7 +549,9 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         not isinstance(urls, list)
         or len(urls) != 1
         or not all(
-            isinstance(url, str) and urlsplit(url.strip()).scheme in {"http", "https"} and bool(urlsplit(url.strip()).netloc)
+            isinstance(url, str)
+            and urlsplit(url.strip()).scheme in {"http", "https"}
+            and bool(urlsplit(url.strip()).netloc)
             for url in urls
         )
     ):
@@ -587,7 +600,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         status_code=200,
         content={
             "receipt": _receipt_body(updated),
-            "result": updated.terminal_result,
+            "result": _terminal_result_body(updated),
         },
     )
 

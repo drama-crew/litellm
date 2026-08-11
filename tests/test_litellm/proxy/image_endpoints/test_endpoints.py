@@ -1010,7 +1010,7 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
 
     assert response.status_code == 200
     assert json.loads(response.body)["result"] == {
-        "url": "https://libtv.example/result.png",
+        "urls": ["https://libtv.example/result.png"],
         "provider_task_id": "task-1",
     }
     event = store.transition_calls[0]["billing_event"]
@@ -1186,7 +1186,7 @@ async def test_image_upscale_poll_is_idempotent_after_terminal_success(monkeypat
     assert first.status_code == 200
     assert second.status_code == 200
     assert json.loads(second.body)["result"] == {
-        "url": "https://libtv.example/result.png",
+        "urls": ["https://libtv.example/result.png"],
         "provider_task_id": "task-1",
     }
     assert client.poll_calls == 1
