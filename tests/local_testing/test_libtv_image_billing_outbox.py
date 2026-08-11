@@ -74,6 +74,36 @@ def test_billing_event_id_and_downstream_request_id_are_stable_across_retries():
     assert first.request_id == retry.request_id
 
 
+@pytest.mark.asyncio
+async def test_billing_event_persists_narrow_upscale_attribution_in_spend_logs():
+    event = ImageBillingEvent(
+        deployment_id="dep-1",
+        provider_task_id="task-1",
+        response_cost=1.25,
+        team_id="team-1",
+        user_id="billing-user-1",
+        organization_id="org-1",
+        api_key="key-1",
+        scale=4,
+        project_id="project-1",
+        artifact_id="artifact-1",
+        attribution_user_id="owner-1",
+    )
+    transaction = FakeTransaction(inserted=True)
+    reconciler = LibTVBillingReconciler(FakeStreamRedis([]), FakePrisma(transaction))
+
+    await reconciler._reconcile_event(event)
+
+    metadata = json.loads(transaction.sql[0][1][7])
+    assert metadata == {
+        "libtv_billing_key": "libtv-image:dep-1:task-1",
+        "scale": 4,
+        "project_id": "project-1",
+        "artifact_id": "artifact-1",
+        "user_id": "owner-1",
+    }
+
+
 class FakeTransaction:
     def __init__(self, inserted=True):
         self.inserted = inserted

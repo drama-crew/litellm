@@ -28,6 +28,10 @@ class ImageBillingEvent:
     user_id: str | None = None
     organization_id: str | None = None
     api_key: str | None = None
+    scale: int | None = None
+    project_id: str | None = None
+    artifact_id: str | None = None
+    attribution_user_id: str | None = None
     model: str = "topaz-image-upscaler"
     event_id: str = field(default="")
     occurred_at: str = field(default="")
@@ -63,6 +67,10 @@ class ImageBillingEvent:
             user_id=_optional_str(value.get("user_id")),
             organization_id=_optional_str(value.get("organization_id", value.get("org_id"))),
             api_key=_optional_str(value.get("api_key", value.get("key_id"))),
+            scale=value.get("scale") if isinstance(value.get("scale"), int) and not isinstance(value.get("scale"), bool) else None,
+            project_id=_optional_str(value.get("project_id")),
+            artifact_id=_optional_str(value.get("artifact_id")),
+            attribution_user_id=_optional_str(value.get("attribution_user_id")),
             model=str(value.get("model") or "topaz-image-upscaler"),
             event_id=str(value.get("event_id") or ""),
             occurred_at=str(value.get("occurred_at") or ""),
@@ -186,7 +194,15 @@ class LibTVBillingReconciler:
                 _event_time(event.occurred_at),
                 event.model,
                 event.user_id or "",
-                json.dumps({"libtv_billing_key": event.billing_key}),
+                json.dumps(
+                    {
+                        "libtv_billing_key": event.billing_key,
+                        **({"scale": event.scale} if event.scale is not None else {}),
+                        **({"project_id": event.project_id} if event.project_id else {}),
+                        **({"artifact_id": event.artifact_id} if event.artifact_id else {}),
+                        **({"user_id": event.attribution_user_id} if event.attribution_user_id else {}),
+                    }
+                ),
                 event.team_id,
                 event.organization_id,
             )

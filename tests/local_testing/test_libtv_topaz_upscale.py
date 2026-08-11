@@ -9,7 +9,7 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, MaskedHTTPS
 from litellm.llms.libtv.client import LibTVClient
 from litellm.llms.libtv.client import parse_progress
 from litellm.llms.libtv.common import LibTVError
-from litellm.llms.libtv.handler import LibTVLLM
+from litellm.llms.libtv.handler import LibTVLLM, _receipt_attribution
 from litellm.llms.libtv.image_upscale import (
     ImageUpscaleSubmitter,
     ProviderRejected,
@@ -21,8 +21,33 @@ from litellm.llms.libtv.image_upscale import (
 from litellm.llms.libtv.receipts import ReceiptClaim, StoredReceipt
 from litellm.llms.libtv.transfer import ValidatedDelegatedTransfer
 from litellm.llms.libtv.transform import build_topaz_upscale_params
+from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 
 _TOPAZ_SOURCE_URL = "https://libtv-res.liblib.art/upload-images/uid/source.mp4"
+
+
+def test_handler_allowlists_normalized_spend_logs_metadata_for_receipt():
+    optional_params = {"metadata": {}}
+    LiteLLMProxyRequestSetup.add_litellm_metadata_from_request_headers(
+        {
+            "x-litellm-spend-logs-metadata": json.dumps(
+                {
+                    "project_id": "project-1",
+                    "artifact_id": "artifact-1",
+                    "user_id": "owner-1",
+                    "nested": {"untrusted": "value"},
+                }
+            )
+        },
+        optional_params,
+        "metadata",
+    )
+
+    assert _receipt_attribution(optional_params) == {
+        "receipt_project_id": "project-1",
+        "receipt_artifact_id": "artifact-1",
+        "receipt_attribution_user_id": "owner-1",
+    }
 
 
 def _topaz_tool_spec_payload():
@@ -123,7 +148,7 @@ def test_topaz_image_payload_is_flat_and_has_no_mode_type(topaz_builder):
     assert "modeType" not in payload
 
 
-def test_completed_image_progress_exposes_verified_result_metadata():
+def test_completed_image_progress_exposes_only_provider_result_url():
     result = parse_progress(
         {
             "data": {
@@ -153,12 +178,10 @@ def test_completed_image_progress_exposes_verified_result_metadata():
         "task-1",
     )
 
-    assert result["result_metadata"] == {
-        "bytes": 42,
-        "mime": "image/png",
-        "width": 8,
-        "height": 8,
-        "sha256": "a" * 64,
+    assert result == {
+        "status": 2,
+        "urls": ["https://provider.example/result.png"],
+        "failed_reason": None,
     }
 
 
@@ -662,7 +685,16 @@ async def test_client_pool_resolves_each_deployment_credential_for_failover(monk
             deployment_id,
             *,
             response_cost=None,
+            api_key=None,
+            user_id=None,
+            organization_id=None,
+            scale=None,
+            project_id=None,
+            artifact_id=None,
+            attribution_user_id=None,
         ):
+            assert (api_key, user_id, organization_id) == ("key-1", "user-1", "org-1")
+            assert (scale, project_id, artifact_id, attribution_user_id) == (2, None, None, None)
             self.receipt = StoredReceipt(
                 team_id=team_id,
                 model=model,
@@ -671,6 +703,13 @@ async def test_client_pool_resolves_each_deployment_credential_for_failover(monk
                 submission_state="submitting",
                 deployment_id=deployment_id,
                 response_cost=response_cost,
+                api_key=api_key,
+                user_id=user_id,
+                organization_id=organization_id,
+                scale=scale,
+                project_id=project_id,
+                artifact_id=artifact_id,
+                attribution_user_id=attribution_user_id,
             )
             return ReceiptClaim("owner", f"receipt-{deployment_id}", self.receipt)
 
@@ -705,6 +744,10 @@ async def test_client_pool_resolves_each_deployment_credential_for_failover(monk
         return {"task_id": "secondary-task"}
 
     monkeypatch.setattr(LibTVClient, "acreate", fake_acreate)
+    async def fake_aensure_libtv_url(self, *_args, **_kwargs):
+        return "https://bridge.example/delegated-source.png"
+
+    monkeypatch.setattr(LibTVClient, "aensure_libtv_url", fake_aensure_libtv_url)
     client = LibTVClient(token="primary-token", webid="primary-webid")
 
     receipt = await client.asubmit_image_upscale(

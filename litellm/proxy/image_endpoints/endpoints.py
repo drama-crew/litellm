@@ -461,6 +461,7 @@ def _receipt_body(receipt: StoredReceipt) -> dict[str, object]:
         "message": receipt.message,
         "response_cost": receipt.response_cost,
         "billing_event_id": receipt.billing_event_id,
+        "result": receipt.terminal_result,
         "resolution_tombstone": receipt.resolution_tombstone,
         "task_state": receipt.task_state,
     }
@@ -495,6 +496,11 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
     if isinstance(loaded, ORJSONResponse):
         return loaded
     store, receipt, receipt_key, client = loaded
+    if receipt.task_state == "succeeded" and receipt.terminal_result is not None:
+        return ORJSONResponse(
+            status_code=200,
+            content={"receipt": _receipt_body(receipt), "result": receipt.terminal_result},
+        )
     if receipt.submission_state != "submitted" or receipt.task_state != "active" or not receipt.provider_task_id:
         return ORJSONResponse(status_code=409, content={"receipt": _receipt_body(receipt)})
     try:
@@ -532,32 +538,11 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         not isinstance(urls, list)
         or len(urls) != 1
         or not all(
-            isinstance(url, str) and urlsplit(url).scheme in {"http", "https"} and bool(urlsplit(url).netloc)
+            isinstance(url, str) and urlsplit(url.strip()).scheme in {"http", "https"} and bool(urlsplit(url.strip()).netloc)
             for url in urls
         )
     ):
         return ORJSONResponse(status_code=502, content={"error": "provider completed without valid result urls"})
-    metadata = state.get("result_metadata")
-    required_metadata = {"bytes", "mime", "width", "height", "sha256"}
-    if (
-        not isinstance(metadata, dict)
-        or set(metadata) != required_metadata
-        or type(metadata["bytes"]) is not int
-        or metadata["bytes"] <= 0
-        or not isinstance(metadata["mime"], str)
-        or not metadata["mime"].startswith("image/")
-        or type(metadata["width"]) is not int
-        or metadata["width"] <= 0
-        or type(metadata["height"]) is not int
-        or metadata["height"] <= 0
-        or not isinstance(metadata["sha256"], str)
-        or len(metadata["sha256"]) != 64
-        or any(char not in "0123456789abcdefABCDEF" for char in metadata["sha256"])
-    ):
-        return ORJSONResponse(
-            status_code=502,
-            content={"error": "provider completed without verified result metadata"},
-        )
     if receipt.response_cost is None or not math.isfinite(receipt.response_cost) or receipt.response_cost <= 0:
         return ORJSONResponse(
             status_code=503,
@@ -577,7 +562,12 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         user_id=receipt.user_id,
         organization_id=receipt.organization_id,
         model=receipt.model,
+        scale=receipt.scale,
+        project_id=receipt.project_id,
+        artifact_id=receipt.artifact_id,
+        attribution_user_id=receipt.attribution_user_id,
     )
+    terminal_result = {"url": urls[0].strip(), "provider_task_id": receipt.provider_task_id}
     try:
         updated = await store.transition(
             receipt,
@@ -586,6 +576,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
             expected_state="submitted",
             billing_event=event,
             task_state="succeeded",
+            terminal_result=terminal_result,
         )
     except RedisError:
         return ORJSONResponse(
@@ -596,7 +587,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         status_code=200,
         content={
             "receipt": _receipt_body(updated),
-            "result": {"urls": urls, **metadata, "provider_task_id": receipt.provider_task_id},
+            "result": updated.terminal_result,
         },
     )
 

@@ -253,18 +253,6 @@ def _extract_urls(task_result: Dict[str, Any], kind: str) -> List[str]:
     return collect(task_result.get("images"))
 
 
-def _extract_verified_image_metadata(task_result: Dict[str, Any]) -> Dict[str, Any] | None:
-    """Read provider scalar metadata without fetching the media body."""
-    images = task_result.get("images")
-    if not isinstance(images, list) or len(images) != 1 or not isinstance(images[0], dict):
-        return None
-    item = images[0]
-    fields = ("bytes", "mime", "width", "height", "sha256")
-    if any(field not in item for field in fields):
-        return None
-    return {field: item[field] for field in fields}
-
-
 _UNKNOWN_TASK_REASON_MARKER = "任务数据异常"
 
 
@@ -321,8 +309,6 @@ def parse_progress(payload: Dict[str, Any], kind: str, task_id: Optional[str] = 
             parsed = raw
         urls = _extract_urls(parsed, kind)
         result = {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
-        if kind == "image":
-            result["result_metadata"] = _extract_verified_image_metadata(parsed)
         return result
     return {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
 
@@ -936,6 +922,9 @@ class LibTVClient:
         receipt_organization_id: str | None = None,
         source_bytes: int | None = None,
         source_hard_cap: int | None = None,
+        receipt_project_id: str | None = None,
+        receipt_artifact_id: str | None = None,
+        receipt_attribution_user_id: str | None = None,
     ) -> ImageUpscaleReceipt:
         params = TopazImageUpscaleBuilder().build(source_url=source_url, style=style, scale=scale)
         if durable_receipts:
@@ -1042,6 +1031,15 @@ class LibTVClient:
                     "style": style,
                     "scale": scale,
                     "response_cost": response_cost,
+                    "spend_logs_metadata": {
+                        key: value
+                        for key, value in {
+                            "project_id": receipt_project_id,
+                            "artifact_id": receipt_artifact_id,
+                            "user_id": receipt_attribution_user_id,
+                        }.items()
+                        if isinstance(value, str) and value
+                    },
                 }
             )
         try:

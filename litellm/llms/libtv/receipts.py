@@ -2,13 +2,38 @@ import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Literal, Mapping
+from typing import Literal, Mapping, TypedDict
+from urllib.parse import urlsplit
 
 from redis.exceptions import RedisError, ResponseError
 
 ReceiptState = Literal["not_submitted", "rejected", "unknown", "submitted", "submitting"]
 TaskState = Literal["active", "succeeded", "failed", "resolved"]
 ClaimOutcome = Literal["owner", "existing", "rejected", "missing", "mismatch"]
+
+
+class TerminalResult(TypedDict):
+    url: str
+    provider_task_id: str
+
+
+def _terminal_result(value: object) -> TerminalResult | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"url", "provider_task_id"}:
+        raise ValueError("terminal result has invalid shape")
+    url = value["url"]
+    provider_task_id = value["provider_task_id"]
+    parsed = urlsplit(url) if isinstance(url, str) else None
+    if (
+        not isinstance(provider_task_id, str)
+        or not provider_task_id
+        or parsed is None
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+    ):
+        raise ValueError("terminal result is invalid")
+    return {"url": url, "provider_task_id": provider_task_id}
 
 _CLAIM_SCRIPT = """
 local function merge_pool_attempt(pool_json, candidate_json)
@@ -127,7 +152,7 @@ end
 if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2] then
   return {'conflict', stored}
 end
-if ARGV[5] ~= '' and (not current['billing_event_id'] or current['billing_event_id'] == '') then
+if ARGV[5] ~= '' and (not current['billing_event_id'] or current['billing_event_id'] == '' or current['billing_event_id'] == cjson.null) then
   if not redis.call('GET', KEYS[5]) then
     redis.call('XADD', KEYS[4], '*', 'payload', ARGV[5])
     redis.call('SET', KEYS[5], 'delivered')
@@ -156,6 +181,11 @@ class StoredReceipt:
     api_key: str | None = None
     user_id: str | None = None
     organization_id: str | None = None
+    scale: int | None = None
+    project_id: str | None = None
+    artifact_id: str | None = None
+    attribution_user_id: str | None = None
+    terminal_result: TerminalResult | None = None
     resolution_tombstone: dict | None = None
     task_state: TaskState = "active"
 
@@ -168,6 +198,12 @@ class StoredReceipt:
         task_state = value.get("task_state") or "active"
         if task_state not in {"active", "succeeded", "failed", "resolved"}:
             raise ValueError("invalid task state")
+        scale = value.get("scale")
+        if scale is not None and (isinstance(scale, bool) or not isinstance(scale, int) or scale <= 0):
+            raise ValueError("invalid receipt scale")
+        terminal_result = _terminal_result(value.get("terminal_result"))
+        if task_state == "succeeded" and terminal_result is None:
+            raise ValueError("succeeded receipt has no terminal result")
         return cls(
             team_id=value["team_id"],
             model=value["model"],
@@ -184,6 +220,11 @@ class StoredReceipt:
             api_key=value.get("api_key"),
             user_id=value.get("user_id"),
             organization_id=value.get("organization_id"),
+            scale=scale,
+            project_id=value.get("project_id"),
+            artifact_id=value.get("artifact_id"),
+            attribution_user_id=value.get("attribution_user_id"),
+            terminal_result=terminal_result,
             resolution_tombstone=value.get("resolution_tombstone"),
             task_state=task_state,
         )
@@ -206,6 +247,11 @@ class StoredReceipt:
                 "api_key": self.api_key,
                 "user_id": self.user_id,
                 "organization_id": self.organization_id,
+                "scale": self.scale,
+                "project_id": self.project_id,
+                "artifact_id": self.artifact_id,
+                "attribution_user_id": self.attribution_user_id,
+                "terminal_result": self.terminal_result,
                 "resolution_tombstone": self.resolution_tombstone,
                 "task_state": self.task_state,
             },
@@ -283,6 +329,10 @@ class LibTVReceiptStore:
         api_key: str | None = None,
         user_id: str | None = None,
         organization_id: str | None = None,
+        scale: int | None = None,
+        project_id: str | None = None,
+        artifact_id: str | None = None,
+        attribution_user_id: str | None = None,
     ) -> ReceiptClaim:
         index_key = self._index_key(team_id, model, request_id)
         pool_key = self._pool_key(team_id, model, request_id)
@@ -298,6 +348,10 @@ class LibTVReceiptStore:
             api_key=api_key,
             user_id=user_id,
             organization_id=organization_id,
+            scale=scale,
+            project_id=project_id,
+            artifact_id=artifact_id,
+            attribution_user_id=attribution_user_id,
         )
         pool = self._pool_record(receipt, receipt_key)
         try:
@@ -333,6 +387,7 @@ class LibTVReceiptStore:
         billing_event: Mapping[str, object] | object | None = None,
         resolution_tombstone: dict | None = None,
         task_state: TaskState | None = None,
+        terminal_result: TerminalResult | Mapping[str, object] | None = None,
     ) -> StoredReceipt:
         updated = StoredReceipt(
             team_id=receipt.team_id,
@@ -358,9 +413,21 @@ class LibTVReceiptStore:
             api_key=getattr(receipt, "api_key", None),
             user_id=getattr(receipt, "user_id", None),
             organization_id=getattr(receipt, "organization_id", None),
+            scale=getattr(receipt, "scale", None),
+            project_id=getattr(receipt, "project_id", None),
+            artifact_id=getattr(receipt, "artifact_id", None),
+            attribution_user_id=getattr(receipt, "attribution_user_id", None),
+            terminal_result=_terminal_result(terminal_result) if terminal_result is not None else getattr(receipt, "terminal_result", None),
             resolution_tombstone=resolution_tombstone or getattr(receipt, "resolution_tombstone", None),
             task_state=task_state or getattr(receipt, "task_state", "active"),
         )
+        if updated.task_state == "succeeded" and updated.terminal_result is None:
+            raise ValueError("succeeded receipt requires a terminal result")
+        if (
+            updated.terminal_result is not None
+            and updated.provider_task_id != updated.terminal_result["provider_task_id"]
+        ):
+            raise ValueError("terminal result task does not match receipt")
         index_key = self._index_key(receipt.team_id, receipt.model, receipt.request_id)
         pool_key = self._pool_key(receipt.team_id, receipt.model, receipt.request_id)
         event_json = ""
@@ -408,6 +475,10 @@ class LibTVReceiptStore:
                 api_key=getattr(receipt, "api_key", None),
                 user_id=getattr(receipt, "user_id", None),
                 organization_id=getattr(receipt, "organization_id", None),
+                scale=getattr(receipt, "scale", None),
+                project_id=getattr(receipt, "project_id", None),
+                artifact_id=getattr(receipt, "artifact_id", None),
+                attribution_user_id=getattr(receipt, "attribution_user_id", None),
             )
         if outcome == "conflict":
             raise RedisError("receipt deployment transition conflict")

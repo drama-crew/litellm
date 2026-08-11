@@ -91,9 +91,10 @@ class ImageUpscaleReceipt:
     message: str | None = None
     response_cost: float | None = None
     billing_event_id: str | None = None
+    terminal_result: dict[str, str] | None = None
     task_state: TaskState = "active"
 
-    def to_dict(self) -> dict[str, str | None]:
+    def to_dict(self) -> dict[str, object]:
         return asdict(self)
 
 
@@ -248,6 +249,7 @@ class ImageUpscaleSubmitter:
             message=message or receipt.message,
             response_cost=receipt.response_cost,
             billing_event_id=receipt.billing_event_id,
+            terminal_result=receipt.terminal_result,
             task_state=receipt.task_state,
         )
 
@@ -261,16 +263,21 @@ class ImageUpscaleSubmitter:
         api_key: str | None = None,
         user_id: str | None = None,
         organization_id: str | None = None,
+        scale: int | None = None,
+        project_id: str | None = None,
+        artifact_id: str | None = None,
+        attribution_user_id: str | None = None,
     ) -> tuple[ReceiptClaim, ImageUpscaleReceipt | None]:
         if self._receipt_store is None:
             raise RuntimeError("receipt store is not configured")
+        claim_kwargs = self._claim_kwargs(
+            api_key, user_id, organization_id, scale, project_id, artifact_id, attribution_user_id
+        )
         if response_cost is None:
-            claim_kwargs = self._identity_claim_kwargs(api_key, user_id, organization_id)
             claim = await self._receipt_store.claim(
                 team_id, self._model, request_id, fingerprint, deployment_id, **claim_kwargs
             )
         else:
-            claim_kwargs = self._identity_claim_kwargs(api_key, user_id, organization_id)
             claim = await self._receipt_store.claim(
                 team_id,
                 self._model,
@@ -300,16 +307,40 @@ class ImageUpscaleSubmitter:
         return claim, None
 
     @staticmethod
-    def _identity_claim_kwargs(api_key: str | None, user_id: str | None, organization_id: str | None) -> dict[str, str]:
+    def _claim_kwargs(
+        api_key: str | None,
+        user_id: str | None,
+        organization_id: str | None,
+        scale: int | None,
+        project_id: str | None,
+        artifact_id: str | None,
+        attribution_user_id: str | None,
+    ) -> dict[str, object]:
         return {
-            key: value
-            for key, value in {
-                "api_key": api_key,
-                "user_id": user_id,
-                "organization_id": organization_id,
-            }.items()
-            if isinstance(value, str) and value
+            "api_key": api_key,
+            "user_id": user_id,
+            "organization_id": organization_id,
+            "scale": scale,
+            "project_id": project_id,
+            "artifact_id": artifact_id,
+            "attribution_user_id": attribution_user_id,
         }
+
+    @staticmethod
+    def _attribution(payload: Mapping[str, object]) -> tuple[str | None, str | None, str | None]:
+        raw = payload.get("spend_logs_metadata")
+        if not isinstance(raw, Mapping):
+            return None, None, None
+        project_id = raw.get("project_id")
+        artifact_id = raw.get("artifact_id")
+        attribution_user_id = raw.get("user_id")
+        return (
+            project_id if isinstance(project_id, str) and project_id else None,
+            artifact_id if isinstance(artifact_id, str) and artifact_id else None,
+            attribution_user_id
+            if isinstance(attribution_user_id, str) and attribution_user_id
+            else None,
+        )
 
     async def _submit_deployment(
         self,
@@ -440,6 +471,10 @@ class ImageUpscaleSubmitter:
             style=payload.get("style", "Standard V2") if isinstance(payload.get("style", "Standard V2"), str) else "",
             scale=payload.get("scale", 2) if isinstance(payload.get("scale", 2), int) else -1,
         )
+        scale = payload.get("scale")
+        if isinstance(scale, bool) or not isinstance(scale, int):
+            raise ValueError("image upscale scale is invalid")
+        project_id, artifact_id, attribution_user_id = self._attribution(payload)
         last_rejection: ProviderRejected | None = None
         last_not_submitted: ImageUpscaleReceipt | None = None
         fingerprint = request_fingerprint(payload, self._model)
@@ -458,6 +493,10 @@ class ImageUpscaleSubmitter:
                         api_key,
                         user_id,
                         organization_id,
+                        scale,
+                        project_id,
+                        artifact_id,
+                        attribution_user_id,
                     )
                 except RedisError:
                     return ImageUpscaleReceipt(

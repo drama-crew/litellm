@@ -5,6 +5,7 @@ import socket
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -549,6 +550,7 @@ async def test_terminal_task_state_cannot_be_overwritten(redis_url):
         "submitted",
         expected_state="submitted",
         task_state="succeeded",
+        terminal_result={"url": "https://provider.example/result.png", "provider_task_id": "task-1"},
     )
     repeated = await store.transition(
         succeeded,
@@ -559,6 +561,145 @@ async def test_terminal_task_state_cannot_be_overwritten(redis_url):
     )
 
     assert repeated.task_state == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_terminal_receipt_persists_replayable_result(redis_url):
+    store = await _store(redis_url)
+    claim = await store.claim(
+        "team-1",
+        "topaz-image-upscaler",
+        "request-1",
+        "f" * 64,
+        "primary",
+        response_cost=0.25,
+        api_key="key-1",
+        user_id="user-1",
+        organization_id="org-1",
+    )
+    submitted = await store.transition(
+        claim.receipt,
+        claim.receipt_key,
+        "submitted",
+        provider_task_id="task-1",
+        resume_token="token-1",
+    )
+
+    result = {"url": "https://provider.example/result.png", "provider_task_id": "task-1"}
+    succeeded = await store.transition(
+        submitted,
+        claim.receipt_key,
+        "submitted",
+        expected_state="submitted",
+        task_state="succeeded",
+        terminal_result=result,
+    )
+    repeated = await store.transition(
+        succeeded,
+        claim.receipt_key,
+        "submitted",
+        expected_state="submitted",
+        task_state="succeeded",
+        terminal_result={"url": "https://different.example/result.png", "provider_task_id": "task-1"},
+    )
+
+    assert succeeded.terminal_result == result
+    assert repeated.terminal_result == result
+    assert (await store.get("team-1", "topaz-image-upscaler", "request-1")).terminal_result == result
+
+
+@pytest.mark.asyncio
+async def test_repeated_finalize_replays_terminal_result_without_provider_or_duplicate_billing(
+    redis_url, monkeypatch
+):
+    from litellm.proxy.image_endpoints import endpoints
+
+    store = await _store(redis_url)
+    claim = await store.claim(
+        "team-1",
+        "topaz-image-upscaler",
+        "request-1",
+        "f" * 64,
+        "primary",
+        response_cost=0.25,
+        api_key="key-1",
+        user_id="user-1",
+        organization_id="org-1",
+    )
+    await store.transition(
+        claim.receipt,
+        claim.receipt_key,
+        "submitted",
+        provider_task_id="task-1",
+        resume_token="token-1",
+    )
+
+    class Provider:
+        calls = 0
+
+        async def apoll_image_upscale(self, provider_task_id):
+            self.calls += 1
+            assert provider_task_id == "task-1"
+            return {"status": 2, "urls": ["https://provider.example/result.png"]}
+
+    provider = Provider()
+
+    async def load(*_args):
+        receipt = await store.get("team-1", "topaz-image-upscaler", "request-1")
+        assert receipt is not None
+        return store, receipt, claim.receipt_key, provider
+
+    monkeypatch.setattr(endpoints, "_load_action_receipt", load)
+    action = SimpleNamespace(model="topaz-image-upscaler", request_id="request-1")
+
+    first = await endpoints._poll_image_upscale(action, object(), True)
+    second = await endpoints._poll_image_upscale(action, object(), True)
+
+    assert first.status_code == second.status_code == 200
+    assert json.loads(first.body)["result"] == json.loads(second.body)["result"] == {
+        "url": "https://provider.example/result.png",
+        "provider_task_id": "task-1",
+    }
+    assert provider.calls == 1
+    current = await store.get("team-1", "topaz-image-upscaler", "request-1")
+    assert await store.redis.xlen("libtv:billing:outbox") == 1, current.billing_event_id
+
+
+@pytest.mark.asyncio
+async def test_receipt_persists_only_allowlisted_upscale_attribution(redis_url):
+    store = await _store(redis_url)
+
+    class Provider:
+        async def create(self, payload):
+            return {"task_id": "task-attribution"}
+
+    receipt = await ImageUpscaleSubmitter(
+        ("primary", Provider()),
+        receipt_store=store,
+        team_id="team-1",
+        api_key="key-1",
+        user_id="billing-user-1",
+        organization_id="org-1",
+    ).submit(
+        {
+            **_payload(),
+            "scale": 4,
+            "spend_logs_metadata": {
+                "project_id": "project-1",
+                "artifact_id": "artifact-1",
+                "user_id": "owner-1",
+                "untrusted": {"nested": "must-not-persist"},
+            },
+        }
+    )
+
+    stored = await store.get("team-1", "topaz-image-upscaler", receipt.request_id)
+    assert stored is not None
+    assert stored.scale == 4
+    assert stored.project_id == "project-1"
+    assert stored.artifact_id == "artifact-1"
+    assert stored.attribution_user_id == "owner-1"
+    assert "untrusted" not in stored.to_json()
 
 
 def test_legacy_receipt_defaults_to_active_provider_task_state():

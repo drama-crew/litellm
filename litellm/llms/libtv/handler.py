@@ -387,6 +387,28 @@ def _receipt_identity(optional_params: dict) -> dict[str, str | None]:
     }
 
 
+def _receipt_attribution(optional_params: dict) -> dict[str, str | None]:
+    metadata = optional_params.get("spend_logs_metadata")
+    if not isinstance(metadata, dict):
+        normalized_metadata = optional_params.get("metadata")
+        metadata = (
+            normalized_metadata.get("spend_logs_metadata")
+            if isinstance(normalized_metadata, dict)
+            else None
+        )
+    if not isinstance(metadata, dict):
+        return {
+            "receipt_project_id": None,
+            "receipt_artifact_id": None,
+            "receipt_attribution_user_id": None,
+        }
+    return {
+        "receipt_project_id": metadata.get("project_id") if isinstance(metadata.get("project_id"), str) else None,
+        "receipt_artifact_id": metadata.get("artifact_id") if isinstance(metadata.get("artifact_id"), str) else None,
+        "receipt_attribution_user_id": metadata.get("user_id") if isinstance(metadata.get("user_id"), str) else None,
+    }
+
+
 def _image_upscale_response_cost(optional_params: dict, scale: int) -> float | None:
     value = optional_params.get(f"output_cost_per_image_{scale}x")
     try:
@@ -1062,6 +1084,7 @@ class LibTVLLM(CustomLLM):
             durable_receipts=True,
             response_cost=_image_upscale_response_cost(optional_params, int(optional_params.get("scale", 2))),
             **_receipt_identity(optional_params),
+            **_receipt_attribution(optional_params),
             deployment_pool=optional_params.get("image_upscale_deployment_pool"),
             source_bytes=optional_params.get("source_bytes") or optional_params.get("input_reference_bytes"),
             source_hard_cap=optional_params.get("source_hard_cap"),

@@ -746,6 +746,8 @@ def test_image_upscale_recovery_resolves_exact_deployment_credential(monkeypatch
         deployment_id="secondary",
         provider_task_id="task-1",
         resume_token="signed",
+        task_state="succeeded",
+        terminal_result={"url": "https://provider.example/result.png", "provider_task_id": "task-1"},
     )
     router = SimpleNamespace(
         get_model_list=lambda **kwargs: [
@@ -792,6 +794,11 @@ async def test_image_upscale_receipt_lookup_is_authenticated_and_team_scoped(mon
         deployment_id="dep-1",
         provider_task_id="task-1",
         resume_token="signed",
+        task_state="succeeded",
+        terminal_result={
+            "url": "https://provider.example/result.png",
+            "provider_task_id": "task-1",
+        },
     )
 
     class Store:
@@ -807,6 +814,10 @@ async def test_image_upscale_receipt_lookup_is_authenticated_and_team_scoped(mon
     )
     assert response.status_code == 200
     assert json.loads(response.body)["receipt"]["provider_task_id"] == "task-1"
+    assert json.loads(response.body)["receipt"]["result"] == {
+        "url": "https://provider.example/result.png",
+        "provider_task_id": "task-1",
+    }
 
 
 def test_not_submitted_receipt_serialization_round_trip_retains_deployment():
@@ -945,6 +956,10 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
         api_key="hashed-key-id",
         user_id="receipt-user",
         organization_id="receipt-org",
+        scale=4,
+        project_id="project-1",
+        artifact_id="artifact-1",
+        attribution_user_id="owner-1",
     )
 
     class Store:
@@ -956,7 +971,12 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
 
         async def transition(self, *args, **kwargs):
             self.transition_calls.append(kwargs)
-            return receipt
+            return replace(
+                receipt,
+                task_state=kwargs["task_state"],
+                billing_event_id=kwargs["billing_event"].event_id,
+                terminal_result=kwargs["terminal_result"],
+            )
 
     store = Store()
 
@@ -966,7 +986,6 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
             return {
                 "status": 2,
                 "urls": ["https://libtv.example/result.png"],
-                "result_metadata": {"bytes": 3, "mime": "image/png", "width": 1, "height": 1, "sha256": "a" * 64},
             }
 
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)
@@ -990,7 +1009,10 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
     )
 
     assert response.status_code == 200
-    assert json.loads(response.body)["result"]["urls"] == ["https://libtv.example/result.png"]
+    assert json.loads(response.body)["result"] == {
+        "url": "https://libtv.example/result.png",
+        "provider_task_id": "task-1",
+    }
     event = store.transition_calls[0]["billing_event"]
     assert event.provider_task_id == "task-1"
     assert event.response_cost == 0.25
@@ -999,6 +1021,12 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
     assert event.organization_id == "receipt-org"
     assert event.team_id == "team-1"
     assert event.model == "topaz-image-upscaler"
+    assert (event.scale, event.project_id, event.artifact_id, event.attribution_user_id) == (
+        4,
+        "project-1",
+        "artifact-1",
+        "owner-1",
+    )
     assert store.transition_calls[0]["task_state"] == "succeeded"
 
 
@@ -1115,7 +1143,12 @@ async def test_image_upscale_poll_is_idempotent_after_terminal_success(monkeypat
 
         async def transition(self, receipt, receipt_key, submission_state, **kwargs):
             self.transition_calls.append(kwargs)
-            self.receipt = replace(receipt, task_state=kwargs["task_state"], billing_event_id="event-1")
+            self.receipt = replace(
+                receipt,
+                task_state=kwargs["task_state"],
+                billing_event_id="event-1",
+                terminal_result=kwargs["terminal_result"],
+            )
             return self.receipt
 
     class Client:
@@ -1127,7 +1160,6 @@ async def test_image_upscale_poll_is_idempotent_after_terminal_success(monkeypat
             return {
                 "status": 2,
                 "urls": ["https://libtv.example/result.png"],
-                "result_metadata": {"bytes": 3, "mime": "image/png", "width": 1, "height": 1, "sha256": "a" * 64},
             }
 
     store = Store()
@@ -1152,7 +1184,11 @@ async def test_image_upscale_poll_is_idempotent_after_terminal_success(monkeypat
     )
 
     assert first.status_code == 200
-    assert second.status_code == 409
+    assert second.status_code == 200
+    assert json.loads(second.body)["result"] == {
+        "url": "https://libtv.example/result.png",
+        "provider_task_id": "task-1",
+    }
     assert client.poll_calls == 1
     assert len(store.transition_calls) == 1
     assert store.transition_calls[0]["task_state"] == "succeeded"
@@ -1198,7 +1234,6 @@ async def test_image_upscale_poll_without_durable_identity_does_not_bill(monkeyp
             return {
                 "status": 2,
                 "urls": ["https://libtv.example/result.png"],
-                "result_metadata": {"bytes": 3, "mime": "image/png", "width": 1, "height": 1, "sha256": "a" * 64},
             }
 
     store = Store()
@@ -1262,7 +1297,6 @@ async def test_image_upscale_poll_without_authoritative_cost_does_not_bill_zero(
             return {
                 "status": 2,
                 "urls": ["https://libtv.example/result.png"],
-                "result_metadata": {"bytes": 3, "mime": "image/png", "width": 1, "height": 1, "sha256": "a" * 64},
             }
 
     store = Store()
