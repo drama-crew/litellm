@@ -359,7 +359,7 @@ class LibTVReceiptStore:
             user_id=getattr(receipt, "user_id", None),
             organization_id=getattr(receipt, "organization_id", None),
             resolution_tombstone=resolution_tombstone or getattr(receipt, "resolution_tombstone", None),
-            task_state=task_state or receipt.task_state,
+            task_state=task_state or getattr(receipt, "task_state", "active"),
         )
         index_key = self._index_key(receipt.team_id, receipt.model, receipt.request_id)
         pool_key = self._pool_key(receipt.team_id, receipt.model, receipt.request_id)
@@ -471,8 +471,11 @@ class LibTVReceiptStore:
         if values.get("appendonly") != "yes" or values.get("appendfsync") != "always":
             return False
         probe = f"libtv:receipt:readiness:{id(self)}"
-        await self.redis.set(probe, "ok")
-        return (await self.redis.get(probe)) == "ok"
+        try:
+            await self.redis.set(probe, "ok")
+            return (await self.redis.get(probe)) == "ok"
+        finally:
+            await self.redis.delete(probe)
 
     async def readiness_check(self) -> bool:
         return await self.readiness()

@@ -599,8 +599,77 @@ async def test_receipt_store_readiness_requires_durable_aof_and_write_read():
         async def get(self, key):
             return self.values.get(key)
 
-    assert await LibTVReceiptStore(Redis({"appendonly": "yes", "appendfsync": "always"})).readiness()
-    assert not await LibTVReceiptStore(Redis({"appendonly": "yes", "appendfsync": "everysec"})).readiness()
+        async def delete(self, key):
+            self.values.pop(key, None)
+
+    ready = Redis({"appendonly": "yes", "appendfsync": "always"})
+    assert await LibTVReceiptStore(ready).readiness()
+    assert ready.values == {}
+
+    not_ready = Redis({"appendonly": "yes", "appendfsync": "everysec"})
+    assert not await LibTVReceiptStore(not_ready).readiness()
+    assert not_ready.values == {}
+
+
+@pytest.mark.asyncio
+async def test_receipt_store_readiness_cleans_probe_after_write_read_failure():
+    class Redis:
+        def __init__(self):
+            self.values = {}
+
+        async def ping(self):
+            return True
+
+        async def config_get(self, *names):
+            return {"appendonly": "yes", "appendfsync": "always"}
+
+        async def set(self, key, value):
+            self.values[key] = value
+
+        async def get(self, key):
+            return "not-ok"
+
+        async def delete(self, key):
+            self.values.pop(key, None)
+
+    redis = Redis()
+    assert not await LibTVReceiptStore(redis).readiness()
+    assert redis.values == {}
+
+
+@pytest.mark.asyncio
+async def test_receipt_store_readiness_cleans_probe_when_cancelled():
+    entered_get = asyncio.Event()
+    release_get = asyncio.Event()
+
+    class Redis:
+        def __init__(self):
+            self.values = {}
+
+        async def ping(self):
+            return True
+
+        async def config_get(self, *names):
+            return {"appendonly": "yes", "appendfsync": "always"}
+
+        async def set(self, key, value):
+            self.values[key] = value
+
+        async def get(self, key):
+            entered_get.set()
+            await release_get.wait()
+            return self.values.get(key)
+
+        async def delete(self, key):
+            self.values.pop(key, None)
+
+    redis = Redis()
+    task = asyncio.create_task(LibTVReceiptStore(redis).readiness())
+    await entered_get.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert redis.values == {}
 
 
 @pytest.mark.asyncio

@@ -1028,7 +1028,7 @@ class LibTVClient:
             return await ImageUpscaleSubmitter(
                 *selected_providers,
                 receipt_store=receipt_store,
-                team_id=team_id or "default",
+                team_id=team_id,
                 api_key=receipt_api_key,
                 user_id=receipt_user_id,
                 organization_id=receipt_organization_id,
@@ -1036,7 +1036,6 @@ class LibTVClient:
             ).submit(
                 {
                     "request_id": request_id,
-                    "team_id": team_id or "default",
                     "model": model_key,
                     "source_url": source_url,
                     "source_sha256": source_sha256 or "",

@@ -372,13 +372,10 @@ def _topaz_source_payload(ref: Any) -> Tuple[str, str, Optional[bytes]]:
     return ("url", ref, None)
 
 
-def _receipt_team_id(optional_params: dict) -> str:
+def _receipt_team_id(optional_params: dict) -> str | None:
     auth = optional_params.get("user_api_key_dict")
-    for field in ("team_id", "org_id", "user_id"):
-        value = getattr(auth, field, None)
-        if isinstance(value, str) and value:
-            return value
-    return "default"
+    team_id = getattr(auth, "team_id", None)
+    return team_id if isinstance(team_id, str) and team_id.strip() else None
 
 
 def _receipt_identity(optional_params: dict) -> dict[str, str | None]:

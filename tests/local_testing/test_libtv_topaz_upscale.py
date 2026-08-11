@@ -100,6 +100,7 @@ def topaz_builder():
 def submit_body():
     return {
         "request_id": "generation-1",
+        "team_id": "team-1",
         "source_url": "https://source.example/input.png",
         "style": "Standard V2",
         "scale": 2,
@@ -716,6 +717,9 @@ async def test_client_pool_resolves_each_deployment_credential_for_failover(monk
         "request-1",
         "primary",
         team_id="team-1",
+        receipt_api_key="key-1",
+        receipt_user_id="user-1",
+        receipt_organization_id="org-1",
         source_sha256="f" * 64,
         durable_receipts=True,
         response_cost=0.42,

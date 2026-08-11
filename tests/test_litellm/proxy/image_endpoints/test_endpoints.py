@@ -118,6 +118,55 @@ class _EndpointRouter:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"api_key": "key-1", "user_id": "user-1", "org_id": "org-1"},
+        {"team_id": "team-1", "user_id": "user-1", "org_id": "org-1"},
+        {"team_id": "team-1", "api_key": "key-1", "org_id": "org-1"},
+        {"team_id": "team-1", "api_key": "key-1", "user_id": "user-1"},
+    ],
+)
+async def test_image_upscale_submit_fails_closed_before_all_side_effects_for_incomplete_billing_identity(
+    monkeypatch, identity
+):
+    calls = []
+
+    async def unexpected_add_litellm_data_to_request(**kwargs):
+        calls.append("add_litellm_data")
+        raise AssertionError("incomplete billing identity must not enter request processing")
+
+    async def unexpected_route_request(**kwargs):
+        calls.append("route")
+        raise AssertionError("incomplete billing identity must not reach provider routing")
+
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.add_litellm_data_to_request", unexpected_add_litellm_data_to_request
+    )
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.route_request", unexpected_route_request)
+
+    result = await endpoints.libtv_image_upscale_submit(
+        request=_request(
+            orjson.dumps(
+                {
+                    "request_id": "identity-gate-request",
+                    "source_url": "https://source.example/input.png",
+                    "source_bytes": 3,
+                    "source_sha256": "a" * 64,
+                }
+            )
+        ),
+        user_api_key_dict=UserAPIKeyAuth(**identity),
+    )
+
+    body = json.loads(result.body)
+    assert result.status_code == 503
+    assert body["error"]["code"] == "libtv_submission_not_submitted"
+    assert body["error"]["metadata"]["submission_receipt"]["submission_state"] == "not_submitted"
+    assert calls == []
+
+
+@pytest.mark.asyncio
 async def test_image_upscale_endpoint_replay_returns_durable_receipt_without_second_provider_create(
     monkeypatch,
 ):
@@ -432,7 +481,7 @@ async def test_image_upscale_submit_maps_source_url_and_runs_proxy_pipeline(monk
                 }
             )
         ),
-        user_api_key_dict=UserAPIKeyAuth(),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1", api_key="key-1", user_id="user-1", org_id="org-1"),
     )
 
     assert result.status_code == 202
@@ -493,7 +542,7 @@ async def test_image_upscale_submit_hook_error_preserves_unknown_submission_stat
                 }
             )
         ),
-        user_api_key_dict=UserAPIKeyAuth(),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1", api_key="key-1", user_id="user-1", org_id="org-1"),
     )
 
     body = json.loads(result.body)

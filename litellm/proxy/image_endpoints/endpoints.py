@@ -191,6 +191,14 @@ async def libtv_image_upscale_submit(
     try:
         raw = orjson.loads(await request.body())
         data = ImageUpscaleSubmitRequest.model_validate(raw).model_dump(exclude_none=True)
+        if not _has_complete_paid_image_upscale_identity(user_api_key_dict):
+            return _image_upscale_response(
+                ImageUpscaleReceipt(
+                    request_id=data["request_id"],
+                    submission_state="not_submitted",
+                    message="paid image upscale requires complete billing identity",
+                ).to_dict()
+            )
         if data.get("source_url") and not data.get("input_reference"):
             data["input_reference"] = data["source_url"]
         data.pop("source_url", None)
@@ -322,6 +330,18 @@ async def libtv_image_upscale_submit(
 def _team_id(user_api_key_dict: UserAPIKeyAuth) -> str | None:
     value = getattr(user_api_key_dict, "team_id", None)
     return value if isinstance(value, str) and value else None
+
+
+def _has_complete_paid_image_upscale_identity(user_api_key_dict: UserAPIKeyAuth) -> bool:
+    return all(
+        isinstance(value, str) and bool(value.strip())
+        for value in (
+            getattr(user_api_key_dict, "team_id", None),
+            getattr(user_api_key_dict, "api_key", None),
+            getattr(user_api_key_dict, "user_id", None),
+            getattr(user_api_key_dict, "org_id", None),
+        )
+    )
 
 
 def _image_upscale_deployment_pool(llm_router: Any, model: str) -> list[dict[str, Any]]:

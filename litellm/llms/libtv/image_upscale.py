@@ -258,16 +258,19 @@ class ImageUpscaleSubmitter:
         fingerprint: str,
         deployment_id: str,
         response_cost: float | None = None,
+        api_key: str | None = None,
+        user_id: str | None = None,
+        organization_id: str | None = None,
     ) -> tuple[ReceiptClaim, ImageUpscaleReceipt | None]:
         if self._receipt_store is None:
             raise RuntimeError("receipt store is not configured")
         if response_cost is None:
-            claim_kwargs = self._identity_claim_kwargs()
+            claim_kwargs = self._identity_claim_kwargs(api_key, user_id, organization_id)
             claim = await self._receipt_store.claim(
                 team_id, self._model, request_id, fingerprint, deployment_id, **claim_kwargs
             )
         else:
-            claim_kwargs = self._identity_claim_kwargs()
+            claim_kwargs = self._identity_claim_kwargs(api_key, user_id, organization_id)
             claim = await self._receipt_store.claim(
                 team_id,
                 self._model,
@@ -296,13 +299,14 @@ class ImageUpscaleSubmitter:
             return claim, self._from_stored(claim.receipt, request_id)
         return claim, None
 
-    def _identity_claim_kwargs(self) -> dict[str, str]:
+    @staticmethod
+    def _identity_claim_kwargs(api_key: str | None, user_id: str | None, organization_id: str | None) -> dict[str, str]:
         return {
             key: value
             for key, value in {
-                "api_key": self._api_key,
-                "user_id": self._user_id,
-                "organization_id": self._organization_id,
+                "api_key": api_key,
+                "user_id": user_id,
+                "organization_id": organization_id,
             }.items()
             if isinstance(value, str) and value
         }
@@ -411,7 +415,7 @@ class ImageUpscaleSubmitter:
         request_id = payload.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("image upscale request_id is required")
-        team_id = self._team_id or (payload.get("team_id") if isinstance(payload.get("team_id"), str) else "default")
+        team_id = self._team_id or (payload.get("team_id") if isinstance(payload.get("team_id"), str) else None)
         response_cost = _response_cost(payload)
         if response_cost is None:
             return ImageUpscaleReceipt(
@@ -424,7 +428,7 @@ class ImageUpscaleSubmitter:
         organization_id = self._organization_id or (
             payload.get("organization_id") if isinstance(payload.get("organization_id"), str) else None
         )
-        if not all((team_id, api_key, user_id, organization_id)):
+        if not all(isinstance(value, str) and value.strip() for value in (team_id, api_key, user_id, organization_id)):
             return ImageUpscaleReceipt(
                 request_id=request_id,
                 submission_state="not_submitted",
@@ -451,6 +455,9 @@ class ImageUpscaleSubmitter:
                         fingerprint,
                         deployment_id,
                         response_cost,
+                        api_key,
+                        user_id,
+                        organization_id,
                     )
                 except RedisError:
                     return ImageUpscaleReceipt(
