@@ -1,4 +1,5 @@
 import json
+import time
 
 import httpx
 import pytest
@@ -366,7 +367,20 @@ async def test_validated_transfer_uses_dedicated_stream_and_validates_result_sha
         async def brpop(self, *args, **kwargs):
             return (
                 "result",
-                json.dumps({"ok": True, "result": {"bytes": 3, "sha256": "a" * 64, "etags": [{"n": 1, "etag": "e1"}]}}),
+                json.dumps(
+                    {
+                        "ok": True,
+                        "result": {
+                            "bytes": 3,
+                            "sha256": "a" * 64,
+                            "mime": "image/png",
+                            "width": 1,
+                            "height": 1,
+                            "validation_version": 1,
+                            "etags": [{"n": 1, "etag": "e1"}],
+                        },
+                    }
+                ),
             )
 
     redis = Redis()
@@ -438,7 +452,20 @@ async def test_validated_transfer_accepts_platform_signed_source_url(monkeypatch
         async def brpop(self, *args, **kwargs):
             return (
                 "result",
-                json.dumps({"ok": True, "result": {"bytes": 3, "sha256": "a" * 64, "etags": [{"n": 1, "etag": "e1"}]}}),
+                json.dumps(
+                    {
+                        "ok": True,
+                        "result": {
+                            "bytes": 3,
+                            "sha256": "a" * 64,
+                            "mime": "image/png",
+                            "width": 1,
+                            "height": 1,
+                            "validation_version": 1,
+                            "etags": [{"n": 1, "etag": "e1"}],
+                        },
+                    }
+                ),
             )
 
     result = await ValidatedDelegatedTransfer(Redis(), wait_timeout=0.1).transfer(
@@ -450,6 +477,115 @@ async def test_validated_transfer_accepts_platform_signed_source_url(monkeypatch
     )
 
     assert result == [{"n": 1, "etag": "e1"}]
+
+
+@pytest.mark.asyncio
+async def test_validated_transfer_accepts_oss2_presigned_source_url(monkeypatch):
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+
+    class Redis:
+        async def zcount(self, *args):
+            return 1
+
+        async def set(self, *args, **kwargs):
+            return True
+
+        async def xadd(self, *args, **kwargs):
+            return "stream-id"
+
+        async def brpop(self, *args, **kwargs):
+            return (
+                "result",
+                json.dumps(
+                    {
+                        "ok": True,
+                        "result": {
+                            "bytes": 3,
+                            "sha256": "a" * 64,
+                            "mime": "image/png",
+                            "width": 1,
+                            "height": 1,
+                            "validation_version": 1,
+                            "etags": [{"n": 1, "etag": "e1"}],
+                        },
+                    }
+                ),
+            )
+
+    expires = int(time.time()) + 60
+    result = await ValidatedDelegatedTransfer(Redis()).transfer(
+        f"https://assets.platform.example/input.png?OSSAccessKeyId=test-key&Expires={expires}&Signature=real-oss2-signature",
+        3,
+        [{"n": 1, "url": "https://bridge.example/part-1"}],
+        source_sha256="a" * 64,
+        hard_cap=64,
+    )
+
+    assert result == [{"n": 1, "etag": "e1"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    [
+        "OSSAccessKeyId=test-key&Expires=1&Signature=real-oss2-signature",
+        "OSSAccessKeyId=test-key&Expires=not-a-timestamp&Signature=real-oss2-signature",
+        "OSSAccessKeyId=test-key&Expires=9999999999",
+    ],
+)
+async def test_validated_transfer_rejects_expired_or_unsigned_oss2_source_url(monkeypatch, query):
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+
+    class Redis:
+        async def zcount(self, *args):
+            return 1
+
+    with pytest.raises(LibTVError, match="platform-signed"):
+        await ValidatedDelegatedTransfer(Redis()).transfer(
+            f"https://assets.platform.example/input.png?{query}",
+            3,
+            [{"n": 1, "url": "https://bridge.example/part-1"}],
+            source_sha256="a" * 64,
+            hard_cap=64,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("mime", None), ("width", 0), ("height", "1"), ("validation_version", 2)])
+async def test_validated_transfer_rejects_unvalidated_worker_media_metadata(monkeypatch, field, value):
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+
+    class Redis:
+        async def zcount(self, *args):
+            return 1
+
+        async def set(self, *args, **kwargs):
+            return True
+
+        async def xadd(self, *args, **kwargs):
+            return "stream-id"
+
+        async def brpop(self, *args, **kwargs):
+            result = {
+                "bytes": 3,
+                "sha256": "a" * 64,
+                "mime": "image/png",
+                "width": 1,
+                "height": 1,
+                "validation_version": 1,
+                "etags": [{"n": 1, "etag": "e1"}],
+            }
+            result[field] = value
+            return "result", json.dumps({"ok": True, "result": result})
+
+    with pytest.raises(LibTVError, match="metadata"):
+        await ValidatedDelegatedTransfer(Redis()).transfer(
+            "https://assets.platform.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+            3,
+            [{"n": 1, "url": "https://bridge.example/part-1"}],
+            source_sha256="a" * 64,
+            hard_cap=64,
+        )
 
 
 @pytest.mark.asyncio

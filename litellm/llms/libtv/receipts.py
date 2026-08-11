@@ -10,6 +10,33 @@ ReceiptState = Literal["not_submitted", "rejected", "unknown", "submitted", "sub
 ClaimOutcome = Literal["owner", "existing", "rejected", "missing", "mismatch"]
 
 _CLAIM_SCRIPT = """
+local function merge_pool_attempt(pool_json, candidate_json)
+  local candidate = cjson.decode(candidate_json)
+  local attempts = {}
+  if pool_json then
+    local existing = cjson.decode(pool_json)
+    attempts = existing['attempts'] or {}
+    if #attempts == 0 and existing['deployment_id'] and existing['receipt_key'] then
+      table.insert(attempts, {
+        deployment_id = existing['deployment_id'],
+        receipt_key = existing['receipt_key'],
+        submission_state = existing['submission_state'],
+      })
+    end
+  end
+  local next_attempt = candidate['attempts'][1]
+  local replaced = false
+  for index, attempt in ipairs(attempts) do
+    if attempt['deployment_id'] == next_attempt['deployment_id'] then
+      attempts[index] = next_attempt
+      replaced = true
+      break
+    end
+  end
+  if not replaced then table.insert(attempts, next_attempt) end
+  candidate['attempts'] = attempts
+  return cjson.encode(candidate)
+end
 local indexed = redis.call('GET', KEYS[1])
 if indexed then
   local stored = redis.call('GET', indexed)
@@ -49,13 +76,41 @@ if pool then
     return {'missing', pool_receipt}
   end
 end
+local merged_pool = merge_pool_attempt(pool, ARGV[4])
 redis.call('SET', KEYS[1], KEYS[3])
-redis.call('SET', KEYS[2], ARGV[4])
+redis.call('SET', KEYS[2], merged_pool)
 redis.call('SET', KEYS[3], ARGV[3])
 return {'owner', KEYS[3], ARGV[3]}
 """
 
 _TRANSITION_SCRIPT = """
+local function merge_pool_attempt(pool_json, candidate_json)
+  local candidate = cjson.decode(candidate_json)
+  local attempts = {}
+  if pool_json then
+    local existing = cjson.decode(pool_json)
+    attempts = existing['attempts'] or {}
+    if #attempts == 0 and existing['deployment_id'] and existing['receipt_key'] then
+      table.insert(attempts, {
+        deployment_id = existing['deployment_id'],
+        receipt_key = existing['receipt_key'],
+        submission_state = existing['submission_state'],
+      })
+    end
+  end
+  local next_attempt = candidate['attempts'][1]
+  local replaced = false
+  for index, attempt in ipairs(attempts) do
+    if attempt['deployment_id'] == next_attempt['deployment_id'] then
+      attempts[index] = next_attempt
+      replaced = true
+      break
+    end
+  end
+  if not replaced then table.insert(attempts, next_attempt) end
+  candidate['attempts'] = attempts
+  return cjson.encode(candidate)
+end
 local stored = redis.call('GET', KEYS[3])
 if not stored then
   return {'missing'}
@@ -69,7 +124,7 @@ if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2]
   return {'conflict', stored}
 end
 redis.call('SET', KEYS[3], ARGV[3])
-redis.call('SET', KEYS[2], ARGV[4])
+redis.call('SET', KEYS[2], merge_pool_attempt(redis.call('GET', KEYS[2]), ARGV[4]))
 if ARGV[5] ~= '' and (not current['billing_event_id'] or current['billing_event_id'] == '') then
   redis.call('XADD', KEYS[4], '*', 'payload', ARGV[5])
 end
@@ -186,12 +241,18 @@ class LibTVReceiptStore:
 
     @staticmethod
     def _pool_record(receipt: StoredReceipt, receipt_key: str) -> str:
+        attempt = {
+            "deployment_id": receipt.deployment_id,
+            "receipt_key": receipt_key,
+            "submission_state": receipt.submission_state,
+        }
         return json.dumps(
             {
                 "fingerprint": receipt.fingerprint,
                 "submission_state": receipt.submission_state,
                 "deployment_id": receipt.deployment_id,
                 "receipt_key": receipt_key,
+                "attempts": [attempt],
             },
             separators=(",", ":"),
             sort_keys=True,

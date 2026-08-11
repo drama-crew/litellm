@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 import socket
 import subprocess
@@ -179,6 +180,12 @@ async def test_explicit_rejection_allows_secondary_claim(redis_url):
     assert calls == ["primary", "secondary"]
     assert receipt.submission_state == "submitted"
     assert receipt.deployment_id == "secondary"
+    pool_key = store._pool_key("team-1", "topaz-image-upscaler", "request-1")
+    pool = json.loads(await store.redis.get(pool_key))
+    assert {(attempt["deployment_id"], attempt["submission_state"]) for attempt in pool["attempts"]} == {
+        ("primary", "rejected"),
+        ("secondary", "submitted"),
+    }
 
 
 @pytest.mark.asyncio

@@ -1277,49 +1277,61 @@ class LibTVClient:
             "upload/init",
         )
         data = init.get("data") or {}
-        parts: List[PartTarget] = [
-            {"n": part.get("partNumber"), "url": part["url"]} for part in data.get("parts") or []
-        ]
-        if require_delegated:
-            expected_parts = max(1, (size + BRIDGE_PART_SIZE - 1) // BRIDGE_PART_SIZE)
-            part_numbers = tuple(part["n"] for part in parts)
-            if part_numbers != tuple(range(1, expected_parts + 1)) or any(not part["url"] for part in parts):
+        try:
+            parts: List[PartTarget] = [
+                {"n": part.get("partNumber"), "url": part["url"]} for part in data.get("parts") or []
+            ]
+            if require_delegated:
+                expected_parts = max(1, (size + BRIDGE_PART_SIZE - 1) // BRIDGE_PART_SIZE)
+                part_numbers = tuple(part["n"] for part in parts)
+                if part_numbers != tuple(range(1, expected_parts + 1)) or any(not part["url"] for part in parts):
+                    raise LibTVError(status_code=503, message="delegated source transfer returned incomplete parts")
+            redis_client = self._redis_client or get_transfer_redis()
+            if require_delegated and redis_client is None:
+                raise LibTVError(status_code=503, message="delegated source transfer worker is unavailable")
+            if require_delegated:
+                strategy = ValidatedDelegatedTransfer(
+                    redis_client, hard_cap=int(os.getenv("TRANSFER_GLOBAL_HARD_CAP", str(64 * 1024 * 1024)))
+                )
+                etags = await strategy.transfer(
+                    source_url,
+                    size,
+                    parts,
+                    source_sha256=source_sha256 or "",
+                    hard_cap=source_hard_cap,
+                )
+            else:
+                strategy = build_transfer_strategy(
+                    size=size,
+                    redis_client=redis_client,
+                    fetch=self._afetch_bytes,
+                    put=self._aput_bytes,
+                    fallback=None,
+                )
+                etags = await strategy.transfer(source_url, size, parts)
+            if require_delegated and tuple(item.get("n") for item in etags) != tuple(part["n"] for part in parts):
                 raise LibTVError(status_code=503, message="delegated source transfer returned incomplete parts")
-        redis_client = self._redis_client or get_transfer_redis()
-        if require_delegated and redis_client is None:
-            raise LibTVError(status_code=503, message="delegated source transfer worker is unavailable")
-        if require_delegated:
-            strategy = ValidatedDelegatedTransfer(
-                redis_client, hard_cap=int(os.getenv("TRANSFER_GLOBAL_HARD_CAP", str(64 * 1024 * 1024)))
+            complete = self._check(
+                await self.async_client.post(
+                    url=self._bridge_url("complete"),
+                    json={"path": path, "uploadId": data.get("uploadId")},
+                    headers=build_bridge_headers(self.token),
+                    timeout=self.request_timeout,
+                ),
+                "upload/complete",
             )
-            etags = await strategy.transfer(
-                source_url,
-                size,
-                parts,
-                source_sha256=source_sha256 or "",
-                hard_cap=source_hard_cap,
-            )
-        else:
-            strategy = build_transfer_strategy(
-                size=size,
-                redis_client=redis_client,
-                fetch=self._afetch_bytes,
-                put=self._aput_bytes,
-                fallback=None,
-            )
-            etags = await strategy.transfer(source_url, size, parts)
-        if require_delegated and tuple(item.get("n") for item in etags) != tuple(part["n"] for part in parts):
-            raise LibTVError(status_code=503, message="delegated source transfer returned incomplete parts")
-        complete = self._check(
-            await self.async_client.post(
-                url=self._bridge_url("complete"),
-                json={"path": path, "uploadId": data.get("uploadId")},
-                headers=build_bridge_headers(self.token),
-                timeout=self.request_timeout,
-            ),
-            "upload/complete",
-        )
-        return parse_upload_url(complete)
+            return parse_upload_url(complete)
+        except BaseException:
+            try:
+                await self.async_client.post(
+                    url=self._bridge_url("abort"),
+                    json={"path": path, "uploadId": data.get("uploadId")},
+                    headers=build_bridge_headers(self.token),
+                    timeout=self.request_timeout,
+                )
+            except Exception:
+                logger.warning("libtv upload abort failed", exc_info=True)
+            raise
 
     async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> CompliantAssetRef:
         asset_uuid = parse_third_asset_uuid(

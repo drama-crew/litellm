@@ -546,6 +546,27 @@ def test_image_upscale_openapi_contract_requires_source_digest_and_exposes_recei
 
 
 @pytest.mark.asyncio
+async def test_image_upscale_submit_rejects_inline_media_body():
+    result = await endpoints.libtv_image_upscale_submit(
+        request=_request(
+            orjson.dumps(
+                {
+                    "request_id": "r1",
+                    "source_url": "https://source.example/input.png",
+                    "source_bytes": 3,
+                    "source_sha256": "a" * 64,
+                    "source_body": "base64-media-must-not-reach-libtv",
+                }
+            )
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
+    )
+
+    assert result.status_code == 503
+    assert "source_body" not in result.body.decode()
+
+
+@pytest.mark.asyncio
 async def test_image_upscale_submit_requires_stable_request_id_with_422():
     result = await endpoints.libtv_image_upscale_submit(
         request=_request(
@@ -704,7 +725,11 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
     class Client:
         async def apoll_image_upscale(self, provider_task_id):
             assert provider_task_id == "task-1"
-            return {"status": 2, "urls": ["https://libtv.example/result.png"]}
+            return {
+                "status": 2,
+                "urls": ["https://libtv.example/result.png"],
+                "result_metadata": {"bytes": 3, "mime": "image/png", "width": 1, "height": 1, "sha256": "a" * 64},
+            }
 
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints._client_for_receipt", lambda _: Client())
@@ -774,7 +799,11 @@ async def test_image_upscale_poll_without_durable_identity_does_not_bill(monkeyp
 
     class Client:
         async def apoll_image_upscale(self, provider_task_id):
-            return {"status": 2, "urls": ["https://libtv.example/result.png"]}
+            return {
+                "status": 2,
+                "urls": ["https://libtv.example/result.png"],
+                "result_metadata": {"bytes": 3, "mime": "image/png", "width": 1, "height": 1, "sha256": "a" * 64},
+            }
 
     store = Store()
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)
@@ -834,7 +863,11 @@ async def test_image_upscale_poll_without_authoritative_cost_does_not_bill_zero(
 
     class Client:
         async def apoll_image_upscale(self, provider_task_id):
-            return {"status": 2, "urls": ["https://libtv.example/result.png"]}
+            return {
+                "status": 2,
+                "urls": ["https://libtv.example/result.png"],
+                "result_metadata": {"bytes": 3, "mime": "image/png", "width": 1, "height": 1, "sha256": "a" * 64},
+            }
 
     store = Store()
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: store)

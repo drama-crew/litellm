@@ -37,6 +37,7 @@ WARN_INTERVAL_SECONDS = 300.0
 WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
 PLATFORM_SOURCE_HOSTS_ENV = "LIBTV_PLATFORM_SOURCE_HOSTS"
 PLATFORM_SOURCE_MAX_TTL_SECONDS = 3600
+VALIDATED_MEDIA_METADATA_VERSION = 1
 # httpx's 5s default read/write timeout leaves no margin on the bandwidth-constrained
 # egress DirectTransfer runs on (a 5.4MB part at ~0.5MiB/s takes ~11s); the caller
 # already enforces the overall budget, so per-operation timeouts only need to catch
@@ -296,6 +297,32 @@ class ValidatedDelegatedTransfer:
         return await self.redis.zcount(VALIDATED_WORKERS_ZSET, now - WORKER_HEARTBEAT_WINDOW_SECONDS, "+inf") > 0
 
     @staticmethod
+    def _is_platform_signed_source_url(parsed: Any, query: dict[str, list[str]]) -> bool:
+        """Accept only the two presign formats emitted by the platform object store.
+
+        Signature verification remains the object store's responsibility; this boundary
+        only accepts an allowlisted host plus a complete, still-valid presign envelope.
+        """
+
+        def one(name: str) -> str | None:
+            values = query.get(name)
+            return values[0] if values and len(values) == 1 and values[0] else None
+
+        aws_signature = one("X-Amz-Signature")
+        aws_expires = one("X-Amz-Expires")
+        if aws_signature and aws_expires and aws_expires.isdigit():
+            return 0 < int(aws_expires) <= PLATFORM_SOURCE_MAX_TTL_SECONDS
+
+        oss_access_key = one("OSSAccessKeyId")
+        oss_signature = one("Signature")
+        oss_expires = one("Expires")
+        if not oss_access_key or not oss_signature or not oss_expires or not oss_expires.isdigit():
+            return False
+        expires_at = int(oss_expires)
+        now = int(time.time())
+        return now < expires_at <= now + PLATFORM_SOURCE_MAX_TTL_SECONDS
+
+    @staticmethod
     def _validate_parts(size: int, parts: List[PartTarget], part_size: int) -> None:
         expected = max(1, (size + part_size - 1) // part_size)
         numbers = [part.get("n") for part in parts]
@@ -320,7 +347,6 @@ class ValidatedDelegatedTransfer:
             host.strip().lower() for host in os.getenv(PLATFORM_SOURCE_HOSTS_ENV, "").split(",") if host.strip()
         }
         query = parse_qs(parsed.query)
-        expires = query.get("X-Amz-Expires", [""])[0]
         if (
             parsed.scheme != "https"
             or not parsed.hostname
@@ -328,10 +354,7 @@ class ValidatedDelegatedTransfer:
             or parsed.username is not None
             or parsed.password is not None
             or parsed.fragment
-            or not query.get("X-Amz-Signature")
-            or not query.get("X-Amz-Expires")
-            or not expires.isdigit()
-            or not 0 < int(expires) <= PLATFORM_SOURCE_MAX_TTL_SECONDS
+            or not self._is_platform_signed_source_url(parsed, query)
         ):
             raise LibTVError(
                 status_code=503,
@@ -379,6 +402,18 @@ class ValidatedDelegatedTransfer:
             raise LibTVError(status_code=503, message="validated source transfer failed")
         if inner.get("bytes") != size or str(inner.get("sha256", "")).lower() != source_sha256.lower():
             raise LibTVError(status_code=503, message="validated source transfer size or digest mismatch")
+        if (
+            not isinstance(inner.get("mime"), str)
+            or not inner["mime"].startswith("image/")
+            or not isinstance(inner.get("width"), int)
+            or isinstance(inner["width"], bool)
+            or inner["width"] <= 0
+            or not isinstance(inner.get("height"), int)
+            or isinstance(inner["height"], bool)
+            or inner["height"] <= 0
+            or inner.get("validation_version") != VALIDATED_MEDIA_METADATA_VERSION
+        ):
+            raise LibTVError(status_code=503, message="validated source transfer returned invalid media metadata")
         etags = inner.get("etags")
         if not isinstance(etags, list) or len(etags) != len(parts):
             raise LibTVError(status_code=503, message="validated source transfer returned incomplete parts")

@@ -3727,6 +3727,98 @@ class _FullAsyncFake(_FullSyncFake):
         return _FullSyncFake.get(self, url, headers, None, params)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["parts", "worker", "etag", "complete"])
+async def test_aupload_via_transfer_aborts_after_init_without_masking_original_error(monkeypatch, failure_stage):
+    """An initialized multipart upload is aborted on every later failure path."""
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+
+    class Fake:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, json=None, headers=None, timeout=None):
+            self.calls.append((url, json))
+            if url.endswith("/init/4"):
+                parts = [] if failure_stage == "parts" else [{"partNumber": 1, "url": "https://put.example/1"}]
+                return FakeResponse({"code": 0, "data": {"uploadId": "up-1", "parts": parts}})
+            if url.endswith("/abort/4"):
+                raise RuntimeError("abort must not mask original error")
+            if url.endswith("/complete/4") and failure_stage == "complete":
+                return FakeResponse({"code": 500, "message": "complete failed"}, status_code=500)
+            return FakeResponse({"code": 0, "data": {"cdnUrl": "https://cdn.example/result.png"}})
+
+    fake = Fake()
+    lt = LibTVClient(token="t", webid="w", async_client=fake, redis_client=object())
+    lt._user_uuid = "user-1"
+
+    if failure_stage != "parts":
+
+        class Transfer:
+            async def transfer(self, *args, **kwargs):
+                if failure_stage == "worker":
+                    raise RuntimeError("worker failed")
+                if failure_stage == "etag":
+                    return [{"n": 2, "etag": "wrong-part"}]
+                return [{"n": 1, "etag": "ok"}]
+
+        monkeypatch.setattr("litellm.llms.libtv.client.ValidatedDelegatedTransfer", lambda *args, **kwargs: Transfer())
+
+    with pytest.raises(Exception, match="incomplete parts|worker failed|complete failed"):
+        await lt._aupload_via_transfer(
+            "https://source.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+            "input.png",
+            3,
+            require_delegated=True,
+            source_sha256="a" * 64,
+            source_hard_cap=64,
+        )
+
+    assert any(url.endswith("/abort/4") for url, _ in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_aupload_via_transfer_does_not_abort_successful_upload(monkeypatch):
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+
+    class Fake:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, json=None, headers=None, timeout=None):
+            self.calls.append((url, json))
+            if url.endswith("/init/4"):
+                return FakeResponse(
+                    {
+                        "code": 0,
+                        "data": {"uploadId": "up-1", "parts": [{"partNumber": 1, "url": "https://put.example/1"}]},
+                    }
+                )
+            return FakeResponse({"code": 0, "data": {"cdnUrl": "https://cdn.example/result.png"}})
+
+    class Transfer:
+        async def transfer(self, *args, **kwargs):
+            return [{"n": 1, "etag": "ok"}]
+
+    monkeypatch.setattr("litellm.llms.libtv.client.ValidatedDelegatedTransfer", lambda *args, **kwargs: Transfer())
+    fake = Fake()
+    lt = LibTVClient(token="t", webid="w", async_client=fake, redis_client=object())
+    lt._user_uuid = "user-1"
+
+    assert (
+        await lt._aupload_via_transfer(
+            "https://source.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+            "input.png",
+            3,
+            require_delegated=True,
+            source_sha256="a" * 64,
+            source_hard_cap=64,
+        )
+        == "https://cdn.example/result.png"
+    )
+    assert not any(url.endswith("/abort/4") for url, _ in fake.calls)
+
+
 def _gen_params(calls):
     return next(j["params"] for u, j in calls if u.endswith("/api/task/generation/create"))
 

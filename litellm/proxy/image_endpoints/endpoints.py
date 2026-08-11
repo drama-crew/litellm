@@ -51,6 +51,15 @@ class ImageUpscaleSubmitRequest(BaseModel):
     scale: Literal[2, 4, 6] = 2
     model_config = ConfigDict(extra="allow")
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_inline_media_body(cls, value: object):
+        if isinstance(value, dict) and any(
+            field in value for field in ("source_body", "source_data", "image_data", "media_body")
+        ):
+            raise ValueError("image upscale accepts a source URL and verified metadata, not inline media")
+        return value
+
     @model_validator(mode="after")
     def validate_source(self):
         if self.source_url is None and self.input_reference is None:
@@ -391,9 +400,7 @@ async def _load_action_receipt(action: ImageUpscaleActionRequest, user_api_key_d
     return store, receipt, key, client
 
 
-async def _load_resolution_receipt(
-    action: ImageUpscaleResolutionRequest, user_api_key_dict: UserAPIKeyAuth
-):
+async def _load_resolution_receipt(action: ImageUpscaleResolutionRequest, user_api_key_dict: UserAPIKeyAuth):
     """Load by team/request ownership for the dedicated resolution contract."""
     team_id = _team_id(user_api_key_dict)
     if team_id is None:
@@ -473,9 +480,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
         not isinstance(urls, list)
         or len(urls) != 1
         or not all(
-            isinstance(url, str)
-            and urlsplit(url).scheme in {"http", "https"}
-            and bool(urlsplit(url).netloc)
+            isinstance(url, str) and urlsplit(url).scheme in {"http", "https"} and bool(urlsplit(url).netloc)
             for url in urls
         )
     ):
