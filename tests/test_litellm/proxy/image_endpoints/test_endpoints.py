@@ -15,7 +15,12 @@ from litellm.proxy.image_endpoints import endpoints
 from litellm.llms.libtv.handler import LibTVLLM
 from litellm.llms.libtv.common import LibTVError
 from litellm.llms.libtv.receipts import ReceiptClaim, StoredReceipt, request_fingerprint
-from litellm.llms.libtv.image_upscale import make_resume_token, verify_resume_token
+from litellm.llms.libtv.image_upscale import (
+    ImageUpscaleReceipt,
+    make_resume_token,
+    normalize_image_upscale_receipt,
+    verify_resume_token,
+)
 from litellm.types.utils import ImageResponse
 
 
@@ -47,7 +52,7 @@ class _EndpointReceiptStore:
         self.receipt = None
         self.receipt_key = "endpoint-receipt"
 
-    async def claim(self, team_id, model, request_id, fingerprint, deployment_id):
+    async def claim(self, team_id, model, request_id, fingerprint, deployment_id, **kwargs):
         if self.receipt is not None:
             if self.receipt.fingerprint != fingerprint:
                 return ReceiptClaim("mismatch", self.receipt_key, None)
@@ -99,6 +104,7 @@ class _EndpointRouter:
         return None
 
     async def aimage_generation(self, **data):
+        data.setdefault("output_cost_per_image_2x", 0.25)
         return await LibTVLLM(poll_interval=0).aimage_generation(
             model=data["model"],
             prompt=data.get("prompt", ""),
@@ -167,7 +173,9 @@ async def test_image_upscale_endpoint_replay_returns_durable_receipt_without_sec
             "model_info": {"id": "primary"},
         }
     )
-    user_api_key = UserAPIKeyAuth(team_id="team-1")
+    user_api_key = UserAPIKeyAuth(
+        team_id="team-1", api_key="key-1", user_id="user-1", org_id="org-1"
+    )
     first = await endpoints.libtv_image_upscale_submit(request=_request(request_body), user_api_key_dict=user_api_key)
     second = await endpoints.libtv_image_upscale_submit(request=_request(request_body), user_api_key_dict=user_api_key)
 
@@ -247,7 +255,9 @@ async def test_image_upscale_endpoint_fingerprint_mismatch_returns_stable_confli
             }
         )
 
-    user_api_key = UserAPIKeyAuth(team_id="team-1")
+    user_api_key = UserAPIKeyAuth(
+        team_id="team-1", api_key="key-1", user_id="user-1", org_id="org-1"
+    )
     first = await endpoints.libtv_image_upscale_submit(
         request=_request(body("Standard V2")), user_api_key_dict=user_api_key
     )
@@ -750,6 +760,118 @@ async def test_image_upscale_receipt_lookup_is_authenticated_and_team_scoped(mon
     )
     assert response.status_code == 200
     assert json.loads(response.body)["receipt"]["provider_task_id"] == "task-1"
+
+
+def test_not_submitted_receipt_serialization_round_trip_retains_deployment():
+    receipt = ImageUpscaleReceipt(
+        request_id="request-1",
+        submission_state="not_submitted",
+        deployment_id="primary",
+        message="source transfer failed",
+    )
+
+    response = endpoints._image_upscale_response(receipt.to_dict())
+    payload = json.loads(response.body)
+    restored = normalize_image_upscale_receipt(payload, "request-1")
+
+    assert response.status_code == 503
+    assert restored.submission_state == "not_submitted"
+    assert restored.deployment_id == "primary"
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_resolution_rejects_non_operator_before_store_lookup(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: calls.append(True) or None
+    )
+
+    response = await endpoints.libtv_image_upscale_resolve(
+        request=_action_request(
+            "/v1/libtv/image-upscale/resolve",
+            orjson.dumps(
+                {
+                    "request_id": "request-1",
+                    "reason": "duplicate risk",
+                    "confirm_submission_risk": True,
+                }
+            ),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1", user_id="user-1", user_role="internal_user"),
+    )
+
+    assert response.status_code == 403
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_resolution_records_authenticated_operator_only(monkeypatch):
+    receipt = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint="f" * 64,
+        submission_state="unknown",
+        deployment_id="primary",
+    )
+
+    class Store:
+        async def get(self, team_id, model, request_id):
+            return receipt
+
+        async def transition(self, stored, receipt_key, state, **kwargs):
+            return StoredReceipt(
+                team_id=stored.team_id,
+                model=stored.model,
+                request_id=stored.request_id,
+                fingerprint=stored.fingerprint,
+                submission_state=state,
+                deployment_id=stored.deployment_id,
+                resolution_tombstone=kwargs["resolution_tombstone"],
+            )
+
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.get_receipt_store", lambda: Store())
+
+    response = await endpoints.libtv_image_upscale_resolve(
+        request=_action_request(
+            "/v1/libtv/image-upscale/resolve",
+            orjson.dumps(
+                {
+                    "request_id": "request-1",
+                    "reason": "duplicate risk",
+                    "confirm_submission_risk": True,
+                }
+            ),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1", user_id="operator-1", user_role="proxy_admin"),
+    )
+
+    tombstone = json.loads(response.body)["receipt"]["resolution_tombstone"]
+    assert response.status_code == 200
+    assert tombstone["operator_id"] == "operator-1"
+    assert tombstone["reason"] == "duplicate risk"
+    assert tombstone["confirmed_submission_risk"] is True
+    assert "resolved_at" in tombstone
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_resolution_rejects_client_supplied_audit_fields(monkeypatch):
+    response = await endpoints.libtv_image_upscale_resolve(
+        request=_action_request(
+            "/v1/libtv/image-upscale/resolve",
+            orjson.dumps(
+                {
+                    "request_id": "request-1",
+                    "reason": "duplicate risk",
+                    "confirm_submission_risk": True,
+                    "operator_id": "spoofed",
+                }
+            ),
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1", user_id="operator-1", user_role="proxy_admin"),
+    )
+
+    assert response.status_code == 422
 
 
 @pytest.mark.asyncio

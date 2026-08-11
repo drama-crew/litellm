@@ -755,6 +755,9 @@ async def proxy_shutdown_event():
             await _libtv_billing_reconciler.stop()
         finally:
             _libtv_billing_reconciler = None
+    from litellm.llms.libtv.persistence import close_receipt_stores
+
+    await close_receipt_stores()
     if prisma_client:
         verbose_proxy_logger.debug("Disconnecting from Prisma")
         await prisma_client.disconnect()

@@ -2,13 +2,14 @@ import asyncio
 import math
 import os
 import traceback
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal
 from urllib.parse import urlsplit
 
 import orjson
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, status
 from fastapi.responses import ORJSONResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, ValidationError, model_validator
 from redis.exceptions import RedisError
 
 import litellm
@@ -110,11 +111,11 @@ class ImageUpscaleActionRequest(BaseModel):
 
 
 class ImageUpscaleResolutionRequest(BaseModel):
-    """Team-authenticated receipt resolution does not use a task resume token."""
-
     request_id: str = Field(min_length=1)
     model: str = Field(default="topaz-image-upscaler", min_length=1)
-    tombstone: Dict[str, Any]
+    reason: str = Field(min_length=1, max_length=512)
+    confirm_submission_risk: StrictBool
+    model_config = ConfigDict(extra="forbid")
 
 
 def _image_upscale_response(receipt: dict) -> ORJSONResponse:
@@ -398,7 +399,11 @@ async def _load_action_receipt(action: ImageUpscaleActionRequest, user_api_key_d
         fingerprint=receipt.fingerprint,
     ):
         return ORJSONResponse(status_code=403, content={"error": "invalid image upscale resume token"})
-    key = LibTVReceiptStore.receipt_key(team_id, action.model, action.request_id, receipt.fingerprint)
+    if receipt.deployment_id is None:
+        return ORJSONResponse(status_code=409, content={"error": "receipt has no deployment attempt"})
+    key = LibTVReceiptStore.receipt_key(
+        team_id, action.model, action.request_id, receipt.fingerprint, receipt.deployment_id
+    )
     return store, receipt, key, client
 
 
@@ -416,7 +421,11 @@ async def _load_resolution_receipt(action: ImageUpscaleResolutionRequest, user_a
         return ORJSONResponse(status_code=503, content={"error": "receipt store unavailable"})
     if receipt is None:
         return ORJSONResponse(status_code=404, content={"error": "image upscale receipt not found"})
-    key = LibTVReceiptStore.receipt_key(team_id, action.model, action.request_id, receipt.fingerprint)
+    if receipt.deployment_id is None:
+        return ORJSONResponse(status_code=409, content={"error": "receipt has no deployment attempt"})
+    key = LibTVReceiptStore.receipt_key(
+        team_id, action.model, action.request_id, receipt.fingerprint, receipt.deployment_id
+    )
     return store, receipt, key
 
 
@@ -597,6 +606,13 @@ async def libtv_image_upscale_resolve(
     except (orjson.JSONDecodeError, ValidationError) as error:
         detail = error.errors(include_context=False) if isinstance(error, ValidationError) else str(error)
         return ORJSONResponse(status_code=422, content={"detail": detail})
+    if user_api_key_dict.user_role not in (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.PROXY_ADMIN.value):
+        return ORJSONResponse(status_code=403, content={"error": "operator authorization is required"})
+    operator_id = getattr(user_api_key_dict, "user_id", None)
+    if not isinstance(operator_id, str) or not operator_id:
+        return ORJSONResponse(status_code=403, content={"error": "operator identity is required"})
+    if action.confirm_submission_risk is not True:
+        return ORJSONResponse(status_code=422, content={"error": "explicit submission risk confirmation is required"})
     loaded = await _load_resolution_receipt(action, user_api_key_dict)
     if isinstance(loaded, ORJSONResponse):
         return loaded
@@ -605,9 +621,13 @@ async def libtv_image_upscale_resolve(
         return ORJSONResponse(status_code=200, content={"receipt": _receipt_body(receipt)})
     if receipt.submission_state != "unknown":
         return ORJSONResponse(status_code=409, content={"error": "receipt is not unknown"})
-    tombstone = dict(action.tombstone)
-    tombstone.setdefault("request_id", receipt.request_id)
-    tombstone.setdefault("operator_id", "authenticated")
+    tombstone = {
+        "request_id": receipt.request_id,
+        "operator_id": operator_id,
+        "reason": action.reason,
+        "confirmed_submission_risk": True,
+        "resolved_at": datetime.now(timezone.utc).isoformat(),
+    }
     try:
         updated = await store.transition(
             receipt,

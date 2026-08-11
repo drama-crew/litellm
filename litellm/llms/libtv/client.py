@@ -934,6 +934,8 @@ class LibTVClient:
         receipt_api_key: str | None = None,
         receipt_user_id: str | None = None,
         receipt_organization_id: str | None = None,
+        source_bytes: int | None = None,
+        source_hard_cap: int | None = None,
     ) -> ImageUpscaleReceipt:
         params = TopazImageUpscaleBuilder().build(source_url=source_url, style=style, scale=scale)
         if durable_receipts:
@@ -966,12 +968,22 @@ class LibTVClient:
                     inner_self.target_client = target_client
 
                 async def create(inner_self, payload):
-                    provider_params = TopazImageUpscaleBuilder().build(
-                        source_url=str(payload["source_url"]),
-                        style=str(payload.get("style", "Standard V2")),
-                        scale=int(payload.get("scale", 2)),
-                    )
                     try:
+                        delegated_source_url = await inner_self.target_client.aensure_libtv_url(
+                            "url",
+                            str(payload["source_url"]),
+                            None,
+                            "image.png",
+                            require_delegated=True,
+                            source_bytes=source_bytes,
+                            source_sha256=source_sha256,
+                            source_hard_cap=source_hard_cap,
+                        )
+                        provider_params = TopazImageUpscaleBuilder().build(
+                            source_url=delegated_source_url,
+                            style=str(payload.get("style", "Standard V2")),
+                            scale=int(payload.get("scale", 2)),
+                        )
                         return await inner_self.target_client.acreate(
                             model_key,
                             vendor,

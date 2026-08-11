@@ -306,7 +306,9 @@ def test_image_upscale_resolution_request_uses_dedicated_auth_contract():
 
     request = ImageUpscaleResolutionRequest(
         request_id="generation-1",
-        tombstone={"operator_id": "operator-1", "reason": "duplicate risk"},
+        reason="duplicate risk",
+        confirm_submission_risk=True,
     )
 
     assert "resume_token" not in request.model_dump()
+    assert "operator_id" not in request.model_dump()

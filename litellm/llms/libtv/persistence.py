@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 import os
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 _tables_ready = False
 _last_warn_ts = 0.0
+_receipt_stores: dict[tuple[asyncio.AbstractEventLoop, str], LibTVReceiptStore] = {}
 
 CREATE_UPLOAD_CACHE_TABLE = """
 CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVUploadCache" (
@@ -293,4 +295,19 @@ def get_receipt_store(redis_url: str | None = None) -> LibTVReceiptStore | None:
     url = redis_url or os.getenv("LIBTV_RECEIPTS_REDIS_URL")
     if not url:
         return None
-    return LibTVReceiptStore(Redis.from_url(url, decode_responses=True))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = (loop, url)
+    store = _receipt_stores.get(key)
+    if store is None:
+        store = LibTVReceiptStore(Redis.from_url(url, decode_responses=True))
+        _receipt_stores[key] = store
+    return store
+
+
+async def close_receipt_stores() -> None:
+    stores = tuple(_receipt_stores.values())
+    _receipt_stores.clear()
+    await asyncio.gather(*(store.redis.aclose() for store in stores), return_exceptions=True)

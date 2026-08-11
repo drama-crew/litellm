@@ -19,6 +19,7 @@ from litellm.llms.libtv.image_upscale import (
     ProviderTransportError,
     make_resume_token,
     verify_resume_token,
+    normalize_image_upscale_receipt,
 )
 from litellm.llms.libtv.client import LibTVClient
 from litellm.llms.libtv.receipts import LibTVReceiptStore, request_fingerprint
@@ -33,6 +34,10 @@ def _payload(request_id: str = "request-1", style: str = "Standard V2") -> dict[
         "source_url": "https://assets.example/input.png",
         "style": style,
         "scale": 2,
+        "response_cost": 0.25,
+        "api_key": "key-1",
+        "user_id": "user-1",
+        "organization_id": "org-1",
     }
 
 
@@ -106,6 +111,125 @@ async def test_concurrent_submitters_create_once_and_share_receipt(redis_url):
     assert receipts[0] == receipts[1]
     assert receipts[0].submission_state == "submitted"
     assert receipts[0].provider_task_id == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_duplicate_submitted_request_does_not_reupload_source(redis_url):
+    store = await _store(redis_url)
+    uploads = []
+
+    class Provider:
+        async def create(self, payload):
+            uploads.append(payload["source_url"])
+            return {"task_id": "task-1"}
+
+    submitter = ImageUpscaleSubmitter(
+        ("primary", Provider()), receipt_store=store, team_id="team-1", model="topaz-image-upscaler"
+    )
+    first = await submitter.submit(_payload())
+
+    class UploadWouldFail:
+        async def create(self, payload):
+            raise AssertionError("duplicate submission must not upload or create")
+
+    duplicate = await ImageUpscaleSubmitter(
+        ("primary", UploadWouldFail()), receipt_store=store, team_id="team-1", model="topaz-image-upscaler"
+    ).submit(_payload())
+
+    assert first == duplicate
+    assert uploads == ["https://assets.example/input.png"]
+
+
+def test_not_submitted_receipt_retains_deployment_audit_identity():
+    receipt = normalize_image_upscale_receipt(
+        {
+            "receipt": {
+                "request_id": "request-1",
+                "submission_state": "not_submitted",
+                "deployment_id": "primary",
+                "message": "source transfer failed",
+            }
+        },
+        "request-1",
+    )
+
+    assert receipt.submission_state == "not_submitted"
+    assert receipt.deployment_id == "primary"
+
+
+@pytest.mark.asyncio
+async def test_pre_create_failure_retains_deployment_in_retryable_receipt():
+    class Provider:
+        async def create(self, payload):
+            raise ProviderTransportError("source transfer failed", crossed_create_boundary=False)
+
+    receipt = await ImageUpscaleSubmitter(
+        ("primary", Provider()),
+        team_id="team-1",
+        api_key="key-1",
+        user_id="user-1",
+        organization_id="org-1",
+    ).submit(_payload())
+
+    assert receipt.submission_state == "not_submitted"
+    assert receipt.deployment_id == "primary"
+    assert receipt.message == "source transfer failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cost", [None, 0.0, float("nan"), float("inf")])
+async def test_invalid_billing_contract_blocks_provider_create(cost):
+    calls = []
+
+    class Provider:
+        async def create(self, payload):
+            calls.append(payload)
+            return {"task_id": "task-1"}
+
+    receipt = await ImageUpscaleSubmitter(
+        ("primary", Provider()),
+        receipt_store=None,
+        team_id="team-1",
+        api_key="key-1",
+        user_id="user-1",
+        organization_id="org-1",
+    ).submit({**_payload(), "response_cost": cost})
+
+    assert calls == []
+    assert receipt.submission_state == "not_submitted"
+
+
+@pytest.mark.asyncio
+async def test_missing_billing_identity_blocks_provider_create():
+    calls = []
+
+    class Provider:
+        async def create(self, payload):
+            calls.append(payload)
+            return {"task_id": "task-1"}
+
+    receipt = await ImageUpscaleSubmitter(("primary", Provider()), team_id="team-1").submit(
+        {**_payload(), "response_cost": 0.25}
+    )
+
+    assert calls == []
+    assert receipt.submission_state == "not_submitted"
+
+
+@pytest.mark.asyncio
+async def test_deployment_attempt_receipts_are_distinct_and_enumerable(redis_url):
+    store = await _store(redis_url)
+    first = await store.claim("team-1", "topaz-image-upscaler", "request-1", "f" * 64, "primary")
+    await store.transition(first.receipt, first.receipt_key, "rejected", message="capacity")
+    second = await store.claim("team-1", "topaz-image-upscaler", "request-1", "f" * 64, "secondary")
+
+    assert first.receipt_key != second.receipt_key
+    assert second.outcome == "owner"
+    attempts = await store.get_attempts("team-1", "topaz-image-upscaler", "request-1")
+    assert {(attempt.deployment_id, attempt.submission_state) for attempt in attempts} == {
+        ("primary", "rejected"),
+        ("secondary", "submitting"),
+    }
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ import binascii
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 from dataclasses import asdict, dataclass
@@ -131,7 +132,7 @@ def normalize_image_upscale_receipt(
         isinstance(value, str) and value for value in (task_id, deployment_id, resume_token)
     ):
         state = "unknown"
-    if state != "submitted" and any(value is not None for value in (task_id, deployment_id, resume_token)):
+    if state != "submitted" and any(value is not None for value in (task_id, resume_token)):
         return ImageUpscaleReceipt(request_id=request_id, submission_state="unknown")
     return ImageUpscaleReceipt(
         request_id=request_id,
@@ -162,7 +163,7 @@ class ImageUpscaleProvider(Protocol):
 
 def _response_cost(payload: Mapping[str, object]) -> float | None:
     value = payload.get("response_cost")
-    if isinstance(value, (int, float)) and value >= 0:
+    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
         return float(value)
     return None
 
@@ -218,10 +219,6 @@ class ImageUpscaleSubmitter:
         self._resume_secret = (
             resume_secret or os.getenv("LIBTV_IMAGE_UPSCALE_RESUME_SECRET") or secrets.token_urlsafe(32)
         )
-        if receipt_store is None and os.getenv("LIBTV_RECEIPTS_REDIS_URL"):
-            from litellm.llms.libtv.persistence import get_receipt_store
-
-            receipt_store = get_receipt_store()
         self._receipt_store = receipt_store
         self._team_id = team_id
         self._api_key = api_key
@@ -334,7 +331,7 @@ class ImageUpscaleSubmitter:
                 )
                 if error.crossed_create_boundary:
                     return self._from_stored(stored, request_id), None
-                return None, None
+                return self._from_stored(stored, request_id), None
             if error.crossed_create_boundary:
                 return (
                     ImageUpscaleReceipt(
@@ -345,7 +342,15 @@ class ImageUpscaleSubmitter:
                     ),
                     None,
                 )
-            return None, None
+            return (
+                ImageUpscaleReceipt(
+                    request_id=request_id,
+                    submission_state="not_submitted",
+                    deployment_id=deployment_id,
+                    message=str(error),
+                ),
+                None,
+            )
         task_id = response.get("task_id") or response.get("taskId")
         if not isinstance(task_id, str) or not task_id:
             if self._receipt_store is not None and claim is not None and claim.receipt is not None:
@@ -392,10 +397,32 @@ class ImageUpscaleSubmitter:
         return self._from_stored(stored, request_id), None
 
     async def submit(self, payload: Mapping[str, object]) -> ImageUpscaleReceipt:
+        if self._receipt_store is None and os.getenv("LIBTV_RECEIPTS_REDIS_URL"):
+            from litellm.llms.libtv.persistence import get_receipt_store
+
+            self._receipt_store = get_receipt_store()
         request_id = payload.get("request_id")
         if not isinstance(request_id, str) or not request_id:
             raise ValueError("image upscale request_id is required")
         team_id = self._team_id or (payload.get("team_id") if isinstance(payload.get("team_id"), str) else "default")
+        response_cost = _response_cost(payload)
+        if response_cost is None:
+            return ImageUpscaleReceipt(
+                request_id=request_id,
+                submission_state="not_submitted",
+                message="paid image upscale requires a finite positive response cost",
+            )
+        api_key = self._api_key or (payload.get("api_key") if isinstance(payload.get("api_key"), str) else None)
+        user_id = self._user_id or (payload.get("user_id") if isinstance(payload.get("user_id"), str) else None)
+        organization_id = self._organization_id or (
+            payload.get("organization_id") if isinstance(payload.get("organization_id"), str) else None
+        )
+        if not all((team_id, api_key, user_id, organization_id)):
+            return ImageUpscaleReceipt(
+                request_id=request_id,
+                submission_state="not_submitted",
+                message="paid image upscale requires complete billing identity",
+            )
         TopazImageUpscaleBuilder().build(
             source_url=payload.get("source_url") if isinstance(payload.get("source_url"), str) else None,
             source_urls=payload.get("source_urls") if isinstance(payload.get("source_urls"), Sequence) else None,
@@ -403,6 +430,7 @@ class ImageUpscaleSubmitter:
             scale=payload.get("scale", 2) if isinstance(payload.get("scale", 2), int) else -1,
         )
         last_rejection: ProviderRejected | None = None
+        last_not_submitted: ImageUpscaleReceipt | None = None
         fingerprint = request_fingerprint(payload, self._model)
         for deployment in self._deployments:
             deployment_id, provider = deployment[:2]
@@ -415,7 +443,7 @@ class ImageUpscaleSubmitter:
                         request_id,
                         fingerprint,
                         deployment_id,
-                        _response_cost(payload),
+                        response_cost,
                     )
                 except RedisError:
                     return ImageUpscaleReceipt(
@@ -437,10 +465,15 @@ class ImageUpscaleSubmitter:
                 request_id, deployment_id, provider, resume_secret, claim, payload, team_id, fingerprint
             )
             if result is not None:
+                if result.submission_state == "not_submitted":
+                    last_not_submitted = result
+                    continue
                 return result
             if rejection is not None:
                 last_rejection = rejection
                 continue
+        if last_not_submitted is not None:
+            return last_not_submitted
         if last_rejection is not None:
             return ImageUpscaleReceipt(
                 request_id=request_id,

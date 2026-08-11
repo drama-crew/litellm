@@ -103,6 +103,10 @@ def submit_body():
         "source_url": "https://source.example/input.png",
         "style": "Standard V2",
         "scale": 2,
+        "response_cost": 0.25,
+        "api_key": "key-1",
+        "user_id": "user-1",
+        "organization_id": "org-1",
     }
 
 
@@ -744,6 +748,59 @@ async def test_client_pool_resolves_each_deployment_credential_for_failover(monk
     )
     assert not verify_resume_token(receipt.resume_token or "", "primary-token")
     assert store.receipt.response_cost == 0.42
+
+
+@pytest.mark.asyncio
+async def test_client_reuses_submitted_receipt_without_reuploading_expired_source(monkeypatch):
+    fingerprint = "f" * 64
+    stored = StoredReceipt(
+        team_id="team-1",
+        model="topaz-image-upscaler",
+        request_id="request-1",
+        fingerprint=fingerprint,
+        submission_state="submitted",
+        deployment_id="primary",
+        provider_task_id="task-1",
+        resume_token="receipt-token",
+        response_cost=0.42,
+        api_key="key-1",
+        user_id="user-1",
+        organization_id="org-1",
+    )
+
+    class Store:
+        async def readiness(self):
+            return True
+
+        async def claim(self, *args, **kwargs):
+            return ReceiptClaim("existing", "receipt-primary", stored)
+
+    async def failed_upload(*args, **kwargs):
+        raise AssertionError("existing submitted receipt must return before source upload")
+
+    monkeypatch.setattr("litellm.llms.libtv.client.get_receipt_store", lambda: Store())
+    monkeypatch.setattr(LibTVClient, "aensure_libtv_url", failed_upload)
+
+    receipt = await LibTVClient(token="token", webid="webid").asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://source.example/expired-signature.png",
+        "Standard V2",
+        2,
+        "project",
+        "request-1",
+        "primary",
+        team_id="team-1",
+        source_sha256=fingerprint,
+        durable_receipts=True,
+        response_cost=0.42,
+        receipt_api_key="key-1",
+        receipt_user_id="user-1",
+        receipt_organization_id="org-1",
+    )
+
+    assert receipt.submission_state == "submitted"
+    assert receipt.provider_task_id == "task-1"
 
 
 def _gen_params(calls):

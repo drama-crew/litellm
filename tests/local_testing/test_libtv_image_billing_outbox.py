@@ -53,12 +53,24 @@ async def test_terminal_receipt_transition_appends_one_billing_event():
     script, numkeys, args = redis.eval_calls[0]
     assert numkeys == 4
     assert args[3] == BILLING_STREAM_KEY
-    assert json.loads(args[8])["provider_task_id"] == "task-1"
+    assert json.loads(args[-1])["provider_task_id"] == "task-1"
     assert script.count("XADD") == 1
 
 
 def test_terminal_transition_script_deduplicates_billing_event_on_repeated_poll():
     assert "current['billing_event_id']" in _TRANSITION_SCRIPT
+
+
+def test_terminal_transition_enqueues_before_recording_delivery_marker():
+    assert _TRANSITION_SCRIPT.index("redis.call('XADD'") < _TRANSITION_SCRIPT.index("redis.call('SET', KEYS[3]")
+
+
+def test_billing_event_id_and_downstream_request_id_are_stable_across_retries():
+    first = ImageBillingEvent(deployment_id="dep-1", provider_task_id="task-1", response_cost=1.25)
+    retry = ImageBillingEvent(deployment_id="dep-1", provider_task_id="task-1", response_cost=1.25)
+
+    assert first.event_id == retry.event_id
+    assert first.request_id == retry.request_id
 
 
 class FakeTransaction:

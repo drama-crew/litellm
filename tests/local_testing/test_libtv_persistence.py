@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 from typing import Any, List, Optional, Tuple
 
@@ -8,6 +9,7 @@ from litellm.llms.libtv import persistence
 from litellm.llms.libtv.persistence import (
     LibTVPersistence,
     account_key,
+    close_receipt_stores,
     get_persistence,
     get_receipt_store,
     normalize_source_key,
@@ -78,7 +80,8 @@ def test_account_key_stable_and_16_chars():
     assert k1 == hashlib.sha1(b"token-abc").hexdigest()[:16]
 
 
-def test_get_receipt_store_uses_dedicated_redis_url(monkeypatch):
+@pytest.mark.asyncio
+async def test_get_receipt_store_uses_dedicated_redis_url(monkeypatch):
     monkeypatch.setenv("LIBTV_RECEIPTS_REDIS_URL", "redis://receipt-host:6380/4")
 
     store = get_receipt_store()
@@ -89,10 +92,67 @@ def test_get_receipt_store_uses_dedicated_redis_url(monkeypatch):
     assert store.redis.connection_pool.connection_kwargs["db"] == 4
 
 
-def test_get_receipt_store_is_disabled_without_dedicated_url(monkeypatch):
+@pytest.mark.asyncio
+async def test_get_receipt_store_is_disabled_without_dedicated_url(monkeypatch):
     monkeypatch.delenv("LIBTV_RECEIPTS_REDIS_URL", raising=False)
 
     assert get_receipt_store() is None
+
+
+@pytest.mark.asyncio
+async def test_get_receipt_store_reuses_client_per_event_loop_and_url(monkeypatch):
+    persistence._receipt_stores.clear()
+    created = []
+
+    class RedisFactory:
+        @classmethod
+        def from_url(cls, url, decode_responses):
+            created.append((url, decode_responses))
+            return object()
+
+    monkeypatch.setattr(persistence, "Redis", RedisFactory)
+
+    first = get_receipt_store("redis://receipt-host:6380/4")
+    again = get_receipt_store("redis://receipt-host:6380/4")
+    changed = get_receipt_store("redis://receipt-host:6380/5")
+
+    assert first is again
+    assert first is not changed
+    assert created == [
+        ("redis://receipt-host:6380/4", True),
+        ("redis://receipt-host:6380/5", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receipt_store_isolated_by_event_loop_and_closed_on_shutdown(monkeypatch):
+    persistence._receipt_stores.clear()
+    created = []
+
+    class Client:
+        def __init__(self):
+            self.closed = False
+
+        async def aclose(self):
+            self.closed = True
+
+    class RedisFactory:
+        @classmethod
+        def from_url(cls, url, decode_responses):
+            client = Client()
+            created.append(client)
+            return client
+
+    async def in_other_loop():
+        return get_receipt_store("redis://receipt-host:6380/4")
+
+    monkeypatch.setattr(persistence, "Redis", RedisFactory)
+    current = get_receipt_store("redis://receipt-host:6380/4")
+    other = await asyncio.to_thread(lambda: asyncio.run(in_other_loop()))
+
+    assert current is not other
+    await close_receipt_stores()
+    assert all(client.closed for client in created)
 
 
 @pytest.mark.asyncio

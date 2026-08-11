@@ -1051,26 +1051,10 @@ class LibTVLLM(CustomLLM):
         request_id = request_id_value.strip()
         model_info = optional_params.get("model_info") or {}
         deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
-        try:
-            source_url = await lt.aensure_libtv_url(
-                *source,
-                _REF_DEFAULT_NAME["image"],
-                require_delegated=True,
-                source_bytes=optional_params.get("source_bytes") or optional_params.get("input_reference_bytes"),
-                source_sha256=optional_params.get("source_sha256") or optional_params.get("input_reference_sha256"),
-                source_hard_cap=optional_params.get("source_hard_cap"),
-            )
-        except LibTVError as error:
-            return ImageUpscaleReceipt(
-                request_id=request_id,
-                submission_state="not_submitted",
-                deployment_id=str(deployment_id) if deployment_id is not None else None,
-                message=str(error),
-            )
         return await lt.asubmit_image_upscale(
             model,
             spec["vendor"],
-            source_url,
+            source[1],
             str(optional_params.get("style", "Standard V2")),
             int(optional_params.get("scale", 2)),
             _project_name(model),
@@ -1082,6 +1066,8 @@ class LibTVLLM(CustomLLM):
             response_cost=_image_upscale_response_cost(optional_params, int(optional_params.get("scale", 2))),
             **_receipt_identity(optional_params),
             deployment_pool=optional_params.get("image_upscale_deployment_pool"),
+            source_bytes=optional_params.get("source_bytes") or optional_params.get("input_reference_bytes"),
+            source_hard_cap=optional_params.get("source_hard_cap"),
         )
 
     @normalize_libtv_errors

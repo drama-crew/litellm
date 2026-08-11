@@ -123,11 +123,14 @@ end
 if current['submission_state'] ~= ARGV[1] or current['deployment_id'] ~= ARGV[2] then
   return {'conflict', stored}
 end
+if ARGV[5] ~= '' and (not current['billing_event_id'] or current['billing_event_id'] == '') then
+  if not redis.call('GET', KEYS[5]) then
+    redis.call('XADD', KEYS[4], '*', 'payload', ARGV[5])
+    redis.call('SET', KEYS[5], 'delivered')
+  end
+end
 redis.call('SET', KEYS[3], ARGV[3])
 redis.call('SET', KEYS[2], merge_pool_attempt(redis.call('GET', KEYS[2]), ARGV[4]))
-if ARGV[5] ~= '' and (not current['billing_event_id'] or current['billing_event_id'] == '') then
-  redis.call('XADD', KEYS[4], '*', 'payload', ARGV[5])
-end
 return {'ok', ARGV[3]}
 """
 
@@ -235,8 +238,10 @@ class LibTVReceiptStore:
         return f"libtv:receipt:pool:{cls._identity(team_id, model, request_id)}"
 
     @classmethod
-    def receipt_key(cls, team_id: str, model: str, request_id: str, fingerprint: str) -> str:
-        identity = "\0".join((team_id, model, request_id, fingerprint))
+    def receipt_key(
+        cls, team_id: str, model: str, request_id: str, fingerprint: str, deployment_id: str
+    ) -> str:
+        identity = "\0".join((team_id, model, request_id, fingerprint, deployment_id))
         return f"libtv:receipt:{hashlib.sha256(identity.encode()).hexdigest()}"
 
     @staticmethod
@@ -273,7 +278,7 @@ class LibTVReceiptStore:
     ) -> ReceiptClaim:
         index_key = self._index_key(team_id, model, request_id)
         pool_key = self._pool_key(team_id, model, request_id)
-        receipt_key = self.receipt_key(team_id, model, request_id, fingerprint)
+        receipt_key = self.receipt_key(team_id, model, request_id, fingerprint, deployment_id)
         receipt = StoredReceipt(
             team_id=team_id,
             model=model,
@@ -359,7 +364,10 @@ class LibTVReceiptStore:
             event_json = json.dumps(event_value, separators=(",", ":"), sort_keys=True)
         eval_args = [index_key, pool_key, receipt_key]
         if event_json:
-            eval_args.append("libtv:billing:outbox")
+            event_id = updated.billing_event_id
+            if not event_id:
+                raise ValueError("billing event must have an event_id")
+            eval_args.extend(("libtv:billing:outbox", f"libtv:billing:outbox:delivered:{event_id}"))
         eval_args.extend(
             [
                 expected_state,
@@ -372,7 +380,7 @@ class LibTVReceiptStore:
         try:
             result = await self.redis.eval(
                 _TRANSITION_SCRIPT,
-                4 if event_json else 3,
+                5 if event_json else 3,
                 *eval_args,
             )
         except ResponseError as error:
@@ -409,6 +417,17 @@ class LibTVReceiptStore:
 
     async def get_receipt(self, team_id: str, model: str, request_id: str) -> StoredReceipt | None:
         return await self.get(team_id, model, request_id)
+
+    async def get_attempts(self, team_id: str, model: str, request_id: str) -> tuple[StoredReceipt, ...]:
+        raw = await self.redis.get(self._pool_key(team_id, model, request_id))
+        if raw is None:
+            return ()
+        pool = json.loads(self._text(raw))
+        attempts = pool.get("attempts") or (() if not pool.get("receipt_key") else (pool,))
+        values = await asyncio.gather(
+            *(self.redis.get(attempt.get("receipt_key")) for attempt in attempts if attempt.get("receipt_key"))
+        )
+        return tuple(StoredReceipt.from_json(self._text(value)) for value in values if value is not None)
 
     async def recover_pending(self, team_id: str, model: str, request_id: str) -> StoredReceipt | None:
         current = await self.get(team_id, model, request_id)
