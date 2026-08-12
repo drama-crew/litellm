@@ -1220,9 +1220,7 @@ class LibTVClient:
         if kind == "url":
             filename = _filename_from_url(url, default_name)
             transfer_mode = os.getenv("MEDIA_TRANSFER_MODE", "direct").lower()
-            if require_delegated and transfer_mode != "delegated":
-                raise LibTVError(status_code=503, message="delegated source transfer is unavailable")
-            if transfer_mode == "delegated":
+            if require_delegated or transfer_mode == "delegated":
                 if require_delegated:
                     if source_bytes is None or not source_sha256:
                         raise LibTVError(status_code=503, message="validated Topaz source requires bytes and SHA-256")
@@ -1244,8 +1242,6 @@ class LibTVClient:
                     source_sha256=source_sha256,
                     source_hard_cap=source_hard_cap,
                 ), size
-            if require_delegated:
-                raise LibTVError(status_code=503, message="delegated source transfer is unavailable")
             fetched = await self._afetch_bytes(url)
             return await self.aupload_media(fetched, filename), len(fetched)
         uploaded_bytes = data or b""
@@ -1296,8 +1292,6 @@ class LibTVClient:
                 if part_numbers != tuple(range(1, expected_parts + 1)) or any(not part["url"] for part in parts):
                     raise LibTVError(status_code=503, message="delegated source transfer returned incomplete parts")
             redis_client = self._redis_client or get_transfer_redis()
-            if require_delegated and redis_client is None:
-                raise LibTVError(status_code=503, message="delegated source transfer worker is unavailable")
             if require_delegated:
                 strategy = ValidatedDelegatedTransfer(
                     redis_client, hard_cap=int(os.getenv("TRANSFER_GLOBAL_HARD_CAP", str(64 * 1024 * 1024)))

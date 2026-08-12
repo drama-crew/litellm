@@ -589,7 +589,7 @@ class ValidatedTransferRouter:
                 await pipe.watch(status, owner_storage, lease)
                 current = await pipe.get(status)
                 current = current.decode() if isinstance(current, bytes) else current
-                if current not in {"queued", "claimed"}:
+                if current not in {"queued", "claimed", "worker_transient"}:
                     await pipe.unwatch()
                     return False
                 pipe.multi()
@@ -616,3 +616,63 @@ class ValidatedTransferRouter:
                 return False
 
         return owned
+
+
+_shared_executors: dict[tuple[object, ...], StrictValidatedTransferExecutor] = {}
+_shared_routers: dict[tuple[object, ...], ValidatedTransferRouter] = {}
+
+
+def _executor_key(
+    settings: ValidatedTransferSettings,
+    client: httpx.AsyncClient | None,
+) -> tuple[object, ...]:
+    """Include loop and effective config so capacity is process-wide per runtime."""
+    try:
+        loop: object | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    return (loop, settings, id(client))
+
+
+def _router_key(
+    executor: StrictValidatedTransferExecutor,
+    redis: Any | None,
+    instance_id: str,
+    wait_timeout: float,
+) -> tuple[object, ...]:
+    return (id(executor), id(redis), instance_id, wait_timeout)
+
+
+def get_shared_validated_transfer_router(
+    *,
+    settings: ValidatedTransferSettings | None = None,
+    redis: Any | None = None,
+    client: httpx.AsyncClient | None = None,
+    instance_id: str | None = None,
+    wait_timeout: float = 60.0,
+) -> ValidatedTransferRouter:
+    """Return the process-scoped bounded router for an effective configuration."""
+    effective_settings = settings or ValidatedTransferSettings.from_environment()
+    effective_instance_id = instance_id or os.getenv("LIBTV_VALIDATED_TRANSFER_INSTANCE_ID", "litellm")
+    executor_key = _executor_key(effective_settings, client)
+    executor = _shared_executors.get(executor_key)
+    if executor is None:
+        executor = StrictValidatedTransferExecutor(effective_settings, client=client)
+        _shared_executors[executor_key] = executor
+    key = _router_key(executor, redis, effective_instance_id, wait_timeout)
+    router = _shared_routers.get(key)
+    if router is None:
+        router = ValidatedTransferRouter(
+            executor,
+            redis=redis,
+            instance_id=effective_instance_id,
+            wait_timeout=wait_timeout,
+        )
+        _shared_routers[key] = router
+    return router
+
+
+def reset_shared_validated_transfer_routers() -> None:
+    """Test/lifecycle seam for discarding loop-bound router state."""
+    _shared_routers.clear()
+    _shared_executors.clear()

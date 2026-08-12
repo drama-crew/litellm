@@ -4244,6 +4244,50 @@ async def test_aensure_libtv_url_strict_topaz_transfer_bypasses_upload_cache():
 
 
 @pytest.mark.asyncio
+async def test_topaz_strict_source_transfer_uses_local_router_without_legacy_mode_or_redis(monkeypatch):
+    """The paid path never falls back to legacy in-memory media transfer."""
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "direct")
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "source.example")
+    monkeypatch.setenv("LIBTV_VALIDATED_TRANSFER_TARGET_HOSTS", "put.example")
+    calls: list[str] = []
+
+    class Transfer:
+        async def transfer(self, *args, **kwargs):
+            calls.append("strict")
+            return [{"n": 1, "etag": "etag-1"}]
+
+    class Fake:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            if url.endswith("/init/4"):
+                return FakeResponse({"code": 0, "data": {"uploadId": "up-1", "parts": [{"partNumber": 1, "url": "https://put.example/1"}]}})
+            if url.endswith("/complete/4"):
+                return FakeResponse({"code": 0, "data": {"cdnUrl": "https://cdn.example/result.png"}})
+            raise AssertionError(f"unexpected bridge request: {url}")
+
+    monkeypatch.setattr("litellm.llms.libtv.client.ValidatedDelegatedTransfer", lambda *args, **kwargs: Transfer())
+    lt = LibTVClient(token="t", webid="w", async_client=Fake(), redis_client=None)
+    lt._user_uuid = "user-1"
+
+    async def legacy_fetch(url):
+        raise AssertionError("strict Topaz path must not use legacy byte fetch")
+
+    lt._afetch_bytes = legacy_fetch
+    result = await lt._aensure_uploaded(
+        "url",
+        "https://source.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+        None,
+        "input.png",
+        require_delegated=True,
+        source_bytes=3,
+        source_sha256="a" * 64,
+        source_hard_cap=64,
+    )
+
+    assert result == ("https://cdn.example/result.png", 3)
+    assert calls == ["strict"]
+
+
+@pytest.mark.asyncio
 async def test_aensure_libtv_url_cache_hit_alive_skips_size_probe_in_delegated_mode(monkeypatch):
     monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
 

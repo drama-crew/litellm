@@ -7,6 +7,8 @@ network or provider calls.
 from __future__ import annotations
 
 import base64
+import asyncio
+import hashlib
 
 import httpx
 import pytest
@@ -18,7 +20,10 @@ from litellm.llms.libtv.validated_transfer import (
     ValidatedTransferRequest,
     ValidatedTransferSettings,
     ValidatedTransferRouter,
+    get_shared_validated_transfer_router,
+    reset_shared_validated_transfer_routers,
 )
+from litellm.llms.libtv.transfer import ValidatedDelegatedTransfer
 
 
 def _png_bytes(size: tuple[int, int] = (4, 3)) -> bytes:
@@ -278,3 +283,147 @@ async def test_router_fallback_claim_uses_platform_owner_status_and_deletes_leas
     assert redis.values["worker:task:owner:task-1"] == "fallback:sgp-1"
     assert "worker:task:lease:task-1" not in redis.values
     assert await router._ownership_check("task-1")() is True
+
+
+@pytest.mark.asyncio
+async def test_shared_router_factory_reuses_executor_and_enforces_capacity_across_callers(tmp_path):
+    image = _png_bytes()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    get_calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal get_calls
+        if request.method == "GET":
+            get_calls += 1
+            if get_calls == 1:
+                first_started.set()
+                await release_first.wait()
+            return httpx.Response(200, content=image)
+        return httpx.Response(200, headers={"etag": "e"})
+
+    settings = _settings(tmp_path).with_limits(local_concurrency=1, local_queue_limit=0)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    reset_shared_validated_transfer_routers()
+    first = get_shared_validated_transfer_router(settings=settings, redis=None, client=client)
+    second = get_shared_validated_transfer_router(settings=settings, redis=None, client=client)
+    assert first is second
+    assert first.executor is second.executor
+
+    first_task = asyncio.create_task(first.execute(_request()))
+    await first_started.wait()
+    with pytest.raises(ValidatedTransferError, match="queue is saturated"):
+        await second.execute(_request())
+    release_first.set()
+    await first_task
+    await client.aclose()
+    reset_shared_validated_transfer_routers()
+
+
+@pytest.mark.asyncio
+async def test_shared_router_factory_keys_wait_timeout(tmp_path):
+    settings = _settings(tmp_path)
+    reset_shared_validated_transfer_routers()
+    first = get_shared_validated_transfer_router(settings=settings, redis=None, wait_timeout=3)
+    same = get_shared_validated_transfer_router(settings=settings, redis=None, wait_timeout=3)
+    different = get_shared_validated_transfer_router(settings=settings, redis=None, wait_timeout=9)
+    assert first is same
+    assert first is not different
+    assert first.executor is different.executor
+    assert first.wait_timeout == 3
+    assert different.wait_timeout == 9
+    reset_shared_validated_transfer_routers()
+
+
+@pytest.mark.asyncio
+async def test_router_claims_fallback_after_worker_transient_result(tmp_path):
+    class Pipeline:
+        def __init__(self, redis):
+            self.redis = redis
+
+        async def __aenter__(self):
+            self.pending = []
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def watch(self, *keys):
+            return None
+
+        async def get(self, key):
+            return self.redis.values.get(key)
+
+        async def unwatch(self):
+            return None
+
+        def multi(self):
+            return None
+
+        def set(self, key, value, ex=None):
+            self.pending.append(("set", key, value))
+
+        def delete(self, key):
+            self.pending.append(("delete", key))
+        async def execute(self):
+            for action in self.pending:
+                if action[0] == "set":
+                    self.redis.values[action[1]] = action[2]
+                else:
+                    self.redis.values.pop(action[1], None)
+
+    class Redis:
+        def __init__(self): self.values = {}
+        async def zcount(self, *args): return 1
+        async def set(self, key, value, **kwargs): self.values[key] = value
+        async def xadd(self, *args, **kwargs): return "1-0"
+        async def brpop(self, *args, **kwargs): return "key", '{"ok": false, "error_kind": "transient"}'
+        def pipeline(self, **kwargs): return Pipeline(self)
+        async def get(self, key): return self.values.get(key)
+        async def mget(self, *keys): return [self.values.get(key) for key in keys]
+
+    image = _png_bytes()
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=image) if request.method == "GET" else httpx.Response(200, headers={"etag": "e"})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    result = await ValidatedTransferRouter(
+        StrictValidatedTransferExecutor(_settings(tmp_path), client=client), redis=Redis()
+    ).execute(_request())
+    assert result["route"] == "local_worker_failure"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_validated_delegated_transfer_without_redis_uses_shared_strict_local_router(monkeypatch, tmp_path):
+    image = _png_bytes()
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, content=image)
+            if request.method == "GET"
+            else httpx.Response(200, headers={"etag": "strict-etag"})
+        )
+    )
+
+    def factory(*, settings, redis, wait_timeout, **kwargs):
+        return get_shared_validated_transfer_router(
+            settings=settings, redis=redis, client=client, wait_timeout=wait_timeout
+        )
+
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "source.example")
+    monkeypatch.setenv("LIBTV_VALIDATED_TRANSFER_TARGET_HOSTS", "target.example")
+    monkeypatch.setattr("litellm.llms.libtv.validated_transfer.get_shared_validated_transfer_router", factory)
+    reset_shared_validated_transfer_routers()
+
+    result = await ValidatedDelegatedTransfer(None).transfer(
+        "https://source.example/image.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+        len(image),
+        [{"n": 1, "url": "https://target.example/part-1"}],
+        source_sha256=hashlib.sha256(image).hexdigest(),
+        hard_cap=1024,
+        part_size=1024,
+    )
+
+    assert result == [{"n": 1, "etag": "strict-etag"}]
+    await client.aclose()
+    reset_shared_validated_transfer_routers()

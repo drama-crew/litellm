@@ -373,10 +373,9 @@ class ValidatedDelegatedTransfer:
         self._validate_parts(size, parts, part_size)
         # Import lazily: the strict module shares protocol helpers from this module.
         from .validated_transfer import (
-            StrictValidatedTransferExecutor,
             ValidatedTransferRequest,
-            ValidatedTransferRouter,
             ValidatedTransferSettings,
+            get_shared_validated_transfer_router,
         )
 
         settings = ValidatedTransferSettings.from_environment()
@@ -392,9 +391,10 @@ class ValidatedDelegatedTransfer:
                 "quota_bytes": size,
             }
         )
-        result = await ValidatedTransferRouter(
-            StrictValidatedTransferExecutor(settings), redis=self.redis, wait_timeout=self.wait_timeout
-        ).execute(request)
+        router = get_shared_validated_transfer_router(
+            settings=settings, redis=self.redis, wait_timeout=self.wait_timeout
+        )
+        result = await router.execute(request)
         if result.get("bytes") != size or str(result.get("sha256", "")).lower() != source_sha256.lower():
             raise LibTVError(status_code=503, message="validated source transfer size or digest mismatch")
         etags = result.get("etags")

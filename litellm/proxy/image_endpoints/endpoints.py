@@ -20,11 +20,11 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
 from litellm.llms.libtv.common import LibTVError
 from litellm.llms.libtv.transfer import get_transfer_redis
 from litellm.llms.libtv.validated_transfer import (
-    StrictValidatedTransferExecutor,
     ValidatedTransferError,
     ValidatedTransferRequest,
     ValidatedTransferRouter,
     ValidatedTransferSettings,
+    get_shared_validated_transfer_router,
 )
 from litellm.llms.libtv.image_upscale import (
     ImageUpscaleReceipt,
@@ -52,8 +52,8 @@ def get_validated_transfer_router() -> ValidatedTransferRouter:
     """Create the strictly configured router; no user input chooses a route."""
     settings = ValidatedTransferSettings.from_environment()
     redis_client = get_transfer_redis(os.getenv("LIBTV_VALIDATED_TRANSFER_REDIS_URL"))
-    return ValidatedTransferRouter(
-        StrictValidatedTransferExecutor(settings), redis=redis_client,
+    return get_shared_validated_transfer_router(
+        settings=settings, redis=redis_client,
         instance_id=os.getenv("LIBTV_VALIDATED_TRANSFER_INSTANCE_ID", "litellm"),
     )
 
