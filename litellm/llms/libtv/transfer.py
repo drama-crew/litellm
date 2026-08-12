@@ -37,7 +37,7 @@ WARN_INTERVAL_SECONDS = 300.0
 WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
 PLATFORM_SOURCE_HOSTS_ENV = "LIBTV_PLATFORM_SOURCE_HOSTS"
 PLATFORM_SOURCE_MAX_TTL_SECONDS = 3600
-VALIDATED_MEDIA_METADATA_VERSION = 1
+VALIDATED_MEDIA_METADATA_VERSION = "image-v1"
 # httpx's 5s default read/write timeout leaves no margin on the bandwidth-constrained
 # egress DirectTransfer runs on (a 5.4MB part at ~0.5MiB/s takes ~11s); the caller
 # already enforces the overall budget, so per-operation timeouts only need to catch
@@ -59,13 +59,13 @@ def _warn_unavailable(message: str, exc_info: bool = False) -> None:
         logger.warning(message, exc_info=exc_info)
 
 
-def get_transfer_redis() -> Optional[Any]:
+def get_transfer_redis(url: Optional[str] = None) -> Optional[Any]:
     """Lazy redis.asyncio client built from MEDIA_TRANSFER_REDIS_URL; None when the
     env var is unset. Cached per (event loop, url): a redis.asyncio client binds to
     the loop it was created under, so sharing one across loops raises RuntimeError
     and leaks connections. Entries for closed loops (and superseded urls on the
     current loop) are evicted, closing their clients best-effort."""
-    url = os.getenv("MEDIA_TRANSFER_REDIS_URL")
+    url = url or os.getenv("MEDIA_TRANSFER_REDIS_URL")
     if not url:
         return None
     try:
@@ -371,65 +371,36 @@ class ValidatedDelegatedTransfer:
         if not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0 or size > cap or cap > self.hard_cap:
             raise LibTVError(status_code=503, message="validated source transfer exceeds hard cap")
         self._validate_parts(size, parts, part_size)
-        if not await self._has_active_worker():
-            raise LibTVError(status_code=503, message="validated source transfer worker is unavailable")
+        # Import lazily: the strict module shares protocol helpers from this module.
+        from .validated_transfer import (
+            StrictValidatedTransferExecutor,
+            ValidatedTransferRequest,
+            ValidatedTransferRouter,
+            ValidatedTransferSettings,
+        )
 
-        task_id = str(uuid.uuid4())
-        now = time.time()
-        payload = {
-            "type": VALIDATED_TASK_TYPE,
-            "task_id": task_id,
-            "source": {"url": source_url, "bytes": size, "sha256": source_sha256.lower()},
-            "expected": {},
-            "target": {"kind": "presigned_parts", "parts": parts, "part_size": part_size},
-            "mode": "source_transfer",
-            "hard_cap": cap,
-            "deadline_ts": now + self.wait_timeout,
-            "created_ts": now,
-        }
-        await self.redis.set(status_key(task_id), "queued", ex=STATUS_TTL_SECONDS)
-        await self.redis.xadd(f"worker:tasks:{VALIDATED_TASK_TYPE}", {"payload": json.dumps(payload)})
-        raw_result = await self.redis.brpop(result_key(task_id), timeout=self.wait_timeout)
-        if raw_result is None:
-            raise LibTVError(status_code=503, message="validated source transfer timed out")
-        try:
-            _, body = raw_result
-            result = json.loads(body)
-        except (TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise LibTVError(status_code=503, message="validated source transfer returned malformed result") from exc
-        inner = result.get("result") if isinstance(result, dict) else None
-        if not isinstance(result, dict) or not result.get("ok") or not isinstance(inner, dict):
-            raise LibTVError(status_code=503, message="validated source transfer failed")
-        if inner.get("bytes") != size or str(inner.get("sha256", "")).lower() != source_sha256.lower():
+        settings = ValidatedTransferSettings.from_environment()
+        request = ValidatedTransferRequest.from_payload(
+            {
+                "type": VALIDATED_TASK_TYPE,
+                "task_id": str(uuid.uuid4()),
+                "source": {"url": source_url, "bytes": size, "sha256": source_sha256.lower()},
+                "expected": {},
+                "target": {"kind": "presigned_parts", "parts": parts, "part_size": part_size},
+                "mode": "source_transfer",
+                "hard_cap": cap,
+                "quota_bytes": size,
+            }
+        )
+        result = await ValidatedTransferRouter(
+            StrictValidatedTransferExecutor(settings), redis=self.redis, wait_timeout=self.wait_timeout
+        ).execute(request)
+        if result.get("bytes") != size or str(result.get("sha256", "")).lower() != source_sha256.lower():
             raise LibTVError(status_code=503, message="validated source transfer size or digest mismatch")
-        if (
-            not isinstance(inner.get("mime"), str)
-            or not inner["mime"].startswith("image/")
-            or not isinstance(inner.get("width"), int)
-            or isinstance(inner["width"], bool)
-            or inner["width"] <= 0
-            or not isinstance(inner.get("height"), int)
-            or isinstance(inner["height"], bool)
-            or inner["height"] <= 0
-            or inner.get("validation_version") != VALIDATED_MEDIA_METADATA_VERSION
-        ):
-            raise LibTVError(status_code=503, message="validated source transfer returned invalid media metadata")
-        etags = inner.get("etags")
+        etags = result.get("etags")
         if not isinstance(etags, list) or len(etags) != len(parts):
             raise LibTVError(status_code=503, message="validated source transfer returned incomplete parts")
-        normalized = []
-        for item in etags:
-            if (
-                not isinstance(item, dict)
-                or set(item) != {"n", "etag"}
-                or not isinstance(item["n"], int)
-                or not item["etag"]
-            ):
-                raise LibTVError(status_code=503, message="validated source transfer returned invalid parts")
-            normalized.append({"n": item["n"], "etag": item["etag"]})
-        if [item["n"] for item in normalized] != list(range(1, len(parts) + 1)):
-            raise LibTVError(status_code=503, message="validated source transfer returned incomplete parts")
-        return normalized
+        return [{"n": item["n"], "etag": item["etag"]} for item in etags]
 
 
 def build_transfer_strategy(

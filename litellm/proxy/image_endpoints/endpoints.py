@@ -18,6 +18,14 @@ from litellm.litellm_core_utils.prompt_templates.common_utils import (
     get_str_from_messages,
 )
 from litellm.llms.libtv.common import LibTVError
+from litellm.llms.libtv.transfer import get_transfer_redis
+from litellm.llms.libtv.validated_transfer import (
+    StrictValidatedTransferExecutor,
+    ValidatedTransferError,
+    ValidatedTransferRequest,
+    ValidatedTransferRouter,
+    ValidatedTransferSettings,
+)
 from litellm.llms.libtv.image_upscale import (
     ImageUpscaleReceipt,
     IdempotencyFingerprintMismatch,
@@ -38,6 +46,62 @@ from litellm.proxy.route_llm_request import route_request
 from litellm.types.llms.openai import ChatCompletionUserMessage
 
 router = APIRouter()
+
+
+def get_validated_transfer_router() -> ValidatedTransferRouter:
+    """Create the strictly configured router; no user input chooses a route."""
+    settings = ValidatedTransferSettings.from_environment()
+    redis_client = get_transfer_redis(os.getenv("LIBTV_VALIDATED_TRANSFER_REDIS_URL"))
+    return ValidatedTransferRouter(
+        StrictValidatedTransferExecutor(settings), redis=redis_client,
+        instance_id=os.getenv("LIBTV_VALIDATED_TRANSFER_INSTANCE_ID", "litellm"),
+    )
+
+
+def _is_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> bool:
+    return user_api_key_dict.user_role in (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.PROXY_ADMIN.value)
+
+
+@router.post(
+    "/v1/libtv/validated-media-transfer",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["images"],
+)
+async def libtv_validated_media_transfer(
+    request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
+):
+    if not _is_proxy_admin(user_api_key_dict):
+        return ORJSONResponse(status_code=403, content={"error": "proxy-admin authorization is required"})
+    try:
+        payload = orjson.loads(await request.body())
+        task = ValidatedTransferRequest.from_payload(payload)
+        result = await get_validated_transfer_router().execute(task)
+        return ORJSONResponse(status_code=200, content=result)
+    except (orjson.JSONDecodeError, ValidatedTransferError) as exc:
+        code = 422 if isinstance(exc, orjson.JSONDecodeError) or exc.validation else 503
+        return ORJSONResponse(status_code=code, content={"error": str(exc)})
+
+
+@router.get(
+    "/v1/libtv/validated-media-transfer/readiness",
+    dependencies=[Depends(user_api_key_auth)],
+    response_class=ORJSONResponse,
+    tags=["images"],
+)
+async def libtv_validated_media_transfer_readiness(
+    user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
+):
+    if not _is_proxy_admin(user_api_key_dict):
+        return ORJSONResponse(status_code=403, content={"error": "proxy-admin authorization is required"})
+    try:
+        ready = get_validated_transfer_router().executor.ready()
+    except ValidatedTransferError:
+        ready = False
+    return ORJSONResponse(
+        status_code=200 if ready else 503,
+        content={"ready": ready, "validation_version": "image-v1", "route": "local", "bounded": ready},
+    )
 
 
 class ImageUpscaleSubmitRequest(BaseModel):

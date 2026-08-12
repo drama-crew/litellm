@@ -378,6 +378,7 @@ async def test_paid_pre_create_timeout_returns_not_submitted_receipt():
 @pytest.mark.asyncio
 async def test_validated_transfer_uses_dedicated_stream_and_validates_result_shape(monkeypatch):
     monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "source.platform.example")
+    monkeypatch.setenv("LIBTV_VALIDATED_TRANSFER_TARGET_HOSTS", "bridge.example")
 
     class Redis:
         def __init__(self):
@@ -404,7 +405,7 @@ async def test_validated_transfer_uses_dedicated_stream_and_validates_result_sha
                             "mime": "image/png",
                             "width": 1,
                             "height": 1,
-                            "validation_version": 1,
+                            "validation_version": "image-v1",
                             "etags": [{"n": 1, "etag": "e1"}],
                         },
                     }
@@ -436,6 +437,7 @@ async def test_validated_transfer_uses_dedicated_stream_and_validates_result_sha
 @pytest.mark.asyncio
 async def test_validated_transfer_rejects_untrusted_source_host(monkeypatch):
     monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+    monkeypatch.setenv("LIBTV_VALIDATED_TRANSFER_TARGET_HOSTS", "bridge.example")
 
     class Redis:
         async def zcount(self, *args):
@@ -463,6 +465,7 @@ async def test_validated_transfer_rejects_untrusted_source_host(monkeypatch):
 @pytest.mark.asyncio
 async def test_validated_transfer_accepts_platform_signed_source_url(monkeypatch):
     monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+    monkeypatch.setenv("LIBTV_VALIDATED_TRANSFER_TARGET_HOSTS", "bridge.example")
 
     class Redis:
         def __init__(self):
@@ -489,7 +492,7 @@ async def test_validated_transfer_accepts_platform_signed_source_url(monkeypatch
                             "mime": "image/png",
                             "width": 1,
                             "height": 1,
-                            "validation_version": 1,
+                            "validation_version": "image-v1",
                             "etags": [{"n": 1, "etag": "e1"}],
                         },
                     }
@@ -510,6 +513,7 @@ async def test_validated_transfer_accepts_platform_signed_source_url(monkeypatch
 @pytest.mark.asyncio
 async def test_validated_transfer_accepts_oss2_presigned_source_url(monkeypatch):
     monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+    monkeypatch.setenv("LIBTV_VALIDATED_TRANSFER_TARGET_HOSTS", "bridge.example")
 
     class Redis:
         async def zcount(self, *args):
@@ -533,7 +537,7 @@ async def test_validated_transfer_accepts_oss2_presigned_source_url(monkeypatch)
                             "mime": "image/png",
                             "width": 1,
                             "height": 1,
-                            "validation_version": 1,
+                            "validation_version": "image-v1",
                             "etags": [{"n": 1, "etag": "e1"}],
                         },
                     }
@@ -579,9 +583,10 @@ async def test_validated_transfer_rejects_expired_or_unsigned_oss2_source_url(mo
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field,value", [("mime", None), ("width", 0), ("height", "1"), ("validation_version", 2)])
+@pytest.mark.parametrize("field,value", [("mime", None), ("width", 0), ("height", "1"), ("validation_version", "image-v2")])
 async def test_validated_transfer_rejects_unvalidated_worker_media_metadata(monkeypatch, field, value):
     monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "assets.platform.example")
+    monkeypatch.setenv("LIBTV_VALIDATED_TRANSFER_TARGET_HOSTS", "bridge.example")
 
     class Redis:
         async def zcount(self, *args):
@@ -600,7 +605,7 @@ async def test_validated_transfer_rejects_unvalidated_worker_media_metadata(monk
                 "mime": "image/png",
                 "width": 1,
                 "height": 1,
-                "validation_version": 1,
+                "validation_version": "image-v1",
                 "etags": [{"n": 1, "etag": "e1"}],
             }
             result[field] = value

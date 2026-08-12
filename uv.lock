@@ -9,7 +9,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-07-06T18:05:33.611729Z"
+exclude-newer = "2026-08-09T08:40:10.214135Z"
 exclude-newer-span = "P3D"
 
 [manifest]
@@ -3368,6 +3368,7 @@ proxy-runtime = [
     { name = "opentelemetry-exporter-otlp" },
     { name = "opentelemetry-instrumentation-fastapi" },
     { name = "opentelemetry-sdk" },
+    { name = "pillow" },
     { name = "prometheus-client" },
     { name = "pypdf" },
     { name = "sentry-sdk" },
@@ -3523,6 +3524,7 @@ requires-dist = [
     { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'proxy-runtime'", specifier = "==0.49b0" },
     { name = "opentelemetry-sdk", marker = "extra == 'proxy-runtime'", specifier = "==1.28.0" },
     { name = "orjson", marker = "extra == 'proxy'", specifier = ">=3.11.6,<4.0" },
+    { name = "pillow", marker = "extra == 'proxy-runtime'", specifier = ">=12.1.1,<13.0" },
     { name = "polars", marker = "extra == 'proxy'", specifier = ">=1.38.1,<2.0" },
     { name = "prisma", marker = "extra == 'extra-proxy'", specifier = ">=0.11.0,<1.0" },
     { name = "prometheus-client", marker = "extra == 'proxy-runtime'", specifier = ">=0.20.0,<1.0" },
