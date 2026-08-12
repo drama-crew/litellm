@@ -67,7 +67,9 @@ class ImageBillingEvent:
             user_id=_optional_str(value.get("user_id")),
             organization_id=_optional_str(value.get("organization_id", value.get("org_id"))),
             api_key=_optional_str(value.get("api_key", value.get("key_id"))),
-            scale=value.get("scale") if isinstance(value.get("scale"), int) and not isinstance(value.get("scale"), bool) else None,
+            scale=value.get("scale")
+            if isinstance(value.get("scale"), int) and not isinstance(value.get("scale"), bool)
+            else None,
             project_id=_optional_str(value.get("project_id")),
             artifact_id=_optional_str(value.get("artifact_id")),
             attribution_user_id=_optional_str(value.get("attribution_user_id")),

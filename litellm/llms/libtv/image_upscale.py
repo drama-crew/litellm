@@ -337,9 +337,7 @@ class ImageUpscaleSubmitter:
         return (
             project_id if isinstance(project_id, str) and project_id else None,
             artifact_id if isinstance(artifact_id, str) and artifact_id else None,
-            attribution_user_id
-            if isinstance(attribution_user_id, str) and attribution_user_id
-            else None,
+            attribution_user_id if isinstance(attribution_user_id, str) and attribution_user_id else None,
         )
 
     async def _submit_deployment(

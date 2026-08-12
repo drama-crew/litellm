@@ -744,6 +744,7 @@ async def test_client_pool_resolves_each_deployment_credential_for_failover(monk
         return {"task_id": "secondary-task"}
 
     monkeypatch.setattr(LibTVClient, "acreate", fake_acreate)
+
     async def fake_aensure_libtv_url(self, *_args, **_kwargs):
         return "https://bridge.example/delegated-source.png"
 

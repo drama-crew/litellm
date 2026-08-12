@@ -35,6 +35,7 @@ def _terminal_result(value: object) -> TerminalResult | None:
         raise ValueError("terminal result is invalid")
     return {"url": url, "provider_task_id": provider_task_id}
 
+
 _CLAIM_SCRIPT = """
 local function merge_pool_attempt(pool_json, candidate_json)
   local candidate = cjson.decode(candidate_json)
@@ -417,7 +418,9 @@ class LibTVReceiptStore:
             project_id=getattr(receipt, "project_id", None),
             artifact_id=getattr(receipt, "artifact_id", None),
             attribution_user_id=getattr(receipt, "attribution_user_id", None),
-            terminal_result=_terminal_result(terminal_result) if terminal_result is not None else getattr(receipt, "terminal_result", None),
+            terminal_result=_terminal_result(terminal_result)
+            if terminal_result is not None
+            else getattr(receipt, "terminal_result", None),
             resolution_tombstone=resolution_tombstone or getattr(receipt, "resolution_tombstone", None),
             task_state=task_state or getattr(receipt, "task_state", "active"),
         )
