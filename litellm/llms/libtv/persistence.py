@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import inspect
 import logging
 import os
 import time
@@ -310,4 +311,19 @@ def get_receipt_store(redis_url: str | None = None) -> LibTVReceiptStore | None:
 async def close_receipt_stores() -> None:
     stores = tuple(_receipt_stores.values())
     _receipt_stores.clear()
-    await asyncio.gather(*(store.redis.aclose() for store in stores), return_exceptions=True)
+    await asyncio.gather(*(_close_receipt_store(store) for store in stores), return_exceptions=True)
+
+
+async def _close_receipt_store(store: LibTVReceiptStore) -> None:
+    client = store.redis
+    close = getattr(client, "aclose", None)
+    if not callable(close):
+        close = getattr(client, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:  # noqa: BLE001  # shutdown must continue closing the remaining receipt stores
+        _warn("libtv persistence: receipt store close failed", exc_info=True)

@@ -15,6 +15,7 @@ from litellm.llms.libtv.persistence import (
     normalize_source_key,
     url_alive,
 )
+from litellm.llms.libtv.receipts import LibTVReceiptStore
 
 
 class FakeDb:
@@ -153,6 +154,37 @@ async def test_receipt_store_isolated_by_event_loop_and_closed_on_shutdown(monke
     assert current is not other
     await close_receipt_stores()
     assert all(client.closed for client in created)
+
+
+@pytest.mark.asyncio
+async def test_close_receipt_stores_closes_async_and_sync_clients_and_ignores_non_closable_clients():
+    persistence._receipt_stores.clear()
+    closed = []
+
+    class AsyncClient:
+        async def aclose(self):
+            closed.append("async")
+
+    class SyncClient:
+        def close(self):
+            closed.append("sync")
+
+    class FailingClient:
+        def close(self):
+            closed.append("failing")
+            raise RuntimeError("close failed")
+
+    loop = asyncio.get_running_loop()
+    persistence._receipt_stores[(loop, "redis://async")] = LibTVReceiptStore(AsyncClient())
+    persistence._receipt_stores[(loop, "redis://sync")] = LibTVReceiptStore(SyncClient())
+    persistence._receipt_stores[(loop, "redis://failing")] = LibTVReceiptStore(FailingClient())
+    persistence._receipt_stores[(loop, "redis://fake")] = LibTVReceiptStore(object())
+
+    await close_receipt_stores()
+    await close_receipt_stores()
+
+    assert closed == ["async", "sync", "failing"]
+    assert persistence._receipt_stores == {}
 
 
 @pytest.mark.asyncio
