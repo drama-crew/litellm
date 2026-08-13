@@ -157,6 +157,13 @@ def parse_task_id(payload: Dict[str, Any]) -> str:
     return str(task_id)
 
 
+def _forwarded_prompt_chars(params: dict[str, Any]) -> int:
+    prompt = params.get("prompt")
+    if not isinstance(prompt, str):
+        raise LibTVError(status_code=400, message="libtv generation/create requires a string prompt")
+    return len(prompt)
+
+
 def parse_verify_passed(payload: Dict[str, Any]) -> Dict[str, bool]:
     out: Dict[str, bool] = {}
     for item in (payload.get("data") or {}).get("list") or []:
@@ -509,12 +516,15 @@ class LibTVClient:
             build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params),
             "nodes/batch",
         )
-        created = self._post(
-            "/api/task/generation/create",
-            build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
-            "generation/create",
-        )
-        return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+        generation_body = build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id)
+        forwarded_prompt_chars = _forwarded_prompt_chars(generation_body["params"])
+        created = self._post("/api/task/generation/create", generation_body, "generation/create")
+        return {
+            "task_id": parse_task_id(created),
+            "project_uuid": project_uuid,
+            "node_key": node_key,
+            "forwarded_prompt_chars": forwarded_prompt_chars,
+        }
 
     def poll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
         progress = self._post("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
@@ -643,19 +653,17 @@ class LibTVClient:
         vendor: str,
         task_type: str,
         params: dict[str, Any],
-    ) -> tuple[dict[str, Any], str]:
+    ) -> tuple[dict[str, Any], str, int]:
         node_key = str(uuid.uuid4())
         await self._apost(
             "/api/canvas/nodes/batch",
             build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params),
             "nodes/batch",
         )
-        created = await self._apost(
-            "/api/task/generation/create",
-            build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id),
-            "generation/create",
-        )
-        return created, node_key
+        generation_body = build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id)
+        forwarded_prompt_chars = _forwarded_prompt_chars(generation_body["params"])
+        created = await self._apost("/api/task/generation/create", generation_body, "generation/create")
+        return created, node_key, forwarded_prompt_chars
 
     async def _project_cache_lookup(self, persistence: "LibTVPersistence", day: str) -> tuple[str, int | None] | None:
         try:
@@ -695,10 +703,15 @@ class LibTVClient:
         persistence = self._get_persistence()
         if persistence is None or os.getenv("LIBTV_PROJECT_REUSE_DISABLED") == "1":
             project_uuid, team_id = await self._acreate_fresh_project(project_name)
-            created, node_key = await self._acreate_nodes_and_generation(
+            created, node_key, forwarded_prompt_chars = await self._acreate_nodes_and_generation(
                 project_uuid, team_id, model_key, vendor, task_type, params
             )
-            return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+            return {
+                "task_id": parse_task_id(created),
+                "project_uuid": project_uuid,
+                "node_key": node_key,
+                "forwarded_prompt_chars": forwarded_prompt_chars,
+            }
 
         day = time.strftime("%Y-%m-%d")
         cached = await self._project_cache_lookup(persistence, day)
@@ -709,7 +722,7 @@ class LibTVClient:
             project_uuid, team_id = await self._acreate_fresh_project(project_name, persistence, day)
 
         try:
-            created, node_key = await self._acreate_nodes_and_generation(
+            created, node_key, forwarded_prompt_chars = await self._acreate_nodes_and_generation(
                 project_uuid, team_id, model_key, vendor, task_type, params
             )
         except LibTVError:
@@ -717,11 +730,16 @@ class LibTVClient:
                 raise
             await self._project_cache_invalidate(persistence, day)
             project_uuid, team_id = await self._acreate_fresh_project(project_name, persistence, day)
-            created, node_key = await self._acreate_nodes_and_generation(
+            created, node_key, forwarded_prompt_chars = await self._acreate_nodes_and_generation(
                 project_uuid, team_id, model_key, vendor, task_type, params
             )
 
-        return {"task_id": parse_task_id(created), "project_uuid": project_uuid, "node_key": node_key}
+        return {
+            "task_id": parse_task_id(created),
+            "project_uuid": project_uuid,
+            "node_key": node_key,
+            "forwarded_prompt_chars": forwarded_prompt_chars,
+        }
 
     async def apoll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
         progress = await self._apost("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")

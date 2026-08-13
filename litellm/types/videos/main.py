@@ -20,6 +20,7 @@ class VideoObject(BaseModel):
     seconds: Optional[str] = None
     size: Optional[str] = None
     model: Optional[str] = None
+    forwarded_prompt_chars: Optional[int] = None
     usage: Optional[Dict[str, Any]] = None
     _hidden_params: Dict[str, Any] = {}
 

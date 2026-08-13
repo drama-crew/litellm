@@ -566,6 +566,9 @@ class LibTVLLM(CustomLLM):
             deployment_id or op.get("libtv_status_model"),
         )
         vo = VideoObject(id=video_id, object="video", status="queued", model=model)
+        forwarded_prompt_chars = created.get("forwarded_prompt_chars")
+        if type(forwarded_prompt_chars) is int:
+            vo.forwarded_prompt_chars = forwarded_prompt_chars
         vo.usage = _video_usage(op)
         vo._hidden_params = {"project_uuid": created.get("project_uuid")}
         return vo

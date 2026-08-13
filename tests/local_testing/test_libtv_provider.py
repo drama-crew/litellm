@@ -47,6 +47,7 @@ from litellm.llms.libtv.handler import (
     _reference_payload,
 )
 from litellm.types.utils import ImageObject, ImageResponse
+from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider
 from litellm.llms.libtv.transform import build_generation_params, size_to_ratio
 
@@ -895,6 +896,8 @@ async def test_avideo_generation_records_task_usage_for_status_billing(monkeypat
     )
 
     assert vo.status == "queued"
+    assert vo.forwarded_prompt_chars == len("a fox")
+    assert "prompt" not in vo.model_dump()
     assert fake_persistence.store_usage_calls == [("libtv:task-1", 8.0, "720p")]
 
 
@@ -5077,7 +5080,9 @@ def test_create_does_not_poll_and_returns_task_id():
     )
     lt = LibTVClient(token="t", webid="w", sync_client=client, poll_interval=0)
     out = lt.create("star-video2-fast", "star-video2-fast", "video", {"prompt": "x"}, "proj")
-    assert out == {"task_id": "task-async-1", "project_uuid": "p9", "node_key": out["node_key"]}
+    assert out["task_id"] == "task-async-1"
+    assert out["project_uuid"] == "p9"
+    assert out["forwarded_prompt_chars"] == 1
     paths = [c[0] for c in client.calls]
     assert paths == [
         "/api/canvas/project/create",
@@ -5258,6 +5263,7 @@ async def test_acreate_cached_project_generation_create_failure_invalidates_and_
 
     assert out["project_uuid"] == "fresh-proj"
     assert out["task_id"] == "task-4"
+    assert out["forwarded_prompt_chars"] == 2
     creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
     assert len(creates) == 1
     nodes_bodies = [b for p, b in fake.calls if p == "/api/canvas/nodes/batch"]
@@ -5347,3 +5353,67 @@ async def test_acreate_no_persistence_always_creates_project():
     assert out["project_uuid"] == "new-proj"
     creates = [p for p, _ in fake.calls if p == "/api/canvas/project/create"]
     assert len(creates) == 1
+
+
+def test_create_records_final_forwarded_prompt_chars_for_mixed2video_body():
+    prompt = "前景🙂" * 1001
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p-forwarded"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-forwarded"}},
+        }
+    )
+    out = LibTVClient(token="t", webid="w", sync_client=client).create(
+        "model-x", "vendor-x", "video", {"prompt": prompt, "modeType": "mixed2video"}, "proj-name"
+    )
+
+    generation_body = next(body for path, body in client.calls if path == "/api/task/generation/create")
+    assert generation_body["params"]["prompt"] == prompt
+    assert out["forwarded_prompt_chars"] == len(prompt)
+
+
+@pytest.mark.asyncio
+async def test_acreate_records_final_forwarded_prompt_chars_for_frames2video_body():
+    prompt = "镜头🎬" * 1001
+    client = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p-forwarded"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": {"code": 0, "data": {"taskId": "task-forwarded"}},
+        }
+    )
+    out = await LibTVClient(token="t", webid="w", async_client=client).acreate(
+        "model-x", "vendor-x", "video", {"prompt": prompt, "modeType": "frames2video"}, "proj-name"
+    )
+
+    generation_body = next(body for path, body in client.calls if path == "/api/task/generation/create")
+    assert generation_body["params"]["prompt"] == prompt
+    assert out["forwarded_prompt_chars"] == len(prompt)
+
+
+@pytest.mark.parametrize("params", [{}, {"prompt": None}, {"prompt": 123}])
+def test_create_rejects_invalid_prompt_before_generation_create(params):
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p-forwarded"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        }
+    )
+    with pytest.raises(LibTVError):
+        LibTVClient(token="t", webid="w", sync_client=client).create(
+            "model-x", "vendor-x", "video", params, "proj-name"
+        )
+
+    assert "/api/task/generation/create" not in [path for path, _ in client.calls]
+
+
+def test_video_object_exposes_forwarded_prompt_chars_without_prompt_content():
+    video = LibTVLLM()._build_video_object("model-x", {"task_id": "task-forwarded", "forwarded_prompt_chars": 4001})
+    dumped = video.model_dump()
+    assert isinstance(video, VideoObject)
+    assert dumped["forwarded_prompt_chars"] == 4001
+    assert "prompt" not in dumped
+    assert "project_uuid" not in dumped
+    assert "task-forwarded" not in json.dumps(dumped)
+    assert "4001" in json.dumps(dumped)
