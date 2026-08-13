@@ -5408,6 +5408,24 @@ def test_create_rejects_invalid_prompt_before_generation_create(params):
     assert "/api/task/generation/create" not in [path for path, _ in client.calls]
 
 
+def test_create_rejects_string_subclass_prompt_before_generation_create():
+    class PromptSubclass(str):
+        pass
+
+    client = FakeSyncClient(
+        post_by_path={
+            "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p-forwarded"}}},
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        }
+    )
+    with pytest.raises(LibTVError):
+        LibTVClient(token="t", webid="w", sync_client=client).create(
+            "model-x", "vendor-x", "video", {"prompt": PromptSubclass("prompt")}, "proj-name"
+        )
+
+    assert "/api/task/generation/create" not in [path for path, _ in client.calls]
+
+
 def test_video_object_exposes_forwarded_prompt_chars_without_prompt_content():
     video = LibTVLLM()._build_video_object("model-x", {"task_id": "task-forwarded", "forwarded_prompt_chars": 4001})
     dumped = video.model_dump()

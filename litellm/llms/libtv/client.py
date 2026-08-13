@@ -159,7 +159,7 @@ def parse_task_id(payload: Dict[str, Any]) -> str:
 
 def _forwarded_prompt_chars(params: dict[str, Any]) -> int:
     prompt = params.get("prompt")
-    if not isinstance(prompt, str):
+    if type(prompt) is not str:
         raise LibTVError(status_code=400, message="libtv generation/create requires a string prompt")
     return len(prompt)
 
