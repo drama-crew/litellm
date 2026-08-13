@@ -172,6 +172,24 @@ def build_topaz_upscale_params(prompt: str, optional_params: Dict[str, Any]) -> 
     return params
 
 
+def build_topaz_image_upscale_params(
+    source_url: str | None = None,
+    source_urls: list[str] | None = None,
+    optional_params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    from .image_upscale import TopazImageUpscaleBuilder
+
+    params = optional_params or {}
+    style = params.get("style", "Standard V2")
+    scale = params.get("scale", 2)
+    return TopazImageUpscaleBuilder().build(
+        source_url=source_url,
+        source_urls=source_urls,
+        style=style,
+        scale=scale,
+    )
+
+
 def build_generation_params(
     prompt: str,
     optional_params: Dict[str, Any],

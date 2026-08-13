@@ -174,6 +174,9 @@ class FakeAsyncClient:
             raise item
         return FakeResponse(item)
 
+    async def post_once(self, url, json=None, headers=None, timeout=None):
+        return await self.post(url, json, headers, timeout)
+
     async def get(self, url, headers=None, params=None):
         self.calls.append((self._path(url), None))
         return FakeResponse(self.get_payload)
@@ -582,6 +585,36 @@ def test_reference_payload_url_passthrough():
 def test_reference_payload_bytes_and_tuple():
     assert _reference_payload(b"abc") == ("bytes", "reference.png", b"abc")
     assert _reference_payload(("my.png", b"data")) == ("bytes", "my.png", b"data")
+
+
+@pytest.mark.parametrize(
+    ("mime", "filename"),
+    [
+        ("image/png", "reference.png"),
+        ("image/jpeg", "reference.jpg"),
+        ("image/webp", "reference.webp"),
+        ("image/gif", "reference.gif"),
+        ("image/heic", "reference.heic"),
+        ("image/heif", "reference.heif"),
+        ("video/mp4", "reference.mp4"),
+        ("video/quicktime", "reference.mov"),
+        ("audio/mpeg", "reference.mp3"),
+        ("audio/wav", "reference.wav"),
+        ("audio/flac", "reference.flac"),
+        ("audio/mp4", "reference.m4a"),
+        ("audio/aac", "reference.aac"),
+        ("audio/ogg", "reference.ogg"),
+    ],
+)
+def test_reference_payload_data_url_decodes_bytes(mime, filename):
+    assert _reference_payload(f"data:{mime};base64,YWJj") == ("bytes", filename, b"abc")
+
+
+@pytest.mark.parametrize("value", ["data:image/png,abc", "data:image/png;base64,***", "data:;base64,YWJj"])
+def test_reference_payload_invalid_data_url_is_bad_request(value):
+    with pytest.raises(LibTVError) as exc_info:
+        _reference_payload(value)
+    assert exc_info.value.status_code == 400
 
 
 def test_reference_payload_none():
@@ -3727,6 +3760,159 @@ class _FullAsyncFake(_FullSyncFake):
         return _FullSyncFake.get(self, url, headers, None, params)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["parts", "worker", "etag", "complete"])
+async def test_aupload_via_transfer_aborts_after_init_without_masking_original_error(monkeypatch, failure_stage):
+    """An initialized multipart upload is aborted on every later failure path."""
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+
+    class Fake:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, json=None, headers=None, timeout=None):
+            self.calls.append((url, json))
+            if url.endswith("/init/4"):
+                parts = [] if failure_stage == "parts" else [{"partNumber": 1, "url": "https://put.example/1"}]
+                return FakeResponse({"code": 0, "data": {"uploadId": "up-1", "parts": parts}})
+            if url.endswith("/abort/4"):
+                raise RuntimeError("abort must not mask original error")
+            if url.endswith("/complete/4") and failure_stage == "complete":
+                return FakeResponse({"code": 500, "message": "complete failed"}, status_code=500)
+            return FakeResponse({"code": 0, "data": {"cdnUrl": "https://cdn.example/result.png"}})
+
+    fake = Fake()
+    lt = LibTVClient(token="t", webid="w", async_client=fake, redis_client=object())
+    lt._user_uuid = "user-1"
+
+    if failure_stage != "parts":
+
+        class Transfer:
+            async def transfer(self, *args, **kwargs):
+                if failure_stage == "worker":
+                    raise RuntimeError("worker failed")
+                if failure_stage == "etag":
+                    return [{"n": 2, "etag": "wrong-part"}]
+                return [{"n": 1, "etag": "ok"}]
+
+        monkeypatch.setattr("litellm.llms.libtv.client.ValidatedDelegatedTransfer", lambda *args, **kwargs: Transfer())
+
+    with pytest.raises(Exception, match="incomplete parts|worker failed|complete failed"):
+        await lt._aupload_via_transfer(
+            "https://source.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+            "input.png",
+            3,
+            require_delegated=True,
+            source_sha256="a" * 64,
+            source_hard_cap=64,
+        )
+
+    assert any(url.endswith("/abort/4") for url, _ in fake.calls)
+
+
+@pytest.mark.asyncio
+async def test_aupload_via_transfer_does_not_abort_successful_upload(monkeypatch):
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "delegated")
+
+    class Fake:
+        def __init__(self):
+            self.calls = []
+
+        async def post(self, url, json=None, headers=None, timeout=None):
+            self.calls.append((url, json))
+            if url.endswith("/init/4"):
+                return FakeResponse(
+                    {
+                        "code": 0,
+                        "data": {"uploadId": "up-1", "parts": [{"partNumber": 1, "url": "https://put.example/1"}]},
+                    }
+                )
+            return FakeResponse({"code": 0, "data": {"cdnUrl": "https://cdn.example/result.png"}})
+
+    class Transfer:
+        async def transfer(self, *args, **kwargs):
+            return [{"n": 1, "etag": "ok"}]
+
+    monkeypatch.setattr("litellm.llms.libtv.client.ValidatedDelegatedTransfer", lambda *args, **kwargs: Transfer())
+    fake = Fake()
+    lt = LibTVClient(token="t", webid="w", async_client=fake, redis_client=object())
+    lt._user_uuid = "user-1"
+
+    assert (
+        await lt._aupload_via_transfer(
+            "https://source.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+            "input.png",
+            3,
+            require_delegated=True,
+            source_sha256="a" * 64,
+            source_hard_cap=64,
+        )
+        == "https://cdn.example/result.png"
+    )
+    assert not any(url.endswith("/abort/4") for url, _ in fake.calls)
+
+
+class _FullSyncUploadFake(_FullSyncFake):
+    def __init__(self, api_routes, get_payload=None):
+        super().__init__(api_routes, get_payload=get_payload)
+        self.uploaded = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        if "getUserInfo" in url:
+            self.calls.append((url, json))
+            return FakeResponse({"code": 0, "data": {"uuid": "user-1"}})
+        if url.endswith("/init/4"):
+            self.calls.append((url, json))
+            return FakeResponse(
+                {"code": 0, "data": {"uploadId": "up", "parts": [{"partNumber": 1, "url": "https://oss/put/1"}]}}
+            )
+        if url.endswith("/complete/4"):
+            self.calls.append((url, json))
+            return FakeResponse({"code": 0, "data": {"cdnUrl": f"https://libtv-res/uploaded-{len(self.uploaded)}.bin"}})
+        return super().post(url, json, headers, timeout)
+
+
+def test_video_generation_uploads_data_url_references_with_mime_extensions():
+    routes = _submit_routes()
+    fake = _FullSyncUploadFake(routes, get_payload=_tool_spec_payload(auto_compliance=False))
+    uploaded_bytes = []
+
+    def put_bytes(_url, data):
+        uploaded_bytes.append(bytes(data))
+        fake.uploaded.append(bytes(data))
+        return 200
+
+    llm = LibTVLLM(poll_interval=0, http_put=put_bytes)
+    vo = llm.video_generation(
+        "star-video2",
+        "combine",
+        "tok",
+        None,
+        {
+            "webid": "w",
+            "reference_images": ["data:image/heic;base64,aGVpYw=="],
+            "reference_videos": ["data:video/quicktime;base64,bW92"],
+            "reference_audios": ["data:audio/flac;base64,ZmxhYw=="],
+            "modeType": "mixed2video",
+        },
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    assert uploaded_bytes == [b"heic", b"mov", b"flac"]
+    init_paths = [j["path"] for u, j in fake.calls if u.endswith("/init/4")]
+    assert [p.rsplit(".", 1)[-1] for p in init_paths] == ["heic", "mov", "flac"]
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["imageList"] == ["https://libtv-res/uploaded-1.bin"]
+    assert gen_params["videoList"] == ["https://libtv-res/uploaded-2.bin"]
+    assert gen_params["audioList"] == ["https://libtv-res/uploaded-3.bin"]
+    assert gen_params["mixedList"] == [
+        {"url": "https://libtv-res/uploaded-1.bin", "type": "image"},
+        {"url": "https://libtv-res/uploaded-2.bin", "type": "video"},
+        {"url": "https://libtv-res/uploaded-3.bin", "type": "audio"},
+    ]
+
+
 def _gen_params(calls):
     return next(j["params"] for u, j in calls if u.endswith("/api/task/generation/create"))
 
@@ -3769,7 +3955,7 @@ async def test_aensure_libtv_url_uploads_external_url():
 
 @pytest.mark.asyncio
 async def test_aensure_libtv_url_delegated_mode_heads_source_then_delegates(monkeypatch):
-    fakeredis = pytest.importorskip("fakeredis")
+    pytest.importorskip("fakeredis")
     from fakeredis import aioredis as fakeredis_aioredis
 
     from litellm.llms.libtv.transfer import WORKERS_ZSET, result_key
@@ -4031,6 +4217,77 @@ async def test_aensure_libtv_url_cache_hit_alive_returns_cached_url_without_uplo
     assert len(persistence.cached_upload_calls) == 1
     assert persistence.store_upload_calls == []
     assert persistence.delete_upload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_aensure_libtv_url_strict_topaz_transfer_bypasses_upload_cache():
+    persistence = FakePersistence(cached="https://libtv-res/cached.png")
+    lt = LibTVClient(token="t", webid="w", async_client=AsyncUploadFake(), persistence=persistence)
+    called = False
+
+    async def strict_upload(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise LibTVError(status_code=503, message="validated worker unavailable")
+
+    lt._aensure_uploaded = strict_upload
+    with pytest.raises(LibTVError, match="validated worker"):
+        await lt.aensure_libtv_url(
+            "url",
+            "https://source.example/input.png",
+            None,
+            "reference.png",
+            require_delegated=True,
+            source_bytes=3,
+            source_sha256="a" * 64,
+        )
+
+    assert called is True
+    assert persistence.cached_upload_calls == []
+
+
+@pytest.mark.asyncio
+async def test_topaz_strict_source_transfer_uses_local_router_without_legacy_mode_or_redis(monkeypatch):
+    """The paid path never falls back to legacy in-memory media transfer."""
+    monkeypatch.setenv("MEDIA_TRANSFER_MODE", "direct")
+    monkeypatch.setenv("LIBTV_PLATFORM_SOURCE_HOSTS", "source.example")
+    monkeypatch.setenv("LIBTV_VALIDATED_TRANSFER_TARGET_HOSTS", "put.example")
+    calls: list[str] = []
+
+    class Transfer:
+        async def transfer(self, *args, **kwargs):
+            calls.append("strict")
+            return [{"n": 1, "etag": "etag-1"}]
+
+    class Fake:
+        async def post(self, url, json=None, headers=None, timeout=None):
+            if url.endswith("/init/4"):
+                return FakeResponse({"code": 0, "data": {"uploadId": "up-1", "parts": [{"partNumber": 1, "url": "https://put.example/1"}]}})
+            if url.endswith("/complete/4"):
+                return FakeResponse({"code": 0, "data": {"cdnUrl": "https://cdn.example/result.png"}})
+            raise AssertionError(f"unexpected bridge request: {url}")
+
+    monkeypatch.setattr("litellm.llms.libtv.client.ValidatedDelegatedTransfer", lambda *args, **kwargs: Transfer())
+    lt = LibTVClient(token="t", webid="w", async_client=Fake(), redis_client=None)
+    lt._user_uuid = "user-1"
+
+    async def legacy_fetch(url):
+        raise AssertionError("strict Topaz path must not use legacy byte fetch")
+
+    lt._afetch_bytes = legacy_fetch
+    result = await lt._aensure_uploaded(
+        "url",
+        "https://source.example/input.png?X-Amz-Signature=abc&X-Amz-Expires=60",
+        None,
+        "input.png",
+        require_delegated=True,
+        source_bytes=3,
+        source_sha256="a" * 64,
+        source_hard_cap=64,
+    )
+
+    assert result == ("https://cdn.example/result.png", 3)
+    assert calls == ["strict"]
 
 
 @pytest.mark.asyncio
@@ -5269,6 +5526,35 @@ async def test_acreate_cached_project_generation_create_failure_invalidates_and_
     nodes_bodies = [b for p, b in fake.calls if p == "/api/canvas/nodes/batch"]
     assert len(nodes_bodies) == 2
     assert len(persistence.invalidate_project_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_asubmit_image_upscale_does_not_retry_after_paid_create_boundary():
+    persistence = FakeProjectPersistence(cached={"project_uuid": "stale-proj", "team_id": "3"})
+    fake = FakeAsyncClient(
+        post_by_path={
+            "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+            "/api/task/generation/create": [
+                LibTVError(status_code=500, message="ambiguous generation create"),
+                LibTVError(status_code=500, message="would duplicate paid create"),
+            ],
+        }
+    )
+    lt = LibTVClient(token="t", webid="w", async_client=fake, persistence=persistence, poll_interval=0)
+
+    receipt = await lt.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://libtv-res/source.png",
+        "Standard V2",
+        2,
+        "proj-name",
+        "request-1",
+        "dep-1",
+    )
+
+    assert receipt.submission_state == "unknown"
+    assert len([path for path, _ in fake.calls if path == "/api/task/generation/create"]) == 1
 
 
 @pytest.mark.asyncio

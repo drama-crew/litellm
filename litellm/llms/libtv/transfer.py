@@ -2,9 +2,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from typing import Any, Awaitable, Callable, List, Optional, Protocol, Tuple, TypedDict
+from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import redis.exceptions as redis_exceptions
@@ -14,8 +16,10 @@ from .common import BRIDGE_PART_SIZE, LibTVError
 # Generic worker-task protocol namespace (workers are general task executors;
 # media transfer is one task type). Keep all key names here for cross-repo reference.
 TASK_TYPE = "media_transfer"
+VALIDATED_TASK_TYPE = "validated_media_transfer"
 TASKS_STREAM = f"worker:tasks:{TASK_TYPE}"
 WORKERS_ZSET = f"worker:alive:{TASK_TYPE}"
+VALIDATED_WORKERS_ZSET = f"worker:alive:{VALIDATED_TASK_TYPE}"
 STATUS_KEY_PREFIX = "worker:task:status:"
 RESULT_KEY_PREFIX = "worker:task:result:"
 STATUS_TTL_SECONDS = 24 * 3600
@@ -31,6 +35,9 @@ WARN_INTERVAL_SECONDS = 300.0
 # A worker's heartbeat key/zset entry is refreshed every ~15s; anything older than
 # 2x that interval is treated as dead so a stalled worker doesn't win task claims.
 WORKER_HEARTBEAT_WINDOW_SECONDS = 30.0
+PLATFORM_SOURCE_HOSTS_ENV = "LIBTV_PLATFORM_SOURCE_HOSTS"
+PLATFORM_SOURCE_MAX_TTL_SECONDS = 3600
+VALIDATED_MEDIA_METADATA_VERSION = "image-v1"
 # httpx's 5s default read/write timeout leaves no margin on the bandwidth-constrained
 # egress DirectTransfer runs on (a 5.4MB part at ~0.5MiB/s takes ~11s); the caller
 # already enforces the overall budget, so per-operation timeouts only need to catch
@@ -52,13 +59,13 @@ def _warn_unavailable(message: str, exc_info: bool = False) -> None:
         logger.warning(message, exc_info=exc_info)
 
 
-def get_transfer_redis() -> Optional[Any]:
+def get_transfer_redis(url: Optional[str] = None) -> Optional[Any]:
     """Lazy redis.asyncio client built from MEDIA_TRANSFER_REDIS_URL; None when the
     env var is unset. Cached per (event loop, url): a redis.asyncio client binds to
     the loop it was created under, so sharing one across loops raises RuntimeError
     and leaks connections. Entries for closed loops (and superseded urls on the
     current loop) are evicted, closing their clients best-effort."""
-    url = os.getenv("MEDIA_TRANSFER_REDIS_URL")
+    url = url or os.getenv("MEDIA_TRANSFER_REDIS_URL")
     if not url:
         return None
     try:
@@ -275,6 +282,125 @@ class DelegatedTransfer:
             inner = result.get("result") or {}
             return [{"n": e["n"], "etag": e.get("etag", "")} for e in inner.get("etags", [])]
         return await self.fallback.transfer(source_url, size, parts)
+
+
+class ValidatedDelegatedTransfer:
+    """Fail-closed source transfer for paid Topaz image submissions."""
+
+    def __init__(self, redis: Any, *, wait_timeout: float = DEFAULT_WAIT_TIMEOUT, hard_cap: int = 64 * 1024 * 1024):
+        self.redis = redis
+        self.wait_timeout = wait_timeout
+        self.hard_cap = hard_cap
+
+    async def _has_active_worker(self) -> bool:
+        now = time.time()
+        return await self.redis.zcount(VALIDATED_WORKERS_ZSET, now - WORKER_HEARTBEAT_WINDOW_SECONDS, "+inf") > 0
+
+    @staticmethod
+    def _is_platform_signed_source_url(parsed: Any, query: dict[str, list[str]]) -> bool:
+        """Accept only the two presign formats emitted by the platform object store.
+
+        Signature verification remains the object store's responsibility; this boundary
+        only accepts an allowlisted host plus a complete, still-valid presign envelope.
+        """
+
+        def one(name: str) -> str | None:
+            values = query.get(name)
+            return values[0] if values and len(values) == 1 and values[0] else None
+
+        aws_signature = one("X-Amz-Signature")
+        aws_expires = one("X-Amz-Expires")
+        if aws_signature and aws_expires and aws_expires.isdigit():
+            return 0 < int(aws_expires) <= PLATFORM_SOURCE_MAX_TTL_SECONDS
+
+        oss_access_key = one("OSSAccessKeyId")
+        oss_signature = one("Signature")
+        oss_expires = one("Expires")
+        if not oss_access_key or not oss_signature or not oss_expires or not oss_expires.isdigit():
+            return False
+        expires_at = int(oss_expires)
+        now = int(time.time())
+        return now < expires_at <= now + PLATFORM_SOURCE_MAX_TTL_SECONDS
+
+    @staticmethod
+    def _validate_parts(size: int, parts: List[PartTarget], part_size: int) -> None:
+        expected = max(1, (size + part_size - 1) // part_size)
+        numbers = [part.get("n") for part in parts]
+        if numbers != list(range(1, expected + 1)) or any(
+            not isinstance(part.get("url"), str) or not part["url"].startswith(("http://", "https://"))
+            for part in parts
+        ):
+            raise LibTVError(status_code=503, message="validated source transfer returned incomplete parts")
+
+    async def transfer(
+        self,
+        source_url: str,
+        size: int,
+        parts: List[PartTarget],
+        *,
+        source_sha256: str,
+        hard_cap: int | None = None,
+        part_size: int = BRIDGE_PART_SIZE,
+    ) -> List[PartEtag]:
+        parsed = urlsplit(source_url)
+        allowed_hosts = {
+            host.strip().lower() for host in os.getenv(PLATFORM_SOURCE_HOSTS_ENV, "").split(",") if host.strip()
+        }
+        query = parse_qs(parsed.query)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.hostname.lower() not in allowed_hosts
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+            or not self._is_platform_signed_source_url(parsed, query)
+        ):
+            raise LibTVError(
+                status_code=503,
+                message=(
+                    "validated source transfer requires a platform-signed HTTPS source URL "
+                    f"from an allowlisted host ({PLATFORM_SOURCE_HOSTS_ENV})"
+                ),
+            )
+        if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+            raise LibTVError(status_code=503, message="validated source transfer requires a positive source size")
+        if not isinstance(source_sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", source_sha256):
+            raise LibTVError(status_code=503, message="validated source transfer requires a SHA-256 digest")
+        cap = self.hard_cap if hard_cap is None else hard_cap
+        if not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0 or size > cap or cap > self.hard_cap:
+            raise LibTVError(status_code=503, message="validated source transfer exceeds hard cap")
+        self._validate_parts(size, parts, part_size)
+        # Import lazily: the strict module shares protocol helpers from this module.
+        from .validated_transfer import (
+            ValidatedTransferRequest,
+            ValidatedTransferSettings,
+            get_shared_validated_transfer_router,
+        )
+
+        settings = ValidatedTransferSettings.from_environment()
+        request = ValidatedTransferRequest.from_payload(
+            {
+                "type": VALIDATED_TASK_TYPE,
+                "task_id": str(uuid.uuid4()),
+                "source": {"url": source_url, "bytes": size, "sha256": source_sha256.lower()},
+                "expected": {},
+                "target": {"kind": "presigned_parts", "parts": parts, "part_size": part_size},
+                "mode": "source_transfer",
+                "hard_cap": cap,
+                "quota_bytes": size,
+            }
+        )
+        router = get_shared_validated_transfer_router(
+            settings=settings, redis=self.redis, wait_timeout=self.wait_timeout
+        )
+        result = await router.execute(request)
+        if result.get("bytes") != size or str(result.get("sha256", "")).lower() != source_sha256.lower():
+            raise LibTVError(status_code=503, message="validated source transfer size or digest mismatch")
+        etags = result.get("etags")
+        if not isinstance(etags, list) or len(etags) != len(parts):
+            raise LibTVError(status_code=503, message="validated source transfer returned incomplete parts")
+        return [{"n": item["n"], "etag": item["etag"]} for item in etags]
 
 
 def build_transfer_strategy(

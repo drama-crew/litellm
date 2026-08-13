@@ -16205,6 +16205,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/libtv/image-upscale/submit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Libtv Image Upscale Submit */
+        post: operations["libtv_image_upscale_submit_v1_libtv_image_upscale_submit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/mcp/access_groups": {
         parameters: {
             query?: never;
@@ -24197,6 +24214,47 @@ export interface components {
             url: string;
         } & {
             [key: string]: unknown;
+        };
+        /** ImageUpscaleAcceptedResponse */
+        ImageUpscaleAcceptedResponse: {
+            /** Receipt */
+            receipt: {
+                [key: string]: unknown;
+            };
+        };
+        /** ImageUpscaleErrorBody */
+        ImageUpscaleErrorBody: {
+            /** Code */
+            code: string;
+            metadata: components["schemas"]["ImageUpscaleErrorMetadata"];
+        };
+        /** ImageUpscaleErrorMetadata */
+        ImageUpscaleErrorMetadata: {
+            submission_receipt: components["schemas"]["ImageUpscaleReceiptResponse"];
+        };
+        /** ImageUpscaleErrorResponse */
+        ImageUpscaleErrorResponse: {
+            error: components["schemas"]["ImageUpscaleErrorBody"];
+        };
+        /** ImageUpscaleReceiptResponse */
+        ImageUpscaleReceiptResponse: {
+            /** Deployment Id */
+            deployment_id?: string | null;
+            /** Message */
+            message?: string | null;
+            /** Provider Code */
+            provider_code?: string | null;
+            /** Provider Task Id */
+            provider_task_id?: string | null;
+            /** Request Id */
+            request_id: string;
+            /** Resume Token */
+            resume_token?: string | null;
+            /**
+             * Submission State
+             * @enum {string}
+             */
+            submission_state: "not_submitted" | "rejected" | "unknown" | "submitted";
         };
         /** IndexCreateLiteLLMParams */
         IndexCreateLiteLLMParams: {
@@ -53646,6 +53704,85 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    libtv_image_upscale_submit_v1_libtv_image_upscale_submit_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** Input Reference */
+                    input_reference?: string | null;
+                    /** Model */
+                    model?: string | null;
+                    /** Request Id */
+                    request_id?: string | null;
+                    /**
+                     * Scale
+                     * @default 2
+                     * @enum {integer}
+                     */
+                    scale?: 2 | 4 | 6;
+                    /** Source Bytes */
+                    source_bytes: number;
+                    /** Source Hard Cap */
+                    source_hard_cap?: number | null;
+                    /** Source Sha256 */
+                    source_sha256: string;
+                    /** Source Url */
+                    source_url?: string | null;
+                    /**
+                     * Style
+                     * @default Standard V2
+                     */
+                    style?: string;
+                } & {
+                    [key: string]: unknown;
+                };
+            };
+        };
+        responses: {
+            /** @description Provider task submitted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageUpscaleAcceptedResponse"];
+                };
+            };
+            /** @description Submission outcome is unknown */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
+                };
+            };
+            /** @description Provider explicitly rejected submission */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
+                };
+            };
+            /** @description Submission was not sent */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
                 };
             };
         };

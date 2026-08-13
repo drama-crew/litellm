@@ -668,6 +668,60 @@ class AsyncHTTPHandler:
         except Exception as e:
             raise e
 
+    @track_llm_api_timing()
+    async def post_once(
+        self,
+        url: str,
+        data: Optional[Union[dict, str, bytes]] = None,  # type: ignore
+        json: Optional[dict] = None,
+        params: Optional[dict] = None,
+        headers: Optional[dict] = None,
+        timeout: Optional[Union[float, httpx.Timeout]] = None,
+        stream: bool = False,
+        logging_obj: Optional[LiteLLMLoggingObject] = None,
+        files: Optional[RequestFiles] = None,
+        content: Any = None,
+    ):
+        """Send a POST exactly once.
+
+        This is reserved for non-idempotent provider operations whose response may
+        be lost after the server accepts the request. Unlike ``post``, connection
+        errors are surfaced without dialing a second client.
+        """
+        if timeout is None:
+            timeout = self.timeout
+
+        request_data, request_content = _prepare_request_data_and_content(data, content)
+        req = self.client.build_request(
+            "POST",
+            url,
+            data=request_data,
+            json=json,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+            files=files,
+            content=request_content,
+        )
+        try:
+            response = await self.client.send(req, stream=stream)
+            response.raise_for_status()
+            return response
+        except httpx.TimeoutException as e:
+            headers = {}
+            error_response = getattr(e, "response", None)
+            if error_response is not None:
+                for key, value in error_response.headers.items():
+                    headers["response_headers-{}".format(key)] = value
+            raise litellm.Timeout(
+                message=f"Connection timed out. Timeout passed={timeout}",
+                model="default-model-name",
+                llm_provider="litellm-httpx-handler",
+                headers=headers,
+            )
+        except httpx.HTTPStatusError as e:
+            await _raise_masked_async_error(e, stream)
+
     async def put(
         self,
         url: str,

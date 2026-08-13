@@ -17,15 +17,13 @@ Pins covered:
 
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 import os
-from typing import List, Optional, Union
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Optional, Union
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI
 from pydantic import BaseModel
 from typing_extensions import TypedDict
 
@@ -121,6 +119,34 @@ async def test_proxy_shutdown_event_disconnects_prisma_and_resets(monkeypatch):
         "master_key_reset": None,
         "prisma_reset": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_libtv_billing_reconciler_is_lifespan_global_and_stops_before_prisma(monkeypatch):
+    """The reconciler started by the lifespan must survive to its shutdown half."""
+    wrapped = getattr(proxy_startup_event, "__wrapped__", proxy_startup_event)
+    source = inspect.getsource(wrapped)
+    global_statement = source[source.index("global ") : source.index("import json")]
+    assert "_libtv_billing_reconciler" in global_statement
+
+    calls = []
+    reconciler = MagicMock()
+    reconciler.stop = AsyncMock(side_effect=lambda: calls.append("stop"))
+    prisma = MagicMock()
+    prisma.disconnect = AsyncMock(side_effect=lambda: calls.append("disconnect"))
+    monkeypatch.setattr(ps, "_libtv_billing_reconciler", reconciler, raising=False)
+    monkeypatch.setattr(ps, "prisma_client", prisma, raising=False)
+    monkeypatch.setattr(ps, "db_writer_client", None, raising=False)
+    monkeypatch.setattr(ps, "jwt_handler", MagicMock(close=AsyncMock()), raising=False)
+
+    import litellm
+
+    monkeypatch.setattr(litellm, "cache", None, raising=False)
+    monkeypatch.setattr(litellm, "success_callback", [], raising=False)
+    await proxy_shutdown_event()
+
+    assert calls == ["stop", "disconnect"]
+    assert ps._libtv_billing_reconciler is None
 
 
 @pytest.mark.asyncio
@@ -335,9 +361,7 @@ def test__redact_worker_config_for_logging_masks_nested_secret_fields():
                 "database_url": nested_db_url,
                 "database_extra_connection_params": {"password": nested_extra_pw},
                 "alert_to_webhook_url": {"budget_alerts": nested_webhook},
-                "pass_through_endpoints": [
-                    {"path": "/up", "headers": {"Authorization": nested_bearer}}
-                ],
+                "pass_through_endpoints": [{"path": "/up", "headers": {"Authorization": nested_bearer}}],
             }
         }
     }
@@ -389,16 +413,13 @@ def test_load_from_azure_key_vault_disabled_no_side_effect(monkeypatch):
     import litellm
 
     sentinel_secret_mgr = object()
-    monkeypatch.setattr(
-        litellm, "secret_manager_client", sentinel_secret_mgr, raising=False
-    )
+    monkeypatch.setattr(litellm, "secret_manager_client", sentinel_secret_mgr, raising=False)
 
     result = load_from_azure_key_vault(use_azure_key_vault=False)
 
     observed = {
         "return_value": result,
-        "secret_manager_unchanged": litellm.secret_manager_client
-        is sentinel_secret_mgr,
+        "secret_manager_unchanged": litellm.secret_manager_client is sentinel_secret_mgr,
         "called_with": False,
     }
     assert normalize(observed) == {
@@ -552,9 +573,7 @@ def test_get_litellm_model_info_uses_base_model_for_lookup(monkeypatch):
 
     observed = {
         "called_arg": (
-            fake_get.call_args.args[0]
-            if fake_get.call_args.args
-            else fake_get.call_args.kwargs.get("model")
+            fake_get.call_args.args[0] if fake_get.call_args.args else fake_get.call_args.kwargs.get("model")
         ),
         "returned_max_tokens": result.get("max_tokens"),
         "returned_cost": result.get("input_cost_per_token"),
@@ -601,9 +620,7 @@ def test_run_ollama_serve_invokes_subprocess_popen(monkeypatch):
 
 def test_run_ollama_serve_popen_failure_is_swallowed(monkeypatch):
     """Popen raising OSError must NOT propagate — function logs and returns."""
-    monkeypatch.setattr(
-        ps.subprocess, "Popen", MagicMock(side_effect=OSError("no ollama binary"))
-    )
+    monkeypatch.setattr(ps.subprocess, "Popen", MagicMock(side_effect=OSError("no ollama binary")))
 
     result = run_ollama_serve()
     assert result is None
@@ -623,8 +640,7 @@ async def test_proxy_startup_event_is_async_context_manager_with_expected_signat
     observed = {
         "param_count": len(sig.parameters),
         "has_app_param": "app" in sig.parameters,
-        "wrapped_is_async": inspect.iscoroutinefunction(wrapped)
-        or inspect.isasyncgenfunction(wrapped),
+        "wrapped_is_async": inspect.iscoroutinefunction(wrapped) or inspect.isasyncgenfunction(wrapped),
         "has_asynccontextmanager_wrapper": wrapped is not None,
     }
     assert normalize(observed) == {

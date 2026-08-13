@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 import litellm
 from litellm import Router
+from litellm.llms.libtv.image_upscale import IdempotencyFingerprintMismatch
 
 
 def _deployment(dep_id: str, token: str = "token") -> dict:
@@ -70,6 +71,10 @@ def test_failover_eligibility_blocks_deterministic_400():
         )
         is True
     )
+
+
+def test_image_upscale_fingerprint_mismatch_is_not_replayed():
+    assert Router._is_failover_eligible_exception(IdempotencyFingerprintMismatch("different request")) is False
 
 
 def test_video_aliases_resolve_only_via_explicit_video_method():

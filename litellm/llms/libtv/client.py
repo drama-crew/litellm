@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict
 from urllib.parse import urlsplit
 
 import httpx
@@ -28,8 +28,23 @@ from .common import (
     build_upload_path,
     is_compliance_failure,
 )
-from .persistence import LibTVPersistence, account_key, get_persistence, normalize_source_key, url_alive
-from .transfer import PartTarget, build_transfer_strategy
+from .image_upscale import (
+    ImageUpscaleSubmitter,
+    ImageUpscaleReceipt,
+    ProviderRejected,
+    ProviderTransportError,
+    TopazImageUpscaleBuilder,
+    make_resume_token,
+)
+from .persistence import (
+    LibTVPersistence,
+    account_key,
+    get_persistence,
+    get_receipt_store,
+    normalize_source_key,
+    url_alive,
+)
+from .transfer import PartTarget, ValidatedDelegatedTransfer, build_transfer_strategy, get_transfer_redis
 
 
 def _raise_generation_failed(failed_reason: Optional[str]) -> None:
@@ -42,6 +57,14 @@ def _raise_generation_failed(failed_reason: Optional[str]) -> None:
 THIRD_ASSET_POLL_ATTEMPTS = 30
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_pool_credential(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    if value.startswith("os.environ/"):
+        return os.getenv(value.removeprefix("os.environ/"), "")
+    return value
 
 
 def probe_size_via_ranged_get(url: str, timeout: float, client: Optional[httpx.Client] = None) -> int:
@@ -157,7 +180,11 @@ def parse_task_id(payload: Dict[str, Any]) -> str:
     return str(task_id)
 
 
-def _forwarded_prompt_chars(params: dict[str, Any]) -> int:
+def _forwarded_prompt_chars(params: dict[str, Any], task_type: str) -> int | None:
+    if "prompt" not in params:
+        if task_type == "video":
+            raise LibTVError(status_code=400, message="libtv generation/create requires a string prompt")
+        return None
     prompt = params.get("prompt")
     if type(prompt) is not str:
         raise LibTVError(status_code=400, message="libtv generation/create requires a string prompt")
@@ -292,6 +319,8 @@ def parse_progress(payload: Dict[str, Any], kind: str, task_id: Optional[str] = 
         elif isinstance(raw, dict):
             parsed = raw
         urls = _extract_urls(parsed, kind)
+        result = {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
+        return result
     return {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
 
 
@@ -446,6 +475,7 @@ class LibTVClient:
             model_key = meta.get("modelKey")
             if model_key:
                 index[str(model_key)] = {
+                    "model_key": str(model_key),
                     "vendor": meta.get("modelVendor") or "",
                     "task_type": tool.get("type") or "",
                     "properties": meta.get("properties") or {},
@@ -517,7 +547,7 @@ class LibTVClient:
             "nodes/batch",
         )
         generation_body = build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id)
-        forwarded_prompt_chars = _forwarded_prompt_chars(generation_body["params"])
+        forwarded_prompt_chars = _forwarded_prompt_chars(generation_body["params"], task_type)
         created = self._post("/api/task/generation/create", generation_body, "generation/create")
         return {
             "task_id": parse_task_id(created),
@@ -548,6 +578,40 @@ class LibTVClient:
             time.sleep(self.poll_interval)
         raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {created['task_id']})")
 
+    def submit_image_upscale(
+        self,
+        model_key: str,
+        vendor: str,
+        source_url: str,
+        style: str,
+        scale: int,
+        project_name: str,
+        request_id: str,
+        deployment_id: str | None = None,
+    ) -> ImageUpscaleReceipt:
+        params = TopazImageUpscaleBuilder().build(source_url=source_url, style=style, scale=scale)
+        created = self.create(model_key, vendor, "image", params, project_name)
+        task_id = created["task_id"]
+        return ImageUpscaleReceipt(
+            request_id=request_id,
+            submission_state="submitted",
+            deployment_id=deployment_id,
+            provider_task_id=task_id,
+            resume_token=make_resume_token(deployment_id or "unknown", task_id, self.token),
+        )
+
+    def poll_image_upscale(self, provider_task_id: str) -> dict[str, Any]:
+        return self.poll_once(provider_task_id, "image")
+
+    def finalize_image_upscale(self, provider_task_id: str) -> dict[str, Any]:
+        state = self.poll_image_upscale(provider_task_id)
+        if state.get("status") != 2:
+            raise LibTVError(status_code=409, message="libtv image upscale is not completed")
+        urls = state.get("urls") or []
+        if not urls:
+            raise LibTVError(status_code=502, message="libtv image upscale completed without a result url")
+        return {"urls": urls, "provider_task_id": provider_task_id}
+
     def _fetch_bytes(self, url: str) -> bytes:
         # Bare httpx, not the litellm http client wrappers: the async wrapper injects
         # default headers that break the presigned object-store signature (it returns
@@ -562,10 +626,19 @@ class LibTVClient:
             raise LibTVError(status_code=resp.status_code, message=f"libtv reference fetch HTTP {resp.status_code}")
         return resp.content
 
-    def ensure_libtv_url(self, kind: str, url: str, data: Optional[bytes], default_name: str = "reference.png") -> str:
+    def ensure_libtv_url(
+        self,
+        kind: str,
+        url: str,
+        data: bytes | None,
+        default_name: str = "reference.png",
+        require_delegated: bool = False,
+    ) -> str:
         """Return a url libtv can fetch: a libtv-res url passes through, any other reference
         (external presigned url or raw bytes) is uploaded into the libtv project store first.
         libtv generation cannot reach arbitrary external presigned object-store urls."""
+        if require_delegated:
+            raise LibTVError(status_code=503, message="delegated source transfer requires the async worker path")
         if kind == "url":
             if "libtv-res.liblib.art" in url:
                 return url
@@ -625,11 +698,17 @@ class LibTVClient:
         ]
 
     # ---------- async ----------
-    async def _apost(self, path: str, body: Dict[str, Any], step: str) -> Dict[str, Any]:
+    async def _apost(self, path: str, body: Dict[str, Any], step: str, *, submit_once: bool = False) -> Dict[str, Any]:
         assert self.async_client is not None, "async_client required for async calls"
-        resp = await self.async_client.post(
-            url=f"{self.api_base}{path}", json=body, headers=self.headers, timeout=self.request_timeout
-        )
+        if submit_once:
+            post = getattr(self.async_client, "post_once", None)
+            if not callable(post):
+                raise ProviderTransportError(
+                    "paid create requires an async client with post_once", crossed_create_boundary=False
+                )
+        else:
+            post = self.async_client.post
+        resp = await post(url=f"{self.api_base}{path}", json=body, headers=self.headers, timeout=self.request_timeout)
         return self._check(resp, step)
 
     async def _acreate_fresh_project(
@@ -645,6 +724,23 @@ class LibTVClient:
             await self._project_cache_store(persistence, day, project_uuid, team_id)
         return project_uuid, team_id
 
+    async def _acreate_fresh_project_for_submission(
+        self,
+        project_name: str,
+        persistence: Optional["LibTVPersistence"] = None,
+        day: str | None = None,
+        *,
+        paid_submission: bool,
+    ) -> tuple[str, int | None]:
+        try:
+            return await self._acreate_fresh_project(project_name, persistence, day)
+        except ProviderTransportError:
+            raise
+        except Exception as error:
+            if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=False) from error
+            raise
+
     async def _acreate_nodes_and_generation(
         self,
         project_uuid: str,
@@ -653,16 +749,46 @@ class LibTVClient:
         vendor: str,
         task_type: str,
         params: dict[str, Any],
-    ) -> tuple[dict[str, Any], str, int]:
+        paid_submission: bool = False,
+    ) -> tuple[dict[str, Any], str, int | None]:
         node_key = str(uuid.uuid4())
-        await self._apost(
-            "/api/canvas/nodes/batch",
-            build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params),
-            "nodes/batch",
-        )
+        try:
+            await self._apost(
+                "/api/canvas/nodes/batch",
+                build_node_batch_body(
+                    project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params
+                ),
+                "nodes/batch",
+            )
+        except ProviderTransportError:
+            raise
+        except Exception as error:
+            if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=False) from error
+            raise
         generation_body = build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id)
-        forwarded_prompt_chars = _forwarded_prompt_chars(generation_body["params"])
-        created = await self._apost("/api/task/generation/create", generation_body, "generation/create")
+        forwarded_prompt_chars = _forwarded_prompt_chars(generation_body["params"], task_type)
+        try:
+            created = await self._apost(
+                "/api/task/generation/create",
+                generation_body,
+                "generation/create",
+                submit_once=paid_submission,
+            )
+        except ProviderTransportError:
+            raise
+        except LibTVError as error:
+            if paid_submission and error.status_code == 429:
+                raise ProviderRejected(str(error), provider_code=str(error.status_code)) from error
+            if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
+            raise
+        except Exception as error:
+            if paid_submission:
+                if getattr(error, "status_code", None) == 429:
+                    raise ProviderRejected(str(error), provider_code="429") from error
+                raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
+            raise
         return created, node_key, forwarded_prompt_chars
 
     async def _project_cache_lookup(self, persistence: "LibTVPersistence", day: str) -> tuple[str, int | None] | None:
@@ -699,15 +825,31 @@ class LibTVClient:
         task_type: str,
         params: dict[str, Any],
         project_name: str,
+        allow_cached_project_retry: bool = True,
+        paid_submission: bool = False,
     ) -> dict[str, Any]:
         persistence = self._get_persistence()
         if persistence is None or os.getenv("LIBTV_PROJECT_REUSE_DISABLED") == "1":
-            project_uuid, team_id = await self._acreate_fresh_project(project_name)
-            created, node_key, forwarded_prompt_chars = await self._acreate_nodes_and_generation(
-                project_uuid, team_id, model_key, vendor, task_type, params
+            project_uuid, team_id = await self._acreate_fresh_project_for_submission(
+                project_name, paid_submission=paid_submission
             )
+            created, node_key, forwarded_prompt_chars = await self._acreate_nodes_and_generation(
+                project_uuid,
+                team_id,
+                model_key,
+                vendor,
+                task_type,
+                params,
+                paid_submission=paid_submission,
+            )
+            try:
+                task_id = parse_task_id(created)
+            except LibTVError as error:
+                if paid_submission:
+                    raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
+                raise
             return {
-                "task_id": parse_task_id(created),
+                "task_id": task_id,
                 "project_uuid": project_uuid,
                 "node_key": node_key,
                 "forwarded_prompt_chars": forwarded_prompt_chars,
@@ -719,23 +861,45 @@ class LibTVClient:
         if cached is not None:
             project_uuid, team_id = cached
         else:
-            project_uuid, team_id = await self._acreate_fresh_project(project_name, persistence, day)
+            project_uuid, team_id = await self._acreate_fresh_project_for_submission(
+                project_name, persistence, day, paid_submission=paid_submission
+            )
 
         try:
             created, node_key, forwarded_prompt_chars = await self._acreate_nodes_and_generation(
-                project_uuid, team_id, model_key, vendor, task_type, params
+                project_uuid,
+                team_id,
+                model_key,
+                vendor,
+                task_type,
+                params,
+                paid_submission=paid_submission,
             )
         except LibTVError:
-            if not from_cache:
+            if not from_cache or not allow_cached_project_retry:
                 raise
             await self._project_cache_invalidate(persistence, day)
-            project_uuid, team_id = await self._acreate_fresh_project(project_name, persistence, day)
+            project_uuid, team_id = await self._acreate_fresh_project_for_submission(
+                project_name, persistence, day, paid_submission=paid_submission
+            )
             created, node_key, forwarded_prompt_chars = await self._acreate_nodes_and_generation(
-                project_uuid, team_id, model_key, vendor, task_type, params
+                project_uuid,
+                team_id,
+                model_key,
+                vendor,
+                task_type,
+                params,
+                paid_submission=paid_submission,
             )
 
+        try:
+            task_id = parse_task_id(created)
+        except LibTVError as error:
+            if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
+            raise
         return {
-            "task_id": parse_task_id(created),
+            "task_id": task_id,
             "project_uuid": project_uuid,
             "node_key": node_key,
             "forwarded_prompt_chars": forwarded_prompt_chars,
@@ -762,6 +926,199 @@ class LibTVClient:
                 _raise_generation_failed(state["failed_reason"])
             await asyncio.sleep(self.poll_interval)
         raise LibTVError(status_code=504, message=f"libtv generation poll timeout (task {created['task_id']})")
+
+    async def asubmit_image_upscale(
+        self,
+        model_key: str,
+        vendor: str,
+        source_url: str,
+        style: str,
+        scale: int,
+        project_name: str,
+        request_id: str,
+        deployment_id: str | None = None,
+        *,
+        team_id: str | None = None,
+        source_sha256: str | None = None,
+        durable_receipts: bool = False,
+        response_cost: float | None = None,
+        deployment_pool: Sequence[Mapping[str, object]] | None = None,
+        receipt_api_key: str | None = None,
+        receipt_user_id: str | None = None,
+        receipt_organization_id: str | None = None,
+        source_bytes: int | None = None,
+        source_hard_cap: int | None = None,
+        receipt_project_id: str | None = None,
+        receipt_artifact_id: str | None = None,
+        receipt_attribution_user_id: str | None = None,
+    ) -> ImageUpscaleReceipt:
+        params = TopazImageUpscaleBuilder().build(source_url=source_url, style=style, scale=scale)
+        if durable_receipts:
+            receipt_store = get_receipt_store()
+            if receipt_store is None:
+                return ImageUpscaleReceipt(
+                    request_id=request_id,
+                    submission_state="not_submitted",
+                    deployment_id=deployment_id,
+                    message="receipt store unavailable",
+                )
+            try:
+                if not await receipt_store.readiness():
+                    return ImageUpscaleReceipt(
+                        request_id=request_id,
+                        submission_state="not_submitted",
+                        deployment_id=deployment_id,
+                        message="receipt store is not durable",
+                    )
+            except Exception as error:
+                return ImageUpscaleReceipt(
+                    request_id=request_id,
+                    submission_state="not_submitted",
+                    deployment_id=deployment_id,
+                    message=f"receipt store unavailable: {error}",
+                )
+
+            class _Provider:
+                def __init__(inner_self, target_client: "LibTVClient"):
+                    inner_self.target_client = target_client
+
+                async def create(inner_self, payload):
+                    try:
+                        delegated_source_url = await inner_self.target_client.aensure_libtv_url(
+                            "url",
+                            str(payload["source_url"]),
+                            None,
+                            "image.png",
+                            require_delegated=True,
+                            source_bytes=source_bytes,
+                            source_sha256=source_sha256,
+                            source_hard_cap=source_hard_cap,
+                        )
+                        provider_params = TopazImageUpscaleBuilder().build(
+                            source_url=delegated_source_url,
+                            style=str(payload.get("style", "Standard V2")),
+                            scale=int(payload.get("scale", 2)),
+                        )
+                        return await inner_self.target_client.acreate(
+                            model_key,
+                            vendor,
+                            "image",
+                            provider_params,
+                            project_name,
+                            allow_cached_project_retry=False,
+                            paid_submission=True,
+                        )
+                    except (ProviderRejected, ProviderTransportError):
+                        raise
+                    except LibTVError as error:
+                        raise ProviderTransportError(str(error), crossed_create_boundary=False) from error
+
+            pool = tuple(deployment_pool or ())
+            providers = []
+            for entry in pool:
+                entry_id = entry.get("id")
+                if not isinstance(entry_id, str) or not entry_id:
+                    continue
+                if entry_id == str(deployment_id):
+                    providers.append((entry_id, _Provider(self), self.token))
+                    continue
+                token = _resolve_pool_credential(entry.get("api_key"))
+                webid = _resolve_pool_credential(entry.get("webid"))
+                if not token or not webid:
+                    continue
+                providers.append(
+                    (
+                        entry_id,
+                        _Provider(
+                            LibTVClient(
+                                token=token,
+                                webid=webid,
+                                async_client=AsyncHTTPHandler(),
+                            )
+                        ),
+                        token,
+                    )
+                )
+            selected_providers = providers or ((deployment_id or "unknown", _Provider(self), self.token),)
+            return await ImageUpscaleSubmitter(
+                *selected_providers,
+                receipt_store=receipt_store,
+                team_id=team_id,
+                api_key=receipt_api_key,
+                user_id=receipt_user_id,
+                organization_id=receipt_organization_id,
+                model=model_key,
+            ).submit(
+                {
+                    "request_id": request_id,
+                    "model": model_key,
+                    "source_url": source_url,
+                    "source_sha256": source_sha256 or "",
+                    "style": style,
+                    "scale": scale,
+                    "response_cost": response_cost,
+                    "spend_logs_metadata": {
+                        key: value
+                        for key, value in {
+                            "project_id": receipt_project_id,
+                            "artifact_id": receipt_artifact_id,
+                            "user_id": receipt_attribution_user_id,
+                        }.items()
+                        if isinstance(value, str) and value
+                    },
+                }
+            )
+        try:
+            created = await self.acreate(
+                model_key,
+                vendor,
+                "image",
+                params,
+                project_name,
+                allow_cached_project_retry=False,
+                paid_submission=True,
+            )
+        except ProviderRejected as error:
+            return ImageUpscaleReceipt(
+                request_id=request_id,
+                submission_state="rejected",
+                provider_code=error.provider_code,
+                message=str(error),
+            )
+        except ProviderTransportError as error:
+            return ImageUpscaleReceipt(
+                request_id=request_id,
+                submission_state="unknown" if error.crossed_create_boundary else "not_submitted",
+                deployment_id=deployment_id,
+                message=str(error),
+            )
+        except LibTVError as error:
+            return ImageUpscaleReceipt(
+                request_id=request_id,
+                submission_state="not_submitted",
+                deployment_id=deployment_id,
+                message=str(error),
+            )
+        task_id = created["task_id"]
+        return ImageUpscaleReceipt(
+            request_id=request_id,
+            submission_state="submitted",
+            deployment_id=deployment_id,
+            provider_task_id=task_id,
+            resume_token=make_resume_token(deployment_id or "unknown", task_id, self.token),
+        )
+
+    async def apoll_image_upscale(self, provider_task_id: str) -> dict[str, Any]:
+        return await self.apoll_once(provider_task_id, "image")
+
+    async def afinalize_image_upscale(self, provider_task_id: str) -> dict[str, Any]:
+        state = await self.apoll_image_upscale(provider_task_id)
+        if state.get("status") != 2:
+            raise LibTVError(status_code=409, message="libtv image upscale is not completed")
+        urls = state.get("urls") or []
+        if not urls:
+            raise LibTVError(status_code=502, message="libtv image upscale completed without a result url")
+        return {"urls": urls, "provider_task_id": provider_task_id}
 
     async def _afetch_bytes(self, url: str) -> bytes:
         return await asyncio.to_thread(self._fetch_bytes, url)
@@ -793,17 +1150,38 @@ class LibTVClient:
         return httpx.put(url, content=data, timeout=self.request_timeout).status_code
 
     async def aensure_libtv_url(
-        self, kind: str, url: str, data: Optional[bytes], default_name: str = "reference.png"
+        self,
+        kind: str,
+        url: str,
+        data: bytes | None,
+        default_name: str = "reference.png",
+        require_delegated: bool = False,
+        source_bytes: int | None = None,
+        source_sha256: str | None = None,
+        source_hard_cap: int | None = None,
     ) -> str:
-        if kind == "url" and "libtv-res.liblib.art" in url:
+        if require_delegated and kind == "url" and "libtv-res.liblib.art" in url:
+            raise LibTVError(status_code=503, message="Topaz image source requires a delegated source transfer")
+        if kind == "url" and "libtv-res.liblib.art" in url and not require_delegated:
             return url
-        cache_target = self._resolve_cache_target(kind, url, data)
+        # Paid Topaz submissions must always pass through the validated worker;
+        # a cache hit would bypass byte/digest validation and source transfer.
+        cache_target = None if require_delegated else self._resolve_cache_target(kind, url, data)
         if cache_target is not None:
             persistence, source_key = cache_target
             cached_url = await self._cache_lookup(persistence, source_key)
             if cached_url is not None:
                 return cached_url
-        cdn_url, size_bytes = await self._aensure_uploaded(kind, url, data, default_name)
+        cdn_url, size_bytes = await self._aensure_uploaded(
+            kind,
+            url,
+            data,
+            default_name,
+            require_delegated,
+            source_bytes=source_bytes,
+            source_sha256=source_sha256,
+            source_hard_cap=source_hard_cap,
+        )
         if cache_target is not None:
             persistence, source_key = cache_target
             await self._cache_store(persistence, source_key, cdn_url, size_bytes)
@@ -851,27 +1229,61 @@ class LibTVClient:
         except Exception:
             logger.warning("libtv upload cache: store_upload failed", exc_info=True)
 
-    async def _aensure_uploaded(self, kind: str, url: str, data: bytes | None, default_name: str) -> tuple[str, int]:
+    async def _aensure_uploaded(
+        self,
+        kind: str,
+        url: str,
+        data: bytes | None,
+        default_name: str,
+        require_delegated: bool = False,
+        *,
+        source_bytes: int | None = None,
+        source_sha256: str | None = None,
+        source_hard_cap: int | None = None,
+    ) -> tuple[str, int]:
+        if require_delegated and (kind != "url" or not url):
+            raise LibTVError(status_code=503, message="Topaz image source requires a delegated source transfer")
         if kind == "url":
             filename = _filename_from_url(url, default_name)
-            if os.getenv("MEDIA_TRANSFER_MODE", "direct").lower() == "delegated":
-                try:
-                    size = await self._aprobe_size(url)
-                except (LibTVError, httpx.HTTPError, ValueError) as e:
-                    # Size probe failed (403 store, chunked source without a length,
-                    # network fault): the delegated path needs the size up front, the
-                    # legacy fetch+upload path does not.
-                    logger.warning("libtv media size probe failed, using direct upload: %s", e)
-                    fetched = await self._afetch_bytes(url)
-                    return await self.aupload_media(fetched, filename), len(fetched)
-                return await self._aupload_via_transfer(url, filename, size), size
+            transfer_mode = os.getenv("MEDIA_TRANSFER_MODE", "direct").lower()
+            if require_delegated or transfer_mode == "delegated":
+                if require_delegated:
+                    if source_bytes is None or not source_sha256:
+                        raise LibTVError(status_code=503, message="validated Topaz source requires bytes and SHA-256")
+                    size = source_bytes
+                else:
+                    try:
+                        size = await self._aprobe_size(url)
+                    except (LibTVError, httpx.HTTPError, ValueError) as e:
+                        # The legacy delegated path may still fall back to direct
+                        # upload; the strict Topaz path never does.
+                        logger.warning("libtv media size probe failed, using direct upload: %s", e)
+                        fetched = await self._afetch_bytes(url)
+                        return await self.aupload_media(fetched, filename), len(fetched)
+                return await self._aupload_via_transfer(
+                    url,
+                    filename,
+                    size,
+                    require_delegated,
+                    source_sha256=source_sha256,
+                    source_hard_cap=source_hard_cap,
+                ), size
             fetched = await self._afetch_bytes(url)
             return await self.aupload_media(fetched, filename), len(fetched)
         uploaded_bytes = data or b""
         cdn_url = await self.aupload_media(uploaded_bytes, url or default_name)
         return cdn_url, len(uploaded_bytes)
 
-    async def _aupload_via_transfer(self, source_url: str, filename: str, size: int) -> str:
+    async def _aupload_via_transfer(
+        self,
+        source_url: str,
+        filename: str,
+        size: int,
+        require_delegated: bool = False,
+        *,
+        source_sha256: str | None = None,
+        source_hard_cap: int | None = None,
+    ) -> str:
         """Delegated-mode counterpart to aupload_media: open a bridge multipart upload
         for the probed source size, hand the byte transfer off to a
         MediaTransferStrategy (a Redis-coordinated worker when one is available, or
@@ -896,26 +1308,59 @@ class LibTVClient:
             "upload/init",
         )
         data = init.get("data") or {}
-        parts: List[PartTarget] = [
-            {"n": part.get("partNumber"), "url": part["url"]} for part in data.get("parts") or []
-        ]
-        strategy = build_transfer_strategy(
-            size=size,
-            redis_client=self._redis_client,
-            fetch=self._afetch_bytes,
-            put=self._aput_bytes,
-        )
-        await strategy.transfer(source_url, size, parts)
-        complete = self._check(
-            await self.async_client.post(
-                url=self._bridge_url("complete"),
-                json={"path": path, "uploadId": data.get("uploadId")},
-                headers=build_bridge_headers(self.token),
-                timeout=self.request_timeout,
-            ),
-            "upload/complete",
-        )
-        return parse_upload_url(complete)
+        try:
+            parts: List[PartTarget] = [
+                {"n": part.get("partNumber"), "url": part["url"]} for part in data.get("parts") or []
+            ]
+            if require_delegated:
+                expected_parts = max(1, (size + BRIDGE_PART_SIZE - 1) // BRIDGE_PART_SIZE)
+                part_numbers = tuple(part["n"] for part in parts)
+                if part_numbers != tuple(range(1, expected_parts + 1)) or any(not part["url"] for part in parts):
+                    raise LibTVError(status_code=503, message="delegated source transfer returned incomplete parts")
+            redis_client = self._redis_client or get_transfer_redis()
+            if require_delegated:
+                strategy = ValidatedDelegatedTransfer(
+                    redis_client, hard_cap=int(os.getenv("TRANSFER_GLOBAL_HARD_CAP", str(64 * 1024 * 1024)))
+                )
+                etags = await strategy.transfer(
+                    source_url,
+                    size,
+                    parts,
+                    source_sha256=source_sha256 or "",
+                    hard_cap=source_hard_cap,
+                )
+            else:
+                strategy = build_transfer_strategy(
+                    size=size,
+                    redis_client=redis_client,
+                    fetch=self._afetch_bytes,
+                    put=self._aput_bytes,
+                    fallback=None,
+                )
+                etags = await strategy.transfer(source_url, size, parts)
+            if require_delegated and tuple(item.get("n") for item in etags) != tuple(part["n"] for part in parts):
+                raise LibTVError(status_code=503, message="delegated source transfer returned incomplete parts")
+            complete = self._check(
+                await self.async_client.post(
+                    url=self._bridge_url("complete"),
+                    json={"path": path, "uploadId": data.get("uploadId")},
+                    headers=build_bridge_headers(self.token),
+                    timeout=self.request_timeout,
+                ),
+                "upload/complete",
+            )
+            return parse_upload_url(complete)
+        except BaseException:
+            try:
+                await self.async_client.post(
+                    url=self._bridge_url("abort"),
+                    json={"path": path, "uploadId": data.get("uploadId")},
+                    headers=build_bridge_headers(self.token),
+                    timeout=self.request_timeout,
+                )
+            except Exception:
+                logger.warning("libtv upload abort failed", exc_info=True)
+            raise
 
     async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> CompliantAssetRef:
         asset_uuid = parse_third_asset_uuid(
