@@ -567,3 +567,60 @@ async def test_post_enqueue_writes_exact_status_key_value_ttl_and_envelope(clien
         'request': VALID['request'],
         'staging_upload': VALID['staging_upload'],
     }
+
+
+# ---------------------------------------------------------------------------
+# F12: _validate_shape only ever checked that `model` and `deadline_ts` were
+# *present* (via the closed top-level key set), never their type -- unlike
+# task_id/request/staging_upload, which all get an explicit isinstance check
+# right below the presence check. Same defect class as F1 ("非法输入无限重试"):
+# a deterministically-bad input must be rejected at the door, not sail
+# through validation and blow up downstream. Here "downstream" is
+# video_worker/ark_client.py's `max(0.0, deadline_ts - time.time())` --
+# `deadline_ts=None` (or a non-numeric string) raises TypeError, which is not
+# a TaskError, so it's caught by the worker's generic catch-all and reported
+# as error_kind='transient' -- the platform retries a deterministically-
+# broken envelope forever.
+#
+# The bool case is the sharp edge: isinstance(True, int) is True in Python,
+# so a naive `isinstance(deadline_ts, (int, float))` check would silently
+# accept `"deadline_ts": true` and then use it as an epoch timestamp of 1
+# (`True == 1`) -- not rejected, just silently "expired since 1970" -- so
+# bool must be excluded explicitly, same pattern as _valid_result's existing
+# bool-exclusion for duration_seconds/bytes above.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'field,bad_value',
+    [
+        ('deadline_ts', None),
+        ('deadline_ts', 'abc'),
+        ('deadline_ts', True),
+        ('model', None),
+        ('model', ''),
+        ('model', 123),
+    ],
+    ids=[
+        'deadline_ts-null',
+        'deadline_ts-non-numeric-string',
+        'deadline_ts-bool-true',
+        'model-null',
+        'model-empty-string',
+        'model-int',
+    ],
+)
+async def test_invalid_model_or_deadline_ts_is_422_invalid_params_and_not_enqueued(
+    client_admin, fake_redis, field, bad_value
+):
+    bad = {**VALID, field: bad_value}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_params'
+    # A rejection that still enqueues is not a fix (F1's exact failure mode:
+    # validation raises, but only *after* the envelope already hit the
+    # stream). _validate_shape runs before redis_factory() is ever called
+    # (see enqueue_video_generate's ordering comment), so a genuine rejection
+    # here must leave the fake Redis completely untouched -- not just
+    # xadd-free.
+    assert fake_redis.calls == []

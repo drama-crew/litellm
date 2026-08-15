@@ -230,6 +230,22 @@ def _validate_shape(payload: Any) -> None:
         raise VideoGenerateError("invalid_params", f"missing required field(s): {', '.join(sorted(missing))}")
     if not isinstance(payload.get("task_id"), str) or not payload["task_id"]:
         raise VideoGenerateError("invalid_params", "task_id must be a non-empty string")
+    if not isinstance(payload.get("model"), str) or not payload["model"]:
+        raise VideoGenerateError("invalid_params", "model must be a non-empty string")
+    # F12: deadline_ts gets no type check downstream either -- the worker
+    # consumes it as `deadline_ts - time.time()` (video_worker/ark_client.py),
+    # so None/a non-numeric string raises TypeError there instead of being
+    # rejected here, and that TypeError isn't a TaskError, so it's caught by
+    # the worker's generic catch-all and reported as error_kind='transient'
+    # -- a deterministically-bad envelope gets retried forever. bool must be
+    # excluded explicitly: isinstance(True, int) is True in Python, so
+    # "deadline_ts": true would otherwise sail through and then be used as
+    # epoch-timestamp 1 (True == 1) -- silently "expired since 1970" rather
+    # than rejected. Mirrors _valid_result's existing bool-exclusion for
+    # duration_seconds/bytes below.
+    deadline_ts = payload.get("deadline_ts")
+    if isinstance(deadline_ts, bool) or not isinstance(deadline_ts, (int, float)):
+        raise VideoGenerateError("invalid_params", "deadline_ts must be a number")
     request = payload.get("request")
     if not isinstance(request, dict):
         raise VideoGenerateError("invalid_params", "request must be an object")
