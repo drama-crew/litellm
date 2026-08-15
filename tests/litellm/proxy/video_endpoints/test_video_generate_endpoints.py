@@ -503,3 +503,67 @@ async def test_all_error_bodies_share_error_code_message_shape(client_admin, cli
         assert isinstance(body['error'], dict), body
         assert isinstance(body['error']['code'], str)
         assert isinstance(body['error']['message'], str)
+
+
+# ---------------------------------------------------------------------------
+# F9: FakeRedis itself must be a strict test double -- a key with the wrong
+# prefix must raise, not be silently accepted via a lenient rsplit.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_fake_redis_get_rejects_wrong_key_prefix(fake_redis):
+    """F9: _task_id_from_key 旧实现无条件 `key.rsplit(":", 1)[-1]`——不管调用方
+    传进来的 key 到底带的是 status 前缀还是 result 前缀，只要冒号分隔的最后一段
+    能凑出一个 task_id 形状的字符串就默默接受。这意味着如果生产代码不小心把
+    result_key(task_id) 传给了本该用 status_key(task_id) 的 GET 调用（或反过来），
+    这个测试替身会假装它是合法的、按 task_id 查表返回一个『看起来正常』的值，
+    掩盖一个真实的用键错误——测试全绿，但生产代码是错的。加固后
+    _task_id_from_key 必须显式校验前缀，前缀不对就 raise。"""
+    fake_redis.status['t1'] = 'queued'
+    with pytest.raises(AssertionError):
+        await fake_redis.get('worker:task:result:t1')  # wrong prefix for get()
+
+
+# ---------------------------------------------------------------------------
+# F4: precise regression assertions on exact key strings/values/TTL/envelope
+# shape for the enqueue write path -- imports the real key-derivation
+# helpers/constants from production code rather than hardcoding literals, so
+# a typo'd key/value/TTL in either the test or the implementation would
+# disagree and fail loudly instead of silently drifting apart.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_post_enqueue_writes_exact_status_key_value_ttl_and_envelope(client_admin, fake_redis):
+    """F4: 已有的写序测试（test_post_writes_status_nx_before_xadd）只断言
+    nx=True、ex 是 truthy 和 set/xadd 的调用顺序，从不锁定 SET 的 key/value
+    精确字符串，也完全不检查 XADD 写进 stream 的 envelope 具体内容——一次把
+    status value 或 stream key 打错、或漏塞 envelope 某个字段的回归会被那条
+    测试放过。这条用例直接 import 生产代码（video_generate.py）与
+    transfer.py 里的真实 key 派生函数/常量做断言，锁定精确值，而不是重新
+    手写一遍字面量（重复字面量本身就可能和实现一起打错、对齐着错）。"""
+    from litellm.llms.libtv.transfer import STATUS_TTL_SECONDS, status_key
+    from litellm.llms.libtv.video_generate import STATUS_QUEUED, TASK_TYPE_VIDEO_GENERATE, stream_key
+
+    r = await client_admin.post('/v1/libtv/video-generate', json=VALID)
+    assert r.status_code == 202
+    task_id = r.json()['task_id']
+
+    set_calls = [op for op in fake_redis.calls if op[0] == 'set']
+    assert len(set_calls) == 1
+    _, set_key, set_kwargs = set_calls[0]
+    assert set_key == status_key(task_id) == f'worker:task:status:{task_id}'
+    assert set_kwargs == {'value': STATUS_QUEUED, 'ex': STATUS_TTL_SECONDS, 'nx': True}
+
+    xadd_calls = [op for op in fake_redis.calls if op[0] == 'xadd']
+    assert len(xadd_calls) == 1
+    _, xadd_stream, xadd_fields = xadd_calls[0]
+    assert xadd_stream == stream_key(TASK_TYPE_VIDEO_GENERATE) == 'worker:tasks:video_generate'
+    envelope = json.loads(xadd_fields['payload'])
+    assert envelope == {
+        'type': TASK_TYPE_VIDEO_GENERATE,
+        'task_id': task_id,
+        'deadline_ts': VALID['deadline_ts'],
+        'model': VALID['model'],
+        'request': VALID['request'],
+        'staging_upload': VALID['staging_upload'],
+    }

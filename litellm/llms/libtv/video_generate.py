@@ -42,11 +42,6 @@ _STATUS_TO_PUBLIC = {
     STATUS_CANCELLED: "failed",
 }
 
-# Deadline/staging-upload defaults for the envelope built by enqueue_video_generate
-# (plan Step 3): 15 minute generation budget, presign TTL comfortably >= deadline.
-DEADLINE_SECONDS = 15 * 60
-STAGING_UPLOAD_TTL_SECONDS = 1200
-
 _REQUIRED_RESULT_FIELDS = ("staging_key", "bytes", "content_type", "duration_seconds")
 
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload"})
@@ -166,16 +161,19 @@ def _check_url(raw_url: Any, allowed_hosts: frozenset[str], settings: VideoGener
 
 
 def _iter_reference_urls(payload: dict) -> Iterator[str]:
-    """Yield reference-media URLs from the payload.
+    """Yield reference-media URLs from the spec-correct nested location,
+    ``payload["request"]["references"]`` (spec §1.1).
 
-    Reads references from the spec-correct nested location
-    (``payload["request"]["references"]``) AND, defensively, from a
-    top-level ``references`` key if present. The top-level fallback is not
-    part of the documented request shape (spec §1.1 nests references under
-    ``request``); it exists so a stray top-level references list is still
-    caught by the same fail-closed URL check instead of silently reaching
-    generic extra-field rejection first (see the implementing task's final
-    report for the deviation this resolves).
+    F11: this used to also read a top-level ``payload["references"]`` key as
+    a defensive fallback for a request shape the spec never documents. That
+    fallback was provably dead code: ``_validate_shape`` always runs first
+    (F1, see ``enqueue_video_generate``) and enforces a closed top-level key
+    set (``_ALLOWED_TOP_LEVEL_KEYS``, which does not include ``references``),
+    raising ``invalid_params`` for any payload with a stray top-level
+    ``references`` key before this function is ever reached. So
+    ``payload.get("references")`` could no longer evaluate to anything but
+    ``None`` by the time the fallback ran. Removed rather than kept as
+    unreachable defensive code.
 
     Fail-closed (F6): a present references list is not optional-per-item --
     every item must be a dict with a string ``url``, or this raises
@@ -186,19 +184,15 @@ def _iter_reference_urls(payload: dict) -> Iterator[str]:
     check it was supposed to feed.
     """
     request = payload.get("request")
-    sources = []
-    if isinstance(request, dict):
-        sources.append(request.get("references"))
-    sources.append(payload.get("references"))
-    for references in sources:
-        if references is None:
-            continue
-        if not isinstance(references, list):
-            raise VideoGenerateError("invalid_url", "references must be a list")
-        for item in references:
-            if not isinstance(item, dict) or not isinstance(item.get("url"), str):
-                raise VideoGenerateError("invalid_url", "each reference must be an object with a string url")
-            yield item["url"]
+    references = request.get("references") if isinstance(request, dict) else None
+    if references is None:
+        return
+    if not isinstance(references, list):
+        raise VideoGenerateError("invalid_url", "references must be a list")
+    for item in references:
+        if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+            raise VideoGenerateError("invalid_url", "each reference must be an object with a string url")
+        yield item["url"]
 
 
 def _validate_urls(payload: dict, settings: VideoGenerateSettings) -> None:

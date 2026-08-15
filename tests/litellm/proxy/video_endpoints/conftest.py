@@ -6,6 +6,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from litellm.llms.libtv.transfer import RESULT_KEY_PREFIX, STATUS_KEY_PREFIX
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.libtv_video_endpoints import endpoints as endpoints_module
 
@@ -36,8 +37,25 @@ class FakeRedis:
         self.deleted_keys: list[str] = []
 
     @staticmethod
-    def _task_id_from_key(key: str) -> str:
-        return key.rsplit(":", 1)[-1]
+    def _task_id_from_key(key: str, prefix: str) -> str:
+        """F9: require the exact status/result key prefix (from
+        transfer.py) and raise on mismatch instead of blindly
+        ``key.rsplit(":", 1)[-1]``.
+
+        The old implementation stripped whatever followed the last colon
+        regardless of which prefix (if any) actually preceded it, so this
+        fake would silently "succeed" even if production code passed the
+        wrong key -- e.g. a GET accidentally reading ``result_key(task_id)``
+        instead of ``status_key(task_id)`` still resolves to the same
+        ``task_id`` string and quietly returns a plausible-looking value
+        from ``self.status``/``self.result``, keyed only by that trailing
+        substring. That masks a real wrong-key production bug behind an
+        all-green test suite. A test double that's too permissive about the
+        exact key shape it accepts is worse than no double at all.
+        """
+        if not key.startswith(prefix):
+            raise AssertionError(f"expected key prefixed with {prefix!r}, got {key!r}")
+        return key[len(prefix):]
 
     async def set(
         self, key: str, value: Any, *, ex: Optional[int] = None, nx: Optional[bool] = None
@@ -70,11 +88,11 @@ class FakeRedis:
 
     async def get(self, key: str) -> Optional[str]:
         self.calls.append(("get", key, {}))
-        return self.status.get(self._task_id_from_key(key))
+        return self.status.get(self._task_id_from_key(key, STATUS_KEY_PREFIX))
 
     async def lindex(self, key: str, index: int) -> Optional[str]:
         self.calls.append(("lindex", key, {"index": index}))
-        return self.result.get(self._task_id_from_key(key))
+        return self.result.get(self._task_id_from_key(key, RESULT_KEY_PREFIX))
 
 
 @pytest.fixture(autouse=True)
