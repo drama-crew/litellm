@@ -287,3 +287,107 @@ async def test_get_without_redis_configured_is_503_not_500(client_admin, monkeyp
     r = await client_admin.get('/v1/libtv/video-generate/t1')
     assert r.status_code == 503
     assert r.json()['error']['code'] == 'misconfigured'
+
+
+# ---------------------------------------------------------------------------
+# F6: fail-closed URL validation -- a malformed reference/staging_upload must
+# be a deterministic 422, never silently skipped past URL/allowlist checking.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_reference_item_not_dict_is_422_invalid_url(client_admin):
+    """F6: 旧代码 `isinstance(item, dict) and isinstance(item.get("url"), str)`
+    条件为假时直接跳过该 item，既不 yield 它的 url 也不报错——一个非 dict 的
+    reference（比如整条写成字符串）会被无声无息地放行，白名单形同虚设。"""
+    bad = {**VALID, 'request': {**VALID['request'], 'references': ['not-a-dict']}}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_url'
+
+
+@pytest.mark.asyncio
+async def test_reference_missing_url_is_422_invalid_url(client_admin):
+    """F6: reference 是 dict 但没有 url 键——旧代码同样静默跳过，不报错。"""
+    bad = {**VALID, 'request': {**VALID['request'],
+                                'references': [{'role': 'first_frame', 'media_type': 'image'}]}}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_url'
+
+
+@pytest.mark.asyncio
+async def test_reference_url_non_string_is_422_invalid_url(client_admin):
+    """F6: url 键存在但不是字符串（比如数字）——旧代码的 isinstance(...,str) 门槛
+    只用来决定「要不要 yield 去给 _check_url 校验」，不是 dict/字符串就直接跳过，
+    _check_url 自己的类型检查根本没机会跑到，等于没校验。"""
+    bad = {**VALID, 'request': {**VALID['request'],
+                                'references': [{'role': 'first_frame', 'media_type': 'image', 'url': 123}]}}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_url'
+
+
+@pytest.mark.asyncio
+async def test_staging_upload_missing_url_is_422_invalid_url(client_admin):
+    """F6: staging_upload 是 dict 但没有 url 键——旧代码
+    `isinstance(staging_upload, dict) and "url" in staging_upload` 为假时
+    直接跳过整个 _check_url 调用，请求带着一个没有 url 的 staging_upload
+    静默放行，下游 worker 完成整段 GPU 计算后却没有回传地址。"""
+    bad = {**VALID, 'staging_upload': {'key': VALID['staging_upload']['key'],
+                                        'content_type': 'video/mp4',
+                                        'expires_at': VALID['staging_upload']['expires_at']}}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_url'
+
+
+@pytest.mark.asyncio
+async def test_staging_upload_url_non_string_is_422_invalid_url(client_admin):
+    """F6: staging_upload.url 存在但不是字符串——旧代码的 "url" in staging_upload
+    只检查键是否存在，不检查值类型，非字符串的 url 会被当成「有 url」直接传给
+    _check_url，但更隐蔽的是键缺失时连这条路径都不会走到（见上一条用例）。这条
+    用例锁定「键存在但类型错」也必须被拒绝，不能悄悄放过。"""
+    bad = {**VALID, 'staging_upload': {**VALID['staging_upload'], 'url': 123}}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_url'
+
+
+# ---------------------------------------------------------------------------
+# F7: closed key sets for request / references[i] / staging_upload -- an
+# unrecognized field nested inside any of these three objects must be
+# rejected the same way an unrecognized top-level field already is.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_request_extra_field_is_422_invalid_params(client_admin):
+    """F7: 顶层已有封闭键集校验（_ALLOWED_TOP_LEVEL_KEYS），但 request 对象内部
+    今天没有——多塞一个未知字段（比如 callback_url）会被原样转发进 envelope，
+    塞进 Redis Stream 交给 worker，而不是在入口就被拒绝。"""
+    bad = {**VALID, 'request': {**VALID['request'], 'callback_url': 'https://evil.com/cb'}}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_params'
+
+
+@pytest.mark.asyncio
+async def test_reference_extra_field_is_422_invalid_params(client_admin):
+    """F7: reference item（spec §1.1: role/media_type/url）今天也没有封闭键集
+    校验，可以夹带任意额外字段。"""
+    bad = {**VALID, 'request': {**VALID['request'], 'references': [
+        {'role': 'first_frame', 'media_type': 'image',
+         'url': VALID['request']['references'][0]['url'], 'checksum': 'deadbeef'},
+    ]}}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_params'
+
+
+@pytest.mark.asyncio
+async def test_staging_upload_extra_field_is_422_invalid_params(client_admin):
+    """F7: staging_upload（spec §1.1: url/key/content_type/expires_at）同样
+    今天没有封闭键集校验。"""
+    bad = {**VALID, 'staging_upload': {**VALID['staging_upload'], 'region': 'us-east-1'}}
+    r = await client_admin.post('/v1/libtv/video-generate', json=bad)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_params'

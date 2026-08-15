@@ -51,6 +51,20 @@ _REQUIRED_RESULT_FIELDS = ("staging_key", "bytes", "content_type", "duration_sec
 
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload"})
 
+# F7: closed key sets for the three nested objects spec §1.1 fully documents
+# (request={prompt,duration_seconds,resolution,ratio,seed,references};
+# reference item={role,media_type,url}; staging_upload={url,key,content_type,
+# expires_at}). Mirrors _ALLOWED_TOP_LEVEL_KEYS's existing extra-field
+# rejection convention, just one level deeper -- an unrecognized nested field
+# (e.g. a stray callback_url inside request) used to sail straight through
+# _validate_shape untouched and get forwarded verbatim into the Redis Stream
+# envelope for the worker to deal with.
+_ALLOWED_REQUEST_KEYS = frozenset(
+    {"prompt", "duration_seconds", "resolution", "ratio", "seed", "references"}
+)
+_ALLOWED_REFERENCE_KEYS = frozenset({"role", "media_type", "url"})
+_ALLOWED_STAGING_UPLOAD_KEYS = frozenset({"url", "key", "content_type", "expires_at"})
+
 
 class VideoGenerateError(Exception):
     """A classified video-generate failure.
@@ -162,6 +176,14 @@ def _iter_reference_urls(payload: dict) -> Iterator[str]:
     caught by the same fail-closed URL check instead of silently reaching
     generic extra-field rejection first (see the implementing task's final
     report for the deviation this resolves).
+
+    Fail-closed (F6): a present references list is not optional-per-item --
+    every item must be a dict with a string ``url``, or this raises
+    ``invalid_url``. The old behaviour silently skipped (neither yielded nor
+    rejected) any item that wasn't already a well-formed
+    ``{"url": "<str>", ...}`` dict, which let a malformed/missing reference
+    sail through to the worker instead of being caught by the allowlist
+    check it was supposed to feed.
     """
     request = payload.get("request")
     sources = []
@@ -169,19 +191,38 @@ def _iter_reference_urls(payload: dict) -> Iterator[str]:
         sources.append(request.get("references"))
     sources.append(payload.get("references"))
     for references in sources:
-        if not isinstance(references, list):
+        if references is None:
             continue
+        if not isinstance(references, list):
+            raise VideoGenerateError("invalid_url", "references must be a list")
         for item in references:
-            if isinstance(item, dict) and isinstance(item.get("url"), str):
-                yield item["url"]
+            if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+                raise VideoGenerateError("invalid_url", "each reference must be an object with a string url")
+            yield item["url"]
 
 
 def _validate_urls(payload: dict, settings: VideoGenerateSettings) -> None:
     for url in _iter_reference_urls(payload):
         _check_url(url, settings.source_hosts, settings, "reference")
     staging_upload = payload.get("staging_upload")
-    if isinstance(staging_upload, dict) and "url" in staging_upload:
-        _check_url(staging_upload.get("url"), settings.target_hosts, settings, "staging upload")
+    # Fail-closed (F6): the old `"url" in staging_upload` gate only checked
+    # key *presence*, and only bothered to check that much when
+    # staging_upload was already a dict -- a dict missing the url key (or a
+    # non-dict staging_upload, in case this is ever called before
+    # _validate_shape has run) skipped _check_url entirely, silently
+    # admitting a task with nowhere for the worker to upload its finished
+    # result.
+    if not isinstance(staging_upload, dict) or not isinstance(staging_upload.get("url"), str):
+        raise VideoGenerateError("invalid_url", "staging_upload must be an object with a string url")
+    _check_url(staging_upload["url"], settings.target_hosts, settings, "staging upload")
+
+
+def _reject_extra_keys(obj: dict, allowed: frozenset[str], label: str) -> None:
+    extra = set(obj) - allowed
+    if extra:
+        raise VideoGenerateError(
+            "invalid_params", f"unrecognized {label} field(s): {', '.join(sorted(extra))}"
+        )
 
 
 def _validate_shape(payload: Any) -> None:
@@ -195,10 +236,24 @@ def _validate_shape(payload: Any) -> None:
         raise VideoGenerateError("invalid_params", f"missing required field(s): {', '.join(sorted(missing))}")
     if not isinstance(payload.get("task_id"), str) or not payload["task_id"]:
         raise VideoGenerateError("invalid_params", "task_id must be a non-empty string")
-    if not isinstance(payload.get("request"), dict):
+    request = payload.get("request")
+    if not isinstance(request, dict):
         raise VideoGenerateError("invalid_params", "request must be an object")
-    if not isinstance(payload.get("staging_upload"), dict):
+    _reject_extra_keys(request, _ALLOWED_REQUEST_KEYS, "request")
+    # F7: references[i]'s closed key set only applies to items that are
+    # already dicts -- a malformed (non-dict, or dict-missing-url) item is
+    # F6's job (_iter_reference_urls, run afterwards by _validate_urls), so
+    # this deliberately doesn't raise here for those; it only guards against
+    # an otherwise-well-formed reference carrying an extra unrecognized key.
+    references = request.get("references")
+    if isinstance(references, list):
+        for item in references:
+            if isinstance(item, dict):
+                _reject_extra_keys(item, _ALLOWED_REFERENCE_KEYS, "reference")
+    staging_upload = payload.get("staging_upload")
+    if not isinstance(staging_upload, dict):
         raise VideoGenerateError("invalid_params", "staging_upload must be an object")
+    _reject_extra_keys(staging_upload, _ALLOWED_STAGING_UPLOAD_KEYS, "staging_upload")
 
 
 def _decode(value: Any) -> Any:
