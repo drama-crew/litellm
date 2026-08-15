@@ -391,3 +391,115 @@ async def test_staging_upload_extra_field_is_422_invalid_params(client_admin):
     r = await client_admin.post('/v1/libtv/video-generate', json=bad)
     assert r.status_code == 422
     assert r.json()['error']['code'] == 'invalid_params'
+
+
+# ---------------------------------------------------------------------------
+# F3: capacity admission must degrade to alive-only when no *alive* worker
+# has ever reported free_slots -- spec §3.5: "`free_slots` 缺省时不写容量
+# 键；requester 侧对没有容量信息的任务类型跳过第 2 项检查（退化为只判活）"。
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_capacity_hash_totally_empty_degrades_to_alive_only(client_admin, fake_redis):
+    """F3: 该任务类型从来没有任何 worker 上报过 free_slots（老 worker 二进制，
+    或心跳还没来得及带上容量字段）——容量哈希整个是空的。旧实现
+    `sum(capacity_by_worker.get(name, 0) for name in alive)` 对每个 alive
+    worker 取不到 hash 记录时用 0 兜底，于是永远算出 total_free=0，把『完全没有
+    容量信息』误判成『容量确实是 0』，无差别拒绝这个任务类型的所有请求——
+    即使实际上什么都不知道。spec §3.5 明确要求这种情况『退化为只判活』，
+    不是当成 0 空槽拒绝。"""
+    fake_redis.alive = ['vw-old-binary']
+    fake_redis.capacity = {}
+    r = await client_admin.post('/v1/libtv/video-generate', json=VALID)
+    assert r.status_code == 202
+
+
+@pytest.mark.asyncio
+async def test_capacity_only_known_alive_workers_count_towards_total(client_admin, fake_redis):
+    """F3 的更精确形状：不是『哈希整体是否为空』这么粗的判断，而是『alive 且在
+    容量哈希里有记录』的 worker 集合（known）是否为空。这条用例里容量哈希非空，
+    但唯一的记录属于一个已经不在 alive zset 里的陈旧 worker——当前唯一 alive
+    的 worker 完全没有容量记录，known 集合仍然应该是空，必须退化为只判活，
+    而不是因为『hgetall 返回了非空 dict』就走正常求和路径。"""
+    fake_redis.alive = ['vw-new-unreported']
+    fake_redis.capacity = {'vw-stale-not-alive': 5}
+    r = await client_admin.post('/v1/libtv/video-generate', json=VALID)
+    assert r.status_code == 202
+
+
+# ---------------------------------------------------------------------------
+# F8: _valid_result must type-check (not just presence-check) each of the 4
+# existing required result fields. Deliberately does NOT add any new
+# required field -- rejecting a result this late discards a full (GPU-
+# minutes) completed generation.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_result_with_string_bytes_is_malformed_result(client_admin, fake_redis):
+    """F8: 旧实现只检查 `"bytes" in result`（字段是否存在），不检查类型——
+    worker 上报 "bytes": "12345678"（字符串而非数字）会被当成合法结果直接
+    放行给平台侧，污染下游消费者对该字段类型的假设。"""
+    bad_result = {**RESULT, 'bytes': str(RESULT['bytes'])}
+    fake_redis.status['t1'] = 'done'
+    fake_redis.result['t1'] = json.dumps({'ok': True, 'result': bad_result})
+    body = (await client_admin.get('/v1/libtv/video-generate/t1')).json()
+    assert body['status'] == 'failed'
+    assert body['error']['code'] == 'malformed_result'
+
+
+@pytest.mark.asyncio
+async def test_get_result_with_bool_duration_seconds_is_malformed_result(client_admin, fake_redis):
+    """F8: Python 里 bool 是 int 的子类型——如果类型检查天真地写成
+    isinstance(x, (int, float))，duration_seconds=True 会被误判成合法数字。
+    必须显式排除 bool。"""
+    bad_result = {**RESULT, 'duration_seconds': True}
+    fake_redis.status['t1'] = 'done'
+    fake_redis.result['t1'] = json.dumps({'ok': True, 'result': bad_result})
+    body = (await client_admin.get('/v1/libtv/video-generate/t1')).json()
+    assert body['status'] == 'failed'
+    assert body['error']['code'] == 'malformed_result'
+
+
+# ---------------------------------------------------------------------------
+# F10: every error-path response body must share one {"error": {"code": str,
+# "message": str}} shape. 403 was the sole holdout (a bare string).
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_non_admin_post_403_body_matches_error_shape(client_user):
+    r = await client_user.post('/v1/libtv/video-generate', json=VALID)
+    assert r.status_code == 403
+    assert r.json() == {'error': {'code': 'forbidden', 'message': 'proxy-admin authorization is required'}}
+
+
+@pytest.mark.asyncio
+async def test_non_admin_get_403_body_matches_error_shape(client_user):
+    r = await client_user.get('/v1/libtv/video-generate/t1')
+    assert r.status_code == 403
+    assert r.json() == {'error': {'code': 'forbidden', 'message': 'proxy-admin authorization is required'}}
+
+
+@pytest.mark.asyncio
+async def test_all_error_bodies_share_error_code_message_shape(client_admin, client_user, monkeypatch):
+    """F10 回归锁定：不是只测 403 本身，而是把有代表性的几条错误路径
+    （403 / 422 invalid_params / 503 misconfigured）放在一起断言它们的响应体
+    都是同一个 {"error": {"code": str, "message": str}} 形状。403 曾经是唯一
+    的例外（裸字符串 {"error": "..."}），但此前从没有一条测试把『所有』错误
+    路径的形状放在一起锁定过——以后新增错误路径时很容易不知不觉引入第二种
+    形状而不被任何测试发现。故意不请求 fake_redis fixture：它会整体替换掉
+    _get_redis_client，导致最后一条『redis 未配置』的 503 用例测不到目标路径。
+    """
+    responses = [
+        await client_user.post('/v1/libtv/video-generate', json=VALID),  # 403
+        await client_user.get('/v1/libtv/video-generate/t1'),  # 403
+        await client_admin.post('/v1/libtv/video-generate', json=[]),  # 422 invalid_params
+    ]
+    monkeypatch.delenv('LIBTV_VIDEO_GENERATE_REDIS_URL', raising=False)
+    monkeypatch.delenv('MEDIA_TRANSFER_REDIS_URL', raising=False)
+    responses.append(await client_admin.get('/v1/libtv/video-generate/t1'))  # 503 misconfigured
+    for r in responses:
+        assert r.status_code >= 400
+        body = r.json()
+        assert isinstance(body['error'], dict), body
+        assert isinstance(body['error']['code'], str)
+        assert isinstance(body['error']['message'], str)

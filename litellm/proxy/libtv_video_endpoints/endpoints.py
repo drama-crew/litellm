@@ -78,7 +78,14 @@ def _get_redis_client():
 )
 async def libtv_video_generate(request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)):
     if not _is_proxy_admin(user_api_key_dict):
-        return ORJSONResponse(status_code=403, content={"error": "proxy-admin authorization is required"})
+        # F10: every other error path in this module already returns
+        # {"error": {"code": ..., "message": ...}}; this 403 was the sole
+        # holdout with a bare string, forcing callers to special-case one
+        # response shape out of the whole error surface.
+        return ORJSONResponse(
+            status_code=403,
+            content={"error": {"code": "forbidden", "message": "proxy-admin authorization is required"}},
+        )
     try:
         payload = orjson.loads(await request.body())
         settings = VideoGenerateSettings.from_environment()
@@ -113,7 +120,14 @@ async def libtv_video_generate_status(
     task_id: str, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
 ):
     if not _is_proxy_admin(user_api_key_dict):
-        return ORJSONResponse(status_code=403, content={"error": "proxy-admin authorization is required"})
+        # F10: every other error path in this module already returns
+        # {"error": {"code": ..., "message": ...}}; this 403 was the sole
+        # holdout with a bare string, forcing callers to special-case one
+        # response shape out of the whole error surface.
+        return ORJSONResponse(
+            status_code=403,
+            content={"error": {"code": "forbidden", "message": "proxy-admin authorization is required"}},
+        )
     try:
         body = await fetch_video_generate_status(task_id, redis=_get_redis_client())
         status_code = 200 if "status" in body else 404

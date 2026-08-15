@@ -267,6 +267,27 @@ async def _alive_workers(redis: Any, task_type: str) -> list[str]:
 
 
 async def _check_capacity(redis: Any, task_type: str, alive: list[str]) -> None:
+    """F3: degrade to alive-only admission when no *alive* worker has a
+    capacity record.
+
+    Spec §3.5 is explicit: ``free_slots`` is optional per heartbeat, a
+    worker that doesn't report it writes no capacity-hash entry at all, and
+    "requester 侧对没有容量信息的任务类型跳过第 2 项检查（退化为只判活）" --
+    missing-from-the-hash must never be treated as "reported zero slots".
+
+    The old implementation summed ``capacity_by_worker.get(name, 0) for
+    name in alive``: a ``.get(..., 0)`` default silently folds "no capacity
+    info for this worker" into the same bucket as "this worker explicitly
+    reported 0 free slots", so a task type where *no* worker has ever
+    reported capacity (old worker binary, or a heartbeat that hasn't landed
+    yet) always summed to 0 and rejected every request with
+    ``no_capacity_available`` -- even though nothing was actually known.
+
+    ``known`` is the set of currently-alive workers that *do* have a
+    capacity-hash entry. Only when ``known`` is non-empty do we have any
+    capacity information to admission-check against; a stale entry left
+    behind by a worker that is no longer alive must not count either way.
+    """
     raw_capacity = await redis.hgetall(capacity_key(task_type)) or {}
     capacity_by_worker: dict[str, int] = {}
     for raw_name, raw_slots in raw_capacity.items():
@@ -275,7 +296,10 @@ async def _check_capacity(redis: Any, task_type: str, alive: list[str]) -> None:
             capacity_by_worker[name] = int(_decode(raw_slots))
         except (TypeError, ValueError):
             continue
-    total_free = sum(capacity_by_worker.get(name, 0) for name in alive)
+    known = [name for name in alive if name in capacity_by_worker]
+    if not known:
+        return
+    total_free = sum(capacity_by_worker[name] for name in known)
     if total_free <= 0:
         raise VideoGenerateError("no_capacity_available", "no free capacity among live workers")
 
@@ -369,7 +393,35 @@ async def enqueue_video_generate(
 
 
 def _valid_result(result: Any) -> bool:
-    return isinstance(result, dict) and all(field in result for field in _REQUIRED_RESULT_FIELDS)
+    """Type-check (not just presence-check) each of the 4 existing required
+    result fields (F8).
+
+    The old implementation only checked *presence* (``field in result``): a
+    worker reporting ``"bytes": "12345678"`` (a string) or
+    ``"duration_seconds": True`` (a bool -- a subtype of ``int`` in Python,
+    so a naive ``isinstance(x, (int, float))`` would silently accept it)
+    passed straight through as a "succeeded" result, corrupting the
+    platform-facing payload's field types after the worker already spent
+    real GPU minutes producing it.
+
+    Deliberately does NOT widen ``_REQUIRED_RESULT_FIELDS`` with any new
+    field -- rejecting a result this late in the pipeline discards a fully
+    completed (expensive) generation, so adding new required fields is a
+    red line reserved for an actual spec change, not this type-check fix.
+    """
+    if not isinstance(result, dict):
+        return False
+    if not isinstance(result.get("staging_key"), str):
+        return False
+    if not isinstance(result.get("content_type"), str):
+        return False
+    bytes_value = result.get("bytes")
+    if isinstance(bytes_value, bool) or not isinstance(bytes_value, int):
+        return False
+    duration = result.get("duration_seconds")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+        return False
+    return True
 
 
 def _split_error(raw_error: Any) -> tuple[str, str]:
