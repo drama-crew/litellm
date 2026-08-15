@@ -2,6 +2,7 @@
 Unit tests for auth_utils functions related to rate limiting and customer ID extraction.
 """
 
+import asyncio
 import base64
 from typing import Optional
 from unittest.mock import MagicMock, patch
@@ -552,6 +553,174 @@ def _libtv_pool_router():
             },
         ],
     )
+
+
+def _legacy_seedance_router(
+    *,
+    legacy_hidden: bool = True,
+    owner: str = "seedance-2.0-mini",
+    public_hidden: Optional[bool] = False,
+    public_team_id: Optional[str] = None,
+):
+    from litellm import Router
+
+    model_list = [
+        {
+            "model_name": "_legacy/seedance-2.0-mini",
+            "litellm_params": {"model": "wavespeed/seedance-2.0-mini", "api_key": "legacy"},
+            "model_info": {
+                "id": "fb3-seedance-2-mini",
+                "mode": "video_generation",
+                "hidden": legacy_hidden,
+                "managed_resource_public_model_name": owner,
+            },
+        },
+    ]
+    if public_hidden is not None:
+        model_list.append(
+            {
+                "model_name": "seedance-2.0-mini",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "current"},
+                "model_info": {
+                    "id": "libtv-seedance-2-mini-account-1",
+                    "mode": "video_generation",
+                    "hidden": public_hidden,
+                    "team_id": public_team_id,
+                },
+            }
+        )
+    return Router(model_list=model_list)
+
+
+def test_managed_resource_owner_allows_public_video_owner_for_hidden_deployment():
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    video_id = encode_video_id_with_provider(
+        video_id="provider-video-id",
+        provider="xiaoyunque",
+        model_id="fb3-seedance-2-mini",
+    )
+    router = _legacy_seedance_router()
+
+    for route in (
+        "/v1/videos/{video_id}",
+        "/v1/videos/{video_id}/content",
+        "/v1/videos/{video_id}/remix",
+    ):
+        model = get_model_from_request(
+            request_data={"video_id": video_id},
+            route=route,
+            llm_router=router,
+        )
+
+        assert model == "seedance-2.0-mini"
+        assert (
+            asyncio.run(
+                can_key_call_model(
+                    model=model,
+                    llm_model_list=None,
+                    valid_token=UserAPIKeyAuth(models=["seedance-2.0-mini"]),
+                    llm_router=router,
+                )
+            )
+            is True
+        )
+
+
+def test_managed_resource_without_owner_keeps_legacy_public_model_auth_behavior():
+    from litellm import Router
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    router = Router(
+        model_list=[
+            {
+                "model_name": "_legacy/seedance-2.0-mini",
+                "litellm_params": {"model": "wavespeed/seedance-2.0-mini", "api_key": "legacy"},
+                "model_info": {"id": "fb3-seedance-2-mini", "mode": "video_generation", "hidden": True},
+            },
+        ],
+    )
+    video_id = encode_video_id_with_provider(
+        video_id="provider-video-id",
+        provider="xiaoyunque",
+        model_id="fb3-seedance-2-mini",
+    )
+
+    model = get_model_from_request(
+        request_data={"video_id": video_id},
+        route="/v1/videos/{video_id}",
+        llm_router=router,
+    )
+    assert model == "_legacy/seedance-2.0-mini"
+    with pytest.raises(Exception):
+        asyncio.run(
+            can_key_call_model(
+                model=model,
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(models=["seedance-2.0-mini"]),
+                llm_router=router,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "router_kwargs",
+    [
+        pytest.param({"legacy_hidden": False}, id="source-is-public"),
+        pytest.param({"owner": "missing-public-owner"}, id="owner-does-not-exist"),
+        pytest.param({"public_hidden": True}, id="owner-only-has-hidden-deployment"),
+        pytest.param({"public_team_id": "private-team"}, id="owner-only-has-team-deployment"),
+    ],
+)
+def test_untrusted_managed_resource_owner_does_not_borrow_public_model_access(router_kwargs):
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    router = _legacy_seedance_router(**router_kwargs)
+    video_id = encode_video_id_with_provider(
+        video_id="provider-video-id",
+        provider="xiaoyunque",
+        model_id="fb3-seedance-2-mini",
+    )
+    model = get_model_from_request(
+        request_data={"video_id": video_id},
+        route="/v1/videos/{video_id}",
+        llm_router=router,
+    )
+
+    assert model == "_legacy/seedance-2.0-mini"
+    with pytest.raises(Exception):
+        asyncio.run(
+            can_key_call_model(
+                model=model,
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(models=["seedance-2.0-mini"]),
+                llm_router=router,
+            )
+        )
+
+
+def test_managed_resource_owner_does_not_authorize_direct_create_of_hidden_model():
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    router = _legacy_seedance_router()
+    with pytest.raises(Exception):
+        asyncio.run(
+            can_key_call_model(
+                model="_legacy/seedance-2.0-mini",
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(models=["seedance-2.0-mini"]),
+                llm_router=router,
+            )
+        )
+
+
+def test_managed_resource_owner_does_not_change_exact_deployment_resolution():
+    router = _legacy_seedance_router()
+
+    assert router.resolve_model_name_from_model_id("fb3-seedance-2-mini") == "fb3-seedance-2-mini"
 
 
 def test_get_model_from_request_resolves_video_id_deployment_id_to_public_model_name():

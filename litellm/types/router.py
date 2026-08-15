@@ -145,6 +145,11 @@ class ModelInfo(BaseModel):
     # admin-toggled pause flag; mirrors LiteLLM_ProxyModelTable.blocked
     blocked: Optional[bool] = None
 
+    # Public model owner used only when authenticating managed resources whose
+    # IDs encode this deployment. It deliberately does not affect Router
+    # selection or direct model requests.
+    managed_resource_public_model_name: Optional[str] = None
+
     def __init__(self, id: Optional[Union[str, int]] = None, **params):
         if id is None:
             id = str(uuid.uuid4())  # Generate a UUID if id is None or not provided

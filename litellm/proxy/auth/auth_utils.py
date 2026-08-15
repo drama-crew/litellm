@@ -1400,10 +1400,54 @@ def _extract_models_from_managed_resource_id(
     return _dedupe_model_candidates(candidates)
 
 
+def _get_model_info_value(deployment: Any, key: str) -> Any:
+    if isinstance(deployment, Mapping):
+        model_info = deployment.get("model_info")
+    else:
+        model_info = getattr(deployment, "model_info", None)
+    if isinstance(model_info, Mapping):
+        return model_info.get(key)
+    return getattr(model_info, key, None)
+
+
+def _get_managed_resource_public_model_owner(model_id: str, llm_router: Router) -> Optional[str]:
+    """Return a trusted public owner for a hidden managed-resource deployment."""
+    try:
+        if not llm_router.has_model_id(model_id):
+            return None
+        deployment = llm_router.get_deployment(model_id=model_id)
+        if _get_model_info_value(deployment, "hidden") is not True:
+            return None
+
+        public_owner = _get_model_info_value(deployment, "managed_resource_public_model_name")
+        if not isinstance(public_owner, str) or not public_owner.strip():
+            return None
+        public_owner = public_owner.strip()
+
+        owner_deployments = llm_router.get_model_list(model_name=public_owner) or []
+        if any(
+            _get_model_info_value(candidate, "hidden") is not True
+            and _get_model_info_value(candidate, "team_id") is None
+            for candidate in owner_deployments
+        ):
+            return public_owner
+    except Exception as e:
+        verbose_proxy_logger.debug("Unable to validate managed-resource public model owner: %s", str(e))
+    return None
+
+
 def _resolve_model_id_with_router(model_id: Optional[str], llm_router: Optional[Router]) -> Optional[str]:
     if model_id is None or llm_router is None:
         return model_id
     try:
+        # This owner lookup is exclusive to decoded managed-resource IDs. It
+        # requires a hidden source deployment and a real, non-hidden public
+        # owner group; invalid metadata falls back to the existing model-name
+        # authorization path.
+        public_owner = _get_managed_resource_public_model_owner(model_id=model_id, llm_router=llm_router)
+        if public_owner is not None:
+            return public_owner
+
         resolved_model = llm_router.resolve_model_name_from_model_id(model_id) or model_id
         # `resolve_model_name_from_model_id` returns the input unchanged when it
         # matches a deployment ID (its Strategy 1) - that's the correct value for
