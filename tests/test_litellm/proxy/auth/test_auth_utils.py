@@ -608,6 +608,8 @@ def test_managed_resource_owner_allows_public_video_owner_for_hidden_deployment(
     for route in (
         "/v1/videos/{video_id}",
         "/v1/videos/{video_id}/content",
+        f"/v1/videos/{video_id}",
+        f"/v1/videos/{video_id}/content",
     ):
         model = get_model_from_request(
             request_data={"video_id": video_id},
@@ -632,8 +634,11 @@ def test_managed_resource_owner_allows_public_video_owner_for_hidden_deployment(
     "route,request_data",
     [
         ("/v1/videos/{video_id}/remix", {"video_id": "PLACEHOLDER"}),
+        ("/v1/videos/encoded-video/remix", {"video_id": "PLACEHOLDER"}),
         ("/v1/videos/edits", {"video": {"id": "PLACEHOLDER"}}),
         ("/v1/videos/extensions", {"video": {"id": "PLACEHOLDER"}}),
+        ("/v1/videos/encoded-video/edits", {"video": {"id": "PLACEHOLDER"}}),
+        ("/v1/videos/encoded-video/extensions", {"video": {"id": "PLACEHOLDER"}}),
         ("/v1/videos", {"model": "_legacy/seedance-2.0-mini"}),
     ],
 )
@@ -646,6 +651,7 @@ def test_managed_resource_owner_is_retrieve_only_for_video_mutations(route, requ
         provider="xiaoyunque",
         model_id="fb3-seedance-2-mini",
     )
+    route = route.replace("encoded-video", video_id)
     request_data = {
         key: (video_id if value == "PLACEHOLDER" else {"id": video_id} if key == "video" else value)
         for key, value in request_data.items()
@@ -657,25 +663,32 @@ def test_managed_resource_owner_is_retrieve_only_for_video_mutations(route, requ
 
 
 @pytest.mark.parametrize(
-    "token_kwargs",
+    "model_name,token_kwargs",
     [
-        {"models": ["seedance-2.0-mini"]},
-        {"models": ["*"]},
-        {"models": []},
-        {"models": ["all-proxy-models"]},
-        {"models": ["all-team-models"]},
-        {"models": [], "user_role": "proxy_admin"},
-        {"config": {"model_list": []}},
+        pytest.param("_legacy/seedance-2.0-mini", {"models": ["seedance-2.0-mini"]}),
+        pytest.param("_legacy/seedance-2.0-mini", {"models": ["*"]}),
+        pytest.param("_legacy/seedance-2.0-mini", {"models": []}),
+        pytest.param("_legacy/seedance-2.0-mini", {"models": ["all-proxy-models"]}),
+        pytest.param("_legacy/seedance-2.0-mini", {"models": ["all-team-models"]}),
+        pytest.param("_legacy/seedance-2.0-mini", {"models": [], "user_role": "proxy_admin"}),
+        pytest.param("_legacy/seedance-2.0-mini", {"config": {"model_list": []}}),
+        pytest.param("fb3-seedance-2-mini", {"models": ["fb3-seedance-2-mini"]}),
+        pytest.param("fb3-seedance-2-mini", {"models": ["*"]}),
+        pytest.param("fb3-seedance-2-mini", {"models": []}),
+        pytest.param("fb3-seedance-2-mini", {"models": ["all-proxy-models"]}),
+        pytest.param("fb3-seedance-2-mini", {"models": ["all-team-models"]}),
+        pytest.param("fb3-seedance-2-mini", {"models": [], "user_role": "proxy_admin"}),
+        pytest.param("fb3-seedance-2-mini", {"config": {"model_list": []}}),
     ],
 )
-def test_retrieve_only_managed_resource_cannot_be_bypassed_by_key_shape(token_kwargs):
+def test_retrieve_only_managed_resource_cannot_be_bypassed_by_key_shape(model_name, token_kwargs):
     from litellm.proxy.auth.auth_checks import can_key_call_model
 
     router = _legacy_seedance_router()
     with pytest.raises(Exception, match="Retrieve-only managed resources"):
         asyncio.run(
             can_key_call_model(
-                model="_legacy/seedance-2.0-mini",
+                model=model_name,
                 llm_model_list=None,
                 valid_token=UserAPIKeyAuth(**token_kwargs),
                 llm_router=router,

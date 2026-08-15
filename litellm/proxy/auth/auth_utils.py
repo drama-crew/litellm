@@ -1303,7 +1303,33 @@ _VIDEO_RETRIEVAL_ROUTES = frozenset(
 
 
 def _is_video_retrieval_route(route: str) -> bool:
-    return route.rstrip("/") in _VIDEO_RETRIEVAL_ROUTES
+    normalized_route = route.rstrip("/")
+    if normalized_route in _VIDEO_RETRIEVAL_ROUTES:
+        return True
+
+    # FastAPI's request-route helper may expose the concrete path instead of
+    # the route template. Only a single video-id segment, optionally followed
+    # by ``content``, is a retrieval route. Fixed mutation resources such as
+    # ``edits`` and ``extensions`` therefore cannot be mistaken for an ID.
+    for prefix in ("/v1/videos/", "/videos/"):
+        if not normalized_route.startswith(prefix):
+            continue
+        segments = normalized_route[len(prefix) :].split("/")
+        if len(segments) == 1 and segments[0] not in {
+            "characters",
+            "edits",
+            "extensions",
+            "remix",
+        }:
+            return bool(segments[0])
+        if len(segments) == 2 and segments[1] == "content" and segments[0] not in {
+            "characters",
+            "edits",
+            "extensions",
+            "remix",
+        }:
+            return bool(segments[0])
+    return False
 
 
 def _append_model_candidates(candidates: List[str], value: Any) -> None:
@@ -1469,6 +1495,12 @@ def _is_retrieve_only_managed_resource_model(
         return False
     try:
         deployments = llm_router.get_model_list(model_name=model) or []
+        # A video request can carry the exact deployment ID decoded from its
+        # managed resource. Router selection accepts that ID directly, while
+        # get_model_list(model_name=...) intentionally only matches groups.
+        if not deployments and llm_router.has_model_id(model):
+            deployment = llm_router.get_deployment(model_id=model)
+            deployments = [deployment] if deployment is not None else []
         return any(
             _get_model_info_value(deployment, "hidden") is True
             and isinstance(
