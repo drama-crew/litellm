@@ -1494,24 +1494,27 @@ def _is_retrieve_only_managed_resource_model(
     if not isinstance(model, str) or llm_router is None:
         return False
     try:
-        deployments = llm_router.get_model_list(model_name=model) or []
-        # A video request can carry the exact deployment ID decoded from its
-        # managed resource. Router selection accepts that ID directly, while
-        # get_model_list(model_name=...) intentionally only matches groups.
-        if not deployments and llm_router.has_model_id(model):
+        def _is_retrieve_only_deployment(deployment: Any) -> bool:
+            return (
+                _get_model_info_value(deployment, "hidden") is True
+                and isinstance(
+                    _get_model_info_value(deployment, "managed_resource_public_model_name"),
+                    str,
+                )
+                and bool(
+                    _get_model_info_value(deployment, "managed_resource_public_model_name").strip()
+                )
+            )
+
+        # Router resolution gives an exact deployment ID precedence over a
+        # model group with the same string. Mirror that precedence here so a
+        # public group cannot mask a hidden legacy deployment ID.
+        if llm_router.has_model_id(model):
             deployment = llm_router.get_deployment(model_id=model)
-            deployments = [deployment] if deployment is not None else []
-        return any(
-            _get_model_info_value(deployment, "hidden") is True
-            and isinstance(
-                _get_model_info_value(deployment, "managed_resource_public_model_name"),
-                str,
-            )
-            and bool(
-                _get_model_info_value(deployment, "managed_resource_public_model_name").strip()
-            )
-            for deployment in deployments
-        )
+            return deployment is not None and _is_retrieve_only_deployment(deployment)
+
+        deployments = llm_router.get_model_list(model_name=model) or []
+        return any(_is_retrieve_only_deployment(deployment) for deployment in deployments)
     except Exception as e:
         verbose_proxy_logger.debug(
             "Unable to inspect retrieve-only managed-resource model: %s", str(e)

@@ -696,6 +696,59 @@ def test_retrieve_only_managed_resource_cannot_be_bypassed_by_key_shape(model_na
         )
 
 
+def test_exact_legacy_deployment_id_wins_over_colliding_public_model_group():
+    from litellm import Router
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    router = Router(
+        model_list=[
+            {
+                "model_name": "_legacy/seedance-2.0-mini",
+                "litellm_params": {"model": "wavespeed/seedance-2.0-mini", "api_key": "legacy"},
+                "model_info": {
+                    "id": "fb3-seedance-2-mini",
+                    "hidden": True,
+                    "managed_resource_public_model_name": "seedance-2.0-mini",
+                },
+            },
+            {
+                # This public group deliberately collides with the hidden
+                # deployment ID. Router resolves the exact ID first.
+                "model_name": "fb3-seedance-2-mini",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "public"},
+                "model_info": {"id": "public-deployment"},
+            },
+            {
+                "model_name": "ordinary-public-model",
+                "litellm_params": {"model": "openai/gpt-4o", "api_key": "ordinary"},
+                "model_info": {"id": "ordinary-public-deployment"},
+            },
+        ]
+    )
+
+    with pytest.raises(Exception, match="Retrieve-only managed resources"):
+        asyncio.run(
+            can_key_call_model(
+                model="fb3-seedance-2-mini",
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(models=["*"]),
+                llm_router=router,
+            )
+        )
+
+    assert (
+        asyncio.run(
+            can_key_call_model(
+                model="ordinary-public-model",
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(models=["*"]),
+                llm_router=router,
+            )
+        )
+        is True
+    )
+
+
 def test_managed_resource_without_owner_keeps_legacy_public_model_auth_behavior():
     from litellm import Router
     from litellm.proxy.auth.auth_checks import can_key_call_model
