@@ -2,6 +2,13 @@ import json
 
 import pytest
 
+from litellm.llms.libtv.video_generate import (
+    VideoGenerateError,
+    VideoGenerateSettings,
+    _check_url,
+    _parse_bool_env,
+)
+
 VALID = {
     "task_id": "8f3c1d2e-0000-4000-8000-000000000001",
     "model": "drama-video-1",
@@ -107,10 +114,24 @@ async def test_nested_reference_url_outside_allowlist_is_422_invalid_url(client_
 @pytest.mark.asyncio
 async def test_empty_allowlist_is_503_not_422(client_admin, monkeypatch):
     """fail-closed 的配置缺失是服务端错误，不是用户输入错误
-    （沿用 validated_transfer._parse_hosts 的既有语义）。"""
+    （沿用 validated_transfer._parse_hosts 的既有语义）。
+
+    MINOR-3: 仅断言 status_code == 503 区分度不够——_get_redis_client() 的
+    「redis 未配置」分支（见下面 test_post_without_redis_configured_is_503_not_500）
+    同样产出 503，而且两者的 error.code 都复用同一个通用值 "misconfigured"
+    （_parse_hosts 和 _get_redis_client 各自的失败分支都传的是这个 code），
+    所以哪怕只补上 code == 'misconfigured' 断言，也还是没法把「allowlist 配错」
+    和「redis 没配」这两个根本不同的故障区分开。真正有区分度的是 message
+    文本——两处的 message 字面量不同——所以这里连同下面两条 redis-未配置
+    用例一起，把断言从「code 是什么」升级成「整个 error 字典精确等于什么」，
+    锁定到具体是哪一个环境变量出的错，而不是靠状态码的巧合差异。"""
     monkeypatch.setenv('LIBTV_VIDEO_GENERATE_SOURCE_HOSTS', '')
     r = await client_admin.post('/v1/libtv/video-generate', json=VALID)
     assert r.status_code == 503
+    assert r.json()['error'] == {
+        'code': 'misconfigured',
+        'message': 'LIBTV_VIDEO_GENERATE_SOURCE_HOSTS must contain exact hosts',
+    }
 
 
 @pytest.mark.asyncio
@@ -213,17 +234,59 @@ async def test_get_succeeded_returns_result_verbatim(client_admin, fake_redis):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('body', [[], 'hi', None, 5, True])
+@pytest.mark.parametrize('body', [[], 'hi', 5, True])
 async def test_non_dict_body_is_422_invalid_params_not_500(client_admin, body):
-    """F1: payload 不是 dict 时（[]/'hi'/None/5/True），旧代码先跑
+    """F1: payload 不是 dict 时（[]/'hi'/5/True），旧代码先跑
     _validate_urls -> _iter_reference_urls 立刻 payload.get("request") 炸
     AttributeError；endpoints.py 只捉 orjson.JSONDecodeError/VideoGenerateError，
     AttributeError 直接以未处理异常逃逸（ASGITransport 默认
     raise_app_exceptions=True，这里表现为 client.post 本身抛出，而不是拿到一个
     500 response）。design §9.4 把非 4xx 判定当 TransientTransferError 重试，会对
     一个确定性坏输入无限重试。修复：_validate_shape 先跑，必须是确定性
-    422 invalid_params，且完全不触碰 redis（这条用例故意不给 fake_redis）。"""
+    422 invalid_params，且完全不触碰 redis（这条用例故意不给 fake_redis）。
+
+    MINOR-2: JSON `null`（对应 Python None）故意不放进这份共享 parametrize——
+    httpx 的 `json=None` 无法与「根本没传 json 参数」区分，两者都发送空 body
+    （实测 httpx 0.28.1：content=b''，且不带 content-type 头），而不是字面
+    4 字节 `null`。空 body 会在 endpoints.py 里被 orjson.loads 提前炸出
+    JSONDecodeError（走的是那个分支的 422 invalid_params，见 endpoints.py 里
+    `except orjson.JSONDecodeError`），跟这条用例真正要测的 _validate_shape's
+    isinstance(payload, dict) 分支是两条完全不同的代码路径，只是恰好断言结果
+    长得一样（都是 422/invalid_params），所以旧版本『看起来』覆盖了 None 但
+    从未真正让 _validate_shape 看到过一个 None payload。实测佐证（同一个请求，
+    两种发送方式的 message 完全不同）：
+      json=None       -> {'code': 'invalid_params',
+                           'message': 'Input is a zero-length, empty document: ...'}
+      content=b'null' -> {'code': 'invalid_params',
+                           'message': 'request body must be a JSON object'}
+    真正的 JSON null 覆盖见下面独立的
+    test_json_null_body_is_422_invalid_params_not_500。"""
     r = await client_admin.post('/v1/libtv/video-generate', json=body)
+    assert r.status_code == 422
+    assert r.json()['error']['code'] == 'invalid_params'
+
+
+@pytest.mark.asyncio
+async def test_json_null_body_is_422_invalid_params_not_500(client_admin):
+    """MINOR-2: a genuine JSON `null` body (as opposed to an *empty* body --
+    see the note on test_non_dict_body_is_422_invalid_params_not_500 just
+    above) must also be rejected by _validate_shape's
+    isinstance(payload, dict) check. httpx's `json=None` kwarg cannot send
+    the literal 4-byte `null` -- it sends an empty body instead, indistin-
+    guishable from omitting `json` entirely -- so this sends the raw bytes
+    directly with an explicit application/json content-type, which is the
+    only way to make orjson.loads() actually decode to Python None and hand
+    _validate_shape that exact value. Mutation self-check: deleting
+    _validate_shape's `isinstance(payload, dict)` line would make
+    `set(None)` raise an uncaught TypeError two lines later (extra = set(
+    payload) - _ALLOWED_TOP_LEVEL_KEYS), landing in endpoints.py's
+    catch-all `except Exception` instead -- 503 internal_error, not 422
+    invalid_params -- so this test does go red for the right reason."""
+    r = await client_admin.post(
+        '/v1/libtv/video-generate',
+        content=b'null',
+        headers={'content-type': 'application/json'},
+    )
     assert r.status_code == 422
     assert r.json()['error']['code'] == 'invalid_params'
 
@@ -258,6 +321,32 @@ async def test_xadd_failure_with_failing_rollback_still_surfaces_enqueue_ambiguo
     assert r.json()['error']['code'] == 'enqueue_ambiguous'
 
 
+@pytest.mark.asyncio
+async def test_xadd_failure_503_body_does_not_leak_exception_text(client_admin, fake_redis):
+    """MINOR-4 (extended to a third site): the enqueue_ambiguous 503 raised
+    after an XADD failure used to interpolate the raw driver exception
+    straight into the client-facing message via an f-string
+    (``f"failed to enqueue task after status write: {exc}"``) -- the exact
+    same leak pattern as the two unclassified-exception catch-alls in
+    endpoints.py, just reached through the classified VideoGenerateError
+    path (whose .message the endpoint layer forwards verbatim) instead of
+    the bare `except Exception` path. A misbehaving/misconfigured redis
+    driver's exception text can carry connection strings, credentials, or
+    internal hostnames, same risk as MINOR-4's original two sites.
+
+    Mutation self-check: revert enqueue_video_generate's message back to
+    interpolating {exc} and this goes red (the secret reappears verbatim).
+    """
+    secret = 'internal-detail-redis://user:s3cr3t-password@10.0.0.9:6379/db'
+    fake_redis.xadd_exception = RuntimeError(f'redis stream unavailable: {secret}')
+    r = await client_admin.post('/v1/libtv/video-generate', json=VALID)
+    assert r.status_code == 503
+    body = r.json()
+    assert body['error']['code'] == 'enqueue_ambiguous'
+    assert secret not in body['error']['message']
+    assert secret not in json.dumps(body)
+
+
 # ---------------------------------------------------------------------------
 # F5: an unconfigured redis client must be a loud 503, never a silent
 # AttributeError-turned-500 (POST) or a completely uncaught crash (GET).
@@ -275,7 +364,13 @@ async def test_post_without_redis_configured_is_503_not_500(client_admin, monkey
     monkeypatch.delenv('MEDIA_TRANSFER_REDIS_URL', raising=False)
     r = await client_admin.post('/v1/libtv/video-generate', json=VALID)
     assert r.status_code == 503
-    assert r.json()['error']['code'] == 'misconfigured'
+    # MINOR-3 (symmetry): exact message, not just code -- see the docstring
+    # on test_empty_allowlist_is_503_not_422 above for why "misconfigured"
+    # alone is shared by two different root causes and can't tell them apart.
+    assert r.json()['error'] == {
+        'code': 'misconfigured',
+        'message': 'no redis URL configured for video-generate',
+    }
 
 
 @pytest.mark.asyncio
@@ -286,7 +381,10 @@ async def test_get_without_redis_configured_is_503_not_500(client_admin, monkeyp
     monkeypatch.delenv('MEDIA_TRANSFER_REDIS_URL', raising=False)
     r = await client_admin.get('/v1/libtv/video-generate/t1')
     assert r.status_code == 503
-    assert r.json()['error']['code'] == 'misconfigured'
+    assert r.json()['error'] == {
+        'code': 'misconfigured',
+        'message': 'no redis URL configured for video-generate',
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -624,3 +722,146 @@ async def test_invalid_model_or_deadline_ts_is_422_invalid_params_and_not_enqueu
     # here must leave the fake Redis completely untouched -- not just
     # xadd-free.
     assert fake_redis.calls == []
+
+
+# ---------------------------------------------------------------------------
+# MINOR-4: an unclassified exception hitting either endpoint's catch-all
+# `except Exception` must never leak str(exc) into the 503 response body --
+# only a stable, generic message belongs in a client-facing payload; the real
+# exception text is for logs only.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_post_unclassified_exception_503_body_does_not_leak_exception_text(client_admin, fake_redis):
+    """enqueue_video_generate's _alive_workers calls redis.zrangebyscore with
+    no local try/except, so an injected exception there reaches
+    endpoints.py's outer catch-all `except Exception` undisturbed by any
+    VideoGenerateError reclassification -- the cleanest way to exercise that
+    branch without faking a VideoGenerateError (which would test the wrong
+    handler). Before the fix, the response body directly embedded
+    str(exc) (`content={"error": {"code": "internal_error", "message":
+    str(exc)}}`), handing a caller internal implementation details (here, a
+    literal secret-shaped string chosen specifically so a leak is
+    unmistakable in a failing assertion diff)."""
+    secret = 'internal-detail-redis://user:s3cr3t-password@10.0.0.9:6379/db'
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    fake_redis.zrangebyscore = _boom  # type: ignore[method-assign]
+
+    r = await client_admin.post('/v1/libtv/video-generate', json=VALID)
+    assert r.status_code == 503
+    body = r.json()
+    assert body['error']['code'] == 'internal_error'
+    assert secret not in body['error']['message']
+    assert secret not in json.dumps(body)
+
+
+@pytest.mark.asyncio
+async def test_get_unclassified_exception_503_body_does_not_leak_exception_text(client_admin, fake_redis):
+    """Mirrors the POST case above for the GET/status-poll path:
+    fetch_video_generate_status's first call is redis.get(status_key(...)),
+    with no local try/except around it either."""
+    secret = 'internal-detail-redis://user:s3cr3t-password@10.0.0.9:6379/db'
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError(secret)
+
+    fake_redis.get = _boom  # type: ignore[method-assign]
+
+    r = await client_admin.get('/v1/libtv/video-generate/t1')
+    assert r.status_code == 503
+    body = r.json()
+    assert body['error']['code'] == 'internal_error'
+    assert secret not in body['error']['message']
+    assert secret not in json.dumps(body)
+
+
+# ---------------------------------------------------------------------------
+# MAJOR-1: production-environment HTTP ban, mirroring
+# validated_transfer.ValidatedTransferSettings.from_environment's existing
+# ban block (validated_transfer.py ~118-120). Before this fix,
+# VideoGenerateSettings.from_environment() had no equivalent check at all --
+# LIBTV_VIDEO_GENERATE_ALLOW_HTTP=true silently enabled plaintext HTTP in
+# production, leaking OSS presigned-URL query-string signatures to anyone on
+# the network path between this worker and its source/target hosts.
+# LITELLM_ENVIRONMENT must default to "production" when unset -- fail-closed:
+# "no config" must mean the strictest interpretation, not the most
+# permissive one.
+# ---------------------------------------------------------------------------
+
+def test_allow_http_with_no_litellm_environment_set_is_forbidden(monkeypatch):
+    """Unset LITELLM_ENVIRONMENT must default to the strictest interpretation
+    (production), not the most permissive one."""
+    monkeypatch.delenv('LITELLM_ENVIRONMENT', raising=False)
+    monkeypatch.setenv('LIBTV_VIDEO_GENERATE_ALLOW_HTTP', 'true')
+    with pytest.raises(VideoGenerateError) as exc_info:
+        VideoGenerateSettings.from_environment()
+    assert exc_info.value.code == 'misconfigured'
+
+
+def test_allow_http_with_explicit_production_is_forbidden(monkeypatch):
+    monkeypatch.setenv('LITELLM_ENVIRONMENT', 'production')
+    monkeypatch.setenv('LIBTV_VIDEO_GENERATE_ALLOW_HTTP', 'true')
+    with pytest.raises(VideoGenerateError) as exc_info:
+        VideoGenerateSettings.from_environment()
+    assert exc_info.value.code == 'misconfigured'
+
+
+def test_allow_http_outside_production_is_permitted(monkeypatch):
+    """Non-production environments keep the existing local-dev escape hatch:
+    ALLOW_HTTP=true must both avoid raising *and* actually flip
+    settings.allow_http so _check_url accepts an http:// URL -- not raising
+    is necessary but not sufficient."""
+    monkeypatch.setenv('LITELLM_ENVIRONMENT', 'development')
+    monkeypatch.setenv('LIBTV_VIDEO_GENERATE_ALLOW_HTTP', 'true')
+    settings = VideoGenerateSettings.from_environment()
+    assert settings.allow_http is True
+    _check_url('http://source.example/x.png', settings.source_hosts, settings, 'reference')  # must not raise
+
+
+def test_allow_http_unset_is_never_forbidden_regardless_of_environment(monkeypatch):
+    """ALLOW_HTTP unset (the default, "false") must never trip the new
+    production ban in any environment -- guards against the ban being
+    written too broadly (e.g. keying off LITELLM_ENVIRONMENT alone,
+    regardless of allow_http's actual value)."""
+    monkeypatch.delenv('LIBTV_VIDEO_GENERATE_ALLOW_HTTP', raising=False)
+    for environment in ('production', 'development', None):
+        if environment is None:
+            monkeypatch.delenv('LITELLM_ENVIRONMENT', raising=False)
+        else:
+            monkeypatch.setenv('LITELLM_ENVIRONMENT', environment)
+        settings = VideoGenerateSettings.from_environment()
+        assert settings.allow_http is False
+
+
+# ---------------------------------------------------------------------------
+# MINOR-5: _parse_bool_env must accept only what validated_transfer.py's
+# inline boolean parse accepts (`.strip().lower() == "true"`), not a wider
+# set of common truthy spellings -- the prior "1"/"yes" leniency meant a
+# common ops shorthand was silently accepted here while being rejected by
+# the sibling module: identical operator intent, opposite security outcomes.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('raw_value', ['1', 'yes', 'YES', 'Yes', 'on', ''])
+def test_parse_bool_env_rejects_values_the_sibling_module_rejects(raw_value):
+    assert _parse_bool_env(raw_value) is False
+
+
+@pytest.mark.parametrize('raw_value', ['true', 'True', 'TRUE', ' true '])
+def test_parse_bool_env_still_accepts_true_case_and_whitespace_insensitively(raw_value):
+    assert _parse_bool_env(raw_value) is True
+
+
+def test_allow_http_env_var_set_to_1_is_treated_as_false(monkeypatch):
+    """MINOR-5 tied to its actual consequence via the public
+    from_environment() API (not just the parse helper in isolation),
+    isolated from MAJOR-1's new production-ban check by forcing a
+    non-production environment -- so this test fails via a plain
+    settings.allow_http assertion, not via an unrelated raise, if the
+    tightened parse is ever reverted."""
+    monkeypatch.setenv('LITELLM_ENVIRONMENT', 'development')
+    monkeypatch.setenv('LIBTV_VIDEO_GENERATE_ALLOW_HTTP', '1')
+    settings = VideoGenerateSettings.from_environment()
+    assert settings.allow_http is False

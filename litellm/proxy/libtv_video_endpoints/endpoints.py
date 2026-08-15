@@ -19,11 +19,13 @@ following the same ``libtv_``-prefix convention already used for the sibling
 from __future__ import annotations
 
 import os
+import traceback
 
 import orjson
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import ORJSONResponse
 
+from litellm._logging import verbose_proxy_logger
 from litellm.llms.libtv.transfer import get_transfer_redis
 from litellm.llms.libtv.video_generate import (
     VideoGenerateError,
@@ -49,6 +51,17 @@ _REJECTION_STATUS_CODES = {
     "no_capacity_available": 422,
     "invalid_params": 422,
 }
+
+# MINOR-4: a stable, non-leaking message for the unclassified-exception
+# catch-alls below. str(exc) used to be returned verbatim in the response
+# body -- an unclassified exception is by definition one nothing in this
+# module anticipated, so its text could be anything a driver/library
+# happens to put in an exception message (connection strings, credentials,
+# internal hostnames, stack-adjacent local values). Full details still go
+# to the server-side log (verbose_proxy_logger.error + .debug(traceback)),
+# same convention as image_endpoints/endpoints.py's image_generation
+# handler; only this generic message reaches the client.
+_GENERIC_INTERNAL_ERROR_MESSAGE = "an internal error occurred while processing this request"
 
 
 def _is_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> bool:
@@ -107,7 +120,15 @@ async def libtv_video_generate(request: Request, user_api_key_dict: UserAPIKeyAu
         # transient and retries forever even for a deterministically-bad
         # input. Every intentionally-classified failure is already handled
         # above; this is strictly a last-resort net.
-        return ORJSONResponse(status_code=503, content={"error": {"code": "internal_error", "message": str(exc)}})
+        verbose_proxy_logger.error(
+            "litellm.proxy.libtv_video_endpoints.libtv_video_generate(): "
+            "Exception occured - {}".format(str(exc))
+        )
+        verbose_proxy_logger.debug(traceback.format_exc())
+        return ORJSONResponse(
+            status_code=503,
+            content={"error": {"code": "internal_error", "message": _GENERIC_INTERNAL_ERROR_MESSAGE}},
+        )
 
 
 @router.get(
@@ -141,4 +162,12 @@ async def libtv_video_generate_status(
         status_code = _REJECTION_STATUS_CODES.get(exc.code, 503)
         return ORJSONResponse(status_code=status_code, content={"error": {"code": exc.code, "message": exc.message}})
     except Exception as exc:  # noqa: BLE001 - defense in depth (F1), mirrors POST.
-        return ORJSONResponse(status_code=503, content={"error": {"code": "internal_error", "message": str(exc)}})
+        verbose_proxy_logger.error(
+            "litellm.proxy.libtv_video_endpoints.libtv_video_generate_status(): "
+            "Exception occured - {}".format(str(exc))
+        )
+        verbose_proxy_logger.debug(traceback.format_exc())
+        return ORJSONResponse(
+            status_code=503,
+            content={"error": {"code": "internal_error", "message": _GENERIC_INTERNAL_ERROR_MESSAGE}},
+        )

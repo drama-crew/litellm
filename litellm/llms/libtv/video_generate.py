@@ -34,15 +34,22 @@ STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 
+# NIT-2: only these two statuses are ever looked up through this table (see
+# the single `_STATUS_TO_PUBLIC[raw_status]` call site in
+# fetch_video_generate_status, gated by `raw_status in (STATUS_QUEUED,
+# STATUS_CLAIMED)`). DONE/FAILED/CANCELLED each need their own dedicated
+# response shape (result payload, cancellation reason, translated worker
+# error) rather than a bare status-string swap, so they're handled by
+# dedicated branches further down instead of this table -- a fuller table
+# that included them read as the single source of truth for the whole
+# mapping but silently wasn't, since those three entries' values were
+# independently re-hardcoded as literals in the branches that actually
+# produce those responses. Keeping the table scoped to what it truly drives
+# avoids that drift trap.
 _STATUS_TO_PUBLIC = {
     STATUS_QUEUED: "queued",
     STATUS_CLAIMED: "claimed",
-    STATUS_DONE: "succeeded",
-    STATUS_FAILED: "failed",
-    STATUS_CANCELLED: "failed",
 }
-
-_REQUIRED_RESULT_FIELDS = ("staging_key", "bytes", "content_type", "duration_seconds")
 
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload"})
 
@@ -109,7 +116,12 @@ def _parse_hosts(value: str, name: str) -> frozenset[str]:
 
 
 def _parse_bool_env(value: str) -> bool:
-    return value.strip().lower() in ("1", "true", "yes")
+    # Mirrors validated_transfer.py's exact-match parsing: only the literal
+    # string "true" (case/whitespace-insensitive) is truthy. "1"/"yes"/"on"
+    # etc. are deliberately treated as False rather than guessed at, so a
+    # typo'd or unexpected value fails closed (LIBTV_VIDEO_GENERATE_ALLOW_HTTP
+    # is a security-relevant flag -- see MAJOR-1's production HTTP ban above).
+    return value.strip().lower() == "true"
 
 
 @dataclass(frozen=True)
@@ -131,6 +143,15 @@ class VideoGenerateSettings:
             os.getenv("LIBTV_VIDEO_GENERATE_TARGET_HOSTS", ""), "LIBTV_VIDEO_GENERATE_TARGET_HOSTS"
         )
         allow_http = _parse_bool_env(os.getenv("LIBTV_VIDEO_GENERATE_ALLOW_HTTP", "false"))
+        # Mirrors validated_transfer.ValidatedTransferSettings.from_environment's
+        # production-HTTP ban (validated_transfer.py ~118-120), which this
+        # module was ported from the shape of but had dropped. Plaintext HTTP
+        # to an OSS presigned URL leaks the query-string signature to anyone
+        # on the network path; LITELLM_ENVIRONMENT defaults to "production"
+        # when unset so an unconfigured deployment fails closed (strictest
+        # interpretation), not open.
+        if os.getenv("LITELLM_ENVIRONMENT", "production").lower() == "production" and allow_http:
+            raise VideoGenerateError("misconfigured", "video-generate HTTP is forbidden in production")
         return cls(source_hosts=source_hosts, target_hosts=target_hosts, allow_http=allow_http)
 
 
@@ -396,8 +417,17 @@ async def enqueue_video_generate(
             await redis.delete(status_key(task_id))
         except Exception:
             pass
+        # MINOR-4 (extended): keep this message a stable, non-leaking string
+        # -- the driver exception `exc` used to be interpolated straight in
+        # (f"...: {exc}"), which the endpoint layer forwards verbatim into
+        # the client-facing 503 body and can carry connection strings,
+        # credentials, or internal hostnames. `from exc` still preserves the
+        # original exception via chaining for anything inspecting the
+        # traceback server-side. Matches validated_transfer.py's equivalent
+        # "ambiguous" rollback raise (~line 480), which already only ever
+        # used a bare stable message for the same reason.
         raise VideoGenerateError(
-            "enqueue_ambiguous", f"failed to enqueue task after status write: {exc}"
+            "enqueue_ambiguous", "failed to enqueue task after status write"
         ) from exc
     return task_id
 
@@ -414,10 +444,11 @@ def _valid_result(result: Any) -> bool:
     platform-facing payload's field types after the worker already spent
     real GPU minutes producing it.
 
-    Deliberately does NOT widen ``_REQUIRED_RESULT_FIELDS`` with any new
-    field -- rejecting a result this late in the pipeline discards a fully
-    completed (expensive) generation, so adding new required fields is a
-    red line reserved for an actual spec change, not this type-check fix.
+    Deliberately does NOT widen the set of required result fields
+    (``staging_key``, ``bytes``, ``content_type``, ``duration_seconds``)
+    checked below -- rejecting a result this late in the pipeline discards a
+    fully completed (expensive) generation, so adding new required fields is
+    a red line reserved for an actual spec change, not this type-check fix.
     """
     if not isinstance(result, dict):
         return False
