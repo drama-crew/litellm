@@ -1356,28 +1356,40 @@ def _resolve_managed_resource_alias_chain(
 ) -> Any:
     """Resolve aliases in the same order as the proxy pre-call pipeline.
 
-    The pipeline applies team aliases, global ``model_alias_map``, and key
-    aliases. A bounded loop handles legitimate chained aliases while making a
-    cycle fail closed at the resulting unresolved value.
+    The pipeline has two fixed stages: ``team -> key`` in
+    ``add_litellm_data_to_request`` and then ``global -> key`` in common
+    request processing. Do not repeatedly replay any stage: a key alias target
+    produced by the final stage is the effective production model.
     """
     if not isinstance(model, str):
         return model
     current = model
-    seen = set()
-    for _ in range(16):
-        if current in seen:
-            return None
-        seen.add(current)
-        previous = current
-        if team_model_aliases and current in team_model_aliases:
-            current = team_model_aliases[current]
-        if isinstance(current, str) and current in litellm.model_alias_map:
-            current = litellm.model_alias_map[current]
-        if key_aliases and isinstance(current, str) and current in key_aliases:
-            current = key_aliases[current]
-        if current == previous:
+    visited_alias_sources = set()
+
+    def _apply_alias(alias_map: Optional[Mapping[str, str]]) -> Optional[str]:
+        nonlocal current
+        if not alias_map or current not in alias_map:
             return current
-    return None
+        if current in visited_alias_sources:
+            return None
+        visited_alias_sources.add(current)
+        target = alias_map[current]
+        if not isinstance(target, str) or not target:
+            return None
+        if target in visited_alias_sources:
+            return None
+        current = target
+        return current
+
+    if _apply_alias(team_model_aliases) is None:
+        return None
+    if _apply_alias(key_aliases) is None:
+        return None
+    if _apply_alias(litellm.model_alias_map) is None:
+        return None
+    if _apply_alias(key_aliases) is None:
+        return None
+    return current
 
 
 def _append_model_candidates(candidates: List[str], value: Any) -> None:

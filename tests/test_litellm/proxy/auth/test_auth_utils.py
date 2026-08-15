@@ -824,6 +824,40 @@ def test_alias_chain_and_cycle_fail_closed_but_ordinary_alias_passes(monkeypatch
     )
 
 
+def test_key_alias_wins_over_global_alias_at_first_alias_stage(monkeypatch):
+    import litellm
+
+    from litellm.proxy.auth.auth_utils import _resolve_managed_resource_alias_chain
+
+    monkeypatch.setattr(litellm, "model_alias_map", {"client-alias": "ordinary-public"})
+    assert (
+        _resolve_managed_resource_alias_chain(
+            "client-alias",
+            key_aliases={"client-alias": "_legacy/seedance-2.0-mini"},
+        )
+        == "_legacy/seedance-2.0-mini"
+    )
+
+
+def test_final_key_alias_target_is_not_replayed_through_global_alias(monkeypatch):
+    import litellm
+
+    from litellm.proxy.auth.auth_utils import _resolve_managed_resource_alias_chain
+
+    monkeypatch.setattr(
+        litellm,
+        "model_alias_map",
+        {"x": "y", "ordinary-public": "_legacy/seedance-2.0-mini"},
+    )
+    assert (
+        _resolve_managed_resource_alias_chain(
+            "client-alias",
+            key_aliases={"client-alias": "x", "y": "ordinary-public"},
+        )
+        == "ordinary-public"
+    )
+
+
 def test_managed_resource_without_owner_keeps_legacy_public_model_auth_behavior():
     from litellm import Router
     from litellm.proxy.auth.auth_checks import can_key_call_model
