@@ -558,6 +558,7 @@ def _libtv_pool_router():
 def _legacy_seedance_router(
     *,
     legacy_hidden: bool = True,
+    legacy_team_id: Optional[str] = None,
     owner: str = "seedance-2.0-mini",
     public_hidden: Optional[bool] = False,
     public_team_id: Optional[str] = None,
@@ -572,6 +573,7 @@ def _legacy_seedance_router(
                 "id": "fb3-seedance-2-mini",
                 "mode": "video_generation",
                 "hidden": legacy_hidden,
+                "team_id": legacy_team_id,
                 "managed_resource_public_model_name": owner,
             },
         },
@@ -606,14 +608,12 @@ def test_managed_resource_owner_allows_public_video_owner_for_hidden_deployment(
     for route in (
         "/v1/videos/{video_id}",
         "/v1/videos/{video_id}/content",
-        "/v1/videos/{video_id}/remix",
     ):
         model = get_model_from_request(
             request_data={"video_id": video_id},
             route=route,
             llm_router=router,
         )
-
         assert model == "seedance-2.0-mini"
         assert (
             asyncio.run(
@@ -625,6 +625,61 @@ def test_managed_resource_owner_allows_public_video_owner_for_hidden_deployment(
                 )
             )
             is True
+        )
+
+
+@pytest.mark.parametrize(
+    "route,request_data",
+    [
+        ("/v1/videos/{video_id}/remix", {"video_id": "PLACEHOLDER"}),
+        ("/v1/videos/edits", {"video": {"id": "PLACEHOLDER"}}),
+        ("/v1/videos/extensions", {"video": {"id": "PLACEHOLDER"}}),
+        ("/v1/videos", {"model": "_legacy/seedance-2.0-mini"}),
+    ],
+)
+def test_managed_resource_owner_is_retrieve_only_for_video_mutations(route, request_data):
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    router = _legacy_seedance_router()
+    video_id = encode_video_id_with_provider(
+        video_id="provider-video-id",
+        provider="xiaoyunque",
+        model_id="fb3-seedance-2-mini",
+    )
+    request_data = {
+        key: (video_id if value == "PLACEHOLDER" else {"id": video_id} if key == "video" else value)
+        for key, value in request_data.items()
+    }
+
+    assert get_model_from_request(request_data=request_data, route=route, llm_router=router) == (
+        "_legacy/seedance-2.0-mini"
+    )
+
+
+@pytest.mark.parametrize(
+    "token_kwargs",
+    [
+        {"models": ["seedance-2.0-mini"]},
+        {"models": ["*"]},
+        {"models": []},
+        {"models": ["all-proxy-models"]},
+        {"models": ["all-team-models"]},
+        {"models": [], "user_role": "proxy_admin"},
+        {"config": {"model_list": []}},
+    ],
+)
+def test_retrieve_only_managed_resource_cannot_be_bypassed_by_key_shape(token_kwargs):
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    router = _legacy_seedance_router()
+    with pytest.raises(Exception, match="Retrieve-only managed resources"):
+        asyncio.run(
+            can_key_call_model(
+                model="_legacy/seedance-2.0-mini",
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(**token_kwargs),
+                llm_router=router,
+            )
         )
 
 
@@ -669,6 +724,7 @@ def test_managed_resource_without_owner_keeps_legacy_public_model_auth_behavior(
     "router_kwargs",
     [
         pytest.param({"legacy_hidden": False}, id="source-is-public"),
+        pytest.param({"legacy_team_id": "private-team"}, id="source-is-team-scoped"),
         pytest.param({"owner": "missing-public-owner"}, id="owner-does-not-exist"),
         pytest.param({"public_hidden": True}, id="owner-only-has-hidden-deployment"),
         pytest.param({"public_team_id": "private-team"}, id="owner-only-has-team-deployment"),

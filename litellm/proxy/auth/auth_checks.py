@@ -102,7 +102,10 @@ from .auth_checks_organization import (
     add_team_org_context_to_request_body,
     organization_role_based_access_check,
 )
-from .auth_utils import get_model_from_request
+from .auth_utils import (
+    _is_retrieve_only_managed_resource_model,
+    get_model_from_request,
+)
 
 if TYPE_CHECKING:
     from opentelemetry.trace import Span as _Span
@@ -524,6 +527,26 @@ async def common_checks(
         request_query_params=_safe_get_request_query_params(request=request),
         llm_router=llm_router,
     )
+
+    # Hidden managed-resource deployments carrying an owner alias are
+    # retrieve-only. This check is intentionally before all model allowlist
+    # checks so unrestricted, wildcard, and admin keys cannot turn the alias
+    # into permission to create or mutate a resource.
+    if isinstance(_model, list):
+        if any(_is_retrieve_only_managed_resource_model(model, llm_router) for model in _model):
+            raise ProxyException(
+                message="Retrieve-only managed resources cannot be used by mutation routes.",
+                type=ProxyErrorTypes.key_model_access_denied,
+                param="model",
+                code=status.HTTP_403_FORBIDDEN,
+            )
+    elif _is_retrieve_only_managed_resource_model(_model, llm_router):
+        raise ProxyException(
+            message="Retrieve-only managed resources cannot be used by mutation routes.",
+            type=ProxyErrorTypes.key_model_access_denied,
+            param="model",
+            code=status.HTTP_403_FORBIDDEN,
+        )
 
     if route in MODEL_DISCOVERY_ROUTES:
         skip_budget_checks = True
@@ -3048,6 +3071,15 @@ async def can_key_call_model(
     Raises:
         - Exception: If token not allowed to call model
     """
+    models_to_check = model if isinstance(model, list) else [model]
+    if any(_is_retrieve_only_managed_resource_model(m, llm_router) for m in models_to_check):
+        raise ProxyException(
+            message="Retrieve-only managed resources cannot be used by mutation routes.",
+            type=ProxyErrorTypes.key_model_access_denied,
+            param="model",
+            code=status.HTTP_403_FORBIDDEN,
+        )
+
     key_models = _resolve_key_models_for_auth_check(valid_token=valid_token)
     try:
         return _can_object_call_model(

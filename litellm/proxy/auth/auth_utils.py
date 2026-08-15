@@ -1288,6 +1288,23 @@ _MODEL_ROUTING_ID_FIELDS = (
     "character_id",
 )
 
+# A managed-resource owner alias is deliberately narrower than a normal model
+# alias: it is valid only when an existing video is being retrieved. Keep the
+# route set explicit so a mutation cannot inherit retrieval authorization just
+# because it also carries a video ID.
+_VIDEO_RETRIEVAL_ROUTES = frozenset(
+    {
+        "/v1/videos/{video_id}",
+        "/videos/{video_id}",
+        "/v1/videos/{video_id}/content",
+        "/videos/{video_id}/content",
+    }
+)
+
+
+def _is_video_retrieval_route(route: str) -> bool:
+    return route.rstrip("/") in _VIDEO_RETRIEVAL_ROUTES
+
 
 def _append_model_candidates(candidates: List[str], value: Any) -> None:
     if value is None:
@@ -1336,6 +1353,7 @@ def _route_uses_model_routing_sources(route: str) -> bool:
 def _extract_models_from_managed_resource_id(
     resource_id: Any,
     resource_id_field: Optional[str] = None,
+    route: Optional[str] = None,
     llm_router: Optional[Router] = None,
 ) -> List[str]:
     if not isinstance(resource_id, str) or not resource_id:
@@ -1386,7 +1404,11 @@ def _extract_models_from_managed_resource_id(
                 model_id = decode_video_id_with_provider(resource_id).get("model_id")
                 _append_model_candidates(
                     candidates=candidates,
-                    value=_resolve_model_id_with_router(model_id, llm_router),
+                    value=_resolve_model_id_with_router(
+                        model_id,
+                        llm_router,
+                        allow_managed_resource_owner=_is_video_retrieval_route(route or ""),
+                    ),
                 )
             else:
                 model_id = decode_character_id_with_provider(resource_id).get("model_id")
@@ -1416,7 +1438,10 @@ def _get_managed_resource_public_model_owner(model_id: str, llm_router: Router) 
         if not llm_router.has_model_id(model_id):
             return None
         deployment = llm_router.get_deployment(model_id=model_id)
-        if _get_model_info_value(deployment, "hidden") is not True:
+        if (
+            _get_model_info_value(deployment, "hidden") is not True
+            or _get_model_info_value(deployment, "team_id") is not None
+        ):
             return None
 
         public_owner = _get_model_info_value(deployment, "managed_resource_public_model_name")
@@ -1436,7 +1461,38 @@ def _get_managed_resource_public_model_owner(model_id: str, llm_router: Router) 
     return None
 
 
-def _resolve_model_id_with_router(model_id: Optional[str], llm_router: Optional[Router]) -> Optional[str]:
+def _is_retrieve_only_managed_resource_model(
+    model: Any, llm_router: Optional[Router]
+) -> bool:
+    """Return whether ``model`` names a hidden managed-resource-only group."""
+    if not isinstance(model, str) or llm_router is None:
+        return False
+    try:
+        deployments = llm_router.get_model_list(model_name=model) or []
+        return any(
+            _get_model_info_value(deployment, "hidden") is True
+            and isinstance(
+                _get_model_info_value(deployment, "managed_resource_public_model_name"),
+                str,
+            )
+            and bool(
+                _get_model_info_value(deployment, "managed_resource_public_model_name").strip()
+            )
+            for deployment in deployments
+        )
+    except Exception as e:
+        verbose_proxy_logger.debug(
+            "Unable to inspect retrieve-only managed-resource model: %s", str(e)
+        )
+        return False
+
+
+def _resolve_model_id_with_router(
+    model_id: Optional[str],
+    llm_router: Optional[Router],
+    *,
+    allow_managed_resource_owner: bool = True,
+) -> Optional[str]:
     if model_id is None or llm_router is None:
         return model_id
     try:
@@ -1446,7 +1502,13 @@ def _resolve_model_id_with_router(model_id: Optional[str], llm_router: Optional[
         # authorization path.
         public_owner = _get_managed_resource_public_model_owner(model_id=model_id, llm_router=llm_router)
         if public_owner is not None:
-            return public_owner
+            if allow_managed_resource_owner:
+                return public_owner
+            deployment = llm_router.get_deployment(model_id=model_id)
+            deployment_model_name = getattr(deployment, "model_name", None)
+            if deployment_model_name:
+                return deployment_model_name
+            return model_id
 
         resolved_model = llm_router.resolve_model_name_from_model_id(model_id) or model_id
         # `resolve_model_name_from_model_id` returns the input unchanged when it
@@ -1522,6 +1584,22 @@ def _extract_model_candidates_from_request(
                 _extract_models_from_managed_resource_id(
                     request_data.get(field),
                     resource_id_field=field,
+                    route=route,
+                    llm_router=llm_router,
+                ),
+            )
+
+        # Edit and extension requests carry the source video in a nested
+        # ``video.id`` object; normalize it into the same managed-resource
+        # authorization path as the path-parameter remix route.
+        video_ref = request_data.get("video")
+        if isinstance(video_ref, Mapping):
+            _append_model_candidates(
+                candidates,
+                _extract_models_from_managed_resource_id(
+                    video_ref.get("id"),
+                    resource_id_field="video_id",
+                    route=route,
                     llm_router=llm_router,
                 ),
             )
