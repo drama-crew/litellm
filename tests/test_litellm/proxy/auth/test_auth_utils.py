@@ -779,6 +779,108 @@ def test_aliases_cannot_target_retrieve_only_model_on_mutation(alias_kind, monke
         )
 
 
+@pytest.mark.parametrize(
+    "route,method,expected",
+    [
+        ("/v1/videos", "GET", False),
+        ("/videos", "GET", False),
+        ("/v1/videos", "POST", True),
+        ("/videos", "POST", True),
+        ("/v1/videos/encoded-id", "GET", False),
+        ("/videos/encoded-id/content", "GET", False),
+        ("/v1/videos/encoded-id/remix", "GET", False),
+        ("/videos/encoded-id/remix", "POST", True),
+        ("/v1/videos/edits", "POST", True),
+        ("/videos/extensions", "POST", True),
+    ],
+)
+def test_video_mutation_gate_uses_http_method_and_actual_routes(route, method, expected):
+    from litellm.proxy.auth.auth_utils import _is_video_mutation_route
+
+    assert _is_video_mutation_route(route, method) is expected
+
+
+def test_common_checks_uses_real_http_method_for_video_alias_gate(monkeypatch):
+    import sys
+    import types
+
+    from starlette.requests import Request
+
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.auth import auth_checks
+
+    router = _legacy_seedance_router()
+    monkeypatch.setitem(
+        sys.modules,
+        "litellm.proxy.proxy_server",
+        types.SimpleNamespace(prisma_client=None, user_api_key_cache=None),
+    )
+    monkeypatch.setattr(
+        auth_checks,
+        "_run_project_checks",
+        __import__("unittest.mock", fromlist=["AsyncMock"]).AsyncMock(),
+    )
+    monkeypatch.setattr(auth_checks, "_reject_clientside_metadata_tags_check", lambda *args, **kwargs: None)
+    monkeypatch.setattr(auth_checks, "_enforce_user_param_check", lambda *args, **kwargs: None)
+    monkeypatch.setattr(auth_checks, "_global_proxy_budget_check", lambda *args, **kwargs: None)
+    monkeypatch.setattr(auth_checks, "_guardrail_modification_check", lambda *args, **kwargs: None)
+    monkeypatch.setattr(auth_checks, "organization_role_based_access_check", lambda *args, **kwargs: None)
+    monkeypatch.setattr(auth_checks, "_is_api_route_allowed", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        auth_checks,
+        "add_team_org_context_to_request_body",
+        __import__("unittest.mock", fromlist=["AsyncMock"]).AsyncMock(side_effect=lambda **kwargs: kwargs["request_body"]),
+    )
+    monkeypatch.setattr(
+        auth_checks,
+        "vector_store_access_check",
+        __import__("unittest.mock", fromlist=["AsyncMock"]).AsyncMock(),
+    )
+    monkeypatch.setattr(
+        auth_checks,
+        "check_tools_allowlist",
+        __import__("unittest.mock", fromlist=["AsyncMock"]).AsyncMock(),
+    )
+
+    def _request(method: str) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": method,
+                "path": "/v1/videos",
+                "headers": [],
+                "query_string": b"",
+                "client": ("127.0.0.1", 1234),
+                "server": ("testserver", 80),
+                "scheme": "http",
+            }
+        )
+
+    async def _run(method: str, body: dict):
+        monkeypatch.setattr(auth_checks, "get_model_from_request", lambda **kwargs: body.get("model"))
+        return await auth_checks.common_checks(
+            request_body=body,
+            team_object=None,
+            user_object=None,
+            end_user_object=None,
+            global_proxy_spend=None,
+            general_settings={},
+            route="/v1/videos",
+            llm_router=router,
+            proxy_logging_obj=object(),
+            valid_token=UserAPIKeyAuth(
+                models=["mini-legacy-alias"],
+                aliases={"mini-legacy-alias": "_legacy/seedance-2.0-mini"},
+            ),
+            request=_request(method),
+            skip_budget_checks=True,
+        )
+
+    assert asyncio.run(_run("GET", {})) is True
+    with pytest.raises(ProxyException, match="Retrieve-only managed resources"):
+        asyncio.run(_run("POST", {"model": "mini-legacy-alias"}))
+
+
 def test_alias_chain_and_cycle_fail_closed_but_ordinary_alias_passes(monkeypatch):
     import litellm
 

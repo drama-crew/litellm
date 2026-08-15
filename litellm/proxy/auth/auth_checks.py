@@ -534,7 +534,7 @@ async def common_checks(
     # rewrites happen later in the pre-call pipeline, so checking only the
     # client-supplied model would allow key/team/global aliases to smuggle a
     # retrieve-only deployment into a mutation request.
-    if _is_video_mutation_route(route):
+    if _is_video_mutation_route(route, request.method):
         requested_models = _model if isinstance(_model, list) else [_model]
         for requested_model in requested_models:
             resolved_model = _resolve_managed_resource_alias_chain(

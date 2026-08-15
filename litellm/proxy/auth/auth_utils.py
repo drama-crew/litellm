@@ -1332,8 +1332,10 @@ def _is_video_retrieval_route(route: str) -> bool:
     return False
 
 
-def _is_video_mutation_route(route: str) -> bool:
+def _is_video_mutation_route(route: str, method: str = "POST") -> bool:
     """Return whether an HTTP video route can create or mutate a resource."""
+    if method.upper() != "POST":
+        return False
     normalized_route = route.rstrip("/")
     for prefix in ("/v1/videos", "/videos"):
         if normalized_route == prefix:
