@@ -104,6 +104,8 @@ from .auth_checks_organization import (
 )
 from .auth_utils import (
     _is_retrieve_only_managed_resource_model,
+    _is_video_mutation_route,
+    _resolve_managed_resource_alias_chain,
     get_model_from_request,
 )
 
@@ -527,6 +529,26 @@ async def common_checks(
         request_query_params=_safe_get_request_query_params(request=request),
         llm_router=llm_router,
     )
+
+    # Resolve aliases before checking hidden managed-resource targets. Alias
+    # rewrites happen later in the pre-call pipeline, so checking only the
+    # client-supplied model would allow key/team/global aliases to smuggle a
+    # retrieve-only deployment into a mutation request.
+    if _is_video_mutation_route(route):
+        requested_models = _model if isinstance(_model, list) else [_model]
+        for requested_model in requested_models:
+            resolved_model = _resolve_managed_resource_alias_chain(
+                requested_model,
+                team_model_aliases=(valid_token.team_model_aliases if valid_token else None),
+                key_aliases=(valid_token.aliases if valid_token else None),
+            )
+            if resolved_model is None or _is_retrieve_only_managed_resource_model(resolved_model, llm_router):
+                raise ProxyException(
+                    message="Retrieve-only managed resources cannot be used by mutation routes.",
+                    type=ProxyErrorTypes.key_model_access_denied,
+                    param="model",
+                    code=status.HTTP_403_FORBIDDEN,
+                )
 
     # Hidden managed-resource deployments carrying an owner alias are
     # retrieve-only. This check is intentionally before all model allowlist
@@ -3072,14 +3094,19 @@ async def can_key_call_model(
         - Exception: If token not allowed to call model
     """
     models_to_check = model if isinstance(model, list) else [model]
-    if any(_is_retrieve_only_managed_resource_model(m, llm_router) for m in models_to_check):
-        raise ProxyException(
-            message="Retrieve-only managed resources cannot be used by mutation routes.",
-            type=ProxyErrorTypes.key_model_access_denied,
-            param="model",
-            code=status.HTTP_403_FORBIDDEN,
+    for requested_model in models_to_check:
+        resolved_model = _resolve_managed_resource_alias_chain(
+            requested_model,
+            team_model_aliases=valid_token.team_model_aliases,
+            key_aliases=valid_token.aliases,
         )
-
+        if resolved_model is None or _is_retrieve_only_managed_resource_model(resolved_model, llm_router):
+            raise ProxyException(
+                message="Retrieve-only managed resources cannot be used by mutation routes.",
+                type=ProxyErrorTypes.key_model_access_denied,
+                param="model",
+                code=status.HTTP_403_FORBIDDEN,
+            )
     key_models = _resolve_key_models_for_auth_check(valid_token=valid_token)
     try:
         return _can_object_call_model(

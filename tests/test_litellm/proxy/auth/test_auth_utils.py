@@ -749,6 +749,81 @@ def test_exact_legacy_deployment_id_wins_over_colliding_public_model_group():
     )
 
 
+@pytest.mark.parametrize("alias_kind", ["key", "team", "global"])
+def test_aliases_cannot_target_retrieve_only_model_on_mutation(alias_kind, monkeypatch):
+    import litellm
+
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    router = _legacy_seedance_router()
+    token_kwargs = {"models": ["*"]}
+    if alias_kind == "key":
+        token_kwargs["aliases"] = {"mini-legacy-alias": "_legacy/seedance-2.0-mini"}
+    elif alias_kind == "team":
+        token_kwargs["team_model_aliases"] = {"mini-legacy-alias": "_legacy/seedance-2.0-mini"}
+    else:
+        monkeypatch.setattr(
+            litellm,
+            "model_alias_map",
+            {"mini-legacy-alias": "_legacy/seedance-2.0-mini"},
+        )
+
+    with pytest.raises(Exception, match="Retrieve-only managed resources"):
+        asyncio.run(
+            can_key_call_model(
+                model="mini-legacy-alias",
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(**token_kwargs),
+                llm_router=router,
+            )
+        )
+
+
+def test_alias_chain_and_cycle_fail_closed_but_ordinary_alias_passes(monkeypatch):
+    import litellm
+
+    from litellm.proxy.auth.auth_checks import can_key_call_model
+
+    router = _legacy_seedance_router()
+    monkeypatch.setattr(litellm, "model_alias_map", {"global-mini": "key-mini"})
+
+    with pytest.raises(Exception, match="Retrieve-only managed resources"):
+        asyncio.run(
+            can_key_call_model(
+                model="global-mini",
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(
+                    models=["*"], aliases={"key-mini": "_legacy/seedance-2.0-mini"}
+                ),
+                llm_router=router,
+            )
+        )
+
+    with pytest.raises(Exception, match="Retrieve-only managed resources"):
+        asyncio.run(
+            can_key_call_model(
+                model="cycle-a",
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(models=["*"], aliases={"cycle-a": "cycle-b", "cycle-b": "cycle-a"}),
+                llm_router=router,
+            )
+        )
+
+    assert (
+        asyncio.run(
+            can_key_call_model(
+                model="ordinary-alias",
+                llm_model_list=None,
+                valid_token=UserAPIKeyAuth(
+                    models=["ordinary-alias"], aliases={"ordinary-alias": "seedance-2.0-mini"}
+                ),
+                llm_router=router,
+            )
+        )
+        is True
+    )
+
+
 def test_managed_resource_without_owner_keeps_legacy_public_model_auth_behavior():
     from litellm import Router
     from litellm.proxy.auth.auth_checks import can_key_call_model

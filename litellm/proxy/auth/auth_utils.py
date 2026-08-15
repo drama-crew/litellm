@@ -1332,6 +1332,54 @@ def _is_video_retrieval_route(route: str) -> bool:
     return False
 
 
+def _is_video_mutation_route(route: str) -> bool:
+    """Return whether an HTTP video route can create or mutate a resource."""
+    normalized_route = route.rstrip("/")
+    for prefix in ("/v1/videos", "/videos"):
+        if normalized_route == prefix:
+            return True
+        if not normalized_route.startswith(prefix + "/"):
+            continue
+        suffix = normalized_route[len(prefix) + 1 :].split("/")
+        if suffix in (["edits"], ["extensions"], ["characters"]):
+            return True
+        if len(suffix) == 2 and suffix[1] in {"remix", "edits", "extensions"}:
+            return True
+    return False
+
+
+def _resolve_managed_resource_alias_chain(
+    model: Any,
+    *,
+    team_model_aliases: Optional[Mapping[str, str]] = None,
+    key_aliases: Optional[Mapping[str, str]] = None,
+) -> Any:
+    """Resolve aliases in the same order as the proxy pre-call pipeline.
+
+    The pipeline applies team aliases, global ``model_alias_map``, and key
+    aliases. A bounded loop handles legitimate chained aliases while making a
+    cycle fail closed at the resulting unresolved value.
+    """
+    if not isinstance(model, str):
+        return model
+    current = model
+    seen = set()
+    for _ in range(16):
+        if current in seen:
+            return None
+        seen.add(current)
+        previous = current
+        if team_model_aliases and current in team_model_aliases:
+            current = team_model_aliases[current]
+        if isinstance(current, str) and current in litellm.model_alias_map:
+            current = litellm.model_alias_map[current]
+        if key_aliases and isinstance(current, str) and current in key_aliases:
+            current = key_aliases[current]
+        if current == previous:
+            return current
+    return None
+
+
 def _append_model_candidates(candidates: List[str], value: Any) -> None:
     if value is None:
         return
