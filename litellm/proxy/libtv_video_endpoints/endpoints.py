@@ -56,7 +56,18 @@ def _is_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> bool:
 
 
 def _get_redis_client():
-    return get_transfer_redis(os.getenv("LIBTV_VIDEO_GENERATE_REDIS_URL"))
+    redis = get_transfer_redis(os.getenv("LIBTV_VIDEO_GENERATE_REDIS_URL"))
+    if redis is None:
+        # get_transfer_redis() itself falls back to MEDIA_TRANSFER_REDIS_URL
+        # and only returns None when neither env var is set (F5). Silently
+        # handing that None down to enqueue_video_generate/
+        # fetch_video_generate_status used to blow up as an uncaught
+        # AttributeError the first time either function touched the client
+        # (redis.zrangebyscore / redis.get on None) -- an unconfigured
+        # deployment must fail loudly and deterministically instead, same as
+        # the existing empty-allowlist 503 (design §8.1).
+        raise VideoGenerateError("misconfigured", "no redis URL configured for video-generate")
+    return redis
 
 
 @router.post(
@@ -71,13 +82,25 @@ async def libtv_video_generate(request: Request, user_api_key_dict: UserAPIKeyAu
     try:
         payload = orjson.loads(await request.body())
         settings = VideoGenerateSettings.from_environment()
-        task_id = await enqueue_video_generate(payload, redis=_get_redis_client(), settings=settings)
+        # Pass the factory itself (not its result): enqueue_video_generate
+        # calls it lazily, only after its redis-free shape/URL checks pass,
+        # so a misconfigured-redis 503 (F5) never preempts a deterministic
+        # 422 for redis-free-rejection cases. See that function's docstring.
+        task_id = await enqueue_video_generate(payload, redis_factory=_get_redis_client, settings=settings)
         return ORJSONResponse(status_code=202, content={"ok": True, "task_id": task_id})
     except orjson.JSONDecodeError as exc:
         return ORJSONResponse(status_code=422, content={"error": {"code": "invalid_params", "message": str(exc)}})
     except VideoGenerateError as exc:
         status_code = _REJECTION_STATUS_CODES.get(exc.code, 503)
         return ORJSONResponse(status_code=status_code, content={"error": {"code": exc.code, "message": exc.message}})
+    except Exception as exc:  # noqa: BLE001 - defense in depth (F1): never let an
+        # unclassified bug escape as an unhandled exception, which
+        # ASGITransport/uvicorn would otherwise surface as a connection-level
+        # failure that platform retry logic (design §9.4) treats as
+        # transient and retries forever even for a deterministically-bad
+        # input. Every intentionally-classified failure is already handled
+        # above; this is strictly a last-resort net.
+        return ORJSONResponse(status_code=503, content={"error": {"code": "internal_error", "message": str(exc)}})
 
 
 @router.get(
@@ -91,6 +114,17 @@ async def libtv_video_generate_status(
 ):
     if not _is_proxy_admin(user_api_key_dict):
         return ORJSONResponse(status_code=403, content={"error": "proxy-admin authorization is required"})
-    body = await fetch_video_generate_status(task_id, redis=_get_redis_client())
-    status_code = 200 if "status" in body else 404
-    return ORJSONResponse(status_code=status_code, content=body)
+    try:
+        body = await fetch_video_generate_status(task_id, redis=_get_redis_client())
+        status_code = 200 if "status" in body else 404
+        return ORJSONResponse(status_code=status_code, content=body)
+    except VideoGenerateError as exc:
+        # F5: this path previously had zero exception handling at all -- an
+        # unconfigured redis client's None escaped straight into
+        # fetch_video_generate_status's first redis.get() call as an
+        # uncaught AttributeError, worse than the POST side which at least
+        # caught VideoGenerateError already.
+        status_code = _REJECTION_STATUS_CODES.get(exc.code, 503)
+        return ORJSONResponse(status_code=status_code, content={"error": {"code": exc.code, "message": exc.message}})
+    except Exception as exc:  # noqa: BLE001 - defense in depth (F1), mirrors POST.
+        return ORJSONResponse(status_code=503, content={"error": {"code": "internal_error", "message": str(exc)}})

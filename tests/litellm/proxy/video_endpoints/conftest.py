@@ -26,6 +26,14 @@ class FakeRedis:
         self.capacity: dict[str, int] = {"vw-default": 1}
         self.status: dict[str, str] = {}
         self.result: dict[str, str] = {}
+        # F2 regression fixtures: let a test force XADD to raise (simulating
+        # a network blip strictly after the SET NX status write already
+        # landed) and separately force the best-effort rollback DELETE to
+        # raise too, so we can assert the *original* enqueue error survives
+        # a failing rollback instead of being masked by it.
+        self.xadd_exception: Optional[Exception] = None
+        self.delete_exception: Optional[Exception] = None
+        self.deleted_keys: list[str] = []
 
     @staticmethod
     def _task_id_from_key(key: str) -> str:
@@ -41,7 +49,16 @@ class FakeRedis:
 
     async def xadd(self, stream: str, fields: dict) -> str:
         self.calls.append(("xadd", stream, dict(fields)))
+        if self.xadd_exception is not None:
+            raise self.xadd_exception
         return "0-1"
+
+    async def delete(self, key: str) -> int:
+        self.calls.append(("delete", key, {}))
+        if self.delete_exception is not None:
+            raise self.delete_exception
+        self.deleted_keys.append(key)
+        return 1
 
     async def zrangebyscore(self, key: str, min_score: Any, max_score: Any) -> list:
         self.calls.append(("zrangebyscore", key, {"min": min_score, "max": max_score}))

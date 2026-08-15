@@ -16,7 +16,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
 from .transfer import STATUS_TTL_SECONDS, WORKER_HEARTBEAT_WINDOW_SECONDS, result_key, status_key
@@ -225,23 +225,46 @@ async def _check_capacity(redis: Any, task_type: str, alive: list[str]) -> None:
         raise VideoGenerateError("no_capacity_available", "no free capacity among live workers")
 
 
-async def enqueue_video_generate(payload: dict, *, redis: Any, settings: VideoGenerateSettings) -> str:
+async def enqueue_video_generate(
+    payload: dict, *, redis_factory: Callable[[], Any], settings: VideoGenerateSettings
+) -> str:
     """Validate, admission-check, and enqueue a video-generate task.
+
+    ``redis_factory`` is a zero-arg callable (not an already-resolved
+    client) and is deliberately invoked only *after* the redis-free checks
+    below pass. Passing an already-resolved client would defeat the point:
+    a caller like ``endpoints.py`` builds that client via an expression such
+    as ``redis=_get_redis_client()``, and Python evaluates keyword-argument
+    expressions before this function's body ever runs -- so if
+    ``_get_redis_client()`` itself raises on misconfiguration (F5), it would
+    fire *before* shape/URL validation regardless of how validation is
+    ordered in here, breaking every redis-free-rejection test (e.g.
+    ``test_extra_field_is_422_invalid_params``, which has no ``fake_redis``
+    fixture on purpose). Deferring construction to a factory called from
+    inside this function, after validation, keeps rejections genuinely
+    redis-free.
 
     Returns the (caller-supplied) ``task_id`` regardless of whether this
     call actually enqueued a new stream entry or hit the NX dedupe path
     (spec §1.1: a duplicate submission still returns 202 with the same
     task_id, since that task is already progressing through the pipeline).
     """
-    # Cheap, local, redis-free checks first (URL allowlist, then shape) so
-    # that a purely-input-driven rejection never touches redis at all --
-    # required for e.g. test_extra_field_is_422_invalid_params, which has no
-    # fake_redis fixture and would surface an unrelated AttributeError/500 if
-    # redis were touched before shape validation.
-    _validate_urls(payload, settings)
+    # Cheap, local, redis-free checks first -- shape before URLs. A non-dict
+    # (or otherwise shape-invalid) payload must be a deterministic 422
+    # invalid_params and must never reach _validate_urls -> _iter_reference_urls,
+    # which immediately does payload.get("request") and raises an uncaught
+    # AttributeError for a list/str/int/bool body (F1). That escapes as an
+    # unhandled exception instead of a clean 4xx/5xx, and design §9.4 treats
+    # any non-4xx outcome as a TransientTransferError worth retrying -- i.e. a
+    # deterministically-bad input would be retried forever. Shape-first still
+    # keeps purely-input-driven rejections redis-free, same as before (see
+    # test_extra_field_is_422_invalid_params, which has no fake_redis fixture).
     _validate_shape(payload)
+    _validate_urls(payload, settings)
 
     task_id = payload["task_id"]
+
+    redis = redis_factory()
 
     alive = await _alive_workers(redis, TASK_TYPE_VIDEO_GENERATE)
     if not alive:
@@ -267,7 +290,26 @@ async def enqueue_video_generate(payload: dict, *, redis: Any, settings: VideoGe
     ok = await redis.set(status_key(task_id), STATUS_QUEUED, ex=STATUS_TTL_SECONDS, nx=True)
     if not ok:
         return task_id  # duplicate submission; task is already on the rails, see spec §1.1
-    await redis.xadd(stream_key(TASK_TYPE_VIDEO_GENERATE), {"payload": json.dumps(envelope)})
+    try:
+        await redis.xadd(stream_key(TASK_TYPE_VIDEO_GENERATE), {"payload": json.dumps(envelope)})
+    except Exception as exc:
+        # The status key landed but the stream entry didn't (F2): a bare
+        # 500 here leaves a status:queued key with no matching task_id, so a
+        # platform retry's SET NX finds the key already present, returns
+        # False, and short-circuits straight to a 202 that was never
+        # actually enqueued -- the task then sits "queued" until the 24h
+        # status TTL expires and it turns into a phantom 404 unknown_task.
+        # Best-effort delete the status key so a retry's SET NX can succeed
+        # for real; a failure to delete must not mask the original XADD
+        # failure (mirrors validated_transfer.py:477-484's "ambiguous"
+        # rollback pattern).
+        try:
+            await redis.delete(status_key(task_id))
+        except Exception:
+            pass
+        raise VideoGenerateError(
+            "enqueue_ambiguous", f"failed to enqueue task after status write: {exc}"
+        ) from exc
     return task_id
 
 
