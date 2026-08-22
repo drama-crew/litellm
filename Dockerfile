@@ -37,17 +37,26 @@ USER root
 COPY --from=uvbin /uv /usr/local/bin/uv
 COPY --from=uvbin /uvx /usr/local/bin/uvx
 
-RUN apk add --no-cache \
-    bash \
-    gcc \
-    python3 \
-    python3-dev \
-    rust \
-    openssl \
-    openssl-dev \
-    nodejs \
-    npm \
-    libsndfile
+# apk 从 apk.cgr.dev(Chainguard CDN)拉包；跨境/高延迟链路上单个包偶发
+# HTTP 403/5xx,apk 会把它映射成 errno 打印成 "Permission denied"/"IO ERROR"
+# 并整体失败。重试是幂等的:已装好的包会被跳过,只补拉失败的那一个。
+RUN for attempt in 1 2 3 4 5; do \
+        apk add --no-cache \
+            bash \
+            gcc \
+            python3 \
+            python3-dev \
+            rust \
+            openssl \
+            openssl-dev \
+            nodejs \
+            npm \
+            libsndfile \
+        && exit 0; \
+        echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
+        sleep 5; \
+    done; \
+    echo "apk add failed after 5 attempts" >&2; exit 1
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \
@@ -97,7 +106,12 @@ FROM $LITELLM_RUNTIME_IMAGE AS runtime
 USER root
 
 # node (without npm) is required by the prisma CLI at runtime
-RUN apk add --no-cache bash openssl tzdata nodejs python3 libsndfile
+RUN for attempt in 1 2 3 4 5; do \
+        apk add --no-cache bash openssl tzdata nodejs python3 libsndfile && exit 0; \
+        echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
+        sleep 5; \
+    done; \
+    echo "apk add failed after 5 attempts" >&2; exit 1
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:${PATH}"
