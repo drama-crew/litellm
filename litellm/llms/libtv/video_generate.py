@@ -53,6 +53,15 @@ _STATUS_TO_PUBLIC = {
 
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload"})
 
+# The allowed set doubled as the required set until 2026-08-23, which made
+# staging_upload mandatory at enqueue. It is now injected later, by the
+# platform's worker-runner at claim time (design
+# 2026-08-23-causyn-litellm-provider §3.2c), so it must be permitted-but-absent
+# here. Splitting the two sets keeps the closed-key rejection exactly as strict
+# as before -- an unrecognized top-level field is still refused -- while making
+# this one field optional rather than loosening the check for everything.
+_REQUIRED_TOP_LEVEL_KEYS = _ALLOWED_TOP_LEVEL_KEYS - {"staging_upload"}
+
 # F7: closed key sets for the three nested objects spec §1.1 fully documents
 # (request={prompt,duration_seconds,resolution,ratio,seed,references};
 # reference item={role,media_type,url}; staging_upload={url,key,content_type,
@@ -227,6 +236,16 @@ def _validate_urls(payload: dict, settings: VideoGenerateSettings) -> None:
     # _validate_shape has run) skipped _check_url entirely, silently
     # admitting a task with nowhere for the worker to upload its finished
     # result.
+    # Optional at enqueue since 2026-08-23: the causyn provider path enqueues
+    # without one and the platform's worker-runner presigns and injects it when
+    # the worker claims the task (design 2026-08-23-causyn-litellm-provider
+    # §3.2c -- signing stays on the only side holding OSS credentials). The
+    # F6 fail-closed intent is preserved rather than dropped: a staging_upload
+    # that IS present must still be a well-formed, allowlisted target, and the
+    # "task with nowhere to upload" case is now caught at injection time,
+    # before any worker can claim it.
+    if staging_upload is None:
+        return
     if not isinstance(staging_upload, dict) or not isinstance(staging_upload.get("url"), str):
         raise VideoGenerateError("invalid_url", "staging_upload must be an object with a string url")
     _check_url(staging_upload["url"], settings.target_hosts, settings, "staging upload")
@@ -246,7 +265,7 @@ def _validate_shape(payload: Any) -> None:
     extra = set(payload) - _ALLOWED_TOP_LEVEL_KEYS
     if extra:
         raise VideoGenerateError("invalid_params", f"unrecognized field(s): {', '.join(sorted(extra))}")
-    missing = _ALLOWED_TOP_LEVEL_KEYS - set(payload)
+    missing = _REQUIRED_TOP_LEVEL_KEYS - set(payload)
     if missing:
         raise VideoGenerateError("invalid_params", f"missing required field(s): {', '.join(sorted(missing))}")
     if not isinstance(payload.get("task_id"), str) or not payload["task_id"]:
@@ -282,9 +301,12 @@ def _validate_shape(payload: Any) -> None:
             if isinstance(item, dict):
                 _reject_extra_keys(item, _ALLOWED_REFERENCE_KEYS, "reference")
     staging_upload = payload.get("staging_upload")
-    if not isinstance(staging_upload, dict):
-        raise VideoGenerateError("invalid_params", "staging_upload must be an object")
-    _reject_extra_keys(staging_upload, _ALLOWED_STAGING_UPLOAD_KEYS, "staging_upload")
+    # See _validate_urls: absent is legal (claim-time injection), present must
+    # still be a closed-key object.
+    if staging_upload is not None:
+        if not isinstance(staging_upload, dict):
+            raise VideoGenerateError("invalid_params", "staging_upload must be an object")
+        _reject_extra_keys(staging_upload, _ALLOWED_STAGING_UPLOAD_KEYS, "staging_upload")
 
 
 def _decode(value: Any) -> Any:
