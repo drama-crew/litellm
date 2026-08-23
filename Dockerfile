@@ -82,6 +82,20 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
 # Empty (the default) keeps upstream behaviour exactly.
 ARG PYPI_FILES_MIRROR=""
 
+# Optional crates.io mirror. The image installs rust because litellm-rust/
+# builds a python-bridge extension, and `cargo metadata` has to fetch the
+# crates.io index before it can resolve anything. Direct from mainland China
+# that stalls hard -- observed at 19 minutes with the process alive at 0% CPU
+# and no visible connection, which reads as a hang rather than slow progress.
+# Same pattern the sandbox image already uses for its rust build.
+# Empty (the default) keeps upstream behaviour.
+ARG CARGO_REGISTRY_MIRROR=""
+RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
+      mkdir -p "${CARGO_HOME:-/root/.cargo}"; \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
+        "$CARGO_REGISTRY_MIRROR" > "${CARGO_HOME:-/root/.cargo}/config.toml"; \
+    fi
+
 # Copy dependency metadata first for layer caching
 COPY pyproject.toml uv.lock ./
 COPY enterprise/pyproject.toml enterprise/

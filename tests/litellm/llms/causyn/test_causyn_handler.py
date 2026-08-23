@@ -260,3 +260,59 @@ def test_module_holds_no_object_store_client():
     source = open(mod.__file__, encoding="utf-8").read()
     assert "oss2" not in source
     assert "boto3" not in source
+
+
+# --------------------------------------------------------------------------
+# End-to-end through the real enqueue
+# --------------------------------------------------------------------------
+
+
+class _FakeRedis:
+    """Enough of the client for enqueue_video_generate's happy path."""
+
+    def __init__(self):
+        self.entries = []
+        self.kv = {}
+
+    async def zrangebyscore(self, *a, **k):
+        return [b"worker-1"]
+
+    async def hgetall(self, *a, **k):
+        return {b"worker-1": b"1"}
+
+    async def set(self, key, value, **k):
+        self.kv[key] = value
+        return True
+
+    async def xadd(self, stream, fields, **k):
+        self.entries.append((stream, fields))
+        return b"1-0"
+
+
+@pytest.mark.asyncio
+async def test_submit_survives_the_real_enqueue_without_a_staging_upload(monkeypatch):
+    """Exercises enqueue_video_generate for real rather than stubbing it.
+
+    The handler tests above replace that function wholesale, which is exactly
+    how a KeyError inside it reached production: validation had been relaxed to
+    let staging_upload be absent, but the envelope construction still indexed
+    it directly, so every causyn submit failed with a bare APIConnectionError
+    naming only the missing key. Mocking the callee hid the one place the bug
+    lived.
+    """
+    redis = _FakeRedis()
+    monkeypatch.setattr(mod, "_redis_factory", lambda: redis)
+
+    video = await CausynVideoHandler().avideo_generation(
+        model="causyn-1.0",
+        prompt="a cat",
+        optional_params=_params(),
+    )
+
+    assert video.id.startswith(VIDEO_ID_PREFIX)
+    assert len(redis.entries) == 1
+    _, fields = redis.entries[0]
+    payload = json.loads(fields["payload"] if "payload" in fields else fields[b"payload"])
+    assert "staging_upload" not in payload
+    assert payload["request"]["duration_seconds"] == 5
+    assert payload["request"]["resolution"] == "768x512"

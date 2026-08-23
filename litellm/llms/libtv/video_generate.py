@@ -409,8 +409,16 @@ async def enqueue_video_generate(
         "deadline_ts": payload["deadline_ts"],
         "model": payload["model"],
         "request": payload["request"],
-        "staging_upload": payload["staging_upload"],
     }
+    # Only carried when the enqueuer supplied one. The causyn provider path
+    # does not: the platform's worker-runner presigns and injects it when the
+    # worker claims the task, because that side owns the object-store
+    # credentials. Validation was already relaxed to allow its absence; this
+    # construction still hard-indexed it, which turned an absent field into a
+    # KeyError at submit -- surfaced to the caller as a bare
+    # APIConnectionError with no indication of what was actually missing.
+    if payload.get("staging_upload") is not None:
+        envelope["staging_upload"] = payload["staging_upload"]
 
     # Write order is spec-mandated (§2.3.1) and safety-critical: SET status
     # NX must happen strictly before XADD. If reversed, a claim that races
