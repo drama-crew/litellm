@@ -22,6 +22,7 @@ class VideoObject(BaseModel):
     model: Optional[str] = None
     forwarded_prompt_chars: Optional[int] = None
     usage: Optional[Dict[str, Any]] = None
+    object_store_result: Optional[Dict[str, Any]] = None
     _hidden_params: Dict[str, Any] = {}
 
     def __contains__(self, key):

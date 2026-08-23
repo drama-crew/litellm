@@ -53,6 +53,18 @@ async def test_post_returns_202_with_task_id(client_admin, fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_post_allows_claim_time_staging_upload_injection(client_admin, fake_redis):
+    payload = {key: value for key, value in VALID.items() if key != 'staging_upload'}
+
+    response = await client_admin.post('/v1/libtv/video-generate', json=payload)
+
+    assert response.status_code == 202
+    xadd = next(call for call in fake_redis.calls if call[0] == 'xadd')
+    envelope = json.loads(xadd[2]['payload'])
+    assert 'staging_upload' not in envelope
+
+
+@pytest.mark.asyncio
 async def test_post_writes_status_nx_before_xadd(client_admin, fake_redis):
     """写序不可颠倒：先 SET status NX 再 XADD。
     反过来的话，一次极快的 claim 会在 routes/worker_runner.py:254-263

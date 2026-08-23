@@ -52,6 +52,7 @@ _STATUS_TO_PUBLIC = {
 }
 
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload"})
+_REQUIRED_TOP_LEVEL_KEYS = _ALLOWED_TOP_LEVEL_KEYS - {"staging_upload"}
 
 # F7: closed key sets for the three nested objects spec §1.1 fully documents
 # (request={prompt,duration_seconds,resolution,ratio,seed,references};
@@ -181,6 +182,15 @@ def _check_url(raw_url: Any, allowed_hosts: frozenset[str], settings: VideoGener
         raise VideoGenerateError("invalid_url", f"invalid {role} URL")
 
 
+def validate_video_generate_url(
+    raw_url: object,
+    allowed_hosts: frozenset[str],
+    settings: VideoGenerateSettings,
+    role: str,
+) -> None:
+    _check_url(raw_url, allowed_hosts, settings, role)
+
+
 def _iter_reference_urls(payload: dict) -> Iterator[str]:
     """Yield reference-media URLs from the spec-correct nested location,
     ``payload["request"]["references"]`` (spec §1.1).
@@ -219,14 +229,9 @@ def _iter_reference_urls(payload: dict) -> Iterator[str]:
 def _validate_urls(payload: dict, settings: VideoGenerateSettings) -> None:
     for url in _iter_reference_urls(payload):
         _check_url(url, settings.source_hosts, settings, "reference")
+    if "staging_upload" not in payload:
+        return
     staging_upload = payload.get("staging_upload")
-    # Fail-closed (F6): the old `"url" in staging_upload` gate only checked
-    # key *presence*, and only bothered to check that much when
-    # staging_upload was already a dict -- a dict missing the url key (or a
-    # non-dict staging_upload, in case this is ever called before
-    # _validate_shape has run) skipped _check_url entirely, silently
-    # admitting a task with nowhere for the worker to upload its finished
-    # result.
     if not isinstance(staging_upload, dict) or not isinstance(staging_upload.get("url"), str):
         raise VideoGenerateError("invalid_url", "staging_upload must be an object with a string url")
     _check_url(staging_upload["url"], settings.target_hosts, settings, "staging upload")
@@ -246,7 +251,7 @@ def _validate_shape(payload: Any) -> None:
     extra = set(payload) - _ALLOWED_TOP_LEVEL_KEYS
     if extra:
         raise VideoGenerateError("invalid_params", f"unrecognized field(s): {', '.join(sorted(extra))}")
-    missing = _ALLOWED_TOP_LEVEL_KEYS - set(payload)
+    missing = _REQUIRED_TOP_LEVEL_KEYS - set(payload)
     if missing:
         raise VideoGenerateError("invalid_params", f"missing required field(s): {', '.join(sorted(missing))}")
     if not isinstance(payload.get("task_id"), str) or not payload["task_id"]:
@@ -282,9 +287,10 @@ def _validate_shape(payload: Any) -> None:
             if isinstance(item, dict):
                 _reject_extra_keys(item, _ALLOWED_REFERENCE_KEYS, "reference")
     staging_upload = payload.get("staging_upload")
-    if not isinstance(staging_upload, dict):
-        raise VideoGenerateError("invalid_params", "staging_upload must be an object")
-    _reject_extra_keys(staging_upload, _ALLOWED_STAGING_UPLOAD_KEYS, "staging_upload")
+    if "staging_upload" in payload:
+        if not isinstance(staging_upload, dict):
+            raise VideoGenerateError("invalid_params", "staging_upload must be an object")
+        _reject_extra_keys(staging_upload, _ALLOWED_STAGING_UPLOAD_KEYS, "staging_upload")
 
 
 def _decode(value: Any) -> Any:
@@ -387,7 +393,7 @@ async def enqueue_video_generate(
         "deadline_ts": payload["deadline_ts"],
         "model": payload["model"],
         "request": payload["request"],
-        "staging_upload": payload["staging_upload"],
+        **({"staging_upload": payload["staging_upload"]} if "staging_upload" in payload else {}),
     }
 
     # Write order is spec-mandated (§2.3.1) and safety-critical: SET status

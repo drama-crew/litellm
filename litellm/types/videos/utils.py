@@ -6,13 +6,14 @@ Format: vid_{base64_encoded_string}
 """
 
 import base64
-from typing import Optional, Tuple
+from typing import Optional
 
 from litellm._logging import verbose_logger
 from litellm.types.utils import SpecialEnums
 from litellm.types.videos.main import DecodedVideoId
 
 VIDEO_ID_PREFIX = "video_"
+CAUSYN_VIDEO_ID_PREFIX = "causyn_"
 CHARACTER_ID_PREFIX = "character_"
 CHARACTER_ID_TEMPLATE = "litellm:custom_llm_provider:{};model_id:{};character_id:{}"
 
@@ -62,6 +63,13 @@ def decode_video_id_with_provider(encoded_video_id: str) -> DecodedVideoId:
         return DecodedVideoId(
             custom_llm_provider=None,
             model_id=None,
+            video_id=encoded_video_id,
+        )
+
+    if encoded_video_id.startswith(CAUSYN_VIDEO_ID_PREFIX):
+        return DecodedVideoId(
+            custom_llm_provider="causyn",
+            model_id="causyn-1-0",
             video_id=encoded_video_id,
         )
 
