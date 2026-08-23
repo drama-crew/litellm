@@ -210,6 +210,22 @@ def _stub_status(monkeypatch, body):
     monkeypatch.setattr(mod, "_redis_factory", lambda: object())
 
 
+def _valid_worker_result(**overrides):
+    result = {
+        "validation_version": "video-v1",
+        "staging_key": f"staging/video-tasks/{TASK_ID}.mp4",
+        "etag": "etag-1",
+        "bytes": 123,
+        "content_type": "video/mp4",
+        "duration_seconds": 5.0,
+        "width": 768,
+        "height": 512,
+        "sha256": "a" * 64,
+    }
+    result.update(overrides)
+    return result
+
+
 @pytest.mark.parametrize(
     "engine_status,expected",
     [
@@ -225,12 +241,7 @@ def _stub_status(monkeypatch, body):
 )
 @pytest.mark.asyncio
 async def test_status_translation(monkeypatch, engine_status, expected):
-    result = {
-        "staging_key": f"staging/video-tasks/{TASK_ID}.mp4",
-        "content_type": "video/mp4",
-        "bytes": 123,
-        "duration_seconds": 5.0,
-    }
+    result = _valid_worker_result()
     _stub_status(
         monkeypatch,
         {"ok": True, "task_id": TASK_ID, "status": engine_status, "result": result}
@@ -247,18 +258,68 @@ async def test_status_translation(monkeypatch, engine_status, expected):
 async def test_completed_status_carries_the_object_store_result(monkeypatch):
     """This is what lets the platform finalise with a server-side copy instead
     of pulling the bytes back through the proxy (design §3.2b)."""
-    result = {
-        "staging_key": f"staging/video-tasks/{TASK_ID}.mp4",
-        "content_type": "video/mp4",
-        "bytes": 123,
-        "duration_seconds": 5.0,
-    }
+    result = _valid_worker_result()
     _stub_status(monkeypatch, {"ok": True, "task_id": TASK_ID, "status": "succeeded", "result": result})
     video = await CausynVideoHandler().avideo_status(
         video_id=VALID_LEGACY_ID, api_key=None, api_base=None, optional_params={}, logging_obj=None
     )
     assert video.object_store_result == result
     assert video.seconds == "5.0"
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "validation_version",
+        "staging_key",
+        "etag",
+        "bytes",
+        "content_type",
+        "duration_seconds",
+        "width",
+        "height",
+        "sha256",
+    ],
+)
+@pytest.mark.asyncio
+async def test_completed_status_rejects_missing_worker_validation_field(monkeypatch, missing_field):
+    result = _valid_worker_result()
+    result.pop(missing_field)
+    _stub_status(monkeypatch, {"ok": True, "task_id": TASK_ID, "status": "succeeded", "result": result})
+
+    with pytest.raises(CustomLLMError) as exc:
+        await CausynVideoHandler().avideo_status(
+            video_id=VALID_LEGACY_ID, api_key=None, api_base=None, optional_params={}, logging_obj=None
+        )
+
+    assert exc.value.status_code == 503
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("bytes", 0),
+        ("bytes", -1),
+        ("content_type", "video/webm"),
+        ("duration_seconds", 2.0),
+        ("duration_seconds", 9.0),
+        ("width", 769),
+        ("height", 511),
+        ("sha256", "g" * 64),
+        ("sha256", "a" * 63),
+    ],
+)
+@pytest.mark.asyncio
+async def test_completed_status_rejects_invalid_worker_validation_field(monkeypatch, field, value):
+    result = _valid_worker_result(**{field: value})
+    _stub_status(monkeypatch, {"ok": True, "task_id": TASK_ID, "status": "succeeded", "result": result})
+
+    with pytest.raises(CustomLLMError) as exc:
+        await CausynVideoHandler().avideo_status(
+            video_id=VALID_LEGACY_ID, api_key=None, api_base=None, optional_params={}, logging_obj=None
+        )
+
+    assert exc.value.status_code == 503
 
 
 @pytest.mark.asyncio
@@ -296,10 +357,15 @@ async def test_content_refuses_when_no_signed_url_is_present(monkeypatch):
             "task_id": TASK_ID,
             "status": "succeeded",
             "result": {
+                "validation_version": "video-v1",
                 "staging_key": "k",
+                "etag": "etag-1",
                 "content_type": "video/mp4",
                 "bytes": 1,
                 "duration_seconds": 5.0,
+                "width": 768,
+                "height": 512,
+                "sha256": "a" * 64,
             },
         },
     )

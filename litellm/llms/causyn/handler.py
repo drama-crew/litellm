@@ -292,16 +292,16 @@ class _WorkerError(BaseModel):
 class _WorkerResult(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
+    validation_version: Literal["video-v1"]
     staging_key: str
-    bytes: int
-    content_type: str
-    duration_seconds: float
-    validation_version: Literal["video-v1"] | None = None
     staging_url: str | None = None
-    etag: str | None = None
-    width: int | None = None
-    height: int | None = None
-    sha256: str | None = None
+    etag: str = Field(min_length=1)
+    bytes: int = Field(gt=0)
+    content_type: Literal["video/mp4"]
+    duration_seconds: float = Field(ge=3, le=8)
+    width: Literal[768]
+    height: Literal[512]
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
 class _StatusEnvelope(BaseModel):
