@@ -23,8 +23,8 @@ from litellm.llms.libtv.video_generate import (
     fetch_video_generate_status,  # pyright: ignore[reportUnknownVariableType]  # legacy engine returns an untyped dict
     validate_video_generate_url,
 )
-from litellm.types.videos.main import VideoObject
 from litellm.types.utils import all_litellm_params
+from litellm.types.videos.main import VideoObject
 
 CAUSYN_MODEL = "causyn-1.0"
 CAUSYN_VIDEO_ID_PREFIX = "causyn_"
@@ -39,6 +39,7 @@ _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _CAUSYN_USER_PARAMS = frozenset(
     {
         "seconds",
+        "resolution",
         "size",
         "aspect_ratio",
         "reference_images",
@@ -163,6 +164,20 @@ def _references(optional_params: dict[str, object]) -> tuple[dict[str, str], ...
     return tuple({"role": "reference", "media_type": "image", "url": url} for url in urls)
 
 
+def _resolution(optional_params: dict[str, object]) -> str:
+    resolution = optional_params.get("resolution")
+    size = optional_params.get("size")
+    for name, value in (("resolution", resolution), ("size", size)):
+        if value is not None and not isinstance(value, str):
+            raise _bad_request(f"{name} must be a string")
+    if resolution is not None and size is not None and resolution != size:
+        raise _bad_request("resolution and size must match")
+    canonical = resolution if resolution is not None else size
+    if canonical != CAUSYN_RESOLUTION:
+        raise _bad_request(f"resolution must be {CAUSYN_RESOLUTION}")
+    return CAUSYN_RESOLUTION
+
+
 def _request(model: str, prompt: object, optional_params: dict[str, object]) -> tuple[dict[str, object], int]:
     if model != CAUSYN_MODEL:
         raise _bad_request("unsupported causyn model")
@@ -175,8 +190,7 @@ def _request(model: str, prompt: object, optional_params: dict[str, object]) -> 
     )
     if unsupported:
         raise _bad_request(f"unsupported causyn video parameter: {', '.join(unsupported)}")
-    if optional_params.get("size") != CAUSYN_RESOLUTION:
-        raise _bad_request(f"size must be {CAUSYN_RESOLUTION}")
+    resolution = _resolution(optional_params)
     ratio = optional_params.get("aspect_ratio")
     if ratio is not None and ratio != CAUSYN_RATIO:
         raise _bad_request(f"aspect_ratio must be {CAUSYN_RATIO}")
@@ -193,7 +207,7 @@ def _request(model: str, prompt: object, optional_params: dict[str, object]) -> 
     request: dict[str, object] = {
         "prompt": prompt,
         "duration_seconds": duration,
-        "resolution": CAUSYN_RESOLUTION,
+        "resolution": resolution,
         "ratio": CAUSYN_RATIO,
         # Materialize the platform default in the worker contract so the
         # native-audio choice cannot disappear between /v1/videos and Redis.

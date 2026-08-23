@@ -167,7 +167,7 @@ def handler(
 def create_kwargs(**optional_overrides: object) -> dict[str, object]:
     optional_params: dict[str, object] = {
         "seconds": "5",
-        "size": "768x512",
+        "resolution": "768x512",
         "aspect_ratio": "3:2",
         "reference_images": [REFERENCE_URL],
         "generate_audio": True,
@@ -182,6 +182,46 @@ def create_kwargs(**optional_overrides: object) -> dict[str, object]:
         "optional_params": optional_params,
         "logging_obj": None,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"resolution": None, "size": "768x512"},
+        {"resolution": "768x512", "size": "768x512"},
+    ],
+)
+async def test_async_create_accepts_resolution_and_compatible_size_aliases(
+    overrides: dict[str, object],
+) -> None:
+    redis = FakeRedis()
+
+    response = await handler(redis).avideo_generation(**create_kwargs(**overrides))
+
+    assert response.status == "queued"
+    assert redis.envelope()["request"]["resolution"] == "768x512"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"resolution": "512x768"},
+        {"resolution": 768},
+        {"resolution": None, "size": None},
+        {"resolution": None, "size": 768},
+        {"resolution": "768x512", "size": "512x768"},
+        {"unknown_parameter": "unexpected"},
+    ],
+)
+async def test_async_create_rejects_invalid_resolution_contract(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(FakeRedis()).avideo_generation(**create_kwargs(**overrides))
+
+    assert exc_info.value.status_code == 400
 
 
 def completed_result(**overrides: object) -> dict[str, object]:
