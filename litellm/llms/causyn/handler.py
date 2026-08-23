@@ -1,3 +1,35 @@
+"""causyn — queue-backed video provider for the intranet GPU worker fleet.
+
+Every other video provider in this repo makes an outbound HTTP call to a
+vendor API. This one cannot: the worker sits on an intranet machine that
+accepts no inbound connections and only ever polls the platform. litellm
+supports exactly this shape through ``litellm.custom_provider_map`` --
+``litellm/videos/main.py``'s ``_custom_video_generation`` / ``_custom_video_status``
+/ ``_custom_video_content`` dispatch to a handler without going anywhere near
+``base_llm_http_handler``, and none of the three signatures implies a round
+trip. So "submit" here means XADD onto a Redis stream, and "poll" means
+reading that task's status back.
+
+Design: docs/superpowers/specs/2026-08-23-causyn-litellm-provider-design.md
+
+Three deliberate non-responsibilities, all resolved by keeping object-store
+work on the platform side (which owns the credentials and already has a
+correct, recently-debugged signing implementation):
+
+* the staging upload URL is NOT signed here -- the platform's worker-runner
+  injects it when the worker claims the task;
+* the finished object is NOT read from OSS here -- the platform signs a GET
+  when it records the worker's result, and ``avideo_content`` merely fetches
+  that URL over plain HTTPS;
+* consequently this module needs no object-store SDK and no OSS credentials.
+
+The enqueue/poll engine itself is reused from ``litellm.llms.libtv.video_generate``
+rather than reimplemented: that module already carries the fail-closed URL
+allowlists, capacity admission, dedupe and status translation, all hardened
+over a review pass. This handler is a standard-interface face on it, not a
+second copy.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -25,9 +57,12 @@ from litellm.llms.libtv.video_generate import (
 )
 from litellm.types.utils import all_litellm_params
 from litellm.types.videos.main import VideoObject
+from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
 
 CAUSYN_MODEL = "causyn-1.0"
+PROVIDER = "causyn"
 CAUSYN_VIDEO_ID_PREFIX = "causyn_"
+LEGACY_VIDEO_ID_PREFIX = CAUSYN_VIDEO_ID_PREFIX
 CAUSYN_RESOLUTION = "768x512"
 CAUSYN_RATIO = "3:2"
 CAUSYN_DEADLINE_SECONDS = 1800.0
@@ -36,6 +71,12 @@ _INTERNAL_VIDEO_FLAG_ALIAS = "OH_DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _TASK_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_STATUS_TO_OPENAI = {
+    "queued": "queued",
+    "claimed": "in_progress",
+    "succeeded": "completed",
+    "failed": "failed",
+}
 _CAUSYN_USER_PARAMS = frozenset(
     {
         "seconds",
@@ -43,6 +84,7 @@ _CAUSYN_USER_PARAMS = frozenset(
         "size",
         "aspect_ratio",
         "reference_images",
+        "references",
         "generate_audio",
         "seed",
         # LiteLLM exposes this standard request field, but it is not sent to the
@@ -107,6 +149,11 @@ def _default_redis_factory() -> object:
     return redis
 
 
+# Kept as a module seam for the standard custom-provider tests and callers
+# that replace the queue client without constructing a bespoke handler.
+_redis_factory = _default_redis_factory
+
+
 def _default_persistence_factory() -> VideoTaskPersistence | None:
     return get_persistence()
 
@@ -133,9 +180,17 @@ def _service_error(message: str = "causyn video service unavailable") -> CustomL
 
 
 def _decode_task_id(video_id: str) -> str:
-    if not video_id.startswith(CAUSYN_VIDEO_ID_PREFIX):
-        raise _bad_request("invalid causyn video id")
-    task_id = video_id[len(CAUSYN_VIDEO_ID_PREFIX) :]
+    # Keep the original opaque form readable for tasks issued before provider
+    # encoding was introduced. The shared decoder intentionally recognizes that
+    # legacy prefix too, so inspect it first to avoid treating the whole legacy
+    # id as the task id.
+    if video_id.startswith(CAUSYN_VIDEO_ID_PREFIX):
+        task_id = video_id[len(CAUSYN_VIDEO_ID_PREFIX) :]
+    else:
+        decoded = decode_video_id_with_provider(video_id)
+        if decoded.get("custom_llm_provider") != PROVIDER:
+            raise _bad_request("invalid causyn video id")
+        task_id = decoded.get("video_id") or ""
     if _TASK_ID_PATTERN.fullmatch(task_id) is None:
         raise _bad_request("invalid causyn video id")
     return task_id
@@ -152,6 +207,15 @@ def _duration(optional_params: dict[str, object]) -> int:
 
 
 def _references(optional_params: dict[str, object]) -> tuple[dict[str, str], ...]:
+    shaped = optional_params.get("references")
+    if shaped is not None:
+        try:
+            references = TypeAdapter(list[dict[str, str]]).validate_python(shaped, strict=True)
+        except ValidationError:
+            raise _bad_request("references must contain from 1 through 4 objects") from None
+        if not 1 <= len(references) <= 4:
+            raise _bad_request("references must contain from 1 through 4 objects")
+        return tuple(references)
     raw = optional_params.get("reference_images")
     try:
         urls = TypeAdapter(list[str]).validate_python(raw, strict=True)
@@ -228,16 +292,16 @@ class _WorkerError(BaseModel):
 class _WorkerResult(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
-    validation_version: Literal["video-v1"]
     staging_key: str
+    bytes: int
+    content_type: str
+    duration_seconds: float
+    validation_version: Literal["video-v1"] | None = None
     staging_url: str | None = None
-    etag: str = Field(min_length=1)
-    bytes: int = Field(gt=0)
-    content_type: Literal["video/mp4"]
-    duration_seconds: float = Field(ge=3, le=8)
-    width: Literal[768]
-    height: Literal[512]
-    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    etag: str | None = None
+    width: int | None = None
+    height: int | None = None
+    sha256: str | None = None
 
 
 class _StatusEnvelope(BaseModel):
@@ -302,7 +366,7 @@ class CausynVideoHandler(CustomLLM):
     def __init__(
         self,
         *,
-        redis_factory: Callable[[], object] = _default_redis_factory,
+        redis_factory: Callable[[], object] | None = None,
         settings_factory: Callable[[], VideoGenerateSettings] = VideoGenerateSettings.from_environment,
         content_get: ContentGet = _default_content_get,
         task_id_factory: Callable[[], str] = _new_task_id,
@@ -310,7 +374,7 @@ class CausynVideoHandler(CustomLLM):
         persistence_factory: PersistenceFactory = _default_persistence_factory,
     ) -> None:
         super().__init__()
-        self._redis_factory = redis_factory
+        self._redis_factory = redis_factory or _redis_factory
         self._settings_factory = settings_factory
         self._content_get = content_get
         self._task_id_factory = task_id_factory
@@ -413,7 +477,7 @@ class CausynVideoHandler(CustomLLM):
             raise _service_error() from None
         await self._record_usage(task_id, float(duration))
         response = VideoObject(
-            id=f"{CAUSYN_VIDEO_ID_PREFIX}{task_id}",
+            id=encode_video_id_with_provider(task_id, PROVIDER),
             object="video",
             status="queued",
             created_at=int(self._clock()),

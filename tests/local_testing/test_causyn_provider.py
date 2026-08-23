@@ -258,7 +258,7 @@ async def test_async_create_preserves_generate_audio_in_worker_envelope(generate
     response = await handler(redis).avideo_generation(**create_kwargs(generate_audio=generate_audio))
 
     assert isinstance(response, VideoObject)
-    assert response.id == VIDEO_ID
+    assert decode_video_id_with_provider(response.id)["video_id"] == TASK_ID
     assert response.status == "queued"
     assert response.model == "causyn-1.0"
     assert response.seconds == "5"
@@ -308,6 +308,21 @@ async def test_worker_envelope_rejects_non_boolean_generate_audio() -> None:
     assert exc_info.value.code == "invalid_params"
 
 
+def test_worker_envelope_rejects_explicit_null_staging_upload() -> None:
+    envelope = {
+        "task_id": TASK_ID,
+        "model": "causyn-1.0",
+        "deadline_ts": 2_000_001_800.0,
+        "request": {"prompt": "animate", "duration_seconds": 5, "resolution": "768x512"},
+        "staging_upload": None,
+    }
+
+    with pytest.raises(video_generate_module.VideoGenerateError) as exc_info:
+        video_generate_module._validate_shape(envelope)
+
+    assert exc_info.value.code == "invalid_params"
+
+
 @pytest.mark.asyncio
 async def test_async_create_records_usage_for_completion_billing() -> None:
     redis = FakeRedis()
@@ -347,7 +362,7 @@ async def test_public_litellm_video_api_dispatches_to_handler(monkeypatch: pytes
     )
 
     assert isinstance(response, VideoObject)
-    assert response.id == VIDEO_ID
+    assert decode_video_id_with_provider(response.id)["video_id"] == TASK_ID
     assert redis.envelope()["request"]["references"][0]["url"] == REFERENCE_URL
 
 

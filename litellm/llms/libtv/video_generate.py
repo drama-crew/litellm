@@ -52,6 +52,14 @@ _STATUS_TO_PUBLIC = {
 }
 
 _ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload"})
+
+# The allowed set doubled as the required set until 2026-08-23, which made
+# staging_upload mandatory at enqueue. It is now injected later, by the
+# platform's worker-runner at claim time (design
+# 2026-08-23-causyn-litellm-provider §3.2c), so it must be permitted-but-absent
+# here. Splitting the two sets keeps the closed-key rejection exactly as strict
+# as before -- an unrecognized top-level field is still refused -- while making
+# this one field optional rather than loosening the check for everything.
 _REQUIRED_TOP_LEVEL_KEYS = _ALLOWED_TOP_LEVEL_KEYS - {"staging_upload"}
 
 # F7: closed key sets for the three nested objects spec §1.1 fully documents
@@ -231,7 +239,7 @@ def _validate_urls(payload: dict, settings: VideoGenerateSettings) -> None:
         _check_url(url, settings.source_hosts, settings, "reference")
     if "staging_upload" not in payload:
         return
-    staging_upload = payload.get("staging_upload")
+    staging_upload = payload["staging_upload"]
     if not isinstance(staging_upload, dict) or not isinstance(staging_upload.get("url"), str):
         raise VideoGenerateError("invalid_url", "staging_upload must be an object with a string url")
     _check_url(staging_upload["url"], settings.target_hosts, settings, "staging upload")
@@ -287,8 +295,8 @@ def _validate_shape(payload: Any) -> None:
         for item in references:
             if isinstance(item, dict):
                 _reject_extra_keys(item, _ALLOWED_REFERENCE_KEYS, "reference")
-    staging_upload = payload.get("staging_upload")
     if "staging_upload" in payload:
+        staging_upload = payload["staging_upload"]
         if not isinstance(staging_upload, dict):
             raise VideoGenerateError("invalid_params", "staging_upload must be an object")
         _reject_extra_keys(staging_upload, _ALLOWED_STAGING_UPLOAD_KEYS, "staging_upload")
@@ -394,8 +402,16 @@ async def enqueue_video_generate(
         "deadline_ts": payload["deadline_ts"],
         "model": payload["model"],
         "request": payload["request"],
-        **({"staging_upload": payload["staging_upload"]} if "staging_upload" in payload else {}),
     }
+    # Only carried when the enqueuer supplied one. The causyn provider path
+    # does not: the platform's worker-runner presigns and injects it when the
+    # worker claims the task, because that side owns the object-store
+    # credentials. Validation was already relaxed to allow its absence; this
+    # construction still hard-indexed it, which turned an absent field into a
+    # KeyError at submit -- surfaced to the caller as a bare
+    # APIConnectionError with no indication of what was actually missing.
+    if payload.get("staging_upload") is not None:
+        envelope["staging_upload"] = payload["staging_upload"]
 
     # Write order is spec-mandated (§2.3.1) and safety-critical: SET status
     # NX must happen strictly before XADD. If reversed, a claim that races
