@@ -172,7 +172,9 @@ async def test_the_id_names_no_third_party_and_no_pool_index(enqueued):
 async def test_legacy_ids_stay_queryable(monkeypatch):
     """Ids already handed out before the encoding was adopted must not become
     unreadable -- there were live tasks holding them."""
-    _stub_status(monkeypatch, {"ok": True, "task_id": "t", "status": "running"})
+    # "claimed", not "running" -- the engine has no such status, a fiction the
+    # new drift guard caught immediately.
+    _stub_status(monkeypatch, {"ok": True, "task_id": "t", "status": "claimed"})
     video = await CausynVideoHandler().avideo_status(
         video_id=f"{LEGACY_VIDEO_ID_PREFIX}t"
     )
@@ -200,7 +202,16 @@ def _stub_status(monkeypatch, body):
 
 @pytest.mark.parametrize(
     "engine_status,expected",
-    [("queued", "queued"), ("running", "in_progress"), ("succeeded", "completed")],
+    [
+        ("queued", "queued"),
+        # "claimed" is the worker-has-it-and-is-rendering state. It was absent
+        # from the translation table, so a task mid-render was reported as
+        # "failed" -- terminal, meaning the platform would stop polling and
+        # mark a perfectly healthy generation dead. Seen in production on the
+        # 8-second job while the 3-second one had already succeeded.
+        ("claimed", "in_progress"),
+        ("succeeded", "completed"),
+    ],
 )
 @pytest.mark.asyncio
 async def test_status_translation(monkeypatch, engine_status, expected):
@@ -346,3 +357,37 @@ async def test_submit_survives_the_real_enqueue_without_a_staging_upload(monkeyp
     assert "staging_upload" not in payload
     assert payload["request"]["duration_seconds"] == 5
     assert payload["request"]["resolution"] == "768x512"
+
+
+@pytest.mark.asyncio
+async def test_an_unmapped_status_raises_rather_than_reporting_failure(monkeypatch):
+    """The default that hid the bug above.
+
+    `.get(raw, "failed")` turns anything unrecognised into a *terminal* state,
+    so a status this module simply does not know about ends the job instead of
+    being retried. Raising makes the poll fail and come back.
+    """
+    _stub_status(monkeypatch, {"ok": True, "task_id": "t", "status": "paused"})
+    with pytest.raises(VideoGenerateError) as exc:
+        await CausynVideoHandler().avideo_status(video_id=f"{LEGACY_VIDEO_ID_PREFIX}t")
+    assert exc.value.code == "unknown_status"
+
+
+def test_translation_table_covers_every_status_the_engine_can_return():
+    """Drift guard, read off the engine rather than restated by hand.
+
+    fetch_video_generate_status returns _STATUS_TO_PUBLIC's values for the
+    in-flight states and the literals "succeeded"/"failed" for the terminal
+    ones; cancellation and all error paths are folded into "failed" there. If
+    the engine grows a status, this fails here instead of in production.
+    """
+    from litellm.llms.causyn.handler import _STATUS_TO_OPENAI
+    from litellm.llms.libtv.video_generate import _STATUS_TO_PUBLIC
+
+    engine_can_return = set(_STATUS_TO_PUBLIC.values()) | {"succeeded", "failed"}
+    assert engine_can_return <= set(_STATUS_TO_OPENAI), (
+        f"unmapped: {engine_can_return - set(_STATUS_TO_OPENAI)}"
+    )
+    assert set(_STATUS_TO_OPENAI) <= engine_can_return, (
+        f"maps statuses the engine never emits: {set(_STATUS_TO_OPENAI) - engine_can_return}"
+    )

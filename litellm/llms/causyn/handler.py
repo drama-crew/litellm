@@ -67,12 +67,18 @@ LEGACY_VIDEO_ID_PREFIX = "causyn_"
 # queueing behind other tasks on a single-GPU worker.
 DEFAULT_DEADLINE_SECONDS = 1800
 
-# Status translation. The engine already reduces the worker's raw states to
-# {queued, running, succeeded, failed}; this maps that onto the OpenAI video
-# vocabulary the proxy speaks.
+# Status translation onto the OpenAI video vocabulary the proxy speaks.
+#
+# The keys are exactly what fetch_video_generate_status can return, which is
+# not what an earlier version of this comment claimed: there is no "running"
+# (the engine never emits it), and there *is* a "claimed" -- the worker has
+# taken the task off the stream and is rendering it. Missing that key meant a
+# task in progress came back as "failed", because the lookup fell through to a
+# default. Cancellation and every error path are already folded into "failed"
+# upstream, so they need no entry here.
 _STATUS_TO_OPENAI = {
     "queued": "queued",
-    "running": "in_progress",
+    "claimed": "in_progress",
     "succeeded": "completed",
     "failed": "failed",
 }
@@ -240,7 +246,17 @@ class CausynVideoHandler(CustomLLM):
         if "status" not in body:
             raise VideoGenerateError("unknown_task", "unknown task id")
 
-        status = _STATUS_TO_OPENAI.get(body["status"], "failed")
+        raw = body["status"]
+        if raw not in _STATUS_TO_OPENAI:
+            # Deliberately not defaulting to "failed". "failed" is terminal:
+            # the platform stops polling and marks the generation dead, so an
+            # unmapped status would quietly kill a task that is still running
+            # -- which is exactly what happened with "claimed". Raising makes
+            # the poll fail loudly and retry instead of ending the job.
+            raise VideoGenerateError(
+                "unknown_status", f"unmapped engine status {raw!r} for task {task_id}"
+            )
+        status = _STATUS_TO_OPENAI[raw]
         result = body.get("result") if isinstance(body.get("result"), dict) else None
 
         return VideoObject(
