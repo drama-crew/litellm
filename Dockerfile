@@ -37,21 +37,79 @@ USER root
 COPY --from=uvbin /uv /usr/local/bin/uv
 COPY --from=uvbin /uvx /usr/local/bin/uvx
 
-RUN apk add --no-cache \
-    bash \
-    gcc \
-    python3 \
-    python3-dev \
-    rust \
-    openssl \
-    openssl-dev \
-    nodejs \
-    npm \
-    libsndfile
+# apk 从 apk.cgr.dev(Chainguard CDN)拉包；跨境/高延迟链路上单个包偶发
+# HTTP 403/5xx,apk 会把它映射成 errno 打印成 "Permission denied"/"IO ERROR"
+# 并整体失败。重试是幂等的:已装好的包会被跳过,只补拉失败的那一个。
+RUN for attempt in 1 2 3 4 5; do \
+        apk add --no-cache \
+            bash \
+            gcc \
+            python3 \
+            python3-dev \
+            rust \
+            openssl \
+            openssl-dev \
+            nodejs \
+            npm \
+            libsndfile \
+        && exit 0; \
+        echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
+        sleep 5; \
+    done; \
+    echo "apk add failed after 5 attempts" >&2; exit 1
 
 ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \
     PATH="/app/.venv/bin:${PATH}"
+
+# Optional PyPI file mirror. uv.lock pins an absolute
+# https://files.pythonhosted.org/... URL per wheel/sdist, and `uv sync --frozen`
+# does not re-resolve, so an index override cannot redirect those *locked*
+# downloads -- the URLs in the lock are what get fetched. (Build requirements
+# are a separate matter and DO go through the index; see PYPI_INDEX_MIRROR.) From
+# mainland China that means every package comes across the pacific one at a
+# time; a cold build measured about two hours from the wulanchabu host.
+#
+# So rewrite the host in the lock at BUILD time instead. The lock stays
+# pristine in git -- rewriting the committed file would collide with every
+# upstream change to it, and this file is regenerated often upstream.
+#
+# This is safe because the rewrite touches ONLY the host: every sha256 in the
+# lock is left alone, and uv verifies each download against it. A mirror
+# serving different bytes fails the build loudly rather than silently
+# installing something else. Verified the mirror uses the identical
+# /packages/<hash-path>/<file> layout and returns a byte-identical size.
+#
+# Empty (the default) keeps upstream behaviour exactly.
+ARG PYPI_FILES_MIRROR=""
+
+# Optional crates.io mirror. The image installs rust because litellm-rust/
+# builds a python-bridge extension, and `cargo metadata` has to fetch the
+# crates.io index before it can resolve anything. Direct from mainland China
+# that stalls hard -- observed at 19 minutes with the process alive at 0% CPU
+# and no visible connection, which reads as a hang rather than slow progress.
+# Same pattern the sandbox image already uses for its rust build.
+# Empty (the default) keeps upstream behaviour.
+ARG CARGO_REGISTRY_MIRROR=""
+RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
+      mkdir -p "${CARGO_HOME:-/root/.cargo}"; \
+      printf '[source.crates-io]\nreplace-with = "mirror"\n\n[source.mirror]\nregistry = "%s"\n' \
+        "$CARGO_REGISTRY_MIRROR" > "${CARGO_HOME:-/root/.cargo}/config.toml"; \
+    fi
+
+# Optional PyPI *index* mirror. Distinct from PYPI_FILES_MIRROR above, and both
+# are needed: that one rewrites the pinned file URLs in uv.lock, which covers
+# every locked dependency but NOT the PEP 517 build requirements. Those are not
+# in the lock at all -- uv resolves them against the index while building an
+# isolated build environment (litellm-rust declares maturin==1.9.4), so with the
+# default index that step reaches pypi.org.
+#
+# Measured from the mainland: pypi.org/simple/maturin/ took >20s against 0.26s
+# on the mirror. In a real build it did not present as "slow" but as a hang --
+# uv sat at ~2% CPU for 10+ minutes with no network traffic and no disk growth,
+# which is why the file-URL rewrite alone looked like it had not helped.
+# Empty (the default) keeps upstream behaviour.
+ARG PYPI_INDEX_MIRROR=""
 
 # Copy dependency metadata first for layer caching
 COPY pyproject.toml uv.lock ./
@@ -59,7 +117,9 @@ COPY enterprise/pyproject.toml enterprise/
 COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
 
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
-RUN uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
+RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.org/|${PYPI_FILES_MIRROR}|g" uv.lock; fi && \
+    if [ -n "$PYPI_INDEX_MIRROR" ]; then export UV_DEFAULT_INDEX="$PYPI_INDEX_MIRROR"; fi && \
+    uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --extra extra_proxy \
@@ -78,8 +138,11 @@ COPY --from=ui-builder /ui/out/. litellm/proxy/_experimental/out/
 # Build Admin UI before final sync (applies the enterprise color override when present)
 RUN sed -i 's/\r$//' docker/build_admin_ui.sh && chmod +x docker/build_admin_ui.sh && ./docker/build_admin_ui.sh
 
-# Install project and workspace packages (fast - deps already cached)
-RUN uv sync --frozen --no-default-groups --no-editable \
+# Install project and workspace packages (fast - deps already cached).
+# The `COPY . .` above restored the pristine lock, so re-apply the rewrite.
+RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.org/|${PYPI_FILES_MIRROR}|g" uv.lock; fi && \
+    if [ -n "$PYPI_INDEX_MIRROR" ]; then export UV_DEFAULT_INDEX="$PYPI_INDEX_MIRROR"; fi && \
+    uv sync --frozen --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --extra extra_proxy \
@@ -97,7 +160,12 @@ FROM $LITELLM_RUNTIME_IMAGE AS runtime
 USER root
 
 # node (without npm) is required by the prisma CLI at runtime
-RUN apk add --no-cache bash openssl tzdata nodejs python3 libsndfile
+RUN for attempt in 1 2 3 4 5; do \
+        apk add --no-cache bash openssl tzdata nodejs python3 libsndfile && exit 0; \
+        echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
+        sleep 5; \
+    done; \
+    echo "apk add failed after 5 attempts" >&2; exit 1
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:${PATH}"

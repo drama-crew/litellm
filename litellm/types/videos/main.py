@@ -22,6 +22,13 @@ class VideoObject(BaseModel):
     model: Optional[str] = None
     forwarded_prompt_chars: Optional[int] = None
     usage: Optional[Dict[str, Any]] = None
+    # Set only by providers whose finished object already lives in OUR object
+    # store (causyn). Carrying the staging key back lets the platform finalise
+    # with a server-side copy; without it the uniform path would be
+    # GET /videos/{id}/content, moving the same bytes out of object storage,
+    # through this proxy, to the platform, and back into object storage.
+    # None for every vendor-hosted provider, which is all the others.
+    object_store_result: Optional[Dict[str, Any]] = None
     _hidden_params: Dict[str, Any] = {}
 
     def __contains__(self, key):
