@@ -62,13 +62,34 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
     UV_LINK_MODE=copy \
     PATH="/app/.venv/bin:${PATH}"
 
+# Optional PyPI file mirror. uv.lock pins an absolute
+# https://files.pythonhosted.org/... URL per wheel/sdist, and `uv sync --frozen`
+# does not re-resolve, so an index override (UV_DEFAULT_INDEX etc.) cannot
+# redirect those downloads -- the URLs in the lock are what get fetched. From
+# mainland China that means every package comes across the pacific one at a
+# time; a cold build measured about two hours from the wulanchabu host.
+#
+# So rewrite the host in the lock at BUILD time instead. The lock stays
+# pristine in git -- rewriting the committed file would collide with every
+# upstream change to it, and this file is regenerated often upstream.
+#
+# This is safe because the rewrite touches ONLY the host: every sha256 in the
+# lock is left alone, and uv verifies each download against it. A mirror
+# serving different bytes fails the build loudly rather than silently
+# installing something else. Verified the mirror uses the identical
+# /packages/<hash-path>/<file> layout and returns a byte-identical size.
+#
+# Empty (the default) keeps upstream behaviour exactly.
+ARG PYPI_FILES_MIRROR=""
+
 # Copy dependency metadata first for layer caching
 COPY pyproject.toml uv.lock ./
 COPY enterprise/pyproject.toml enterprise/
 COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
 
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
-RUN uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
+RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.org/|${PYPI_FILES_MIRROR}|g" uv.lock; fi && \
+    uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --extra extra_proxy \
@@ -87,8 +108,10 @@ COPY --from=ui-builder /ui/out/. litellm/proxy/_experimental/out/
 # Build Admin UI before final sync (applies the enterprise color override when present)
 RUN sed -i 's/\r$//' docker/build_admin_ui.sh && chmod +x docker/build_admin_ui.sh && ./docker/build_admin_ui.sh
 
-# Install project and workspace packages (fast - deps already cached)
-RUN uv sync --frozen --no-default-groups --no-editable \
+# Install project and workspace packages (fast - deps already cached).
+# The `COPY . .` above restored the pristine lock, so re-apply the rewrite.
+RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.org/|${PYPI_FILES_MIRROR}|g" uv.lock; fi && \
+    uv sync --frozen --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
     --extra extra_proxy \
