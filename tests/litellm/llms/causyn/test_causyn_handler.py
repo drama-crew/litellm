@@ -14,7 +14,12 @@ import json
 import pytest
 
 import litellm.llms.causyn.handler as mod
-from litellm.llms.causyn.handler import VIDEO_ID_PREFIX, CausynVideoHandler
+from litellm.llms.causyn.handler import (
+    LEGACY_VIDEO_ID_PREFIX,
+    PROVIDER,
+    CausynVideoHandler,
+)
+from litellm.types.videos.utils import decode_video_id_with_provider
 from litellm.llms.libtv.video_generate import VideoGenerateError
 
 
@@ -126,33 +131,58 @@ async def test_accepts_already_shaped_references(enqueued):
 
 
 @pytest.mark.asyncio
-async def test_video_id_reveals_no_internal_topology(enqueued):
-    """The sibling libtv encoding base64s custom_llm_provider and the internal
-    deployment id into the video id -- plain base64, so any caller can decode
-    the vendor name and account-pool index. This one carries a task id we
-    generated and nothing else."""
+async def test_the_id_we_hand_back_routes_back_to_us(enqueued):
+    """The test this file was missing, and the omission was not academic.
+
+    litellm/videos/main.py picks the handler for a retrieval by decoding the
+    provider out of the video id; an id it cannot decode falls through to the
+    default provider. The first cut returned a plain `causyn_<uuid>`, so in
+    production every status poll was sent to api.openai.com and timed out
+    there -- submission worked and nothing could ever be read back. Asserting
+    the id's *shape* did not catch that; asserting it decodes does.
+    """
+    video = await CausynVideoHandler().avideo_generation(
+        model="causyn-1.0", prompt="a cat", optional_params=_params()
+    )
+    decoded = decode_video_id_with_provider(video.id)
+    assert decoded["custom_llm_provider"] == PROVIDER
+    assert decoded["video_id"] == enqueued.payloads[0]["task_id"]
+
+
+@pytest.mark.asyncio
+async def test_the_id_names_no_third_party_and_no_pool_index(enqueued):
+    """What made libtv's use of this encoding worth avoiding does not apply here.
+
+    The encoding carries custom_llm_provider and model_id in plain base64. For
+    libtv that means a third-party vendor name and an account-pool index. Ours
+    says "causyn" -- our own name -- and deliberately leaves model_id empty.
+    """
     import base64
 
     video = await CausynVideoHandler().avideo_generation(
         model="causyn-1.0", prompt="a cat", optional_params=_params()
     )
-    assert video.id.startswith(VIDEO_ID_PREFIX)
-    task_id = enqueued.payloads[0]["task_id"]
-    assert video.id == f"{VIDEO_ID_PREFIX}{task_id}"
-    for candidate in (video.id, video.id[len(VIDEO_ID_PREFIX) :]):
-        try:
-            decoded = base64.b64decode(candidate + "=" * (-len(candidate) % 4)).decode(
-                "utf-8", "ignore"
-            )
-        except Exception:
-            decoded = ""
-        assert "provider" not in decoded and "causyn/" not in decoded
+    body = video.id.split("_", 1)[1]
+    plain = base64.b64decode(body + "=" * (-len(body) % 4)).decode("utf-8", "ignore")
+    assert "libtv" not in plain and "wavespeed" not in plain
+    assert "model_id:;" in plain or plain.endswith("model_id:")  # empty, not the deployment id
+
+
+@pytest.mark.asyncio
+async def test_legacy_ids_stay_queryable(monkeypatch):
+    """Ids already handed out before the encoding was adopted must not become
+    unreadable -- there were live tasks holding them."""
+    _stub_status(monkeypatch, {"ok": True, "task_id": "t", "status": "running"})
+    video = await CausynVideoHandler().avideo_status(
+        video_id=f"{LEGACY_VIDEO_ID_PREFIX}t"
+    )
+    assert video.status == "in_progress"
 
 
 @pytest.mark.asyncio
 async def test_status_rejects_a_foreign_video_id():
     with pytest.raises(VideoGenerateError):
-        await CausynVideoHandler().avideo_status(video_id="video_someothervendor")
+        await CausynVideoHandler().avideo_status(video_id="someothervendor_abc")
 
 
 # --------------------------------------------------------------------------
@@ -186,7 +216,7 @@ async def test_status_translation(monkeypatch, engine_status, expected):
         if engine_status == "succeeded"
         else {"ok": True, "task_id": "t", "status": engine_status},
     )
-    video = await CausynVideoHandler().avideo_status(video_id=f"{VIDEO_ID_PREFIX}t")
+    video = await CausynVideoHandler().avideo_status(video_id=f"{LEGACY_VIDEO_ID_PREFIX}t")
     assert video.status == expected
 
 
@@ -203,7 +233,7 @@ async def test_completed_status_carries_the_object_store_result(monkeypatch):
     _stub_status(
         monkeypatch, {"ok": True, "task_id": "t", "status": "succeeded", "result": result}
     )
-    video = await CausynVideoHandler().avideo_status(video_id=f"{VIDEO_ID_PREFIX}t")
+    video = await CausynVideoHandler().avideo_status(video_id=f"{LEGACY_VIDEO_ID_PREFIX}t")
     assert video.object_store_result == result
     assert video.seconds == "5.0"
 
@@ -219,7 +249,7 @@ async def test_failure_surfaces_the_engine_error(monkeypatch):
             "error": {"code": "invalid_params", "message": "bad prompt"},
         },
     )
-    video = await CausynVideoHandler().avideo_status(video_id=f"{VIDEO_ID_PREFIX}t")
+    video = await CausynVideoHandler().avideo_status(video_id=f"{LEGACY_VIDEO_ID_PREFIX}t")
     assert video.status == "failed"
     assert video.error["code"] == "invalid_params"
 
@@ -249,7 +279,7 @@ async def test_content_refuses_when_no_signed_url_is_present(monkeypatch):
         },
     )
     with pytest.raises(VideoGenerateError) as exc:
-        await CausynVideoHandler().avideo_content(video_id=f"{VIDEO_ID_PREFIX}t")
+        await CausynVideoHandler().avideo_content(video_id=f"{LEGACY_VIDEO_ID_PREFIX}t")
     assert exc.value.code == "result_unavailable"
 
 
@@ -309,7 +339,7 @@ async def test_submit_survives_the_real_enqueue_without_a_staging_upload(monkeyp
         optional_params=_params(),
     )
 
-    assert video.id.startswith(VIDEO_ID_PREFIX)
+    assert decode_video_id_with_provider(video.id)["custom_llm_provider"] == PROVIDER
     assert len(redis.entries) == 1
     _, fields = redis.entries[0]
     payload = json.loads(fields["payload"] if "payload" in fields else fields[b"payload"])

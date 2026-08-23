@@ -48,8 +48,19 @@ from litellm.llms.libtv.video_generate import (
     fetch_video_generate_status,
 )
 from litellm.types.videos.main import VideoObject
+from litellm.types.videos.utils import (
+    decode_video_id_with_provider,
+    encode_video_id_with_provider,
+)
 
-VIDEO_ID_PREFIX = "causyn_"
+PROVIDER = "causyn"
+
+# Legacy id form, still accepted on the way in. The first cut returned this and
+# nothing else, which broke retrieval: litellm/videos/main.py decodes the
+# provider out of the video id in six places, and an id it cannot decode falls
+# through to the default provider -- so every status poll went to
+# api.openai.com and timed out there.
+LEGACY_VIDEO_ID_PREFIX = "causyn_"
 
 # Deadline handed to the worker fleet. Generous relative to a single render
 # (the model tops out at 8 seconds of footage) because it also has to cover
@@ -95,15 +106,29 @@ def _gray_rollout_enabled() -> bool:
 def _task_id_from_video_id(video_id: str) -> str:
     """Strip the public prefix.
 
-    The id is deliberately just ``causyn_<task_id>`` over an id we generated
-    ourselves. It is NOT the sibling libtv encoding, which base64s
-    ``custom_llm_provider`` and the internal deployment id into the value --
-    plain base64, so any caller can decode the vendor name and account-pool
-    index straight out of a video id.
+    Two forms are accepted:
+
+    * ``video_<base64>`` -- the encoding litellm itself defines. Retrieval
+      requires it: ``litellm/videos/main.py`` decodes the provider out of the
+      video id to pick a handler, and an id it cannot decode is routed to the
+      default provider instead.
+    * ``causyn_<task_id>`` -- what the first cut returned, before that
+      requirement was understood. Still parsed so ids already handed out stay
+      queryable.
+
+    What the encoding reveals is the reason libtv's use of it was worth
+    avoiding and ours is not: it carries ``custom_llm_provider`` and the
+    deployment id, which for libtv means a third-party vendor name and an
+    account-pool index. Here both fields say "causyn", which is our own name,
+    and the model_id is left empty rather than filled in.
     """
-    if not video_id.startswith(VIDEO_ID_PREFIX):
+    decoded = decode_video_id_with_provider(video_id)
+    if decoded.get("custom_llm_provider") == PROVIDER:
+        task_id = decoded.get("video_id") or ""
+    elif video_id.startswith(LEGACY_VIDEO_ID_PREFIX):
+        task_id = video_id[len(LEGACY_VIDEO_ID_PREFIX) :]
+    else:
         raise VideoGenerateError("invalid_params", f"not a causyn video id: {video_id!r}")
-    task_id = video_id[len(VIDEO_ID_PREFIX) :]
     if not task_id:
         raise VideoGenerateError("invalid_params", "causyn video id carries no task id")
     return task_id
@@ -185,7 +210,10 @@ class CausynVideoHandler(CustomLLM):
             payload, redis_factory=_redis_factory, settings=settings
         )
         return VideoObject(
-            id=f"{VIDEO_ID_PREFIX}{task_id}",
+            # model_id is left None on purpose: only custom_llm_provider is
+            # consulted to route a retrieval, so there is nothing to gain from
+            # putting the deployment id in a value callers can decode.
+            id=encode_video_id_with_provider(task_id, PROVIDER),
             object="video",
             status="queued",
             model=model,
