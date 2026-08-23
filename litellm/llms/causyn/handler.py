@@ -477,7 +477,10 @@ class CausynVideoHandler(CustomLLM):
             raise _service_error() from None
         await self._record_usage(task_id, float(duration))
         response = VideoObject(
-            id=encode_video_id_with_provider(task_id, PROVIDER),
+            # The public endpoint decodes this deployment id before routing a
+            # status/content request.  Keep the hyphenated form stable because
+            # it is also the deployment id used by the router and auth layer.
+            id=encode_video_id_with_provider(task_id, PROVIDER, "causyn-1-0"),
             object="video",
             status="queued",
             created_at=int(self._clock()),

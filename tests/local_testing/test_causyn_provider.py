@@ -258,7 +258,9 @@ async def test_async_create_preserves_generate_audio_in_worker_envelope(generate
     response = await handler(redis).avideo_generation(**create_kwargs(generate_audio=generate_audio))
 
     assert isinstance(response, VideoObject)
-    assert decode_video_id_with_provider(response.id)["video_id"] == TASK_ID
+    decoded = decode_video_id_with_provider(response.id)
+    assert decoded["video_id"] == TASK_ID
+    assert decoded["model_id"] == "causyn-1-0"
     assert response.status == "queued"
     assert response.model == "causyn-1.0"
     assert response.seconds == "5"

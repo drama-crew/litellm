@@ -188,7 +188,8 @@ def _custom_video_status(
     custom_handler = _get_custom_handler(custom_llm_provider)
     if _is_async:
         async_client = client if isinstance(client, AsyncHTTPHandler) else None
-        return custom_handler.avideo_status(
+        return _async_custom_video_status(
+            custom_handler=custom_handler,
             video_id=video_id,
             api_key=api_key,
             api_base=api_base,
@@ -196,17 +197,47 @@ def _custom_video_status(
             logging_obj=logging_obj,
             timeout=timeout,
             client=async_client,
+            custom_llm_provider=custom_llm_provider,
         )
     sync_client = client if isinstance(client, HTTPHandler) else None
-    return custom_handler.video_status(
-        video_id=video_id,
-        api_key=api_key,
-        api_base=api_base,
-        optional_params=optional_params,
-        logging_obj=logging_obj,
-        timeout=timeout,
-        client=sync_client,
-    )
+    try:
+        return custom_handler.video_status(
+            video_id=video_id,
+            api_key=api_key,
+            api_base=api_base,
+            optional_params=optional_params,
+            logging_obj=logging_obj,
+            timeout=timeout,
+            client=sync_client,
+        )
+    except CustomLLMError as error:
+        _raise_custom_video_error(error, model="", custom_llm_provider=custom_llm_provider)
+
+
+async def _async_custom_video_status(
+    *,
+    custom_handler: CustomLLM,
+    video_id: str,
+    api_key: Optional[str],
+    api_base: Optional[str],
+    optional_params: dict,
+    logging_obj: LiteLLMLoggingObj,
+    timeout: Union[int, float],
+    client: AsyncHTTPHandler | None,
+    custom_llm_provider: str,
+):
+    try:
+        return await custom_handler.avideo_status(
+            video_id=video_id,
+            api_key=api_key,
+            api_base=api_base,
+            optional_params=optional_params,
+            logging_obj=logging_obj,
+            timeout=timeout,
+            client=client,
+        )
+    except CustomLLMError as error:
+        _raise_custom_video_error(error, model="", custom_llm_provider=custom_llm_provider)
 
 
 def _custom_video_content(
@@ -223,7 +254,8 @@ def _custom_video_content(
     custom_handler = _get_custom_handler(custom_llm_provider)
     if _is_async:
         async_client = client if isinstance(client, AsyncHTTPHandler) else None
-        return custom_handler.avideo_content(
+        return _async_custom_video_content(
+            custom_handler=custom_handler,
             video_id=video_id,
             api_key=api_key,
             api_base=api_base,
@@ -231,17 +263,47 @@ def _custom_video_content(
             logging_obj=logging_obj,
             timeout=timeout,
             client=async_client,
+            custom_llm_provider=custom_llm_provider,
         )
     sync_client = client if isinstance(client, HTTPHandler) else None
-    return custom_handler.video_content(
-        video_id=video_id,
-        api_key=api_key,
-        api_base=api_base,
-        optional_params=optional_params,
-        logging_obj=logging_obj,
-        timeout=timeout,
-        client=sync_client,
-    )
+    try:
+        return custom_handler.video_content(
+            video_id=video_id,
+            api_key=api_key,
+            api_base=api_base,
+            optional_params=optional_params,
+            logging_obj=logging_obj,
+            timeout=timeout,
+            client=sync_client,
+        )
+    except CustomLLMError as error:
+        _raise_custom_video_error(error, model="", custom_llm_provider=custom_llm_provider)
+
+
+async def _async_custom_video_content(
+    *,
+    custom_handler: CustomLLM,
+    video_id: str,
+    api_key: Optional[str],
+    api_base: Optional[str],
+    optional_params: dict,
+    logging_obj: LiteLLMLoggingObj,
+    timeout: Union[int, float],
+    client: AsyncHTTPHandler | None,
+    custom_llm_provider: str,
+):
+    try:
+        return await custom_handler.avideo_content(
+            video_id=video_id,
+            api_key=api_key,
+            api_base=api_base,
+            optional_params=optional_params,
+            logging_obj=logging_obj,
+            timeout=timeout,
+            client=client,
+        )
+    except CustomLLMError as error:
+        _raise_custom_video_error(error, model="", custom_llm_provider=custom_llm_provider)
 
 
 ##### Video Generation #######################

@@ -35,7 +35,7 @@ import sys
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Dict
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -43,6 +43,7 @@ sys.path.insert(0, os.path.abspath("../../.."))
 
 import litellm
 from litellm.llms.custom_httpx.llm_http_handler import BaseLLMHTTPHandler
+from litellm.llms.custom_llm import CustomLLMError
 from litellm.types.videos.main import CharacterObject, VideoObject
 from litellm.types.videos.utils import encode_video_id_with_provider
 from litellm.videos import main as videos_main
@@ -378,6 +379,38 @@ async def test_avideo_content__pre_decodes_provider_before_delegating():
     assert result is sentinel
     assert sync.call_args.kwargs["async_call"] is True
     assert sync.call_args.kwargs["custom_llm_provider"] == "azure"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["status", "content"])
+@pytest.mark.parametrize("status_code", [404, 409, 502, 503])
+async def test_custom_video_retrieval_preserves_provider_http_status(operation, status_code):
+    """Status/content use the same CustomLLM error mapping as create."""
+    handler = MagicMock()
+    error = CustomLLMError(status_code=status_code, message="provider failure")
+    if operation == "status":
+        handler.avideo_status = AsyncMock(side_effect=error)
+        call = videos_main._custom_video_status
+    else:
+        handler.avideo_content = AsyncMock(side_effect=error)
+        call = videos_main._custom_video_content
+
+    with patch.object(videos_main, "_get_custom_handler", return_value=handler):
+        with pytest.raises(Exception) as exc_info:
+            result = call(
+                video_id="video_causyn",
+                custom_llm_provider="causyn",
+                optional_params={},
+                logging_obj=MagicMock(),
+                timeout=60,
+                _is_async=True,
+                api_key=None,
+                api_base=None,
+                client=None,
+            )
+            await result
+
+    assert exc_info.value.status_code == status_code
 
 
 # =========================================================================== #

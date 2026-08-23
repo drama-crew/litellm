@@ -169,7 +169,7 @@ async def test_the_id_names_no_third_party_and_no_pool_index(enqueued):
     body = video.id.split("_", 1)[1]
     plain = base64.b64decode(body + "=" * (-len(body) % 4)).decode("utf-8", "ignore")
     assert "libtv" not in plain and "wavespeed" not in plain
-    assert "model_id:;" in plain or plain.endswith("model_id:")  # empty, not the deployment id
+    assert "model_id:causyn-1-0" in plain
 
 
 @pytest.mark.asyncio
