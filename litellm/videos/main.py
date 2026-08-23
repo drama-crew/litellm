@@ -2,13 +2,28 @@ import asyncio
 import contextvars
 import json
 from functools import partial
-from typing import Any, Coroutine, Dict, List, Literal, Optional, Union, overload
+from typing import Any, Coroutine, Dict, List, Literal, NoReturn, Optional, Union, overload
 
+import httpx
 import litellm
 from litellm.constants import DEFAULT_VIDEO_ENDPOINT_MODEL
 from litellm.constants import request_timeout as DEFAULT_REQUEST_TIMEOUT
-from litellm.exceptions import LiteLLMUnknownProvider
+from litellm.exceptions import (
+    APIError,
+    AuthenticationError,
+    BadGatewayError,
+    BadRequestError,
+    InternalServerError,
+    LiteLLMUnknownProvider,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+    ServiceUnavailableError,
+    Timeout,
+    UnprocessableEntityError,
+)
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+from litellm.llms.custom_llm import CustomLLM, CustomLLMError
 from litellm.litellm_core_utils.get_llm_provider_logic import get_llm_provider
 from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
 from litellm.llms.base_llm.videos.transformation import BaseVideoConfig
@@ -58,7 +73,8 @@ def _custom_video_generation(
 
     if _is_async:
         async_client = client if isinstance(client, AsyncHTTPHandler) else None
-        return custom_handler.avideo_generation(
+        return _async_custom_video_generation(
+            custom_handler=custom_handler,
             model=model,
             prompt=prompt,
             api_key=api_key,
@@ -67,18 +83,88 @@ def _custom_video_generation(
             logging_obj=logging_obj,
             timeout=timeout,
             client=async_client,
+            custom_llm_provider=custom_llm_provider,
         )
     sync_client = client if isinstance(client, HTTPHandler) else None
-    return custom_handler.video_generation(
-        model=model,
-        prompt=prompt,
-        api_key=api_key,
-        api_base=api_base,
-        optional_params=optional_params,
-        logging_obj=logging_obj,
-        timeout=timeout,
-        client=sync_client,
+    try:
+        return custom_handler.video_generation(
+            model=model,
+            prompt=prompt,
+            api_key=api_key,
+            api_base=api_base,
+            optional_params=optional_params,
+            logging_obj=logging_obj,
+            timeout=timeout,
+            client=sync_client,
+        )
+    except CustomLLMError as error:
+        _raise_custom_video_error(error, model=model, custom_llm_provider=custom_llm_provider)
+
+
+async def _async_custom_video_generation(
+    *,
+    custom_handler: CustomLLM,
+    model: str,
+    prompt: str,
+    api_key: str | None,
+    api_base: str | None,
+    optional_params: dict,
+    logging_obj: LiteLLMLoggingObj,
+    timeout: float,
+    client: AsyncHTTPHandler | None,
+    custom_llm_provider: str,
+):
+    try:
+        return await custom_handler.avideo_generation(
+            model=model,
+            prompt=prompt,
+            api_key=api_key,
+            api_base=api_base,
+            optional_params=optional_params,
+            logging_obj=logging_obj,
+            timeout=timeout,
+            client=client,
+        )
+    except CustomLLMError as error:
+        _raise_custom_video_error(error, model=model, custom_llm_provider=custom_llm_provider)
+
+
+def _raise_custom_video_error(
+    error: CustomLLMError,
+    *,
+    model: str,
+    custom_llm_provider: str,
+) -> NoReturn:
+    response = httpx.Response(
+        status_code=error.status_code,
+        request=httpx.Request("POST", "https://litellm.ai/v1/videos"),
     )
+    common = {
+        "message": error.message,
+        "model": model,
+        "llm_provider": custom_llm_provider,
+    }
+    if error.status_code == 400:
+        raise BadRequestError(**common, response=response) from error
+    if error.status_code == 401:
+        raise AuthenticationError(**common, response=response) from error
+    if error.status_code == 403:
+        raise PermissionDeniedError(**common, response=response) from error
+    if error.status_code == 404:
+        raise NotFoundError(**common, response=response) from error
+    if error.status_code in (408, 504):
+        raise Timeout(**common, exception_status_code=error.status_code) from error
+    if error.status_code == 422:
+        raise UnprocessableEntityError(**common, response=response) from error
+    if error.status_code == 429:
+        raise RateLimitError(**common, response=response) from error
+    if error.status_code == 502:
+        raise BadGatewayError(**common, response=response) from error
+    if error.status_code == 503:
+        raise ServiceUnavailableError(**common, response=response) from error
+    if error.status_code >= 500:
+        raise InternalServerError(**common, response=response) from error
+    raise APIError(status_code=error.status_code, **common) from error
 
 
 def _get_custom_handler(custom_llm_provider: str, model: str = ""):
@@ -156,6 +242,7 @@ def _custom_video_content(
         timeout=timeout,
         client=sync_client,
     )
+
 
 ##### Video Generation #######################
 @client
@@ -337,16 +424,27 @@ def video_generation(  # noqa: PLR0915
 
         if custom_llm_provider in litellm._custom_providers:
             custom_optional_params = {
-                k: v
-                for k, v in {
+                key: value
+                for key, value in {
                     "seconds": seconds,
                     "size": size,
                     "user": user,
                     "input_reference": input_reference,
                 }.items()
-                if v is not None
+                if value is not None
             }
             custom_optional_params.update(kwargs)
+            custom_optional_params = dict(
+                VideoGenerationRequestUtils.get_requested_video_generation_optional_param(
+                    {
+                        "kwargs": custom_optional_params,
+                        "extra_body": extra_body,
+                    },
+                    preserve_explicit_none=True,
+                    extra_body_overrides=False,
+                )
+            )
+            custom_optional_params.pop("extra_body", None)
             return _custom_video_generation(
                 model=model,
                 prompt=prompt,

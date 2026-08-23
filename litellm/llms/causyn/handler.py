@@ -165,14 +165,15 @@ def _references(optional_params: dict[str, object]) -> tuple[dict[str, str], ...
 
 
 def _resolution(optional_params: dict[str, object]) -> str:
-    resolution = optional_params.get("resolution")
-    size = optional_params.get("size")
+    missing = object()
+    resolution = optional_params.get("resolution", missing)
+    size = optional_params.get("size", missing)
     for name, value in (("resolution", resolution), ("size", size)):
-        if value is not None and not isinstance(value, str):
+        if value is not missing and not isinstance(value, str):
             raise _bad_request(f"{name} must be a string")
-    if resolution is not None and size is not None and resolution != size:
+    if resolution is not missing and size is not missing and resolution != size:
         raise _bad_request("resolution and size must match")
-    canonical = resolution if resolution is not None else size
+    canonical = resolution if resolution is not missing else size
     if canonical != CAUSYN_RESOLUTION:
         raise _bad_request(f"resolution must be {CAUSYN_RESOLUTION}")
     return CAUSYN_RESOLUTION
@@ -184,9 +185,7 @@ def _request(model: str, prompt: object, optional_params: dict[str, object]) -> 
     if not isinstance(prompt, str) or not prompt.strip():
         raise _bad_request("prompt must be a non-empty string")
     unsupported = sorted(
-        key
-        for key, value in optional_params.items()
-        if key not in _CAUSYN_USER_PARAMS and key not in _CAUSYN_FRAMEWORK_PARAMS and value is not None
+        key for key in optional_params if key not in _CAUSYN_USER_PARAMS and key not in _CAUSYN_FRAMEWORK_PARAMS
     )
     if unsupported:
         raise _bad_request(f"unsupported causyn video parameter: {', '.join(unsupported)}")

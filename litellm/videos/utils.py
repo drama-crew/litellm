@@ -47,6 +47,9 @@ class VideoGenerationRequestUtils:
     @staticmethod
     def get_requested_video_generation_optional_param(
         params: Dict[str, Any],
+        *,
+        preserve_explicit_none: bool = False,
+        extra_body_overrides: bool = True,
     ) -> VideoCreateOptionalRequestParams:
         """
         Filter parameters to only include those defined in VideoCreateOptionalRequestParams.
@@ -73,7 +76,9 @@ class VideoGenerationRequestUtils:
         }
         base_params = filter_out_litellm_params(kwargs=base_params_raw)
 
-        cleaned_kwargs = filter_out_litellm_params(kwargs={k: v for k, v in raw_kwargs.items() if v is not None})
+        cleaned_kwargs = filter_out_litellm_params(
+            kwargs={k: v for k, v in raw_kwargs.items() if preserve_explicit_none or v is not None}
+        )
 
         optional_params: Dict[str, Any] = {
             **base_params,
@@ -84,14 +89,17 @@ class VideoGenerationRequestUtils:
         for extra_body_candidate in (top_level_extra_body, kwargs_extra_body):
             if isinstance(extra_body_candidate, dict):
                 for key, value in extra_body_candidate.items():
-                    if value is not None:
+                    if preserve_explicit_none or value is not None:
                         merged_extra_body[key] = value
 
         if merged_extra_body:
             merged_extra_body = filter_out_litellm_params(kwargs=merged_extra_body)
             if merged_extra_body:
                 optional_params["extra_body"] = merged_extra_body
-                optional_params.update(merged_extra_body)
+                if extra_body_overrides:
+                    optional_params.update(merged_extra_body)
+                else:
+                    optional_params = {**merged_extra_body, **optional_params}
 
         optional_params.pop("timeout", None)
 

@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 import litellm
+from litellm.exceptions import BadRequestError
 from litellm.llms.causyn import CausynVideoHandler
 from litellm.llms.causyn import handler as causyn_module
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
@@ -188,7 +189,6 @@ def create_kwargs(**optional_overrides: object) -> dict[str, object]:
 @pytest.mark.parametrize(
     "overrides",
     [
-        {"resolution": None, "size": "768x512"},
         {"resolution": "768x512", "size": "768x512"},
     ],
 )
@@ -210,6 +210,7 @@ async def test_async_create_accepts_resolution_and_compatible_size_aliases(
         {"resolution": "512x768"},
         {"resolution": 768},
         {"resolution": None, "size": None},
+        {"resolution": None, "size": "768x512"},
         {"resolution": None, "size": 768},
         {"resolution": "768x512", "size": "512x768"},
         {"unknown_parameter": "unexpected"},
@@ -348,6 +349,75 @@ async def test_public_litellm_video_api_dispatches_to_handler(monkeypatch: pytes
     assert isinstance(response, VideoObject)
     assert response.id == VIDEO_ID
     assert redis.envelope()["request"]["references"][0]["url"] == REFERENCE_URL
+
+
+def _install_public_causyn_handler(monkeypatch: pytest.MonkeyPatch, provider: CausynVideoHandler) -> None:
+    monkeypatch.setattr(litellm, "custom_provider_map", [{"provider": "causyn", "custom_handler": provider}])
+    monkeypatch.setattr(litellm, "_custom_providers", [*litellm._custom_providers, "causyn"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"extra_body": {"resolution": "768x512"}},
+        {"size": "768x512"},
+        {"size": "768x512", "extra_body": {"resolution": "768x512"}},
+        {"size": "768x512", "extra_body": {"size": "512x768"}},
+    ],
+)
+async def test_public_litellm_video_api_merges_resolution_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+) -> None:
+    redis = FakeRedis()
+    _install_public_causyn_handler(monkeypatch, handler(redis))
+
+    response = await litellm.avideo_generation(
+        model="causyn/causyn-1.0",
+        prompt="animate the reference",
+        seconds="5",
+        aspect_ratio="3:2",
+        reference_images=[REFERENCE_URL],
+        **overrides,
+    )
+
+    assert isinstance(response, VideoObject)
+    assert redis.envelope()["request"]["resolution"] == "768x512"
+    assert "size" not in redis.envelope()["request"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"size": "768x512", "extra_body": {"resolution": "512x768"}},
+        {"extra_body": {"resolution": None}},
+        {"extra_body": {"unknown_parameter": None}},
+        {"extra_body": {"resolution": "512x768"}},
+        {"resolution": 768},
+        {"size": 768},
+    ],
+)
+async def test_public_litellm_video_api_rejects_resolution_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, object],
+) -> None:
+    redis = FakeRedis()
+    _install_public_causyn_handler(monkeypatch, handler(redis))
+
+    with pytest.raises(BadRequestError) as exc_info:
+        await litellm.avideo_generation(
+            model="causyn/causyn-1.0",
+            prompt="animate the reference",
+            seconds="5",
+            aspect_ratio="3:2",
+            reference_images=[REFERENCE_URL],
+            **overrides,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert redis.calls == []
 
 
 @pytest.mark.asyncio
