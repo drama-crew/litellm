@@ -13,6 +13,7 @@ from litellm.llms.causyn import CausynVideoHandler
 from litellm.llms.causyn import handler as causyn_module
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
 from litellm.llms.libtv.transfer import result_key, status_key
+from litellm.llms.libtv import video_generate as video_generate_module
 from litellm.llms.libtv.video_generate import VideoGenerateSettings
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider
@@ -210,9 +211,10 @@ def set_status(redis: FakeRedis, status: str, result: dict[str, object] | None =
 
 
 @pytest.mark.asyncio
-async def test_async_create_uses_video_generate_engine_without_staging_upload() -> None:
+@pytest.mark.parametrize("generate_audio", [True, False])
+async def test_async_create_preserves_generate_audio_in_worker_envelope(generate_audio: bool) -> None:
     redis = FakeRedis()
-    response = await handler(redis).avideo_generation(**create_kwargs())
+    response = await handler(redis).avideo_generation(**create_kwargs(generate_audio=generate_audio))
 
     assert isinstance(response, VideoObject)
     assert response.id == VIDEO_ID
@@ -232,10 +234,37 @@ async def test_async_create_uses_video_generate_engine_without_staging_upload() 
             "duration_seconds": 5,
             "resolution": "768x512",
             "ratio": "3:2",
+            "generate_audio": generate_audio,
             "seed": 7,
             "references": [{"role": "reference", "media_type": "image", "url": REFERENCE_URL}],
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_async_create_defaults_generate_audio_on_in_worker_envelope() -> None:
+    redis = FakeRedis()
+    params = create_kwargs()["optional_params"]
+    assert isinstance(params, dict)
+    params = dict(params)
+    params.pop("generate_audio")
+
+    await handler(redis).avideo_generation(**create_kwargs(**params))
+
+    assert redis.envelope()["request"]["generate_audio"] is True
+
+
+@pytest.mark.asyncio
+async def test_worker_envelope_rejects_non_boolean_generate_audio() -> None:
+    redis = FakeRedis()
+    await handler(redis).avideo_generation(**create_kwargs())
+    envelope = redis.envelope()
+    envelope["request"]["generate_audio"] = "true"
+
+    with pytest.raises(video_generate_module.VideoGenerateError) as exc_info:
+        video_generate_module._validate_shape(envelope)
+
+    assert exc_info.value.code == "invalid_params"
 
 
 @pytest.mark.asyncio

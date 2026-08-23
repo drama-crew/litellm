@@ -63,7 +63,7 @@ _REQUIRED_TOP_LEVEL_KEYS = _ALLOWED_TOP_LEVEL_KEYS - {"staging_upload"}
 # _validate_shape untouched and get forwarded verbatim into the Redis Stream
 # envelope for the worker to deal with.
 _ALLOWED_REQUEST_KEYS = frozenset(
-    {"prompt", "duration_seconds", "resolution", "ratio", "seed", "references"}
+    {"prompt", "duration_seconds", "resolution", "ratio", "seed", "generate_audio", "references"}
 )
 _ALLOWED_REFERENCE_KEYS = frozenset({"role", "media_type", "url"})
 _ALLOWED_STAGING_UPLOAD_KEYS = frozenset({"url", "key", "content_type", "expires_at"})
@@ -240,9 +240,7 @@ def _validate_urls(payload: dict, settings: VideoGenerateSettings) -> None:
 def _reject_extra_keys(obj: dict, allowed: frozenset[str], label: str) -> None:
     extra = set(obj) - allowed
     if extra:
-        raise VideoGenerateError(
-            "invalid_params", f"unrecognized {label} field(s): {', '.join(sorted(extra))}"
-        )
+        raise VideoGenerateError("invalid_params", f"unrecognized {label} field(s): {', '.join(sorted(extra))}")
 
 
 def _validate_shape(payload: Any) -> None:
@@ -276,6 +274,9 @@ def _validate_shape(payload: Any) -> None:
     if not isinstance(request, dict):
         raise VideoGenerateError("invalid_params", "request must be an object")
     _reject_extra_keys(request, _ALLOWED_REQUEST_KEYS, "request")
+    generate_audio = request.get("generate_audio", True)
+    if not isinstance(generate_audio, bool):
+        raise VideoGenerateError("invalid_params", "request.generate_audio must be a boolean")
     # F7: references[i]'s closed key set only applies to items that are
     # already dicts -- a malformed (non-dict, or dict-missing-url) item is
     # F6's job (_iter_reference_urls, run afterwards by _validate_urls), so
@@ -432,9 +433,7 @@ async def enqueue_video_generate(
         # traceback server-side. Matches validated_transfer.py's equivalent
         # "ambiguous" rollback raise (~line 480), which already only ever
         # used a bare stable message for the same reason.
-        raise VideoGenerateError(
-            "enqueue_ambiguous", "failed to enqueue task after status write"
-        ) from exc
+        raise VideoGenerateError("enqueue_ambiguous", "failed to enqueue task after status write") from exc
     return task_id
 
 

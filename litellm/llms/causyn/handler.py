@@ -195,6 +195,9 @@ def _request(model: str, prompt: object, optional_params: dict[str, object]) -> 
         "duration_seconds": duration,
         "resolution": CAUSYN_RESOLUTION,
         "ratio": CAUSYN_RATIO,
+        # Materialize the platform default in the worker contract so the
+        # native-audio choice cannot disappear between /v1/videos and Redis.
+        "generate_audio": True if generate_audio is None else generate_audio,
         "references": list(_references(optional_params)),
     }
     if seed is not None:
