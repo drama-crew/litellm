@@ -64,8 +64,9 @@ ENV UV_PROJECT_ENVIRONMENT=/app/.venv \
 
 # Optional PyPI file mirror. uv.lock pins an absolute
 # https://files.pythonhosted.org/... URL per wheel/sdist, and `uv sync --frozen`
-# does not re-resolve, so an index override (UV_DEFAULT_INDEX etc.) cannot
-# redirect those downloads -- the URLs in the lock are what get fetched. From
+# does not re-resolve, so an index override cannot redirect those *locked*
+# downloads -- the URLs in the lock are what get fetched. (Build requirements
+# are a separate matter and DO go through the index; see PYPI_INDEX_MIRROR.) From
 # mainland China that means every package comes across the pacific one at a
 # time; a cold build measured about two hours from the wulanchabu host.
 #
@@ -96,6 +97,20 @@ RUN if [ -n "$CARGO_REGISTRY_MIRROR" ]; then \
         "$CARGO_REGISTRY_MIRROR" > "${CARGO_HOME:-/root/.cargo}/config.toml"; \
     fi
 
+# Optional PyPI *index* mirror. Distinct from PYPI_FILES_MIRROR above, and both
+# are needed: that one rewrites the pinned file URLs in uv.lock, which covers
+# every locked dependency but NOT the PEP 517 build requirements. Those are not
+# in the lock at all -- uv resolves them against the index while building an
+# isolated build environment (litellm-rust declares maturin==1.9.4), so with the
+# default index that step reaches pypi.org.
+#
+# Measured from the mainland: pypi.org/simple/maturin/ took >20s against 0.26s
+# on the mirror. In a real build it did not present as "slow" but as a hang --
+# uv sat at ~2% CPU for 10+ minutes with no network traffic and no disk growth,
+# which is why the file-URL rewrite alone looked like it had not helped.
+# Empty (the default) keeps upstream behaviour.
+ARG PYPI_INDEX_MIRROR=""
+
 # Copy dependency metadata first for layer caching
 COPY pyproject.toml uv.lock ./
 COPY enterprise/pyproject.toml enterprise/
@@ -103,6 +118,7 @@ COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
 
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
 RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.org/|${PYPI_FILES_MIRROR}|g" uv.lock; fi && \
+    if [ -n "$PYPI_INDEX_MIRROR" ]; then export UV_DEFAULT_INDEX="$PYPI_INDEX_MIRROR"; fi && \
     uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
@@ -125,6 +141,7 @@ RUN sed -i 's/\r$//' docker/build_admin_ui.sh && chmod +x docker/build_admin_ui.
 # Install project and workspace packages (fast - deps already cached).
 # The `COPY . .` above restored the pristine lock, so re-apply the rewrite.
 RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.org/|${PYPI_FILES_MIRROR}|g" uv.lock; fi && \
+    if [ -n "$PYPI_INDEX_MIRROR" ]; then export UV_DEFAULT_INDEX="$PYPI_INDEX_MIRROR"; fi && \
     uv sync --frozen --no-default-groups --no-editable \
     --extra proxy \
     --extra proxy-runtime \
