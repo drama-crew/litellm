@@ -39,7 +39,7 @@ import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -55,6 +55,7 @@ from litellm.llms.libtv.video_generate import (
     fetch_video_generate_status,  # pyright: ignore[reportUnknownVariableType]  # legacy engine returns an untyped dict
     validate_video_generate_url,
 )
+from litellm.litellm_core_utils.asyncify import run_async_function  # pyright: ignore[reportUnknownVariableType]
 from litellm.types.utils import all_litellm_params
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
@@ -502,7 +503,19 @@ class CausynVideoHandler(CustomLLM):
         timeout: RequestTimeout = None,
         client: HTTPHandler | None = None,
     ) -> VideoObject:
-        raise NotImplementedError("causyn video status is async-only")
+        return cast(
+            VideoObject,
+            run_async_function(
+                self.avideo_status,
+                video_id=video_id,
+                api_key=api_key,
+                api_base=api_base,
+                optional_params=optional_params,
+                logging_obj=logging_obj,
+                timeout=timeout,
+                client=None,
+            ),
+        )
 
     async def _status(self, video_id: str) -> _StatusEnvelope:
         task_id = _decode_task_id(video_id)
@@ -578,7 +591,19 @@ class CausynVideoHandler(CustomLLM):
         timeout: RequestTimeout = None,
         client: HTTPHandler | None = None,
     ) -> bytes:
-        raise NotImplementedError("causyn video content is async-only")
+        return cast(
+            bytes,
+            run_async_function(
+                self.avideo_content,
+                video_id=video_id,
+                api_key=api_key,
+                api_base=api_base,
+                optional_params=optional_params,
+                logging_obj=logging_obj,
+                timeout=timeout,
+                client=None,
+            ),
+        )
 
     async def avideo_content(
         self,

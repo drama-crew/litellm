@@ -453,6 +453,16 @@ async def test_status_maps_nonterminal_worker_states(worker_status: str, public_
 
 
 @pytest.mark.asyncio
+async def test_sync_status_bridges_to_async_contract_inside_running_loop() -> None:
+    redis = FakeRedis()
+    set_status(redis, "claimed")
+
+    response = handler(redis).video_status(VIDEO_ID, None, None, {}, None)
+
+    assert response.status == "in_progress"
+
+
+@pytest.mark.asyncio
 async def test_completed_status_exposes_staging_metadata_without_signed_download_url() -> None:
     redis = FakeRedis()
     set_status(redis, "done", completed_result())
@@ -606,6 +616,18 @@ async def test_content_returns_bytes_from_validated_platform_download_url_withou
     set_status(redis, "done", completed_result())
 
     content = await handler(redis, content_get).avideo_content(VIDEO_ID, None, None, {}, None, timeout=12.0)
+
+    assert content == b"video-bytes"
+    assert content_get.calls == [(STAGING_URL, 12.0, False)]
+
+
+@pytest.mark.asyncio
+async def test_sync_content_bridges_to_async_contract_inside_running_loop() -> None:
+    redis = FakeRedis()
+    content_get = FakeContentGet()
+    set_status(redis, "done", completed_result())
+
+    content = handler(redis, content_get).video_content(VIDEO_ID, None, None, {}, None, timeout=12.0)
 
     assert content == b"video-bytes"
     assert content_get.calls == [(STAGING_URL, 12.0, False)]
@@ -842,7 +864,7 @@ def test_handler_method_signature_matches_custom_llm_contract(method_name: str) 
     ]
 
 
-def test_handler_is_real_custom_llm_and_sync_methods_are_explicitly_unsupported() -> None:
+def test_handler_is_real_custom_llm_and_sync_generation_remains_unsupported() -> None:
     provider = handler(FakeRedis())
 
     assert isinstance(provider, CustomLLM)
