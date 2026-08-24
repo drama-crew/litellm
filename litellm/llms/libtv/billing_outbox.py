@@ -1,10 +1,11 @@
-"""Durable billing events for asynchronous libtv image tasks."""
+"""Durable billing events for asynchronous media tasks."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -17,6 +18,19 @@ logger = logging.getLogger(__name__)
 BILLING_STREAM_KEY = "libtv:billing:outbox"
 BILLING_CONSUMER_GROUP = "libtv-billing-reconciler"
 BILLING_EVENT_FIELD = "payload"
+CAUSYN_BILLING_STREAM_KEY = "causyn:billing:outbox"
+CAUSYN_BILLING_CONSUMER_GROUP = "causyn-billing-reconciler"
+CAUSYN_BILLING_MARKER_PREFIX = "causyn:billing:enqueued:"
+
+_ENQUEUE_SCRIPT = """
+local existing = redis.call('GET', KEYS[2])
+if existing then
+  return {'existing', existing}
+end
+redis.call('XADD', KEYS[1], '*', 'payload', ARGV[1])
+redis.call('SET', KEYS[2], ARGV[2])
+return {'enqueued', ARGV[2]}
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +93,56 @@ class ImageBillingEvent:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CausynBillingEvent:
+    """Durable spend delivery for one terminal Causyn video task."""
+
+    provider_task_id: str
+    response_cost: float
+    team_id: str | None = None
+    user_id: str | None = None
+    organization_id: str | None = None
+    api_key: str | None = None
+    model: str = "causyn-1.0"
+    event_id: str = field(default="")
+    occurred_at: str = field(default="")
+
+    def __post_init__(self) -> None:
+        if not self.event_id:
+            object.__setattr__(self, "event_id", self.billing_key)
+        if not self.occurred_at:
+            object.__setattr__(self, "occurred_at", datetime.now(timezone.utc).isoformat())
+
+    @property
+    def billing_key(self) -> str:
+        return f"causyn-video:{self.provider_task_id}"
+
+    @property
+    def request_id(self) -> str:
+        return f"causyn:{self.provider_task_id}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self) | {
+            "billing_type": "causyn_video",
+            "request_id": self.request_id,
+            "billing_key": self.billing_key,
+        }
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "CausynBillingEvent":
+        return cls(
+            provider_task_id=str(value["provider_task_id"]),
+            response_cost=float(value.get("response_cost", value.get("spend", 0.0))),
+            team_id=_optional_str(value.get("team_id")),
+            user_id=_optional_str(value.get("user_id")),
+            organization_id=_optional_str(value.get("organization_id", value.get("org_id"))),
+            api_key=_optional_str(value.get("api_key", value.get("key_id"))),
+            model=str(value.get("model") or "causyn-1.0"),
+            event_id=str(value.get("event_id") or ""),
+            occurred_at=str(value.get("occurred_at") or ""),
+        )
+
+
 BillingOutboxEvent = ImageBillingEvent
 
 
@@ -86,7 +150,7 @@ def _optional_str(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _event_from_stream(fields: Mapping[Any, Any]) -> ImageBillingEvent:
+def _event_from_stream(fields: Mapping[Any, Any]) -> ImageBillingEvent | CausynBillingEvent:
     payload = fields.get(BILLING_EVENT_FIELD)
     if payload is None:
         payload = fields.get(BILLING_EVENT_FIELD.encode())
@@ -94,7 +158,27 @@ def _event_from_stream(fields: Mapping[Any, Any]) -> ImageBillingEvent:
         payload = payload.decode()
     if not isinstance(payload, str):
         raise ValueError("libtv billing event has no payload")
-    return ImageBillingEvent.from_dict(json.loads(payload))
+    value = json.loads(payload)
+    if value.get("billing_type") == "causyn_video":
+        return CausynBillingEvent.from_dict(value)
+    return ImageBillingEvent.from_dict(value)
+
+
+async def enqueue_causyn_billing(redis_client: Any, event: CausynBillingEvent) -> bool:
+    """Atomically enqueue an event and install its terminal marker."""
+    payload = json.dumps(event.to_dict(), separators=(",", ":"), sort_keys=True)
+    result = await redis_client.eval(
+        _ENQUEUE_SCRIPT,
+        2,
+        CAUSYN_BILLING_STREAM_KEY,
+        f"{CAUSYN_BILLING_MARKER_PREFIX}{event.provider_task_id}",
+        payload,
+        event.event_id,
+    )
+    outcome = result[0].decode() if isinstance(result[0], bytes) else str(result[0])
+    if outcome not in {"enqueued", "existing"}:
+        raise RuntimeError(f"unexpected Causyn billing enqueue outcome: {outcome}")
+    return True
 
 
 class LibTVBillingReconciler:
@@ -179,9 +263,23 @@ class LibTVBillingReconciler:
             processed += 1
         return processed
 
-    async def _reconcile_event(self, event: ImageBillingEvent) -> None:
+    async def _reconcile_event(self, event: ImageBillingEvent | CausynBillingEvent) -> None:
         db = getattr(self.prisma_client, "db", self.prisma_client)
         async with db.tx() as transaction:
+            if isinstance(event, CausynBillingEvent):
+                call_type = "video_generation"
+                metadata = json.dumps({"causyn_billing_key": event.billing_key})
+            else:
+                call_type = "image_upscale"
+                metadata = json.dumps(
+                    {
+                        "libtv_billing_key": event.billing_key,
+                        **({"scale": event.scale} if event.scale is not None else {}),
+                        **({"project_id": event.project_id} if event.project_id else {}),
+                        **({"artifact_id": event.artifact_id} if event.artifact_id else {}),
+                        **({"user_id": event.attribution_user_id} if event.attribution_user_id else {}),
+                    }
+                )
             inserted = await transaction.execute_raw(
                 'INSERT INTO "LiteLLM_SpendLogs" '
                 "(request_id, call_type, api_key, spend, total_tokens, prompt_tokens, "
@@ -190,21 +288,13 @@ class LibTVBillingReconciler:
                 "VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5, $6, $7, $8, $9, $10) "
                 "ON CONFLICT (request_id) DO NOTHING",
                 event.request_id,
-                "image_upscale",
+                call_type,
                 event.api_key or "",
                 event.response_cost,
                 _event_time(event.occurred_at),
                 event.model,
                 event.user_id or "",
-                json.dumps(
-                    {
-                        "libtv_billing_key": event.billing_key,
-                        **({"scale": event.scale} if event.scale is not None else {}),
-                        **({"project_id": event.project_id} if event.project_id else {}),
-                        **({"artifact_id": event.artifact_id} if event.artifact_id else {}),
-                        **({"user_id": event.attribution_user_id} if event.attribution_user_id else {}),
-                    }
-                ),
+                metadata,
                 event.team_id,
                 event.organization_id,
             )
@@ -290,6 +380,24 @@ async def start_libtv_billing_reconciler(prisma_client: Any) -> LibTVBillingReco
     if receipt_store is None:
         return None
     reconciler = LibTVBillingReconciler(receipt_store.redis, prisma_client)
+    await reconciler.start()
+    return reconciler
+
+
+async def start_causyn_billing_reconciler(prisma_client: Any) -> LibTVBillingReconciler | None:
+    if prisma_client is None:
+        return None
+    from litellm.llms.libtv.transfer import get_transfer_redis
+
+    redis_client = get_transfer_redis(os.getenv("LIBTV_VIDEO_GENERATE_REDIS_URL"))
+    if redis_client is None:
+        return None
+    reconciler = LibTVBillingReconciler(
+        redis_client,
+        prisma_client,
+        stream_key=CAUSYN_BILLING_STREAM_KEY,
+        consumer_group=CAUSYN_BILLING_CONSUMER_GROUP,
+    )
     await reconciler.start()
     return reconciler
 

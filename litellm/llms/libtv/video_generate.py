@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator
 from urllib.parse import urlsplit
 
+import redis.exceptions as redis_exceptions
+
 from .transfer import STATUS_TTL_SECONDS, WORKER_HEARTBEAT_WINDOW_SECONDS, result_key, status_key
 
 # Task-type namespace for this worker task type. Status/result keys are
@@ -51,7 +53,9 @@ _STATUS_TO_PUBLIC = {
     STATUS_CLAIMED: "claimed",
 }
 
-_ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload"})
+_ALLOWED_TOP_LEVEL_KEYS = frozenset(
+    {"task_id", "model", "deadline_ts", "request", "staging_upload", "task_metadata"}
+)
 
 # The allowed set doubled as the required set until 2026-08-23, which made
 # staging_upload mandatory at enqueue. It is now injected later, by the
@@ -75,6 +79,7 @@ _ALLOWED_REQUEST_KEYS = frozenset(
 )
 _ALLOWED_REFERENCE_KEYS = frozenset({"role", "media_type", "url"})
 _ALLOWED_STAGING_UPLOAD_KEYS = frozenset({"url", "key", "content_type", "expires_at"})
+TASK_METADATA_KEY_PREFIX = "worker:task:metadata:"
 
 
 class VideoGenerateError(Exception):
@@ -300,6 +305,8 @@ def _validate_shape(payload: Any) -> None:
         if not isinstance(staging_upload, dict):
             raise VideoGenerateError("invalid_params", "staging_upload must be an object")
         _reject_extra_keys(staging_upload, _ALLOWED_STAGING_UPLOAD_KEYS, "staging_upload")
+    if "task_metadata" in payload and not isinstance(payload["task_metadata"], dict):
+        raise VideoGenerateError("invalid_params", "task_metadata must be an object")
 
 
 def _decode(value: Any) -> Any:
@@ -420,10 +427,51 @@ async def enqueue_video_generate(
     # vanishes with the generation stuck RUNNING forever. NX is also the
     # *only* de-dup point in the whole pipeline -- the CAS layer explicitly
     # permits re-claiming from "claimed" (cas.py:83), so it never de-dupes.
-    ok = await redis.set(status_key(task_id), STATUS_QUEUED, ex=STATUS_TTL_SECONDS, nx=True)
-    if not ok:
-        return task_id  # duplicate submission; task is already on the rails, see spec §1.1
+    task_metadata = payload.get("task_metadata")
+    metadata_payload = json.dumps(task_metadata, separators=(",", ":"), sort_keys=True) if task_metadata else None
+
+    # Causyn's billing facts must survive a requester crash after submission.
+    # Redis transactions keep the metadata, status marker, and stream entry in
+    # one durable boundary. Older test doubles and Redis-compatible clients
+    # without WATCH support retain the original rollback path below.
+    if metadata_payload is not None and hasattr(redis, "pipeline"):
+        try:
+            async with redis.pipeline(transaction=True) as pipe:
+                await pipe.watch(status_key(task_id))
+                if await pipe.get(status_key(task_id)) is not None:
+                    await pipe.unwatch()
+                    return task_id
+                pipe.multi()
+                pipe.set(status_key(task_id), STATUS_QUEUED, ex=STATUS_TTL_SECONDS)
+                pipe.set(
+                    f"{TASK_METADATA_KEY_PREFIX}{task_id}",
+                    metadata_payload,
+                    ex=STATUS_TTL_SECONDS,
+                )
+                pipe.xadd(stream_key(TASK_TYPE_VIDEO_GENERATE), {"payload": json.dumps(envelope)})
+                await pipe.execute()
+        except redis_exceptions.WatchError:
+            # Another submitter won the watched status key. Its transaction
+            # either committed the complete task or is still the only
+            # writer; both cases are the idempotent duplicate contract.
+            return task_id
+        except Exception as exc:
+            raise VideoGenerateError("enqueue_ambiguous", "failed to enqueue task after status write") from exc
+        return task_id
+
     try:
+        ok = await redis.set(status_key(task_id), STATUS_QUEUED, ex=STATUS_TTL_SECONDS, nx=True)
+        if not ok:
+            return task_id  # duplicate submission; task is already on the rails, see spec §1.1
+        if metadata_payload is not None:
+            metadata_ok = await redis.set(
+                f"{TASK_METADATA_KEY_PREFIX}{task_id}",
+                metadata_payload,
+                ex=STATUS_TTL_SECONDS,
+                nx=True,
+            )
+            if metadata_ok is False:
+                raise RuntimeError("task metadata was not persisted")
         await redis.xadd(stream_key(TASK_TYPE_VIDEO_GENERATE), {"payload": json.dumps(envelope)})
     except Exception as exc:
         # The status key landed but the stream entry didn't (F2): a bare
@@ -438,6 +486,8 @@ async def enqueue_video_generate(
         # rollback pattern).
         try:
             await redis.delete(status_key(task_id))
+            if metadata_payload is not None:
+                await redis.delete(f"{TASK_METADATA_KEY_PREFIX}{task_id}")
         except Exception:
             pass
         # MINOR-4 (extended): keep this message a stable, non-leaking string
@@ -451,6 +501,21 @@ async def enqueue_video_generate(
         # used a bare stable message for the same reason.
         raise VideoGenerateError("enqueue_ambiguous", "failed to enqueue task after status write") from exc
     return task_id
+
+
+async def fetch_video_generate_task_metadata(task_id: str, *, redis: Any) -> dict[str, Any] | None:
+    """Read the metadata committed beside a video task's enqueue boundary."""
+    if not hasattr(redis, "get"):
+        return None
+    raw = await redis.get(f"{TASK_METADATA_KEY_PREFIX}{task_id}")
+    raw = _decode(raw)
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _valid_result(result: Any) -> bool:

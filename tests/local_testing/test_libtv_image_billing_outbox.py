@@ -5,8 +5,13 @@ import pytest
 
 from litellm.llms.libtv.billing_outbox import (
     BILLING_STREAM_KEY,
+    CAUSYN_BILLING_MARKER_PREFIX,
+    CAUSYN_BILLING_STREAM_KEY,
+    CausynBillingEvent,
     ImageBillingEvent,
     LibTVBillingReconciler,
+    _ENQUEUE_SCRIPT,
+    enqueue_causyn_billing,
 )
 from litellm.llms.libtv.receipts import LibTVReceiptStore, _TRANSITION_SCRIPT, request_fingerprint
 
@@ -18,6 +23,16 @@ class RecordingRedis:
     async def eval(self, script, numkeys, *args):
         self.eval_calls.append((script, numkeys, args))
         return ["ok", args[3]]
+
+
+class EnqueueRedis:
+    def __init__(self, outcomes=("enqueued",)):
+        self.outcomes = iter(outcomes)
+        self.calls = []
+
+    async def eval(self, script, numkeys, *args):
+        self.calls.append((script, numkeys, args))
+        return [next(self.outcomes), args[3]]
 
 
 @pytest.mark.asyncio
@@ -72,6 +87,27 @@ def test_billing_event_id_and_downstream_request_id_are_stable_across_retries():
 
     assert first.event_id == retry.event_id
     assert first.request_id == retry.request_id
+
+
+@pytest.mark.asyncio
+async def test_causyn_enqueue_is_atomic_and_repeated_terminal_poll_is_idempotent():
+    event = CausynBillingEvent(provider_task_id="task-1", response_cost=1.25)
+    redis = EnqueueRedis(("enqueued", "existing"))
+
+    assert await enqueue_causyn_billing(redis, event)
+    assert await enqueue_causyn_billing(redis, event)
+
+    assert len(redis.calls) == 2
+    script, numkeys, args = redis.calls[0]
+    assert numkeys == 2
+    assert args[:2] == (
+        CAUSYN_BILLING_STREAM_KEY,
+        f"{CAUSYN_BILLING_MARKER_PREFIX}task-1",
+    )
+    assert script == _ENQUEUE_SCRIPT
+    assert script.index("XADD") < script.index("SET")
+    assert event.request_id == "causyn:task-1"
+    assert CausynBillingEvent.from_dict(__import__("json").loads(args[2])).event_id == event.event_id
 
 
 @pytest.mark.asyncio
@@ -137,8 +173,9 @@ class FakePrisma:
 
 
 class FakeStreamRedis:
-    def __init__(self, events):
+    def __init__(self, events, stream_key=BILLING_STREAM_KEY):
         self.events = list(events)
+        self.stream_key = stream_key
         self.acked = []
 
     async def xgroup_create(self, *args, **kwargs):
@@ -148,7 +185,7 @@ class FakeStreamRedis:
         if not self.events:
             return []
         event = self.events.pop(0)
-        return [(BILLING_STREAM_KEY, [(event[0], event[1])])]
+        return [(self.stream_key, [(event[0], event[1])])]
 
     async def xack(self, stream, group, event_id):
         self.acked.append((stream, group, event_id))
@@ -174,6 +211,52 @@ async def test_replay_after_db_commit_before_ack_is_idempotent():
     assert len(redis.acked) == 2
     assert sum('INSERT INTO "LiteLLM_SpendLogs"' in query for query, _ in transaction.sql) == 2
     assert sum('UPDATE "LiteLLM_VerificationToken"' in query for query, _ in transaction.sql) == 1
+
+
+@pytest.mark.asyncio
+async def test_causyn_event_replays_after_db_failure_without_double_spend():
+    event = CausynBillingEvent(
+        provider_task_id="task-1",
+        response_cost=2.5,
+        team_id="team-1",
+        api_key="hashed-key",
+    )
+    fields = {"payload": json.dumps(event.to_dict())}
+    redis = FakeStreamRedis([("1-0", fields), ("1-0", fields)], stream_key=CAUSYN_BILLING_STREAM_KEY)
+    transaction = FailOnceTransaction()
+    reconciler = LibTVBillingReconciler(
+        redis,
+        FakePrisma(transaction),
+        stream_key=CAUSYN_BILLING_STREAM_KEY,
+        consumer_group="test-group",
+        consumer="test",
+        batch_size=1,
+    )
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await reconciler.reconcile_once()
+    assert redis.acked == []
+
+    await reconciler.reconcile_once()
+
+    assert redis.acked == [(CAUSYN_BILLING_STREAM_KEY, "test-group", "1-0")]
+    assert transaction.attempts >= 2
+    assert sum('INSERT INTO "LiteLLM_SpendLogs"' in query for query, _ in transaction.sql) == 1
+    assert sum('UPDATE "LiteLLM_TeamTable"' in query for query, _ in transaction.sql) == 1
+
+
+class FailOnceTransaction(FakeTransaction):
+    def __init__(self):
+        super().__init__(inserted=True)
+        self.failed = False
+        self.attempts = 0
+
+    async def execute_raw(self, query, *args):
+        self.attempts += 1
+        if not self.failed:
+            self.failed = True
+            raise RuntimeError("database unavailable")
+        return await super().execute_raw(query, *args)
 
 
 @pytest.mark.asyncio

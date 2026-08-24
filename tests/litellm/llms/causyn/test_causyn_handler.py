@@ -35,6 +35,11 @@ def _env(monkeypatch):
     monkeypatch.setenv("LIBTV_VIDEO_GENERATE_ALLOW_HTTP", "false")
     monkeypatch.setenv("DRAMA_INTERNAL_VIDEO_ENABLED", "true")
 
+    async def _accept_billing(redis, event):
+        return True
+
+    monkeypatch.setattr(mod, "enqueue_causyn_billing", _accept_billing)
+
 
 class _Recorder:
     """Captures the payload instead of reaching Redis."""
@@ -60,6 +65,7 @@ def _params(**over):
         "size": "768x512",
         "aspect_ratio": "3:2",
         "reference_images": ["https://source.example/a.png"],
+        "model_info": {"id": "causyn-price-v1", "output_cost_per_second_768x512": 0.1},
     }
     base.update(over)
     return base
@@ -208,7 +214,21 @@ def _stub_status(monkeypatch, body):
     async def _fetch(task_id, *, redis):
         return body
 
+    async def _metadata(task_id, *, redis):
+        return {
+            "version": mod.CAUSYN_BILLING_METADATA_VERSION,
+            "duration_seconds": 5.0,
+            "video_resolution": "768x512",
+            "pricing": {
+                "model": "causyn-1.0",
+                "id": "causyn-price-v1",
+                "output_cost_per_second_768x512": 0.1,
+            },
+            "attribution": {"api_key": None, "team_id": None, "user_id": None, "organization_id": None},
+        }
+
     monkeypatch.setattr(mod, "fetch_video_generate_status", _fetch)
+    monkeypatch.setattr(mod, "fetch_video_generate_task_metadata", _metadata)
     monkeypatch.setattr(mod, "_redis_factory", lambda: object())
 
 

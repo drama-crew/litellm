@@ -507,6 +507,11 @@ def video_generation(  # noqa: PLR0915
                 )
             )
             custom_optional_params.pop("extra_body", None)
+            # VideoGenerationRequestUtils intentionally removes LiteLLM-only
+            # fields. Causyn needs the router-selected deployment pricing to
+            # persist billing facts before the asynchronous worker starts.
+            if custom_llm_provider == "causyn" and isinstance(kwargs.get("model_info"), dict):
+                custom_optional_params["model_info"] = kwargs["model_info"]
             return _custom_video_generation(
                 model=model,
                 prompt=prompt,

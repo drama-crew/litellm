@@ -205,6 +205,21 @@ def is_libtv_image_billing_call(kwargs: dict | None) -> bool:
     return str(provider or "").lower() == "libtv" and call_type in _LIBTV_IMAGE_BILLING_CALL_TYPES
 
 
+def is_causyn_video_billing_call(kwargs: dict | None) -> bool:
+    """Causyn terminal polls are billed by the durable Redis outbox."""
+    if not isinstance(kwargs, dict):
+        return False
+    provider = kwargs.get("custom_llm_provider")
+    if provider is None:
+        params = kwargs.get("litellm_params")
+        provider = params.get("custom_llm_provider") if isinstance(params, dict) else None
+    return str(provider or "").lower() == "causyn" and str(kwargs.get("call_type") or "").lower() in {
+        "avideo_status",
+        "video_status",
+        "video_retrieve",
+    }
+
+
 def get_spend_logs_id(call_type: str, response_obj: dict, kwargs: dict) -> Optional[str]:
     if is_libtv_image_billing_call(kwargs):
         return None
