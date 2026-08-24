@@ -147,10 +147,14 @@ async def _default_refresh_staging_url(task_id: str, timeout: RequestTimeout) ->
     """Ask the platform to mint one short-lived URL for this task."""
     platform_url = os.getenv(_CAUSYN_PLATFORM_URL_ENV, "").strip().rstrip("/")
     service_key = os.getenv(_CAUSYN_SERVICE_API_KEY_ENV, "").strip()
-    parsed_url = urlsplit(platform_url)
+    try:
+        parsed_url = urlsplit(platform_url)
+    except ValueError:
+        parsed_url = None
     if (
         not platform_url
         or not service_key
+        or parsed_url is None
         or parsed_url.scheme not in {"http", "https"}
         or not parsed_url.netloc
     ):

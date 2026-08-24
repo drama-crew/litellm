@@ -492,7 +492,7 @@ async def test_refresh_uses_service_auth_and_rejects_a_wrong_returned_key(monkey
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "platform_url",
-    ["", "platform.example", "ftp://platform.example", "https:///missing-host"],
+    ["", "platform.example", "ftp://platform.example", "https:///missing-host", "https://["],
 )
 async def test_refresh_rejects_an_invalid_platform_url(monkeypatch, platform_url):
     monkeypatch.setenv("DRAMA_CAUSYN_PLATFORM_URL", platform_url)
