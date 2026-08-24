@@ -332,6 +332,14 @@ class _Pricing(BaseModel):
             raise ValueError("pricing rate must be finite")
         return value
 
+    @field_validator("id")
+    @classmethod
+    def _strip_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("pricing id must be non-empty")
+        return value
+
     @model_validator(mode="after")
     def _requires_rate(self) -> "_Pricing":
         if self.output_cost_per_second_768x512 is None and self.output_cost_per_second is None:
@@ -357,7 +365,10 @@ class _DurableAttribution(BaseModel):
     @field_validator("team_id", "user_id", "organization_id")
     @classmethod
     def _validate_owner_id(cls, value: str | None) -> str | None:
-        if value is not None and not value:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
             raise ValueError("owner identifiers must be non-empty")
         return value
 
@@ -463,7 +474,7 @@ def _billing_attribution(optional_params: dict[str, object], logging_obj: object
         value = first(*keys)
         if value is None:
             value = auth_value(auth_attr)
-        if isinstance(value, str) and value:
+        if isinstance(value, str):
             attribution[field] = value
     return attribution
 
@@ -582,6 +593,35 @@ class CausynVideoHandler(CustomLLM):
         except Exception as exc:  # noqa: BLE001  # status must remain retryable until durable delivery succeeds
             raise _service_error() from exc
         _set_response_cost(response, cost)
+
+    def _completed_response(self, video_id: str, task_id: str, result: _WorkerResult) -> VideoObject:
+        if result.staging_key != _staging_key(task_id):
+            raise _service_error("causyn video result is unavailable")
+        duration = result.duration_seconds
+        object_store_result = result.model_dump(exclude={"staging_url"}, exclude_none=True)
+        return VideoObject(
+            id=video_id,
+            object="video",
+            status="completed",
+            completed_at=int(self._clock()),
+            seconds=str(duration),
+            size=CAUSYN_RESOLUTION,
+            model=CAUSYN_MODEL,
+            usage=_usage(duration),
+            object_store_result=object_store_result,
+        )
+
+    async def _refresh_completed_result(self, video_id: str, task_id: str) -> _WorkerResult:
+        """Refresh the signed staging URL after durable billing succeeds."""
+        try:
+            body = await self._status(video_id)
+        except CustomLLMError as exc:
+            raise _service_error("causyn video content is unavailable") from exc
+        if body.status != "succeeded" or body.result is None:
+            raise _service_error("causyn video content is unavailable")
+        if body.result.staging_key != _staging_key(task_id):
+            raise _service_error("causyn video content is unavailable")
+        return body.result
 
     def video_generation(
         self,
@@ -729,21 +769,7 @@ class CausynVideoHandler(CustomLLM):
         if result is None:
             raise _service_error("causyn video result is unavailable")
         task_id = _decode_task_id(video_id)
-        if result.staging_key != _staging_key(task_id):
-            raise _service_error("causyn video result is unavailable")
-        duration = result.duration_seconds
-        object_store_result = result.model_dump(exclude={"staging_url"}, exclude_none=True)
-        response = VideoObject(
-            id=video_id,
-            object="video",
-            status="completed",
-            completed_at=int(self._clock()),
-            seconds=str(duration),
-            size=CAUSYN_RESOLUTION,
-            model=CAUSYN_MODEL,
-            usage=_usage(duration),
-            object_store_result=object_store_result,
-        )
+        response = self._completed_response(video_id, task_id, result)
         await self._bill_completed_video(response, task_id, optional_params, result, logging_obj)
         return response
 
@@ -785,9 +811,16 @@ class CausynVideoHandler(CustomLLM):
         if body.status != "succeeded":
             raise CustomLLMError(status_code=409, message="causyn video is not ready")
         result = body.result
-        staging_url = result.staging_url if result is not None else None
         task_id = _decode_task_id(video_id)
-        if result is None or result.staging_key != _staging_key(task_id) or not isinstance(staging_url, str):
+        if result is None:
+            raise CustomLLMError(status_code=502, message="causyn video content is unavailable")
+        if result.staging_key != _staging_key(task_id):
+            raise CustomLLMError(status_code=502, message="causyn video content is unavailable")
+        response = self._completed_response(video_id, task_id, result)
+        await self._bill_completed_video(response, task_id, optional_params, result, logging_obj)
+        result = await self._refresh_completed_result(video_id, task_id)
+        staging_url = result.staging_url
+        if not isinstance(staging_url, str):
             raise CustomLLMError(status_code=502, message="causyn video content is unavailable")
         try:
             settings = self._settings_factory()

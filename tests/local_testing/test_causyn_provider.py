@@ -493,6 +493,43 @@ async def test_async_create_rejects_incomplete_pricing_before_enqueue() -> None:
 
 
 @pytest.mark.asyncio
+async def test_async_create_strips_only_outer_pricing_and_owner_whitespace() -> None:
+    redis = FakeRedis()
+
+    await handler(redis).avideo_generation(
+        **create_kwargs(
+            model_info={"id": "  causyn-price-v1  ", "output_cost_per_second_768x512": 0.1},
+            metadata={"user_api_key_team_id": "  team-1  "},
+        )
+    )
+
+    metadata = json.loads(redis.status[f"worker:task:metadata:{TASK_ID}"])
+    assert metadata["pricing"]["id"] == "causyn-price-v1"
+    assert metadata["attribution"]["team_id"] == "team-1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "create_overrides",
+    [
+        {"model_info": {"id": "   ", "output_cost_per_second_768x512": 0.1}},
+        {"metadata": {"user_api_key_team_id": "   "}},
+    ],
+)
+async def test_async_create_rejects_blank_pricing_or_owner_id_before_enqueue(
+    create_overrides: dict[str, object],
+) -> None:
+    redis = FakeRedis()
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis).avideo_generation(**create_kwargs(**create_overrides))
+
+    assert exc_info.value.status_code == 503
+    assert redis.status == {}
+    assert redis.calls == []
+
+
+@pytest.mark.asyncio
 async def test_async_create_survives_usage_persistence_failure() -> None:
     redis = FakeRedis()
     persistence = FakeBillingPersistence(store_error=RuntimeError("db unavailable"))
@@ -746,6 +783,8 @@ async def test_completed_status_uses_worker_usage_and_durable_price() -> None:
         "bad_json",
         "bad_version",
         "missing_pricing_id",
+        "blank_pricing_id",
+        "blank_owner_id",
         "non_finite_rate",
         "duration",
         "resolution",
@@ -767,6 +806,12 @@ async def test_completed_status_rejects_invalid_durable_metadata(invalid_kind: s
         redis.status[metadata_key] = json.dumps(metadata)
     elif invalid_kind == "missing_pricing_id":
         del metadata["pricing"]["id"]
+        redis.status[metadata_key] = json.dumps(metadata)
+    elif invalid_kind == "blank_pricing_id":
+        metadata["pricing"]["id"] = "   "
+        redis.status[metadata_key] = json.dumps(metadata)
+    elif invalid_kind == "blank_owner_id":
+        metadata["attribution"]["team_id"] = "   "
         redis.status[metadata_key] = json.dumps(metadata)
     elif invalid_kind == "non_finite_rate":
         metadata["pricing"]["output_cost_per_second_768x512"] = float("inf")
@@ -868,6 +913,69 @@ async def test_completed_status_without_durable_price_is_retryable() -> None:
 
     assert exc_info.value.status_code == 503
     assert persistence.billing_calls == []
+
+
+@pytest.mark.asyncio
+async def test_content_finalizes_billing_before_download() -> None:
+    redis = FakeRedis()
+    content_get = FakeContentGet()
+    captured: list[object] = []
+    set_status(redis, "done", completed_result())
+    set_billing_metadata(redis)
+
+    async def enqueue(redis: object, event: object) -> bool:
+        captured.append(event)
+        return True
+
+    content = await handler(redis, content_get, billing_enqueue=enqueue).avideo_content(
+        VIDEO_ID, None, None, {}, None, timeout=12.0
+    )
+
+    assert content == b"video-bytes"
+    assert len(captured) == 1
+    assert captured[0].response_cost == pytest.approx(0.5)
+    assert content_get.calls == [(STAGING_URL, 12.0, False)]
+
+
+@pytest.mark.asyncio
+async def test_content_refreshes_url_after_billing_finalization() -> None:
+    redis = FakeRedis()
+    content_get = FakeContentGet()
+    refreshed_url = "https://target.example/refreshed-video.mp4?signature=new"
+    set_status(redis, "done", completed_result())
+    set_billing_metadata(redis)
+
+    async def enqueue(redis: object, event: object) -> bool:
+        redis.results[result_key(TASK_ID)] = json.dumps(
+            {"ok": True, "result": completed_result(staging_url=refreshed_url)}
+        )
+        return True
+
+    content = await handler(redis, content_get, billing_enqueue=enqueue).avideo_content(
+        VIDEO_ID, None, None, {}, None, timeout=12.0
+    )
+
+    assert content == b"video-bytes"
+    assert content_get.calls == [(refreshed_url, 12.0, False)]
+
+
+@pytest.mark.asyncio
+async def test_content_outbox_failure_is_retryable_and_does_not_download() -> None:
+    redis = FakeRedis()
+    content_get = FakeContentGet()
+    set_status(redis, "done", completed_result())
+    set_billing_metadata(redis)
+
+    async def fail_enqueue(redis: object, event: object) -> bool:
+        raise RuntimeError("redis unavailable")
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis, content_get, billing_enqueue=fail_enqueue).avideo_content(
+            VIDEO_ID, None, None, {}, None
+        )
+
+    assert exc_info.value.status_code == 503
+    assert content_get.calls == []
 
 
 @pytest.mark.asyncio
@@ -1025,6 +1133,7 @@ async def test_content_returns_bytes_from_validated_platform_download_url_withou
     redis = FakeRedis()
     content_get = FakeContentGet()
     set_status(redis, "done", completed_result())
+    set_billing_metadata(redis)
 
     content = await handler(redis, content_get).avideo_content(VIDEO_ID, None, None, {}, None, timeout=12.0)
 
@@ -1037,6 +1146,7 @@ async def test_sync_content_bridges_to_async_contract_inside_running_loop() -> N
     redis = FakeRedis()
     content_get = FakeContentGet()
     set_status(redis, "done", completed_result())
+    set_billing_metadata(redis)
 
     content = handler(redis, content_get).video_content(VIDEO_ID, None, None, {}, None, timeout=12.0)
 
@@ -1049,6 +1159,7 @@ async def test_content_rejects_download_url_outside_existing_target_allowlist() 
     redis = FakeRedis()
     content_get = FakeContentGet()
     set_status(redis, "done", completed_result(staging_url="https://attacker.example/video.mp4"))
+    set_billing_metadata(redis)
 
     with pytest.raises(CustomLLMError) as exc_info:
         await handler(redis, content_get).avideo_content(VIDEO_ID, None, None, {}, None)

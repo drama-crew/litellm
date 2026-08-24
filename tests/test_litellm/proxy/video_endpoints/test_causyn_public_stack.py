@@ -80,8 +80,16 @@ class _Billing:
         self.mark_calls: list[tuple[str, float, float]] = []
         self.marked_keys: set[str] = set()
         self.outbox_events: list[object] = []
+        self.enqueue_error: Exception | None = None
 
     async def enqueue(self, _: object, event: object) -> bool:
+        if self.enqueue_error is not None:
+            raise self.enqueue_error
+        event_id = getattr(event, "event_id", None)
+        if event_id in self.marked_keys:
+            return True
+        if isinstance(event_id, str):
+            self.marked_keys.add(event_id)
         self.outbox_events.append(event)
         return True
 
@@ -337,13 +345,11 @@ def test_public_endpoint_create_decodes_routes_and_bills_idempotently(stack: _St
     assert first.json()["status"] == "completed"
     assert float(first.headers["x-litellm-response-cost"]) == pytest.approx(0.5)
     assert float(second.headers.get("x-litellm-response-cost") or 0.0) == pytest.approx(0.5)
-    assert len(stack.billing.outbox_events) == 2
+    assert len(stack.billing.outbox_events) == 1
     assert [event.event_id for event in stack.billing.outbox_events] == [
-        f"causyn-video:{TASK_ID}",
         f"causyn-video:{TASK_ID}",
     ]
     assert [event.response_cost for event in stack.billing.outbox_events] == [
-        pytest.approx(0.5),
         pytest.approx(0.5),
     ]
 
@@ -358,6 +364,37 @@ def test_public_endpoint_content_uses_real_router_and_handler(stack: _Stack) -> 
     assert response.status_code == 200, response.text
     assert response.content == b"video-bytes"
     assert stack.content_get.calls == [(STAGING_URL, 600, False)]
+    assert len(stack.billing.outbox_events) == 1
+    assert stack.billing.outbox_events[0].response_cost == pytest.approx(0.5)
+    assert stack.billing.outbox_events[0].api_key == hash_token(stack.allowed_key)
+
+    status = stack.client.get(f"/v1/videos/{video_id}", headers=_auth_headers(stack.allowed_key))
+    repeat = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
+
+    assert status.status_code == 200, status.text
+    assert repeat.status_code == 200, repeat.text
+    assert repeat.content == b"video-bytes"
+    assert len(stack.billing.outbox_events) == 1
+
+
+def test_public_endpoint_content_outbox_failure_is_retryable_before_download(stack: _Stack) -> None:
+    created = stack.client.post("/v1/videos", json=_create_body(), headers=_auth_headers(stack.allowed_key))
+    video_id = created.json()["id"]
+    stack.state.status = "succeeded"
+    stack.billing.enqueue_error = RuntimeError("billing unavailable")
+
+    failed = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
+
+    assert failed.status_code == 503, failed.text
+    assert stack.content_get.calls == []
+    assert stack.billing.outbox_events == []
+
+    stack.billing.enqueue_error = None
+    recovered = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
+
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.content == b"video-bytes"
+    assert len(stack.billing.outbox_events) == 1
 
 
 def test_public_endpoint_virtual_key_allowlist_cannot_be_bypassed(stack: _Stack) -> None:
