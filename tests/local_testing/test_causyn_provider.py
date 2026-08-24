@@ -57,6 +57,21 @@ class FakeRedis:
             raise self.xadd_error
         return "1-0"
 
+    async def eval(self, script: str, numkeys: int, *args: object) -> list[str]:
+        self.calls.append(("eval", (script, numkeys, args)))
+        stream_key, marker_key, payload, event_id = args
+        assert isinstance(marker_key, str)
+        if marker_key in self.status:
+            return ["existing", self.status[marker_key]]
+        if self.xadd_error is not None:
+            raise self.xadd_error
+        assert isinstance(payload, str)
+        assert isinstance(stream_key, str)
+        assert isinstance(event_id, str)
+        self.status[marker_key] = event_id
+        self.calls.append(("xadd", (stream_key, {"payload": payload})))
+        return ["enqueued", event_id]
+
     async def delete(self, key: str) -> int:
         self.calls.append(("delete", key))
         self.status.pop(key, None)
@@ -154,7 +169,13 @@ def handler(
     redis: FakeRedis,
     content_get: FakeContentGet | None = None,
     persistence: FakeBillingPersistence | None = None,
+    billing_enqueue: Any | None = None,
 ) -> CausynVideoHandler:
+    async def _enqueue(redis: object, event: object) -> bool:
+        if billing_enqueue is not None:
+            return await billing_enqueue(redis, event)
+        return await causyn_module.enqueue_causyn_billing(redis, event)  # type: ignore[arg-type]
+
     return CausynVideoHandler(
         redis_factory=lambda: redis,
         settings_factory=lambda: SETTINGS,
@@ -162,6 +183,7 @@ def handler(
         task_id_factory=lambda: TASK_ID,
         clock=lambda: 2_000_000_000.0,
         persistence_factory=lambda: persistence,
+        billing_enqueue=_enqueue,
     )
 
 
@@ -520,17 +542,18 @@ async def test_completed_status_bills_once_from_persisted_usage() -> None:
     assert response.usage == {"duration_seconds": 5.0, "video_resolution": "768x512"}
     assert response._hidden_params["response_cost"] == pytest.approx(0.5)
     assert persistence.lookup_calls == [f"causyn:{TASK_ID}"]
-    assert persistence.billing_calls == [(f"causyn:{TASK_ID}", 5.0, pytest.approx(0.5))]
+    assert not persistence.billing_calls
 
 
 @pytest.mark.asyncio
-async def test_repeated_completed_status_has_zero_cost() -> None:
+async def test_repeated_completed_status_keeps_authoritative_cost_without_duplicate_event() -> None:
     redis = FakeRedis()
     persistence = FakeBillingPersistence(
         stored_usage={"duration_seconds": 5.0, "video_resolution": "768x512"},
         billed=False,
     )
     set_status(redis, "done", completed_result())
+    redis.status[f"causyn:billing:enqueued:{TASK_ID}"] = f"causyn-video:{TASK_ID}"
 
     response = await handler(redis, persistence=persistence).avideo_status(
         VIDEO_ID,
@@ -540,8 +563,8 @@ async def test_repeated_completed_status_has_zero_cost() -> None:
         None,
     )
 
-    assert response._hidden_params["response_cost"] == 0.0
-    assert persistence.billing_calls == [(f"causyn:{TASK_ID}", 5.0, pytest.approx(0.5))]
+    assert response._hidden_params["response_cost"] == pytest.approx(0.5)
+    assert persistence.billing_calls == []
 
 
 @pytest.mark.asyncio
@@ -590,15 +613,17 @@ async def test_completed_status_without_price_has_zero_cost_and_does_not_mark_bi
 
 
 @pytest.mark.asyncio
-async def test_completed_status_billing_failure_has_zero_cost() -> None:
+async def test_completed_status_outbox_failure_has_zero_cost() -> None:
     redis = FakeRedis()
     persistence = FakeBillingPersistence(
         stored_usage={"duration_seconds": 5.0, "video_resolution": "768x512"},
-        billing_error=RuntimeError("db unavailable"),
     )
     set_status(redis, "done", completed_result())
 
-    response = await handler(redis, persistence=persistence).avideo_status(
+    async def fail_enqueue(redis: object, event: object) -> bool:
+        raise RuntimeError("redis unavailable")
+
+    response = await handler(redis, persistence=persistence, billing_enqueue=fail_enqueue).avideo_status(
         VIDEO_ID,
         None,
         None,

@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
+from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
 from litellm.llms.libtv.persistence import get_persistence
 from litellm.llms.libtv.transfer import get_transfer_redis
 from litellm.llms.libtv.video_generate import (
@@ -128,6 +129,7 @@ class VideoTaskPersistence(Protocol):
 
 
 PersistenceFactory = Callable[[], VideoTaskPersistence | None]
+BillingEnqueue = Callable[[object, CausynBillingEvent], Awaitable[bool]]
 
 
 async def _default_content_get(
@@ -373,6 +375,7 @@ class CausynVideoHandler(CustomLLM):
         task_id_factory: Callable[[], str] = _new_task_id,
         clock: Callable[[], float] = time.time,
         persistence_factory: PersistenceFactory = _default_persistence_factory,
+        billing_enqueue: BillingEnqueue = enqueue_causyn_billing,
     ) -> None:
         super().__init__()
         self._redis_factory = redis_factory or _redis_factory
@@ -381,6 +384,7 @@ class CausynVideoHandler(CustomLLM):
         self._task_id_factory = task_id_factory
         self._clock = clock
         self._persistence_factory = persistence_factory
+        self._billing_enqueue = billing_enqueue
 
     async def _record_usage(self, task_id: str, duration_seconds: float) -> None:
         persistence = self._persistence_factory()
@@ -421,15 +425,21 @@ class CausynVideoHandler(CustomLLM):
             logger.warning("causyn video billing: no valid price for completed task")
             return
         try:
-            billed = await persistence.mark_video_billed(
-                _billing_key(task_id),
-                usage.duration_seconds,
-                cost,
+            auth = optional_params.get("user_api_key_dict")
+            event = CausynBillingEvent(
+                provider_task_id=task_id,
+                response_cost=cost,
+                team_id=getattr(auth, "team_id", None),
+                user_id=getattr(auth, "user_id", None),
+                organization_id=getattr(auth, "org_id", None),
+                api_key=getattr(auth, "api_key", None),
+                model=CAUSYN_MODEL,
             )
+            await self._billing_enqueue(self._redis_factory(), event)
         except Exception:  # noqa: BLE001  # a failed idempotency check must never risk charging twice
-            logger.warning("causyn video billing: persistence check failed, skipping charge", exc_info=True)
+            logger.warning("causyn video billing: durable outbox enqueue failed, skipping charge", exc_info=True)
             return
-        _set_response_cost(response, cost if billed else 0.0)
+        _set_response_cost(response, cost)
 
     def video_generation(
         self,

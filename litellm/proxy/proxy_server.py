@@ -748,13 +748,18 @@ def cleanup_router_config_variables():
 
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate, user_custom_key_update
-    global _libtv_billing_reconciler
+    global _libtv_billing_reconciler, _causyn_billing_reconciler
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
     if _libtv_billing_reconciler is not None:
         try:
             await _libtv_billing_reconciler.stop()
         finally:
             _libtv_billing_reconciler = None
+    if _causyn_billing_reconciler is not None:
+        try:
+            await _causyn_billing_reconciler.stop()
+        finally:
+            _causyn_billing_reconciler = None
     from litellm.llms.libtv.persistence import close_receipt_stores
 
     await close_receipt_stores()
@@ -840,7 +845,8 @@ async def proxy_startup_event(app: FastAPI):
         _license_check, \
         proxy_batch_polling_interval, \
         shared_aiohttp_session, \
-        _libtv_billing_reconciler
+        _libtv_billing_reconciler, \
+        _causyn_billing_reconciler
     import json
 
     init_verbose_loggers()
@@ -1064,9 +1070,13 @@ async def proxy_startup_event(app: FastAPI):
     shared_aiohttp_session = await _initialize_shared_aiohttp_session()
 
     try:
-        from litellm.llms.libtv.billing_outbox import start_libtv_billing_reconciler
+        from litellm.llms.libtv.billing_outbox import (
+            start_causyn_billing_reconciler,
+            start_libtv_billing_reconciler,
+        )
 
         _libtv_billing_reconciler = await start_libtv_billing_reconciler(prisma_client)
+        _causyn_billing_reconciler = await start_causyn_billing_reconciler(prisma_client)
     except Exception:
         # Leave unacknowledged Redis events for replay if Redis is unavailable.
         verbose_proxy_logger.exception("Failed to start libtv billing outbox reconciler")
@@ -1908,6 +1918,7 @@ otel_logging = False
 prisma_client: Optional[PrismaClient] = None
 shared_aiohttp_session: Optional["ClientSession"] = None  # Global shared session for connection reuse
 _libtv_billing_reconciler = None
+_causyn_billing_reconciler = None
 user_api_key_cache: UserApiKeyCache = UserApiKeyCache(
     default_in_memory_ttl=UserAPIKeyCacheTTLEnum.in_memory_cache_ttl.value
 )

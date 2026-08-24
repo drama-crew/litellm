@@ -25,6 +25,7 @@ from litellm.proxy.spend_tracking.spend_log_error_logger import (
 )
 from litellm.proxy.spend_tracking.spend_tracking_utils import (
     _sanitize_error_information_for_spend_logs,
+    is_causyn_video_billing_call,
 )
 from litellm.proxy.utils import ProxyUpdateSpend
 from litellm.types.utils import (
@@ -196,6 +197,13 @@ class _ProxyDBLogger(CustomLogger):
                 metadata = await _ProxyDBLogger._enrich_failure_metadata_with_key_info(metadata=metadata)
                 _write_spend_metadata_to_kwargs(kwargs=kwargs, metadata=metadata)
             budget_reservation = _get_budget_reservation_from_metadata(metadata=metadata)
+            if is_causyn_video_billing_call(kwargs):
+                # Causyn terminal polls persist a task-keyed event before the
+                # response is returned. The outbox reconciler owns the spend
+                # row and all counters, so this generic callback must not race
+                # it or create a second per-poll request id.
+                await _release_budget_reservation(budget_reservation=budget_reservation)
+                return
             user_id = cast(Optional[str], metadata.get("user_api_key_user_id", None))
             team_id = cast(Optional[str], metadata.get("user_api_key_team_id", None))
             org_id = cast(Optional[str], metadata.get("user_api_key_org_id", None))
