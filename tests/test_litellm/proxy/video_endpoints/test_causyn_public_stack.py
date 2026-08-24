@@ -433,6 +433,31 @@ def test_public_endpoint_content_outbox_failure_is_retryable_before_download(sta
     assert len(stack.billing.outbox_events) == 1
 
 
+def test_public_endpoint_content_retries_refresh_after_billing_marker_exists(stack: _Stack) -> None:
+    created = stack.client.post("/v1/videos", json=_create_body(), headers=_auth_headers(stack.allowed_key))
+    video_id = created.json()["id"]
+    stack.state.status = "succeeded"
+    stack.refresh_staging_url.error = RuntimeError("refresh unavailable")
+
+    first = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
+
+    assert first.status_code == 502, first.text
+    assert len(stack.billing.outbox_events) == 1
+    assert stack.refresh_staging_url.calls == [(TASK_ID, 600)]
+    assert stack.content_get.calls == []
+
+    stack.trace.clear()
+    stack.refresh_staging_url.error = None
+    second = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
+
+    assert second.status_code == 200, second.text
+    assert second.content == b"video-bytes"
+    assert len(stack.billing.outbox_events) == 1
+    assert stack.refresh_staging_url.calls == [(TASK_ID, 600), (TASK_ID, 600)]
+    assert stack.content_get.calls == [(STAGING_URL, 600, False)]
+    assert stack.trace == ["billing", "refresh", "download"]
+
+
 def test_public_endpoint_virtual_key_allowlist_cannot_be_bypassed(stack: _Stack) -> None:
     created = stack.client.post("/v1/videos", json=_create_body(), headers=_auth_headers(stack.allowed_key))
     video_id = created.json()["id"]
