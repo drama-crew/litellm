@@ -26,6 +26,7 @@ from litellm.exceptions import (
 )
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM
+from litellm.proxy.common_utils.public_surface_sanitization import sanitize_public_provider_text
 from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import (
@@ -116,8 +117,7 @@ _LIBTV_STATUS = {0: "queued", 1: "in_progress", 2: "completed", 3: "failed"}
 
 def _public_provider_text(value: object, fallback: str = "provider request failed") -> str:
     """Remove vendor/domain markers from provider text at the public boundary."""
-    text = str(value or fallback)
-    return re.sub(r"libtv|liblib\.(?:tv|art)", "provider", text, flags=re.IGNORECASE)
+    return sanitize_public_provider_text(value, fallback)
 
 
 def _raise_normalized_libtv_error(error: LibTVError, model: str) -> None:

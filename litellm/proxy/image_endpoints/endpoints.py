@@ -3,7 +3,6 @@ import hashlib
 import hmac
 import math
 import os
-import re
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal
@@ -45,7 +44,10 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
-from litellm.proxy.common_utils.public_surface_sanitization import finalize_public_response_headers
+from litellm.proxy.common_utils.public_surface_sanitization import (
+    finalize_public_response_headers,
+    sanitize_public_provider_text,
+)
 from litellm.proxy.route_llm_request import route_request
 from litellm.types.llms.openai import ChatCompletionUserMessage
 
@@ -94,8 +96,7 @@ def _is_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> bool:
 
 
 def _public_provider_text(value: object, fallback: str = "provider request failed") -> str:
-    text = str(value or fallback)
-    return re.sub(r"libtv|liblib\.(?:tv|art)", "provider", text, flags=re.IGNORECASE)
+    return sanitize_public_provider_text(value, fallback)
 
 
 def _public_error_receipt(receipt: dict) -> dict:

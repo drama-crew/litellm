@@ -233,6 +233,45 @@ def test_model_group_provider_sanitizer_preserves_other_providers():
     ]
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["libtv", "LIBTV", "lib-tv", "lib_tv", "lib.tv", "lib/lib", "LibLib", "lib-lib", "lib_lib", "liblib.tv"],
+)
+def test_shared_private_provider_marker_matches_case_and_separator_variants(value):
+    from litellm.proxy.common_utils.public_surface_sanitization import contains_private_provider_marker
+
+    assert contains_private_provider_marker(value) is True
+
+
+@pytest.mark.parametrize("value", ["ordinary text", "library lookup failed", "public upstream failed", "liberty"])
+def test_shared_private_provider_marker_does_not_match_unrelated_text(value):
+    from litellm.proxy.common_utils.public_surface_sanitization import contains_private_provider_marker
+
+    assert contains_private_provider_marker(value) is False
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("LibLib", "provider"),
+        ("LIB-LIB upstream failure", "provider upstream failure"),
+        ("lib_lib account failure", "provider account failure"),
+        ("liblib.tv failure", "provider failure"),
+    ],
+)
+def test_video_failed_reason_hides_all_private_marker_variants(reason, expected):
+    from litellm.llms.libtv.handler import _public_provider_text
+
+    assert _public_provider_text(reason, "video generation failed") == expected
+
+
+@pytest.mark.parametrize("reason", ["ordinary text", "library unavailable", "public generation failed"])
+def test_video_failed_reason_preserves_unrelated_text(reason):
+    from litellm.llms.libtv.handler import _public_provider_text
+
+    assert _public_provider_text(reason, "video generation failed") == reason
+
+
 def test_public_response_headers_hide_private_identity_but_keep_billing_usage():
     from litellm.proxy.common_utils.public_surface_sanitization import sanitize_public_response_headers
     from litellm.proxy._types import LitellmUserRoles
@@ -253,7 +292,8 @@ def test_public_response_headers_hide_private_identity_but_keep_billing_usage():
             "x-litellm-response-cost": "0.25",
             "x-litellm-key-spend": "1.25",
             "x-ratelimit-libtv-debug": "10",
-            "x-ratelimit-remaining": "libtv-value-is-allowed",
+            "x-ratelimit-remaining": "libtv-private-account",
+            "x-ratelimit-reset": "60",
         },
         non_admin,
     )
@@ -264,7 +304,8 @@ def test_public_response_headers_hide_private_identity_but_keep_billing_usage():
     assert headers["x-litellm-response-cost"] == "0.25"
     assert headers["x-litellm-key-spend"] == "1.25"
     assert "x-ratelimit-libtv-debug" not in headers
-    assert headers["x-ratelimit-remaining"] == "libtv-value-is-allowed"
+    assert "x-ratelimit-remaining" not in headers
+    assert headers["x-ratelimit-reset"] == "60"
 
     admin = MagicMock(
         user_role=LitellmUserRoles.PROXY_ADMIN,
@@ -379,6 +420,35 @@ def test_public_health_sanitizer_hides_private_identity_fields():
     assert result["status"] == "unhealthy"
     assert result["error"] == "provider health check failed"
     assert result["details"] == {"model": "openai/gpt-4o"}
+
+
+def test_public_health_sanitizer_hides_marker_bearing_keys_at_all_nesting_levels():
+    from litellm.proxy.common_utils.public_surface_sanitization import sanitize_health_endpoint
+
+    result = sanitize_health_endpoint(
+        {
+            "libtv_debug": "private",
+            "safe": {
+                "liblib": "private",
+                "nested": {
+                    "LIB-LIB": "private",
+                    "status": "healthy",
+                    "items": [[{"liblib_debug": "private", "status": "healthy"}]],
+                },
+                "status": "healthy",
+            },
+        }
+    )
+
+    assert result == {
+        "safe": {
+            "nested": {
+                "status": "healthy",
+                "items": [[{"status": "healthy"}]],
+            },
+            "status": "healthy",
+        }
+    }
 
 
 def test_health_latest_hides_private_outer_key_for_view_only_admin():

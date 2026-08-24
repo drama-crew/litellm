@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, MutableMapping
+import re
 from typing import Any
 
 PRIVATE_PROVIDER_MARKERS = ("libtv", "liblib")
+PRIVATE_PROVIDER_MARKER_RE = re.compile(
+    r"lib(?:[._:/\\-]*tv|[._:/\\-]*lib(?:[._:/\\-]*(?:tv|art))?)",
+    re.IGNORECASE,
+)
 
 
 def is_full_proxy_admin(user_or_role: Any) -> bool:
@@ -18,13 +23,21 @@ def is_full_proxy_admin(user_or_role: Any) -> bool:
 def contains_private_provider_marker(value: Any) -> bool:
     """Check nested values without stringifying arbitrary objects."""
     if isinstance(value, str):
-        lowered = value.lower()
-        return any(marker in lowered for marker in PRIVATE_PROVIDER_MARKERS)
+        return PRIVATE_PROVIDER_MARKER_RE.search(value) is not None
     if isinstance(value, Mapping):
-        return any(contains_private_provider_marker(item) for item in value.values())
+        return any(
+            contains_private_provider_marker(key) or contains_private_provider_marker(item)
+            for key, item in value.items()
+        )
     if isinstance(value, (list, tuple, set)):
         return any(contains_private_provider_marker(item) for item in value)
     return False
+
+
+def sanitize_public_provider_text(value: Any, fallback: str = "provider request failed") -> str:
+    """Replace provider-private markers while retaining unrelated public text."""
+    text = str(value or fallback)
+    return PRIVATE_PROVIDER_MARKER_RE.sub("provider", text)
 
 
 def neutralize_provider_name(value: Any) -> Any:
@@ -54,8 +67,8 @@ def _is_billing_or_usage_header(name: str) -> bool:
 def sanitize_public_response_headers(headers: Mapping[str, Any], user_or_role: Any) -> dict[str, str]:
     """Drop provider-private identity headers for non-admin callers.
 
-    Billing, quota and usage headers are intentionally retained even if an
-    upstream callback happened to put a provider marker in their value.
+    Billing, quota and usage headers are retained only when their names and
+    values are public-safe. A provider marker in either side is private.
     """
     if is_full_proxy_admin(user_or_role):
         return {str(key): str(value) for key, value in headers.items() if value is not None}
@@ -66,14 +79,13 @@ def sanitize_public_response_headers(headers: Mapping[str, Any], user_or_role: A
         header_name = str(key)
         # A provider marker in the *name* is always private. This check must
         # precede the billing/usage allowlist so ``X-RateLimit-LibTV-Debug``
-        # cannot masquerade as an allowed quota header. Clean billing/usage
-        # names may still carry provider-marked values from upstream callbacks.
+        # cannot masquerade as an allowed quota header.
         if contains_private_provider_marker(header_name):
+            continue
+        if contains_private_provider_marker(value):
             continue
         if _is_billing_or_usage_header(header_name):
             result[header_name] = str(value)
-            continue
-        if contains_private_provider_marker(value):
             continue
         result[header_name] = str(value)
     return result
@@ -101,6 +113,15 @@ def finalize_public_response_headers(headers: Mapping[str, Any], user_or_role: A
 
 def sanitize_health_endpoint(endpoint: Any) -> Any:
     """Remove provider-private health fields while preserving health status."""
+    if isinstance(endpoint, list):
+        return [
+            sanitize_health_endpoint(item)
+            if isinstance(item, (Mapping, list))
+            else sanitize_public_provider_text(item, "provider")
+            if isinstance(item, str) and contains_private_provider_marker(item)
+            else item
+            for item in endpoint
+        ]
     if not isinstance(endpoint, Mapping):
         return endpoint
     sanitized: dict[str, Any] = {}
@@ -117,6 +138,8 @@ def sanitize_health_endpoint(endpoint: Any) -> Any:
         "api_version",
     }
     for key, value in endpoint.items():
+        if contains_private_provider_marker(key):
+            continue
         if key in {"api_base", "api_version"}:
             continue
         if key in marker_sensitive_fields and contains_private_provider_marker(value):
@@ -125,13 +148,8 @@ def sanitize_health_endpoint(endpoint: Any) -> Any:
             if key in {"error", "error_message", "message", "detail"}:
                 sanitized[key] = "provider health check failed"
             continue
-        if isinstance(value, Mapping):
+        if isinstance(value, (Mapping, list)):
             sanitized[key] = sanitize_health_endpoint(value)
-            continue
-        if isinstance(value, list):
-            sanitized[key] = [
-                sanitize_health_endpoint(item) if isinstance(item, Mapping) else item for item in value
-            ]
             continue
         sanitized[key] = value
     return sanitized
