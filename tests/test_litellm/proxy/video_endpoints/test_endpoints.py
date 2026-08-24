@@ -100,6 +100,7 @@ class Harness:
     provider_from_query: MagicMock
     provider_from_body: AsyncMock
     router: MagicMock
+    resolve_video_alias: MagicMock
     resolve_model: MagicMock
 
     def processor_data(self) -> Dict[str, Any]:
@@ -119,7 +120,13 @@ def harness():
     resolve_model = MagicMock(
         side_effect=lambda model_id: RESOLVED_MODELS.get(model_id)
     )
+    resolve_video_alias = MagicMock(
+        side_effect=lambda provider, model_id: {
+            ("azure", VIDEO_MODEL_ID): VIDEO_MODEL_ID,
+        }.get((provider, model_id), model_id)
+    )
     router.resolve_model_name_from_model_id = resolve_model
+    router.resolve_video_model_id_alias = resolve_video_alias
 
     read_body = AsyncMock(return_value={})
     batch_to_bytesio = AsyncMock(return_value=[b"filebytes"])
@@ -192,6 +199,7 @@ def harness():
             provider_from_query=provider_from_query,
             provider_from_body=provider_from_body,
             router=router,
+            resolve_video_alias=resolve_video_alias,
             resolve_model=resolve_model,
         )
 
@@ -278,6 +286,7 @@ async def test_status__model_encoded_id_full_contract(harness):
     assert resp is SENTINEL
     assert harness.route_type() == "avideo_status"
     # provider comes from the decoded id; model_id resolved to a model name.
+    harness.resolve_video_alias.assert_called_once_with("azure", VIDEO_MODEL_ID)
     harness.resolve_model.assert_called_once_with(VIDEO_MODEL_ID)
     assert harness.processor_data() == {
         "video_id": AZURE_VIDEO_ID,
@@ -308,6 +317,7 @@ async def test_status__header_provider_beats_decoded_id(harness):
     # header wins over the provider decoded from the id ...
     assert data["custom_llm_provider"] == "bedrock"
     # ... but the model is still resolved from the decoded model_id.
+    harness.resolve_video_alias.assert_called_once_with("azure", VIDEO_MODEL_ID)
     assert data["model"] == "azure-sora"
 
 
@@ -371,6 +381,7 @@ async def test_content__model_encoded_id(harness):
 
     await call_content(harness, AZURE_VIDEO_ID)
 
+    harness.resolve_video_alias.assert_called_once_with("azure", VIDEO_MODEL_ID)
     harness.resolve_model.assert_called_once_with(VIDEO_MODEL_ID)
     assert harness.processor_data() == {
         "video_id": AZURE_VIDEO_ID,
