@@ -42,7 +42,7 @@ from collections.abc import Awaitable, Callable
 from typing import Literal, Protocol, cast
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
@@ -67,6 +67,7 @@ PROVIDER = "causyn"
 CAUSYN_VIDEO_ID_PREFIX = "causyn_"
 LEGACY_VIDEO_ID_PREFIX = CAUSYN_VIDEO_ID_PREFIX
 CAUSYN_RESOLUTION = "768x512"
+CAUSYN_BILLING_METADATA_VERSION = "causyn-video-billing-v1"
 CAUSYN_RATIO = "3:2"
 CAUSYN_DEADLINE_SECONDS = 1800.0
 _INTERNAL_VIDEO_FLAG = "DRAMA_INTERNAL_VIDEO_ENABLED"
@@ -317,11 +318,58 @@ class _StatusEnvelope(BaseModel):
 
 
 class _Pricing(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
+    model: Literal[CAUSYN_MODEL]
+    id: str = Field(min_length=1)
     output_cost_per_second_768x512: float | None = Field(default=None, gt=0)
     output_cost_per_second: float | None = Field(default=None, gt=0)
-    id: str | None = None
+
+    @field_validator("output_cost_per_second_768x512", "output_cost_per_second")
+    @classmethod
+    def _requires_finite_rate(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("pricing rate must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def _requires_rate(self) -> "_Pricing":
+        if self.output_cost_per_second_768x512 is None and self.output_cost_per_second is None:
+            raise ValueError("pricing must include an output rate")
+        return self
+
+
+class _DurableAttribution(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    api_key: str | None
+    team_id: str | None
+    user_id: str | None
+    organization_id: str | None
+
+    @field_validator("api_key")
+    @classmethod
+    def _validate_api_key(cls, value: str | None) -> str | None:
+        if value is not None and _hashed_api_key(value) is None:
+            raise ValueError("api_key must be a hash")
+        return value
+
+    @field_validator("team_id", "user_id", "organization_id")
+    @classmethod
+    def _validate_owner_id(cls, value: str | None) -> str | None:
+        if value is not None and not value:
+            raise ValueError("owner identifiers must be non-empty")
+        return value
+
+
+class _DurableTaskMetadata(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version: Literal[CAUSYN_BILLING_METADATA_VERSION]
+    duration_seconds: float = Field(ge=3, le=8)
+    video_resolution: Literal[CAUSYN_RESOLUTION]
+    pricing: _Pricing
+    attribution: _DurableAttribution
 
 
 def _public_worker_error(error: _WorkerError | None) -> dict[str, str]:
@@ -344,21 +392,9 @@ def _staging_key(task_id: str) -> str:
     return f"staging/video-tasks/{task_id}.mp4"
 
 
-def _completion_cost(
-    optional_params: dict[str, object], duration_seconds: float, task_metadata: dict[str, object] | None = None
-) -> float | None:
-    raw_model_info: object = None
-    if task_metadata is not None:
-        raw_model_info = task_metadata.get("pricing")
-    if raw_model_info is None:
-        raw_model_info = optional_params.get("model_info")
-    try:
-        pricing = _Pricing.model_validate(raw_model_info)
-    except ValidationError:
-        return None
+def _completion_cost(pricing: _Pricing, duration_seconds: float) -> float:
     rate = pricing.output_cost_per_second_768x512 or pricing.output_cost_per_second
-    if rate is None or not math.isfinite(rate) or rate <= 0:
-        return None
+    assert rate is not None
     return rate * duration_seconds
 
 
@@ -432,8 +468,22 @@ def _billing_attribution(optional_params: dict[str, object], logging_obj: object
     return attribution
 
 
-def _pricing_identity(optional_params: dict[str, object]) -> dict[str, object]:
-    raw = optional_params.get("model_info")
+def _pricing_identity(optional_params: dict[str, object], logging_obj: object) -> dict[str, object]:
+    raw: object = None
+    details = getattr(logging_obj, "model_call_details", None)
+    if isinstance(details, dict):
+        raw = details.get("model_info")
+        params = details.get("litellm_params")
+        if raw is None and isinstance(params, dict):
+            raw = params.get("model_info")
+    if raw is None:
+        for source in _metadata_sources(optional_params, logging_obj):
+            candidate = source.get("model_info")
+            if isinstance(candidate, dict):
+                raw = candidate
+                break
+    if raw is None:
+        raw = optional_params.get("model_info")
     if isinstance(raw, BaseModel):
         raw = raw.model_dump()
     if not isinstance(raw, dict):
@@ -447,6 +497,16 @@ def _pricing_identity(optional_params: dict[str, object]) -> dict[str, object]:
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
             pricing[key] = float(value)
     return pricing
+
+
+def _durable_attribution(optional_params: dict[str, object], logging_obj: object) -> dict[str, str | None]:
+    attribution = _billing_attribution(optional_params, logging_obj)
+    return {
+        "api_key": attribution.get("api_key"),
+        "team_id": attribution.get("team_id"),
+        "user_id": attribution.get("user_id"),
+        "organization_id": attribution.get("organization_id"),
+    }
 
 
 def _set_response_cost(response: VideoObject, response_cost: float) -> None:
@@ -491,20 +551,21 @@ class CausynVideoHandler(CustomLLM):
             )
         except Exception as exc:  # noqa: BLE001
             raise _service_error() from exc
+        try:
+            durable = _DurableTaskMetadata.model_validate(task_metadata)
+        except ValidationError as exc:
+            logger.warning("causyn video billing: task metadata is missing or invalid")
+            raise _service_error() from exc
+        if not math.isclose(durable.duration_seconds, result.duration_seconds, rel_tol=0.0, abs_tol=1e-6):
+            logger.warning("causyn video billing: task metadata duration does not match worker result")
+            raise _service_error()
+        if durable.video_resolution != f"{result.width}x{result.height}":
+            logger.warning("causyn video billing: task metadata resolution does not match worker result")
+            raise _service_error()
         response.usage = _usage(result.duration_seconds)
         _set_response_cost(response, 0.0)
-        cost = _completion_cost(optional_params, result.duration_seconds, task_metadata)
-        if cost is None:
-            logger.warning("causyn video billing: no valid price for completed task")
-            return
-        attribution = _billing_attribution(optional_params, logging_obj)
-        if task_metadata is not None:
-            durable_attribution = task_metadata.get("attribution")
-            if isinstance(durable_attribution, dict):
-                for key in ("api_key", "team_id", "user_id", "organization_id"):
-                    value = durable_attribution.get(key)
-                    if isinstance(value, str) and value:
-                        attribution[key] = value
+        cost = _completion_cost(durable.pricing, result.duration_seconds)
+        attribution = durable.attribution.model_dump()
         try:
             event = CausynBillingEvent(
                 provider_task_id=task_id,
@@ -552,17 +613,26 @@ class CausynVideoHandler(CustomLLM):
         task_id = self._task_id_factory()
         if _TASK_ID_PATTERN.fullmatch(task_id) is None:
             raise _service_error()
+        task_metadata = {
+            "version": CAUSYN_BILLING_METADATA_VERSION,
+            "duration_seconds": float(duration),
+            "video_resolution": CAUSYN_RESOLUTION,
+            "pricing": _pricing_identity(optional_params, logging_obj),
+            "attribution": _durable_attribution(optional_params, logging_obj),
+        }
+        try:
+            durable_metadata = _DurableTaskMetadata.model_validate(task_metadata)
+        except ValidationError as exc:
+            logger.warning("causyn video billing: deployment pricing metadata is missing or invalid")
+            raise _service_error() from exc
+        serialized_metadata = durable_metadata.model_dump()
+        serialized_metadata["pricing"] = durable_metadata.pricing.model_dump(exclude_none=True)
         payload = {
             "task_id": task_id,
             "model": CAUSYN_MODEL,
             "deadline_ts": self._clock() + CAUSYN_DEADLINE_SECONDS,
             "request": request,
-            "task_metadata": {
-                "duration_seconds": float(duration),
-                "video_resolution": CAUSYN_RESOLUTION,
-                "pricing": _pricing_identity(optional_params),
-                "attribution": _billing_attribution(optional_params, logging_obj),
-            },
+            "task_metadata": serialized_metadata,
         }
         try:
             settings = self._settings_factory()

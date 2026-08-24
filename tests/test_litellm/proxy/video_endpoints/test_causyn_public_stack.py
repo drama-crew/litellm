@@ -47,6 +47,22 @@ class _State:
         }
         self.fetch_error: Exception | None = None
         self.enqueued: list[dict[str, object]] = []
+        self.task_metadata: dict[str, object] | None = {
+            "version": causyn_module.CAUSYN_BILLING_METADATA_VERSION,
+            "duration_seconds": 5.0,
+            "video_resolution": "768x512",
+            "pricing": {
+                "model": CAUSYN_MODEL,
+                "id": CAUSYN_MODEL_ID,
+                "output_cost_per_second_768x512": 0.1,
+            },
+            "attribution": {
+                "api_key": None,
+                "team_id": None,
+                "user_id": None,
+                "organization_id": None,
+            },
+        }
         self.fetch_calls = 0
 
     def body(self) -> dict[str, object]:
@@ -167,12 +183,18 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
 
     async def enqueue(payload: dict[str, object], *, redis_factory: object, settings: object) -> str:
         state.enqueued.append(payload)
+        metadata = payload.get("task_metadata")
+        state.task_metadata = metadata if isinstance(metadata, dict) else None
         return "1-0"
 
     async def fetch_status(task_id: str, *, redis: object) -> dict[str, object]:
         assert task_id == TASK_ID
         state.fetch_calls += 1
         return state.body()
+
+    async def fetch_metadata(task_id: str, *, redis: object) -> dict[str, object] | None:
+        assert task_id == TASK_ID
+        return state.task_metadata
 
     settings = VideoGenerateSettings(
         source_hosts=frozenset({"source.example"}),
@@ -189,6 +211,7 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
     )
     monkeypatch.setattr(causyn_module, "enqueue_video_generate", enqueue)
     monkeypatch.setattr(causyn_module, "fetch_video_generate_status", fetch_status)
+    monkeypatch.setattr(causyn_module, "fetch_video_generate_task_metadata", fetch_metadata)
     monkeypatch.setenv("DRAMA_INTERNAL_VIDEO_ENABLED", "true")
 
     old_map = list(litellm.custom_provider_map)
@@ -389,12 +412,12 @@ async def test_sync_and_async_public_apis_share_causyn_retrieval_contract(stack:
     sync_status = litellm.video_status(
         video_id=encoded_id,
         custom_llm_provider="causyn",
-        model_info={"output_cost_per_second_768x512": 0.1},
+        model_info={"id": CAUSYN_MODEL_ID, "output_cost_per_second_768x512": 0.1},
     )
     async_status = await litellm.avideo_status(
         video_id=encoded_id,
         custom_llm_provider="causyn",
-        model_info={"output_cost_per_second_768x512": 0.1},
+        model_info={"id": CAUSYN_MODEL_ID, "output_cost_per_second_768x512": 0.1},
     )
     sync_content = litellm.video_content(video_id=encoded_id, custom_llm_provider="causyn")
     async_content = await litellm.avideo_content(video_id=encoded_id, custom_llm_provider="causyn")
