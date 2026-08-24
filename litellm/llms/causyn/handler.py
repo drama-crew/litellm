@@ -19,8 +19,8 @@ correct, recently-debugged signing implementation):
 * the staging upload URL is NOT signed here -- the platform's worker-runner
   injects it when the worker claims the task;
 * the finished object is NOT read from OSS here -- the platform signs a GET
-  when it records the worker's result, and ``avideo_content`` merely fetches
-  that URL over plain HTTPS;
+  at content-read time through an authenticated internal service endpoint, and
+  ``avideo_content`` merely fetches that URL over plain HTTPS;
 * consequently this module needs no object-store SDK and no OSS credentials.
 
 The enqueue/poll engine itself is reused from ``litellm.llms.libtv.video_generate``
@@ -107,6 +107,7 @@ class ContentResponse(Protocol):
 
 RequestTimeout = float | httpx.Timeout | None
 ContentGet = Callable[[str, RequestTimeout, bool], Awaitable[ContentResponse]]
+RefreshUrl = Callable[[str, RequestTimeout], Awaitable[str]]
 
 
 class VideoTaskPersistence(Protocol):
@@ -137,6 +138,27 @@ async def _default_content_get(
 ) -> ContentResponse:
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=follow_redirects) as client:
         return await client.get(url)
+
+
+async def _default_refresh_staging_url(task_id: str, timeout: RequestTimeout) -> str:
+    """Ask the platform to mint one short-lived URL for this task."""
+    platform_url = os.getenv("DRAMA_CAUSYN_PLATFORM_URL", "").rstrip("/")
+    service_key = os.getenv("DRAMA_CAUSYN_SERVICE_API_KEY", "").strip()
+    if not platform_url or not service_key:
+        raise VideoGenerateError("misconfigured", "Causyn staging refresh is not configured")
+    endpoint = f"{platform_url}/api/service/causyn/tasks/{task_id}/staging-url"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(endpoint, headers={"X-Service-API-Key": service_key})
+    if response.status_code != 200:
+        raise VideoGenerateError("refresh_failed", "Causyn staging URL refresh failed")
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise VideoGenerateError("refresh_failed", "Causyn staging URL refresh failed") from exc
+    expected_key = _staging_key(task_id)
+    if not isinstance(body, dict) or body.get("staging_key") != expected_key or not isinstance(body.get("url"), str):
+        raise VideoGenerateError("refresh_failed", "Causyn staging URL refresh failed")
+    return body["url"]
 
 
 def _new_task_id() -> str:
@@ -370,6 +392,7 @@ class CausynVideoHandler(CustomLLM):
         redis_factory: Callable[[], object] | None = None,
         settings_factory: Callable[[], VideoGenerateSettings] = VideoGenerateSettings.from_environment,
         content_get: ContentGet = _default_content_get,
+        refresh_staging_url: RefreshUrl = _default_refresh_staging_url,
         task_id_factory: Callable[[], str] = _new_task_id,
         clock: Callable[[], float] = time.time,
         persistence_factory: PersistenceFactory = _default_persistence_factory,
@@ -378,6 +401,7 @@ class CausynVideoHandler(CustomLLM):
         self._redis_factory = redis_factory or _redis_factory
         self._settings_factory = settings_factory
         self._content_get = content_get
+        self._refresh_staging_url = refresh_staging_url
         self._task_id_factory = task_id_factory
         self._clock = clock
         self._persistence_factory = persistence_factory
@@ -619,10 +643,13 @@ class CausynVideoHandler(CustomLLM):
         if body.status != "succeeded":
             raise CustomLLMError(status_code=409, message="causyn video is not ready")
         result = body.result
-        staging_url = result.staging_url if result is not None else None
         task_id = _decode_task_id(video_id)
-        if result is None or result.staging_key != _staging_key(task_id) or not isinstance(staging_url, str):
+        if result is None or result.staging_key != _staging_key(task_id):
             raise CustomLLMError(status_code=502, message="causyn video content is unavailable")
+        try:
+            staging_url = await self._refresh_staging_url(task_id, timeout)
+        except Exception:  # noqa: BLE001  # do not expose internal service details
+            raise CustomLLMError(status_code=502, message="causyn video content is unavailable") from None
         try:
             settings = self._settings_factory()
             validate_video_generate_url(staging_url, settings.target_hosts, settings, "staging download")

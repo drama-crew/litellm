@@ -535,8 +535,8 @@ async def fetch_video_generate_status(task_id: str, *, redis: Any) -> dict:
     # done/failed: result_key is a Redis LIST -- read via LINDEX 0, not GET.
     raw_result = _decode(await redis.lindex(result_key(task_id), 0))
     if raw_result is None:
-        # status_key TTL is 24h but result_key TTL is only 1h -- this window
-        # is real, not defensive padding (spec §1.2).
+        # A terminal result may outlive its status key only if retention or
+        # cleanup policy changes; treat a missing result as terminal failure.
         return {
             "ok": False,
             "task_id": task_id,

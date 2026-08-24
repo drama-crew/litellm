@@ -10,6 +10,7 @@ off).
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -20,6 +21,7 @@ from litellm.llms.causyn.handler import (
     PROVIDER,
     CausynVideoHandler,
 )
+from litellm.llms.libtv.video_generate import VideoGenerateError
 from litellm.types.videos.utils import decode_video_id_with_provider
 
 TASK_ID = "0123456789abcdef0123456789abcdef"
@@ -347,9 +349,7 @@ async def test_failure_surfaces_the_engine_error(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_content_refuses_when_no_signed_url_is_present(monkeypatch):
-    """This module signs nothing. If the platform did not attach a URL there is
-    nothing to fetch, and inventing one would mean putting object-store
-    credentials in the proxy."""
+    """A content read fails closed when the internal refresh service is absent."""
     _stub_status(
         monkeypatch,
         {
@@ -374,6 +374,119 @@ async def test_content_refuses_when_no_signed_url_is_present(monkeypatch):
             video_id=VALID_LEGACY_ID, api_key=None, api_base=None, optional_params={}, logging_obj=None
         )
     assert exc.value.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_content_refreshes_an_expired_result_url_before_fetching(monkeypatch):
+    _stub_status(
+        monkeypatch,
+        {
+            "ok": True,
+            "task_id": TASK_ID,
+            "status": "succeeded",
+            "result": _valid_worker_result(),
+        },
+    )
+    fetched = []
+
+    async def refresh(task_id, timeout):
+        assert task_id == TASK_ID
+        return "https://target.example/fresh-url"
+
+    async def content_get(url, timeout, follow_redirects):
+        fetched.append(url)
+        return SimpleNamespace(status_code=200, content=b"video")
+
+    handler = CausynVideoHandler(refresh_staging_url=refresh, content_get=content_get)
+    content = await handler.avideo_content(
+        video_id=VALID_LEGACY_ID,
+        api_key=None,
+        api_base=None,
+        optional_params={},
+        logging_obj=None,
+    )
+    assert content == b"video"
+    assert fetched == ["https://target.example/fresh-url"]
+
+
+@pytest.mark.asyncio
+async def test_content_refreshes_each_time_and_does_not_reuse_a_stale_url(monkeypatch):
+    _stub_status(
+        monkeypatch,
+        {
+            "ok": True,
+            "task_id": TASK_ID,
+            "status": "succeeded",
+            "result": _valid_worker_result(staging_url="https://target.example/expired"),
+        },
+    )
+    refreshed = []
+
+    async def refresh(task_id, timeout):
+        url = f"https://target.example/fresh-{len(refreshed)}"
+        refreshed.append(url)
+        return url
+
+    async def content_get(url, timeout, follow_redirects):
+        return SimpleNamespace(status_code=200, content=url.encode())
+
+    handler = CausynVideoHandler(refresh_staging_url=refresh, content_get=content_get)
+    first = await handler.avideo_content(VALID_LEGACY_ID, None, None, {}, None)
+    second = await handler.avideo_content(VALID_LEGACY_ID, None, None, {}, None)
+    assert first == b"https://target.example/fresh-0"
+    assert second == b"https://target.example/fresh-1"
+
+
+@pytest.mark.asyncio
+async def test_content_hides_refresh_service_failures(monkeypatch):
+    _stub_status(
+        monkeypatch,
+        {
+            "ok": True,
+            "task_id": TASK_ID,
+            "status": "succeeded",
+            "result": _valid_worker_result(),
+        },
+    )
+
+    async def refresh(task_id, timeout):
+        raise RuntimeError("internal URL and service key must not leak")
+
+    handler = CausynVideoHandler(refresh_staging_url=refresh)
+    with pytest.raises(CustomLLMError) as exc:
+        await handler.avideo_content(VALID_LEGACY_ID, None, None, {}, None)
+    assert exc.value.status_code == 502
+    assert "internal URL" not in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_refresh_uses_service_auth_and_rejects_a_wrong_returned_key(monkeypatch):
+    monkeypatch.setenv("DRAMA_CAUSYN_PLATFORM_URL", "https://platform.example/")
+    monkeypatch.setenv("DRAMA_CAUSYN_SERVICE_API_KEY", "service-secret")
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {"staging_key": "staging/video-tasks/other.mp4", "url": "https://target.example/u"}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, headers):
+            assert (
+                url == "https://platform.example/api/service/causyn/tasks/0123456789abcdef0123456789abcdef/staging-url"
+            )
+            assert headers == {"X-Service-API-Key": "service-secret"}
+            return _Response()
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda **kwargs: _Client())
+    with pytest.raises(VideoGenerateError):
+        await mod._default_refresh_staging_url(TASK_ID, None)
 
 
 def test_module_holds_no_object_store_client():
