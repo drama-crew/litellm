@@ -700,3 +700,83 @@ def test_translation_table_covers_every_status_the_engine_can_return():
     assert set(_STATUS_TO_OPENAI) <= engine_can_return, (
         f"maps statuses the engine never emits: {set(_STATUS_TO_OPENAI) - engine_can_return}"
     )
+
+
+# --------------------------------------------------------------------------
+# Billing must not destroy a finished video
+# --------------------------------------------------------------------------
+
+
+# The real pipeline renders duration*24 + 1 frames at 24 fps, so a 5-second
+# order comes back as 5.041667s -- always, by construction. Every fixture in
+# this file had set the metadata and the worker result to the same 5.0, so the
+# equality guard passed in tests and could never pass in production.
+_ACTUAL = 5.0 + 1 / 24
+
+
+def _stub_status_real_frames(monkeypatch, *, ordered=5.0, actual=_ACTUAL):
+    async def _fetch(task_id, *, redis):
+        return {
+            "ok": True,
+            "task_id": TASK_ID,
+            "status": "succeeded",
+            "result": _valid_worker_result(duration_seconds=actual),
+        }
+
+    async def _metadata(task_id, *, redis):
+        return {
+            "version": mod.CAUSYN_BILLING_METADATA_VERSION,
+            "duration_seconds": ordered,
+            "video_resolution": "768x512",
+            "pricing": {
+                "model": "causyn-1.0",
+                "id": "causyn-price-v1",
+                "output_cost_per_second_768x512": 0.1,
+            },
+            "attribution": {"api_key": None, "team_id": None, "user_id": None, "organization_id": None},
+        }
+
+    monkeypatch.setattr(mod, "fetch_video_generate_status", _fetch)
+    monkeypatch.setattr(mod, "fetch_video_generate_task_metadata", _metadata)
+    monkeypatch.setattr(mod, "_redis_factory", lambda: object())
+
+
+@pytest.mark.asyncio
+async def test_frame_quantised_duration_is_not_a_mismatch(monkeypatch):
+    """The guard exists to catch a worker rendering something other than what
+    was ordered. One frame of quantisation is not that."""
+    _stub_status_real_frames(monkeypatch)
+
+    async def _enqueue(redis, event):
+        return True
+
+    handler = CausynVideoHandler(billing_enqueue=_enqueue)
+    video = await handler.avideo_status(
+        video_id=VALID_LEGACY_ID, api_key=None, api_base=None, optional_params={}, logging_obj=None
+    )
+    assert video.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_real_duration_mismatch_is_still_a_hard_stop(monkeypatch):
+    """Ordered 5s, worker returned 8s -- the guard's actual purpose, kept.
+
+    Worth recording what this costs, because it is the same shape as the bug
+    above: the condition is permanent, so the retry the 503 asks for can never
+    succeed, and the platform will keep polling until its budget runs out
+    before failing. That is acceptable only because it means the worker
+    rendered the wrong length, which should not happen; the frame overshoot
+    that tripped this guard on EVERY render is what made it a live problem.
+    """
+    _stub_status_real_frames(monkeypatch, ordered=5.0, actual=8.0)
+
+    async def _enqueue(redis, event):
+        return True
+
+    handler = CausynVideoHandler(billing_enqueue=_enqueue)
+    with pytest.raises(CustomLLMError):
+        await handler.avideo_status(
+            video_id=VALID_LEGACY_ID, api_key=None, api_base=None, optional_params={}, logging_obj=None
+        )
+
+

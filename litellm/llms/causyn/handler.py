@@ -284,6 +284,12 @@ def _bad_request(message: str) -> CustomLLMError:
     return CustomLLMError(status_code=400, message=message)
 
 
+# Ordered durations are whole seconds, so a genuine mis-render differs by >=1s.
+# Half a second separates that from the pipeline's one-frame overshoot without
+# hardcoding its frame rate.
+_DURATION_RECONCILE_TOLERANCE_SECONDS = 0.5
+
+
 def _service_error(message: str = "causyn video service unavailable") -> CustomLLMError:
     return CustomLLMError(status_code=503, message=message)
 
@@ -673,7 +679,17 @@ class CausynVideoHandler(CustomLLM):
         except ValidationError as exc:
             logger.warning("causyn video billing: task metadata is missing or invalid")
             raise _service_error() from exc
-        if not math.isclose(durable.duration_seconds, result.duration_seconds, rel_tol=0.0, abs_tol=1e-6):
+        # Ordered durations are whole seconds (3..8), so a worker that rendered
+        # something other than what was ordered is off by at least a second.
+        # Anything smaller is frame quantisation, not a mismatch: the pipeline
+        # renders duration*24 + 1 frames at 24 fps, so every result comes back
+        # ~0.0417s long by construction. The previous abs_tol=1e-6 demanded
+        # equality and so rejected EVERY completed video -- and because a
+        # rejection here surfaces as a 503 on the status poll, which the
+        # platform treats as terminal, each one became a "生成失败" for a video
+        # that was already sitting in the object store. 45 of them before this
+        # was found.
+        if abs(durable.duration_seconds - result.duration_seconds) > _DURATION_RECONCILE_TOLERANCE_SECONDS:
             logger.warning("causyn video billing: task metadata duration does not match worker result")
             raise _service_error()
         if durable.video_resolution != f"{result.width}x{result.height}":
@@ -681,7 +697,10 @@ class CausynVideoHandler(CustomLLM):
             raise _service_error()
         response.usage = _usage(result.duration_seconds)
         _set_response_cost(response, 0.0)
-        cost = _completion_cost(durable.pricing, result.duration_seconds)
+        # Never bill above the quote. The two differ by that extra frame on every
+        # single render, so billing the worker's figure charged 5.0417s against a
+        # 5s quote every time.
+        cost = _completion_cost(durable.pricing, min(durable.duration_seconds, result.duration_seconds))
         attribution = durable.attribution.model_dump()
         try:
             event = CausynBillingEvent(
