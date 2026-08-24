@@ -14,14 +14,14 @@ def _request(body: dict) -> Request:
     async def receive():
         return {"type": "http.request", "body": raw}
 
-    return Request({"type": "http", "method": "POST", "path": "/v1/libtv/validated-media-transfer", "headers": []}, receive=receive)
+    return Request({"type": "http", "method": "POST", "path": "/internal/v1/validated-media-transfer", "headers": []}, receive=receive)
 
 
 def _raw_request(raw: bytes) -> Request:
     async def receive():
         return {"type": "http.request", "body": raw}
 
-    return Request({"type": "http", "method": "POST", "path": "/v1/libtv/validated-media-transfer", "headers": []}, receive=receive)
+    return Request({"type": "http", "method": "POST", "path": "/internal/v1/validated-media-transfer", "headers": []}, receive=receive)
 
 
 @pytest.mark.asyncio

@@ -447,8 +447,7 @@ class LiteLLMRoutes(enum.Enum):
         "/rag/query",
         "/v1/rag/query",
         # Drama image/transfer operations are data-plane calls.  Keep the
-        # provider-neutral routes first-class for virtual-key RBAC while the
-        # legacy aliases remain available only for the migration window.
+        # Provider-neutral routes are first-class for virtual-key RBAC.
         "/internal/v1/validated-media-transfer",
         "/internal/v1/validated-media-transfer/readiness",
         "/internal/v1/image-upscale/submit",
@@ -456,13 +455,6 @@ class LiteLLMRoutes(enum.Enum):
         "/internal/v1/image-upscale/poll",
         "/internal/v1/image-upscale/finalize",
         "/internal/v1/image-upscale/resolve",
-        "/v1/libtv/validated-media-transfer",
-        "/v1/libtv/validated-media-transfer/readiness",
-        "/v1/libtv/image-upscale/submit",
-        "/v1/libtv/image-upscale/receipt/{request_id}",
-        "/v1/libtv/image-upscale/poll",
-        "/v1/libtv/image-upscale/finalize",
-        "/v1/libtv/image-upscale/resolve",
     ]
 
     anthropic_routes = [

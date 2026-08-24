@@ -28,11 +28,25 @@ from litellm.llms.libtv.image_upscale import (
 from litellm.types.utils import ImageResponse
 
 
+def test_legacy_libtv_routes_are_not_registered_and_internal_routes_are_present():
+    paths = {getattr(route, "path", None) for route in endpoints.router.routes}
+    assert not any(path and path.startswith("/v1/libtv/") for path in paths)
+    assert {
+        "/internal/v1/validated-media-transfer",
+        "/internal/v1/validated-media-transfer/readiness",
+        "/internal/v1/image-upscale/submit",
+        "/internal/v1/image-upscale/receipt/{request_id}",
+        "/internal/v1/image-upscale/poll",
+        "/internal/v1/image-upscale/finalize",
+        "/internal/v1/image-upscale/resolve",
+    } <= paths
+
+
 @pytest.mark.asyncio
 async def test_internal_image_routes_require_derived_service_key(monkeypatch):
     for route in endpoints.router.routes:
         path = getattr(route, "path", "")
-        if path.startswith("/internal/v1/") or path.startswith("/v1/libtv/"):
+        if path.startswith("/internal/v1/"):
             dependency_calls = [dependency.call for dependency in route.dependant.dependencies]
             assert dependency_calls[:2] == [
                 endpoints._require_internal_service_auth,
@@ -88,7 +102,7 @@ def _request(body: bytes) -> Request:
     scope = {
         "type": "http",
         "method": "POST",
-        "path": "/v1/libtv/image-upscale/submit",
+        "path": "/internal/v1/image-upscale/submit",
         "headers": [],
     }
 
@@ -651,7 +665,7 @@ async def test_image_upscale_submit_rejects_conflicting_source_aliases(monkeypat
 
 def test_image_upscale_openapi_contract_requires_source_digest_and_exposes_receipt_schema():
     route = next(
-        route for route in endpoints.router.routes if getattr(route, "path", None) == "/v1/libtv/image-upscale/submit"
+        route for route in endpoints.router.routes if getattr(route, "path", None) == "/internal/v1/image-upscale/submit"
     )
     internal_route = next(
         route
@@ -779,7 +793,7 @@ async def test_image_upscale_submit_requires_stable_request_id_with_422():
 
 def test_image_upscale_openapi_requires_request_id():
     route = next(
-        route for route in endpoints.router.routes if getattr(route, "path", None) == "/v1/libtv/image-upscale/submit"
+        route for route in endpoints.router.routes if getattr(route, "path", None) == "/internal/v1/image-upscale/submit"
     )
     schema = route.openapi_extra["requestBody"]["content"]["application/json"]["schema"]
     assert "request_id" in schema["required"]
@@ -910,7 +924,7 @@ async def test_image_upscale_resolution_rejects_non_operator_before_store_lookup
 
     response = await endpoints.libtv_image_upscale_resolve(
         request=_action_request(
-            "/v1/libtv/image-upscale/resolve",
+            "/internal/v1/image-upscale/resolve",
             orjson.dumps(
                 {
                     "request_id": "request-1",
@@ -957,7 +971,7 @@ async def test_image_upscale_resolution_records_authenticated_operator_only(monk
 
     response = await endpoints.libtv_image_upscale_resolve(
         request=_action_request(
-            "/v1/libtv/image-upscale/resolve",
+            "/internal/v1/image-upscale/resolve",
             orjson.dumps(
                 {
                     "request_id": "request-1",
@@ -982,7 +996,7 @@ async def test_image_upscale_resolution_records_authenticated_operator_only(monk
 async def test_image_upscale_resolution_rejects_client_supplied_audit_fields(monkeypatch):
     response = await endpoints.libtv_image_upscale_resolve(
         request=_action_request(
-            "/v1/libtv/image-upscale/resolve",
+            "/internal/v1/image-upscale/resolve",
             orjson.dumps(
                 {
                     "request_id": "request-1",
@@ -1060,7 +1074,7 @@ async def test_image_upscale_poll_terminal_transition_appends_billing_event(monk
 
     response = await endpoints.libtv_image_upscale_poll(
         request=_action_request(
-            "/v1/libtv/image-upscale/poll",
+            "/internal/v1/image-upscale/poll",
             orjson.dumps(
                 {
                     "request_id": "request-1",
@@ -1131,7 +1145,7 @@ async def test_image_upscale_poll_provider_terminal_failure_marks_failed_without
 
     response = await endpoints.libtv_image_upscale_poll(
         request=_action_request(
-            "/v1/libtv/image-upscale/poll",
+            "/internal/v1/image-upscale/poll",
             orjson.dumps({"request_id": "request-1", "model": "topaz-image-upscaler", "resume_token": "token"}),
         ),
         user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
@@ -1172,7 +1186,7 @@ async def test_image_upscale_poll_transient_provider_state_remains_active(monkey
 
     response = await endpoints.libtv_image_upscale_poll(
         request=_action_request(
-            "/v1/libtv/image-upscale/poll",
+            "/internal/v1/image-upscale/poll",
             orjson.dumps({"request_id": "request-1", "model": "topaz-image-upscaler", "resume_token": "token"}),
         ),
         user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
@@ -1234,7 +1248,7 @@ async def test_image_upscale_poll_is_idempotent_after_terminal_success(monkeypat
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints._client_for_receipt", lambda _: client)
     monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.verify_resume_token", lambda *args, **kwargs: True)
     request = _action_request(
-        "/v1/libtv/image-upscale/poll",
+        "/internal/v1/image-upscale/poll",
         orjson.dumps({"request_id": "request-1", "model": "topaz-image-upscaler", "resume_token": "token"}),
     )
 
@@ -1243,7 +1257,7 @@ async def test_image_upscale_poll_is_idempotent_after_terminal_success(monkeypat
     )
     second = await endpoints.libtv_image_upscale_poll(
         request=_action_request(
-            "/v1/libtv/image-upscale/poll",
+            "/internal/v1/image-upscale/poll",
             orjson.dumps({"request_id": "request-1", "model": "topaz-image-upscaler", "resume_token": "token"}),
         ),
         user_api_key_dict=UserAPIKeyAuth(team_id="team-1"),
@@ -1309,7 +1323,7 @@ async def test_image_upscale_poll_without_durable_identity_does_not_bill(monkeyp
 
     response = await endpoints.libtv_image_upscale_poll(
         request=_action_request(
-            "/v1/libtv/image-upscale/poll",
+            "/internal/v1/image-upscale/poll",
             orjson.dumps(
                 {
                     "request_id": "request-1",
@@ -1372,7 +1386,7 @@ async def test_image_upscale_poll_without_authoritative_cost_does_not_bill_zero(
 
     response = await endpoints.libtv_image_upscale_poll(
         request=_action_request(
-            "/v1/libtv/image-upscale/poll",
+            "/internal/v1/image-upscale/poll",
             orjson.dumps(
                 {
                     "request_id": "request-1",
@@ -1413,7 +1427,7 @@ async def test_image_upscale_poll_maps_receipt_credential_failure_to_503(monkeyp
 
     response = await endpoints.libtv_image_upscale_poll(
         request=_action_request(
-            "/v1/libtv/image-upscale/poll",
+            "/internal/v1/image-upscale/poll",
             orjson.dumps(
                 {
                     "request_id": "request-1",

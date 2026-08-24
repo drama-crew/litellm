@@ -23,13 +23,6 @@ from litellm.types.videos.utils import decode_video_id_with_provider, encode_vid
         "/internal/v1/image-upscale/poll",
         "/internal/v1/image-upscale/finalize",
         "/internal/v1/image-upscale/resolve",
-        "/v1/libtv/validated-media-transfer",
-        "/v1/libtv/validated-media-transfer/readiness",
-        "/v1/libtv/image-upscale/submit",
-        "/v1/libtv/image-upscale/receipt/legacy-receipt-123",
-        "/v1/libtv/image-upscale/poll",
-        "/v1/libtv/image-upscale/finalize",
-        "/v1/libtv/image-upscale/resolve",
     ],
 )
 def test_image_upscale_and_transfer_routes_are_llm_data_plane(route):
@@ -46,8 +39,14 @@ def test_image_upscale_and_transfer_routes_are_llm_data_plane(route):
         "/internal/v1/image-upscale/submit/extra",
         "/internal/v1/management/image-upscale/submit",
         "/internal/v1/validated-media-transfer/admin",
+        "/v1/libtv/validated-media-transfer",
+        "/v1/libtv/validated-media-transfer/readiness",
+        "/v1/libtv/image-upscale/submit",
         "/v1/libtv/image-upscale/receipt",
         "/v1/libtv/image-upscale/receipt/legacy-receipt-123/extra",
+        "/v1/libtv/image-upscale/poll",
+        "/v1/libtv/image-upscale/finalize",
+        "/v1/libtv/image-upscale/resolve",
         "/v1/libtv/image-upscale/submit/extra",
         "/v1/libtv/management/image-upscale/submit",
         "/v1/libtv/validated-media-transfer/admin",
@@ -385,13 +384,6 @@ def test_project_llm_api_routes_allow_only_registered_data_plane_paths(monkeypat
         "/internal/v1/image-upscale/poll",
         "/internal/v1/image-upscale/finalize",
         "/internal/v1/image-upscale/resolve",
-        "/v1/libtv/validated-media-transfer",
-        "/v1/libtv/validated-media-transfer/readiness",
-        "/v1/libtv/image-upscale/submit",
-        "/v1/libtv/image-upscale/receipt/legacy-receipt-123",
-        "/v1/libtv/image-upscale/poll",
-        "/v1/libtv/image-upscale/finalize",
-        "/v1/libtv/image-upscale/resolve",
     ]
     for route in allowed:
         assert RouteChecks.is_virtual_key_allowed_to_call_route(route, key) is True

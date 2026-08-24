@@ -115,13 +115,6 @@ def _public_error_receipt(receipt: dict) -> dict:
     tags=["images"],
     include_in_schema=False,
 )
-@router.post(
-    "/v1/libtv/validated-media-transfer",
-    dependencies=_INTERNAL_DEPENDENCIES,
-    response_class=ORJSONResponse,
-    tags=["images"],
-    include_in_schema=False,
-)
 async def libtv_validated_media_transfer(
     request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
 ):
@@ -139,13 +132,6 @@ async def libtv_validated_media_transfer(
 
 @router.get(
     "/internal/v1/validated-media-transfer/readiness",
-    dependencies=_INTERNAL_DEPENDENCIES,
-    response_class=ORJSONResponse,
-    tags=["images"],
-    include_in_schema=False,
-)
-@router.get(
-    "/v1/libtv/validated-media-transfer/readiness",
     dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
@@ -299,28 +285,6 @@ def _image_upscale_response(receipt: dict) -> ORJSONResponse:
             "model": ImageUpscaleErrorResponse,
             "description": "Submission was not sent",
         },
-    },
-    openapi_extra={
-        "requestBody": {
-            "required": True,
-            "content": {"application/json": {"schema": ImageUpscaleSubmitRequest.model_json_schema()}},
-        }
-    },
-    include_in_schema=False,
-)
-@router.post(
-    "/v1/libtv/image-upscale/submit",
-    dependencies=_INTERNAL_DEPENDENCIES,
-    response_class=ORJSONResponse,
-    status_code=status.HTTP_202_ACCEPTED,
-    tags=["images"],
-    response_model=ImageUpscaleAcceptedResponse,
-    responses={
-        202: {"model": ImageUpscaleAcceptedResponse, "description": "Provider task submitted"},
-        409: {"model": ImageUpscaleErrorResponse, "description": "Submission outcome is unknown"},
-        429: {"model": ImageUpscaleErrorResponse, "description": "Provider explicitly rejected submission"},
-        422: {"description": "A stable request_id is required before a paid submission"},
-        503: {"model": ImageUpscaleErrorResponse, "description": "Submission was not sent"},
     },
     openapi_extra={
         "requestBody": {
@@ -644,13 +608,6 @@ def _terminal_result_body(receipt: StoredReceipt) -> dict[str, object] | None:
     tags=["images"],
     include_in_schema=False,
 )
-@router.get(
-    "/v1/libtv/image-upscale/receipt/{request_id}",
-    dependencies=_INTERNAL_DEPENDENCIES,
-    response_class=ORJSONResponse,
-    tags=["images"],
-    include_in_schema=False,
-)
 async def libtv_image_upscale_receipt(
     request_id: str, model: str = "topaz-image-upscaler", user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
 ):
@@ -779,13 +736,6 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
     tags=["images"],
     include_in_schema=False,
 )
-@router.post(
-    "/v1/libtv/image-upscale/poll",
-    dependencies=_INTERNAL_DEPENDENCIES,
-    response_class=ORJSONResponse,
-    tags=["images"],
-    include_in_schema=False,
-)
 async def libtv_image_upscale_poll(request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)):
     try:
         action = ImageUpscaleActionRequest.model_validate(orjson.loads(await request.body()))
@@ -797,13 +747,6 @@ async def libtv_image_upscale_poll(request: Request, user_api_key_dict: UserAPIK
 
 @router.post(
     "/internal/v1/image-upscale/finalize",
-    dependencies=_INTERNAL_DEPENDENCIES,
-    response_class=ORJSONResponse,
-    tags=["images"],
-    include_in_schema=False,
-)
-@router.post(
-    "/v1/libtv/image-upscale/finalize",
     dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
@@ -822,13 +765,6 @@ async def libtv_image_upscale_finalize(
 
 @router.post(
     "/internal/v1/image-upscale/resolve",
-    dependencies=_INTERNAL_DEPENDENCIES,
-    response_class=ORJSONResponse,
-    tags=["images"],
-    include_in_schema=False,
-)
-@router.post(
-    "/v1/libtv/image-upscale/resolve",
     dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
