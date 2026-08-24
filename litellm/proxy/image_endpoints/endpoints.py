@@ -65,11 +65,7 @@ async def _require_internal_service_auth(request: Request) -> None:
     # precedence ambiguous.
     source = os.getenv("LITELLM_MASTER_KEY") or ""
     supplied = request.headers.get(_INTERNAL_SERVICE_HEADER, "")
-    expected = (
-        hmac.new(source.encode("utf-8"), _INTERNAL_SERVICE_DOMAIN, hashlib.sha256).hexdigest()
-        if source
-        else ""
-    )
+    expected = hmac.new(source.encode("utf-8"), _INTERNAL_SERVICE_DOMAIN, hashlib.sha256).hexdigest() if source else ""
     if not supplied or not expected or not hmac.compare_digest(supplied, expected):
         raise HTTPException(status_code=404, detail="Not Found")
 
@@ -86,7 +82,8 @@ def get_validated_transfer_router() -> ValidatedTransferRouter:
     settings = ValidatedTransferSettings.from_environment()
     redis_client = get_transfer_redis(os.getenv("LIBTV_VALIDATED_TRANSFER_REDIS_URL"))
     return get_shared_validated_transfer_router(
-        settings=settings, redis=redis_client,
+        settings=settings,
+        redis=redis_client,
         instance_id=os.getenv("LIBTV_VALIDATED_TRANSFER_INSTANCE_ID", "litellm"),
     )
 
@@ -665,9 +662,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
             content={"receipt": _public_error_receipt(_receipt_body(updated))},
         )
     if state.get("status") != 2:
-        return ORJSONResponse(
-            status_code=409 if finalize else 200, content={"receipt": _receipt_body(receipt)}
-        )
+        return ORJSONResponse(status_code=409 if finalize else 200, content={"receipt": _receipt_body(receipt)})
     urls = state.get("urls") or []
     if (
         not isinstance(urls, list)
