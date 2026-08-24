@@ -32,6 +32,7 @@ second copy.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import math
 import os
@@ -73,6 +74,7 @@ _INTERNAL_VIDEO_FLAG_ALIAS = "OH_DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _CAUSYN_PLATFORM_URL_ENV = "DRAMA_CAUSYN_PLATFORM_URL"
 _CAUSYN_SERVICE_API_KEY_ENV = "DRAMA_CAUSYN_SERVICE_API_KEY"
+_CAUSYN_REFRESH_PATH = "/api/service/causyn/tasks"
 _TASK_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _STATUS_TO_OPENAI = {
@@ -143,23 +145,90 @@ async def _default_content_get(
         return await client.get(url)
 
 
+def _normalize_causyn_platform_origin(value: str) -> str | None:
+    """Return a safe origin for the fixed platform refresh route.
+
+    This is deliberately stricter than a generic URL parser: this setting is
+    an origin, not a caller-controlled URL.  Rejecting authority delimiters,
+    alternate IP spellings, and non-origin components prevents the value from
+    changing either the host or the fixed refresh path.
+    """
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value) or "\\" in value:
+        return None
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return None
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        return None
+    if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        return None
+    if not parsed.netloc or "%" in parsed.netloc:
+        return None
+    try:
+        hostname = parsed.hostname
+    except ValueError:
+        return None
+    if not hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None and not 1 <= port <= 65535:
+        return None
+
+    authority = parsed.netloc
+    if authority.startswith("["):
+        closing = authority.find("]")
+        if closing < 0:
+            return None
+        literal = authority[1:closing]
+        try:
+            normalized_host = f"[{ipaddress.IPv6Address(literal).compressed.lower()}]"
+        except ValueError:
+            return None
+        suffix = authority[closing + 1 :]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            return None
+        if suffix == ":":
+            return None
+    else:
+        if "[" in authority or "]" in authority or authority.count(":") > 1:
+            return None
+        if ":" in authority and not authority.rsplit(":", 1)[1].isdigit():
+            return None
+        host_part = authority.rsplit(":", 1)[0] if ":" in authority else authority
+        if not host_part or host_part.lower() != hostname.lower():
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9.-]+", hostname):
+            return None
+        if hostname.startswith(".") or hostname.endswith(".") or ".." in hostname:
+            return None
+        if all(char.isdigit() or char == "." for char in hostname):
+            try:
+                ipaddress.IPv4Address(hostname)
+            except ValueError:
+                return None
+        elif hostname.lower().startswith("0x"):
+            # Reject WHATWG-style hexadecimal IPv4 numbers instead of treating
+            # them as a DNS label that another HTTP client may reinterpret.
+            return None
+        normalized_host = hostname.lower()
+
+    normalized_port = f":{port}" if port is not None else ""
+    return f"{parsed.scheme.lower()}://{normalized_host}{normalized_port}"
+
+
 async def _default_refresh_staging_url(task_id: str, timeout: RequestTimeout) -> str:
     """Ask the platform to mint one short-lived URL for this task."""
-    platform_url = os.getenv(_CAUSYN_PLATFORM_URL_ENV, "").strip().rstrip("/")
+    platform_url = _normalize_causyn_platform_origin(os.getenv(_CAUSYN_PLATFORM_URL_ENV, ""))
     service_key = os.getenv(_CAUSYN_SERVICE_API_KEY_ENV, "").strip()
-    try:
-        parsed_url = urlsplit(platform_url)
-    except ValueError:
-        parsed_url = None
-    if (
-        not platform_url
-        or not service_key
-        or parsed_url is None
-        or parsed_url.scheme not in {"http", "https"}
-        or not parsed_url.netloc
-    ):
+    if not platform_url or not service_key:
         raise VideoGenerateError("misconfigured", "Causyn staging refresh is not configured")
-    endpoint = f"{platform_url}/api/service/causyn/tasks/{task_id}/staging-url"
+    endpoint = f"{platform_url}{_CAUSYN_REFRESH_PATH}/{task_id}/staging-url"
     async with httpx.AsyncClient(timeout=timeout) as client:
         response = await client.post(endpoint, headers={"X-Service-API-Key": service_key})
     if response.status_code != 200:

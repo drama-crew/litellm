@@ -460,8 +460,8 @@ async def test_content_hides_refresh_service_failures(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_refresh_uses_service_auth_and_rejects_a_wrong_returned_key(monkeypatch):
-    monkeypatch.setenv("DRAMA_CAUSYN_PLATFORM_URL", "https://platform.example/")
+async def test_refresh_normalizes_a_safe_origin_and_rejects_a_wrong_returned_key(monkeypatch):
+    monkeypatch.setenv("DRAMA_CAUSYN_PLATFORM_URL", "HTTPS://PLATFORM.EXAMPLE/")
     monkeypatch.setenv("DRAMA_CAUSYN_SERVICE_API_KEY", "service-secret")
 
     class _Response:
@@ -487,6 +487,71 @@ async def test_refresh_uses_service_auth_and_rejects_a_wrong_returned_key(monkey
     monkeypatch.setattr(mod.httpx, "AsyncClient", lambda **kwargs: _Client())
     with pytest.raises(VideoGenerateError):
         await mod._default_refresh_staging_url(TASK_ID, None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "platform_url",
+    [
+        "https://user:pass@platform.example",
+        "https://platform.example?query=1",
+        "https://platform.example#fragment",
+        "https://platform.example/path",
+        "https://platform.example\\evil",
+        "https://platform.example:bad",
+        "https://platform.example:",
+        "https://platform.example:0",
+        "https://platform.example:65536",
+        "https://[::1",
+        "https://[v1.fe]",
+        "https://foo%40evil",
+    ],
+)
+async def test_refresh_rejects_non_origin_or_confused_platform_urls(monkeypatch, platform_url):
+    monkeypatch.setenv("DRAMA_CAUSYN_PLATFORM_URL", platform_url)
+    monkeypatch.setenv("DRAMA_CAUSYN_SERVICE_API_KEY", "service-secret")
+
+    with pytest.raises(VideoGenerateError) as exc:
+        await mod._default_refresh_staging_url(TASK_ID, None)
+
+    assert exc.value.code == "misconfigured"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "platform_url, expected",
+    [
+        ("http://[2001:DB8::1]:8080/", "http://[2001:db8::1]:8080"),
+        ("HTTPS://PLATFORM.EXAMPLE/", "https://platform.example"),
+    ],
+)
+async def test_refresh_uses_normalized_http_or_ipv6_origin(monkeypatch, platform_url, expected):
+    monkeypatch.setenv("DRAMA_CAUSYN_PLATFORM_URL", platform_url)
+    monkeypatch.setenv("DRAMA_CAUSYN_SERVICE_API_KEY", "service-secret")
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {
+                "staging_key": f"staging/video-tasks/{TASK_ID}.mp4",
+                "url": "https://target.example/u",
+            }
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, headers):
+            assert url == f"{expected}/api/service/causyn/tasks/{TASK_ID}/staging-url"
+            assert headers == {"X-Service-API-Key": "service-secret"}
+            return _Response()
+
+    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda **kwargs: _Client())
+    assert await mod._default_refresh_staging_url(TASK_ID, None) == "https://target.example/u"
 
 
 @pytest.mark.asyncio
