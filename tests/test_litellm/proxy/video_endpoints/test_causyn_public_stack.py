@@ -15,8 +15,12 @@ import litellm.proxy.video_endpoints.endpoints as video_endpoints
 from litellm import Router
 from litellm.llms.causyn import CausynVideoHandler
 from litellm.llms.libtv.video_generate import VideoGenerateError, VideoGenerateSettings
-from litellm.proxy._types import ProxyException, UserAPIKeyAuth
-from litellm.proxy.auth.auth_checks import can_key_call_model
+from litellm.proxy._types import (
+    LiteLLM_VerificationTokenView,
+    ProxyException,
+    hash_token,
+)
+from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
 
 
@@ -43,6 +47,7 @@ class _State:
         }
         self.fetch_error: Exception | None = None
         self.enqueued: list[dict[str, object]] = []
+        self.fetch_calls = 0
 
     def body(self) -> dict[str, object]:
         if self.fetch_error is not None:
@@ -120,6 +125,22 @@ class _ProxyConfig:
         return None
 
 
+class _AuthStore:
+    """Small DB seam for exercising the production virtual-key resolver."""
+
+    def __init__(self, keys: dict[str, list[str]]) -> None:
+        self.keys = {hash_token(key): models for key, models in keys.items()}
+        self.lookups: list[str] = []
+
+    async def get_data(self, *, token: str, table_name: str, **_: object) -> LiteLLM_VerificationTokenView | None:
+        assert table_name == "combined_view"
+        self.lookups.append(token)
+        models = self.keys.get(token)
+        if models is None:
+            return None
+        return LiteLLM_VerificationTokenView(token=token, models=models)
+
+
 @dataclass
 class _Stack:
     app: FastAPI
@@ -129,7 +150,8 @@ class _Stack:
     billing: _Billing
     content_get: _ContentGet
     handler: CausynVideoHandler
-    allowed_models: list[str]
+    allowed_key: str
+    other_model_key: str
 
 
 @pytest.fixture
@@ -144,6 +166,7 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
 
     async def fetch_status(task_id: str, *, redis: object) -> dict[str, object]:
         assert task_id == TASK_ID
+        state.fetch_calls += 1
         return state.body()
 
     settings = VideoGenerateSettings(
@@ -189,13 +212,28 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
         num_retries=0,
     )
 
+    allowed_key = "sk-causyn"
+    other_model_key = "sk-other-model"
+    auth_store = _AuthStore(
+        {
+            allowed_key: [CAUSYN_MODEL],
+            other_model_key: ["other-model"],
+        }
+    )
+    auth_cache = UserApiKeyCache()
+
     proxy_logging = _ProxyLogging()
     proxy_config = _ProxyConfig()
     for name, value in {
         "llm_router": router,
+        "llm_model_list": router.model_list,
         "proxy_logging_obj": proxy_logging,
-        "general_settings": {},
+        "general_settings": {"disable_budget_reservation": True},
         "proxy_config": proxy_config,
+        "master_key": "sk-test-master",
+        "prisma_client": auth_store,
+        "user_api_key_cache": auth_cache,
+        "user_custom_auth": None,
         "select_data_generator": None,
         "user_model": None,
         "user_temperature": None,
@@ -206,23 +244,7 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
     }.items():
         monkeypatch.setattr(proxy_server, name, value)
 
-    allowed_models = [CAUSYN_MODEL]
     app = FastAPI()
-
-    async def auth(request: Request) -> UserAPIKeyAuth:
-        if request.method == "POST":
-            data = await request.json()
-            requested_model = data.get("model", CAUSYN_MODEL)
-        else:
-            requested_model = CAUSYN_MODEL
-        token = UserAPIKeyAuth(api_key="sk-causyn", models=list(allowed_models))
-        await can_key_call_model(
-            model=requested_model,
-            llm_model_list=router.model_list,
-            valid_token=token,
-            llm_router=router,
-        )
-        return token
 
     @app.exception_handler(ProxyException)
     async def proxy_exception_handler(_: Request, exc: ProxyException) -> JSONResponse:
@@ -230,7 +252,6 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
         return JSONResponse(status_code=status_code, content={"error": {"message": exc.message}})
 
     app.include_router(video_endpoints.router)
-    app.dependency_overrides[video_endpoints.user_api_key_auth] = auth
     client = TestClient(app, raise_server_exceptions=False)
 
     yield _Stack(
@@ -241,7 +262,8 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
         billing=billing,
         content_get=content_get,
         handler=handler,
-        allowed_models=allowed_models,
+        allowed_key=allowed_key,
+        other_model_key=other_model_key,
     )
 
     litellm.provider_list[:] = old_provider_list
@@ -260,8 +282,12 @@ def _create_body() -> dict[str, object]:
     }
 
 
+def _auth_headers(key: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {key}"}
+
+
 def test_public_endpoint_create_decodes_routes_and_bills_idempotently(stack: _Stack) -> None:
-    created = stack.client.post("/v1/videos", json=_create_body())
+    created = stack.client.post("/v1/videos", json=_create_body(), headers=_auth_headers(stack.allowed_key))
     assert created.status_code == 200, created.text
 
     video_id = created.json()["id"]
@@ -274,8 +300,8 @@ def test_public_endpoint_create_decodes_routes_and_bills_idempotently(stack: _St
     assert stack.state.enqueued[0]["model"] == CAUSYN_MODEL
 
     stack.state.status = "succeeded"
-    first = stack.client.get(f"/v1/videos/{video_id}")
-    second = stack.client.get(f"/v1/videos/{video_id}")
+    first = stack.client.get(f"/v1/videos/{video_id}", headers=_auth_headers(stack.allowed_key))
+    second = stack.client.get(f"/v1/videos/{video_id}", headers=_auth_headers(stack.allowed_key))
 
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
@@ -289,11 +315,11 @@ def test_public_endpoint_create_decodes_routes_and_bills_idempotently(stack: _St
 
 
 def test_public_endpoint_content_uses_real_router_and_handler(stack: _Stack) -> None:
-    created = stack.client.post("/v1/videos", json=_create_body())
+    created = stack.client.post("/v1/videos", json=_create_body(), headers=_auth_headers(stack.allowed_key))
     video_id = created.json()["id"]
     stack.state.status = "succeeded"
 
-    response = stack.client.get(f"/v1/videos/{video_id}/content")
+    response = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
 
     assert response.status_code == 200, response.text
     assert response.content == b"video-bytes"
@@ -301,14 +327,14 @@ def test_public_endpoint_content_uses_real_router_and_handler(stack: _Stack) -> 
 
 
 def test_public_endpoint_virtual_key_allowlist_cannot_be_bypassed(stack: _Stack) -> None:
-    created = stack.client.post("/v1/videos", json=_create_body())
+    created = stack.client.post("/v1/videos", json=_create_body(), headers=_auth_headers(stack.allowed_key))
     video_id = created.json()["id"]
-    stack.allowed_models[:] = ["other-model"]
 
-    denied = stack.client.get(f"/v1/videos/{video_id}")
+    denied = stack.client.get(f"/v1/videos/{video_id}", headers=_auth_headers(stack.other_model_key))
 
     assert denied.status_code == 403
     assert stack.state.status == "queued"
+    assert stack.state.fetch_calls == 0
 
 
 @pytest.mark.parametrize(
@@ -325,21 +351,21 @@ def test_public_endpoint_preserves_causyn_error_statuses(
     operation: str,
     status_code: int,
 ) -> None:
-    created = stack.client.post("/v1/videos", json=_create_body())
+    created = stack.client.post("/v1/videos", json=_create_body(), headers=_auth_headers(stack.allowed_key))
     video_id = created.json()["id"]
 
     if operation == "status_not_found":
         stack.state.status = None
-        response = stack.client.get(f"/v1/videos/{video_id}")
+        response = stack.client.get(f"/v1/videos/{video_id}", headers=_auth_headers(stack.allowed_key))
     elif operation == "status_service_error":
         stack.state.fetch_error = VideoGenerateError("misconfigured", "redis unavailable")
-        response = stack.client.get(f"/v1/videos/{video_id}")
+        response = stack.client.get(f"/v1/videos/{video_id}", headers=_auth_headers(stack.allowed_key))
     elif operation == "content_not_ready":
-        response = stack.client.get(f"/v1/videos/{video_id}/content")
+        response = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
     else:
         stack.state.status = "succeeded"
         stack.state.result["staging_url"] = None
-        response = stack.client.get(f"/v1/videos/{video_id}/content")
+        response = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
 
     assert response.status_code == status_code, response.text
 
