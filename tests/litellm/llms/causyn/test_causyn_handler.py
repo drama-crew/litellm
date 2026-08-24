@@ -489,6 +489,32 @@ async def test_refresh_uses_service_auth_and_rejects_a_wrong_returned_key(monkey
         await mod._default_refresh_staging_url(TASK_ID, None)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "platform_url",
+    ["", "platform.example", "ftp://platform.example", "https:///missing-host"],
+)
+async def test_refresh_rejects_an_invalid_platform_url(monkeypatch, platform_url):
+    monkeypatch.setenv("DRAMA_CAUSYN_PLATFORM_URL", platform_url)
+    monkeypatch.setenv("DRAMA_CAUSYN_SERVICE_API_KEY", "service-secret")
+
+    with pytest.raises(VideoGenerateError) as exc:
+        await mod._default_refresh_staging_url(TASK_ID, None)
+
+    assert exc.value.code == "misconfigured"
+
+
+@pytest.mark.asyncio
+async def test_refresh_rejects_a_missing_service_key(monkeypatch):
+    monkeypatch.setenv("DRAMA_CAUSYN_PLATFORM_URL", "https://platform.example")
+    monkeypatch.delenv("DRAMA_CAUSYN_SERVICE_API_KEY", raising=False)
+
+    with pytest.raises(VideoGenerateError) as exc:
+        await mod._default_refresh_staging_url(TASK_ID, None)
+
+    assert exc.value.code == "misconfigured"
+
+
 def test_module_holds_no_object_store_client():
     """Guards design §3.2c/§3.2d: signing and object-store access stay on the
     platform. An import of oss2/boto3 appearing here would mean the proxy had

@@ -40,6 +40,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Literal, Protocol, cast
+from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
@@ -70,6 +71,8 @@ CAUSYN_DEADLINE_SECONDS = 1800.0
 _INTERNAL_VIDEO_FLAG = "DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_FLAG_ALIAS = "OH_DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+_CAUSYN_PLATFORM_URL_ENV = "DRAMA_CAUSYN_PLATFORM_URL"
+_CAUSYN_SERVICE_API_KEY_ENV = "DRAMA_CAUSYN_SERVICE_API_KEY"
 _TASK_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _STATUS_TO_OPENAI = {
@@ -142,9 +145,15 @@ async def _default_content_get(
 
 async def _default_refresh_staging_url(task_id: str, timeout: RequestTimeout) -> str:
     """Ask the platform to mint one short-lived URL for this task."""
-    platform_url = os.getenv("DRAMA_CAUSYN_PLATFORM_URL", "").rstrip("/")
-    service_key = os.getenv("DRAMA_CAUSYN_SERVICE_API_KEY", "").strip()
-    if not platform_url or not service_key:
+    platform_url = os.getenv(_CAUSYN_PLATFORM_URL_ENV, "").strip().rstrip("/")
+    service_key = os.getenv(_CAUSYN_SERVICE_API_KEY_ENV, "").strip()
+    parsed_url = urlsplit(platform_url)
+    if (
+        not platform_url
+        or not service_key
+        or parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.netloc
+    ):
         raise VideoGenerateError("misconfigured", "Causyn staging refresh is not configured")
     endpoint = f"{platform_url}/api/service/causyn/tasks/{task_id}/staging-url"
     async with httpx.AsyncClient(timeout=timeout) as client:
