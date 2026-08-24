@@ -938,28 +938,6 @@ async def test_content_finalizes_billing_before_download() -> None:
 
 
 @pytest.mark.asyncio
-async def test_content_refreshes_url_after_billing_finalization() -> None:
-    redis = FakeRedis()
-    content_get = FakeContentGet()
-    refreshed_url = "https://target.example/refreshed-video.mp4?signature=new"
-    set_status(redis, "done", completed_result())
-    set_billing_metadata(redis)
-
-    async def enqueue(redis: object, event: object) -> bool:
-        redis.results[result_key(TASK_ID)] = json.dumps(
-            {"ok": True, "result": completed_result(staging_url=refreshed_url)}
-        )
-        return True
-
-    content = await handler(redis, content_get, billing_enqueue=enqueue).avideo_content(
-        VIDEO_ID, None, None, {}, None, timeout=12.0
-    )
-
-    assert content == b"video-bytes"
-    assert content_get.calls == [(refreshed_url, 12.0, False)]
-
-
-@pytest.mark.asyncio
 async def test_content_outbox_failure_is_retryable_and_does_not_download() -> None:
     redis = FakeRedis()
     content_get = FakeContentGet()
