@@ -57,6 +57,7 @@ from litellm.proxy._types import (
 )
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+from litellm.proxy.common_utils.public_surface_sanitization import finalize_public_response_headers
 from litellm.proxy.common_utils.http_parsing_utils import (
     _read_request_body,
     _safe_get_request_headers,
@@ -1147,7 +1148,7 @@ async def pass_through_request(
             )
             if callback_headers:
                 _response_headers.update(callback_headers)
-
+            finalize_public_response_headers(_response_headers, user_api_key_dict)
             return StreamingResponse(
                 PassThroughStreamingHandler.chunk_processor(
                     response=response,
@@ -1213,7 +1214,7 @@ async def pass_through_request(
             )
             if callback_headers:
                 _response_headers.update(callback_headers)
-
+            finalize_public_response_headers(_response_headers, user_api_key_dict)
             return StreamingResponse(
                 PassThroughStreamingHandler.chunk_processor(
                     response=response,
@@ -1244,7 +1245,13 @@ async def pass_through_request(
             )
             if relay_callback_headers:
                 relay_custom_headers.update(relay_callback_headers)
+            finalize_public_response_headers(relay_custom_headers, user_api_key_dict)
 
+            response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+                headers=response.headers,
+                custom_headers=relay_custom_headers,
+            )
+            finalize_public_response_headers(response_headers, user_api_key_dict)
             return StreamingResponse(
                 _relay_passthrough_response_bytes(
                     response=response,
@@ -1256,10 +1263,7 @@ async def pass_through_request(
                     success_handler_kwargs=kwargs,
                 ),
                 status_code=response.status_code,
-                headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                    headers=response.headers,
-                    custom_headers=relay_custom_headers,
-                ),
+                headers=response_headers,
             )
 
         content = await response.aread()
@@ -1416,11 +1420,13 @@ async def pass_through_request(
         )
         if callback_headers:
             custom_headers.update(callback_headers)
+        finalize_public_response_headers(custom_headers, user_api_key_dict)
 
         response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
             headers=response.headers,
             custom_headers=custom_headers,
         )
+        finalize_public_response_headers(response_headers, user_api_key_dict)
         if _content_modified:
             response_headers.pop("content-length", None)
 

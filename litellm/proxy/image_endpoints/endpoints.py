@@ -1,6 +1,9 @@
 import asyncio
+import hashlib
+import hmac
 import math
 import os
+import re
 import traceback
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal
@@ -42,10 +45,38 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler
 from litellm.proxy._types import *
 from litellm.proxy.auth.user_api_key_auth import UserAPIKeyAuth, user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+from litellm.proxy.common_utils.public_surface_sanitization import finalize_public_response_headers
 from litellm.proxy.route_llm_request import route_request
 from litellm.types.llms.openai import ChatCompletionUserMessage
 
 router = APIRouter()
+_INTERNAL_SERVICE_HEADER = "X-Drama-Internal-Key"
+_INTERNAL_SERVICE_DOMAIN = b"drama-internal-service-v1"
+
+
+async def _require_internal_service_auth(request: Request) -> None:
+    """Require the platform-to-LiteLLM service credential on internal routes."""
+    # The platform derives this request credential from DRAMA_LITELLM_MASTER_KEY,
+    # which is the same shared secret exposed to LiteLLM as LITELLM_MASTER_KEY.
+    # Do not introduce a second override: it would let the two sides silently
+    # derive different credentials and would make deployment configuration
+    # precedence ambiguous.
+    source = os.getenv("LITELLM_MASTER_KEY") or ""
+    supplied = request.headers.get(_INTERNAL_SERVICE_HEADER, "")
+    expected = (
+        hmac.new(source.encode("utf-8"), _INTERNAL_SERVICE_DOMAIN, hashlib.sha256).hexdigest()
+        if source
+        else ""
+    )
+    if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+# Check the private service boundary before user-key authentication.  A direct
+# request without the internal header must get the same generic 404 regardless
+# of whether its bearer key is valid; otherwise the route can be enumerated via
+# the auth error (401) before the gateway deny rule is applied.
+_INTERNAL_DEPENDENCIES = [Depends(_require_internal_service_auth), Depends(user_api_key_auth)]
 
 
 def get_validated_transfer_router() -> ValidatedTransferRouter:
@@ -62,11 +93,33 @@ def _is_proxy_admin(user_api_key_dict: UserAPIKeyAuth) -> bool:
     return user_api_key_dict.user_role in (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.PROXY_ADMIN.value)
 
 
+def _public_provider_text(value: object, fallback: str = "provider request failed") -> str:
+    text = str(value or fallback)
+    return re.sub(r"libtv|liblib\.(?:tv|art)", "provider", text, flags=re.IGNORECASE)
+
+
+def _public_error_receipt(receipt: dict) -> dict:
+    """Scrub provider markers from error metadata without changing internals."""
+    result = dict(receipt)
+    for key in ("message", "provider_code", "deployment_id", "provider_task_id"):
+        if result.get(key) is not None:
+            result[key] = _public_provider_text(result[key])
+    return result
+
+
 @router.post(
-    "/v1/libtv/validated-media-transfer",
-    dependencies=[Depends(user_api_key_auth)],
+    "/internal/v1/validated-media-transfer",
+    dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
+    include_in_schema=False,
+)
+@router.post(
+    "/v1/libtv/validated-media-transfer",
+    dependencies=_INTERNAL_DEPENDENCIES,
+    response_class=ORJSONResponse,
+    tags=["images"],
+    include_in_schema=False,
 )
 async def libtv_validated_media_transfer(
     request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
@@ -80,14 +133,22 @@ async def libtv_validated_media_transfer(
         return ORJSONResponse(status_code=200, content=result)
     except (orjson.JSONDecodeError, ValidatedTransferError) as exc:
         code = 422 if isinstance(exc, orjson.JSONDecodeError) or exc.validation else 503
-        return ORJSONResponse(status_code=code, content={"error": str(exc)})
+        return ORJSONResponse(status_code=code, content={"error": _public_provider_text(exc)})
 
 
 @router.get(
-    "/v1/libtv/validated-media-transfer/readiness",
-    dependencies=[Depends(user_api_key_auth)],
+    "/internal/v1/validated-media-transfer/readiness",
+    dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
+    include_in_schema=False,
+)
+@router.get(
+    "/v1/libtv/validated-media-transfer/readiness",
+    dependencies=_INTERNAL_DEPENDENCIES,
+    response_class=ORJSONResponse,
+    tags=["images"],
+    include_in_schema=False,
 )
 async def libtv_validated_media_transfer_readiness(
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
@@ -184,28 +245,38 @@ class ImageUpscaleResolutionRequest(BaseModel):
 
 
 def _image_upscale_response(receipt: dict) -> ORJSONResponse:
+    error_receipt = _public_error_receipt(receipt)
     state = receipt.get("submission_state")
     if state == "submitted":
         return ORJSONResponse(status_code=status.HTTP_202_ACCEPTED, content={"receipt": receipt})
     if state == "unknown":
         return ORJSONResponse(
             status_code=status.HTTP_409_CONFLICT,
-            content={"error": {"code": "libtv_submission_unknown", "metadata": {"submission_receipt": receipt}}},
+            content={
+                "error": {"code": "provider_submission_unknown", "metadata": {"submission_receipt": error_receipt}}
+            },
         )
     if state == "rejected":
         return ORJSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            content={"error": {"code": "libtv_submission_rejected", "metadata": {"submission_receipt": receipt}}},
+            content={
+                "error": {"code": "provider_submission_rejected", "metadata": {"submission_receipt": error_receipt}}
+            },
         )
     return ORJSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"error": {"code": "libtv_submission_not_submitted", "metadata": {"submission_receipt": receipt}}},
+        content={
+            "error": {
+                "code": "provider_submission_not_submitted",
+                "metadata": {"submission_receipt": error_receipt},
+            }
+        },
     )
 
 
 @router.post(
-    "/v1/libtv/image-upscale/submit",
-    dependencies=[Depends(user_api_key_auth)],
+    "/internal/v1/image-upscale/submit",
+    dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     status_code=status.HTTP_202_ACCEPTED,
     tags=["images"],
@@ -234,6 +305,29 @@ def _image_upscale_response(receipt: dict) -> ORJSONResponse:
             "content": {"application/json": {"schema": ImageUpscaleSubmitRequest.model_json_schema()}},
         }
     },
+    include_in_schema=False,
+)
+@router.post(
+    "/v1/libtv/image-upscale/submit",
+    dependencies=_INTERNAL_DEPENDENCIES,
+    response_class=ORJSONResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["images"],
+    response_model=ImageUpscaleAcceptedResponse,
+    responses={
+        202: {"model": ImageUpscaleAcceptedResponse, "description": "Provider task submitted"},
+        409: {"model": ImageUpscaleErrorResponse, "description": "Submission outcome is unknown"},
+        429: {"model": ImageUpscaleErrorResponse, "description": "Provider explicitly rejected submission"},
+        422: {"description": "A stable request_id is required before a paid submission"},
+        503: {"model": ImageUpscaleErrorResponse, "description": "Submission was not sent"},
+    },
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": ImageUpscaleSubmitRequest.model_json_schema()}},
+        }
+    },
+    include_in_schema=False,
 )
 async def libtv_image_upscale_submit(
     request: Request,
@@ -471,7 +565,7 @@ async def _load_action_receipt(action: ImageUpscaleActionRequest, user_api_key_d
     try:
         client = _client_for_receipt(receipt)
     except LibTVError:
-        return ORJSONResponse(status_code=503, content={"error": "LibTV credentials unavailable"})
+        return ORJSONResponse(status_code=503, content={"error": "provider credentials unavailable"})
     secret = getattr(client, "token", None) or os.getenv("LIBTV_IMAGE_UPSCALE_RESUME_SECRET", "")
     if not verify_resume_token(
         action.resume_token,
@@ -543,10 +637,18 @@ def _terminal_result_body(receipt: StoredReceipt) -> dict[str, object] | None:
 
 
 @router.get(
-    "/v1/libtv/image-upscale/receipt/{request_id}",
-    dependencies=[Depends(user_api_key_auth)],
+    "/internal/v1/image-upscale/receipt/{request_id}",
+    dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
+    include_in_schema=False,
+)
+@router.get(
+    "/v1/libtv/image-upscale/receipt/{request_id}",
+    dependencies=_INTERNAL_DEPENDENCIES,
+    response_class=ORJSONResponse,
+    tags=["images"],
+    include_in_schema=False,
 )
 async def libtv_image_upscale_receipt(
     request_id: str, model: str = "topaz-image-upscaler", user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
@@ -583,7 +685,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
     except LibTVError:
         return ORJSONResponse(
             status_code=503,
-            content={"error": "LibTV poll unavailable", "receipt": _receipt_body(receipt)},
+            content={"error": "provider poll unavailable", "receipt": _public_error_receipt(_receipt_body(receipt))},
         )
     if state.get("status") == 3:
         try:
@@ -602,11 +704,11 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
             )
         return ORJSONResponse(
             status_code=409 if finalize else 200,
-            content={"receipt": _receipt_body(updated), "provider": state},
+            content={"receipt": _public_error_receipt(_receipt_body(updated))},
         )
     if state.get("status") != 2:
         return ORJSONResponse(
-            status_code=409 if finalize else 200, content={"receipt": _receipt_body(receipt), "provider": state}
+            status_code=409 if finalize else 200, content={"receipt": _receipt_body(receipt)}
         )
     urls = state.get("urls") or []
     if (
@@ -670,10 +772,18 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
 
 
 @router.post(
-    "/v1/libtv/image-upscale/poll",
-    dependencies=[Depends(user_api_key_auth)],
+    "/internal/v1/image-upscale/poll",
+    dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
+    include_in_schema=False,
+)
+@router.post(
+    "/v1/libtv/image-upscale/poll",
+    dependencies=_INTERNAL_DEPENDENCIES,
+    response_class=ORJSONResponse,
+    tags=["images"],
+    include_in_schema=False,
 )
 async def libtv_image_upscale_poll(request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)):
     try:
@@ -685,10 +795,18 @@ async def libtv_image_upscale_poll(request: Request, user_api_key_dict: UserAPIK
 
 
 @router.post(
-    "/v1/libtv/image-upscale/finalize",
-    dependencies=[Depends(user_api_key_auth)],
+    "/internal/v1/image-upscale/finalize",
+    dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
+    include_in_schema=False,
+)
+@router.post(
+    "/v1/libtv/image-upscale/finalize",
+    dependencies=_INTERNAL_DEPENDENCIES,
+    response_class=ORJSONResponse,
+    tags=["images"],
+    include_in_schema=False,
 )
 async def libtv_image_upscale_finalize(
     request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)
@@ -702,10 +820,18 @@ async def libtv_image_upscale_finalize(
 
 
 @router.post(
-    "/v1/libtv/image-upscale/resolve",
-    dependencies=[Depends(user_api_key_auth)],
+    "/internal/v1/image-upscale/resolve",
+    dependencies=_INTERNAL_DEPENDENCIES,
     response_class=ORJSONResponse,
     tags=["images"],
+    include_in_schema=False,
+)
+@router.post(
+    "/v1/libtv/image-upscale/resolve",
+    dependencies=_INTERNAL_DEPENDENCIES,
+    response_class=ORJSONResponse,
+    tags=["images"],
+    include_in_schema=False,
 )
 async def libtv_image_upscale_resolve(
     request: Request,
@@ -913,6 +1039,7 @@ async def image_generation(
         )
         if callback_headers:
             fastapi_response.headers.update(callback_headers)
+        finalize_public_response_headers(fastapi_response.headers, user_api_key_dict)
 
         return response
     except Exception as e:

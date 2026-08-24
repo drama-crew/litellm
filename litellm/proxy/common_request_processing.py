@@ -48,6 +48,10 @@ from litellm.proxy.common_utils.callback_utils import (
     get_logging_caching_headers,
     get_remaining_tokens_and_requests_from_request_data,
 )
+from litellm.proxy.common_utils.public_surface_sanitization import (
+    finalize_public_response_headers,
+    sanitize_public_response_headers,
+)
 from litellm.proxy.dd_span_tagger import DDSpanTagger
 from litellm.proxy.route_llm_request import route_request
 from litellm.proxy.utils import ProxyLogging
@@ -899,7 +903,10 @@ class ProxyBaseLLMRequestProcessing:
                 headers.update(logging_caching_headers)
 
         try:
-            return {key: str(value) for key, value in headers.items() if value not in exclude_values}
+            return sanitize_public_response_headers(
+                {key: str(value) for key, value in headers.items() if value not in exclude_values},
+                user_api_key_dict,
+            )
         except Exception as e:
             verbose_proxy_logger.error(f"Error setting custom headers: {e}")
             return {}
@@ -959,7 +966,7 @@ class ProxyBaseLLMRequestProcessing:
         if callback_headers:
             custom_headers.update(callback_headers)
 
-        return custom_headers
+        return finalize_public_response_headers(custom_headers, user_api_key_dict)
 
     async def common_processing_pre_call_logic(
         self,
@@ -1617,6 +1624,7 @@ class ProxyBaseLLMRequestProcessing:
                 )
                 if callback_headers:
                     custom_headers.update(callback_headers)
+                finalize_public_response_headers(custom_headers, user_api_key_dict)
 
                 # Preserve the original client-requested model (pre-alias mapping) for downstream
                 # streaming generators. Pre-call processing can rewrite `self.data["model"]` for
@@ -1882,6 +1890,7 @@ class ProxyBaseLLMRequestProcessing:
         )
         if callback_headers:
             fastapi_response.headers.update(callback_headers)
+        finalize_public_response_headers(fastapi_response.headers, user_api_key_dict)
 
         await check_response_size_is_safe(response=response)
 
@@ -2038,13 +2047,15 @@ class ProxyBaseLLMRequestProcessing:
             return result
 
         content = await result.aread()
+        response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+            headers=result.headers,
+            custom_headers=dict(fastapi_response.headers),
+        )
+        finalize_public_response_headers(response_headers, user_api_key_dict)
         return Response(
             content=content,
             status_code=result.status_code,
-            headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                headers=result.headers,
-                custom_headers=dict(fastapi_response.headers),
-            ),
+            headers=response_headers,
         )
 
     def _is_streaming_response(self, response: Any) -> bool:
@@ -2200,6 +2211,7 @@ class ProxyBaseLLMRequestProcessing:
         )
         if callback_headers:
             response_headers.update(callback_headers)
+        finalize_public_response_headers(response_headers, user_api_key_dict)
 
         if is_event_stream:
             body_bytes = await response.aread()  # type: ignore[union-attr]
@@ -2476,12 +2488,13 @@ class ProxyBaseLLMRequestProcessing:
             pass
 
         self._apply_router_cooldown_retry_after(headers, e)
+        finalize_public_response_headers(headers, user_api_key_dict)
 
         if isinstance(e, ProxyException):
-            e.headers = {
+            e.headers = finalize_public_response_headers({
                 **e.headers,
                 **{k: v if isinstance(v, str) else str(v) for k, v in headers.items()},
-            }
+            }, user_api_key_dict)
             raise e
 
         if isinstance(e, HTTPException):

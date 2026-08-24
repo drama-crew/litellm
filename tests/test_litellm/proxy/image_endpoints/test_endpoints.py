@@ -1,12 +1,15 @@
 import asyncio
 import copy
 from dataclasses import replace
+import hashlib
+import hmac
 import json
 from types import SimpleNamespace
 from typing import Any, Dict
 
 import orjson
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import Response
@@ -23,6 +26,62 @@ from litellm.llms.libtv.image_upscale import (
     verify_resume_token,
 )
 from litellm.types.utils import ImageResponse
+
+
+@pytest.mark.asyncio
+async def test_internal_image_routes_require_derived_service_key(monkeypatch):
+    for route in endpoints.router.routes:
+        path = getattr(route, "path", "")
+        if path.startswith("/internal/v1/") or path.startswith("/v1/libtv/"):
+            dependency_calls = [dependency.call for dependency in route.dependant.dependencies]
+            assert dependency_calls[:2] == [
+                endpoints._require_internal_service_auth,
+                endpoints.user_api_key_auth,
+            ]
+
+    monkeypatch.setenv("LITELLM_MASTER_KEY", "shared-master")
+    missing = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/internal/v1/image-upscale/receipt/request-1",
+            "headers": [(b"authorization", b"Bearer ordinary-team-key")],
+        }
+    )
+    with pytest.raises(HTTPException) as missing_error:
+        await endpoints._require_internal_service_auth(missing)
+    assert missing_error.value.status_code == 404
+
+    expected = hmac.new(
+        b"shared-master", b"drama-internal-service-v1", hashlib.sha256
+    ).hexdigest().encode("ascii")
+    valid = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/internal/v1/image-upscale/receipt/request-1",
+            "headers": [(b"x-drama-internal-key", expected)],
+        }
+    )
+    assert await endpoints._require_internal_service_auth(valid) is None
+
+    monkeypatch.setenv("DRAMA_INTERNAL_SERVICE_KEY", "dedicated-service-key")
+    # A deprecated override must not change the shared-secret boundary.
+    assert await endpoints._require_internal_service_auth(valid) is None
+    dedicated = hmac.new(
+        b"dedicated-service-key", b"drama-internal-service-v1", hashlib.sha256
+    ).hexdigest().encode("ascii")
+    dedicated_request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": "/internal/v1/image-upscale/receipt/request-1",
+            "headers": [(b"x-drama-internal-key", dedicated)],
+        }
+    )
+    with pytest.raises(HTTPException) as override_ignored:
+        await endpoints._require_internal_service_auth(dedicated_request)
+    assert override_ignored.value.status_code == 404
 
 
 def _request(body: bytes) -> Request:
@@ -161,7 +220,7 @@ async def test_image_upscale_submit_fails_closed_before_all_side_effects_for_inc
 
     body = json.loads(result.body)
     assert result.status_code == 503
-    assert body["error"]["code"] == "libtv_submission_not_submitted"
+    assert body["error"]["code"] == "provider_submission_not_submitted"
     assert body["error"]["metadata"]["submission_receipt"]["submission_state"] == "not_submitted"
     assert calls == []
 
@@ -594,6 +653,13 @@ def test_image_upscale_openapi_contract_requires_source_digest_and_exposes_recei
     route = next(
         route for route in endpoints.router.routes if getattr(route, "path", None) == "/v1/libtv/image-upscale/submit"
     )
+    internal_route = next(
+        route
+        for route in endpoints.router.routes
+        if getattr(route, "path", None) == "/internal/v1/image-upscale/submit"
+    )
+    assert route.include_in_schema is False
+    assert internal_route.include_in_schema is False
     request_schema = route.openapi_extra["requestBody"]["content"]["application/json"]["schema"]
     assert {"source_bytes", "source_sha256"}.issubset(set(request_schema["required"]))
 

@@ -6,7 +6,8 @@ Format: vid_{base64_encoded_string}
 """
 
 import base64
-from typing import Optional
+import importlib
+from typing import Callable, Optional
 
 from litellm._logging import verbose_logger
 from litellm.types.utils import SpecialEnums
@@ -16,6 +17,30 @@ VIDEO_ID_PREFIX = "video_"
 CAUSYN_VIDEO_ID_PREFIX = "causyn_"
 CHARACTER_ID_PREFIX = "character_"
 CHARACTER_ID_TEMPLATE = "litellm:custom_llm_provider:{};model_id:{};character_id:{}"
+
+# Provider codecs register themselves at provider-module import time.  Keeping
+# this registry in the type layer lets the generic video router decode opaque
+# IDs without importing proxy internals (or any concrete provider module).
+_VIDEO_ID_CODECS: dict[str, tuple[str, Callable[[str], Optional[DecodedVideoId]]]] = {}
+_VIDEO_ID_CODEC_MODULES = {"video_v2_": "litellm.llms.libtv.video_id_codec"}
+
+
+def register_video_id_codec(
+    provider: str, prefix: str, decoder: Callable[[str], Optional[DecodedVideoId]]
+) -> None:
+    """Register a provider-neutral decoder for a versioned public ID."""
+    if provider and prefix and callable(decoder):
+        _VIDEO_ID_CODECS[prefix] = (provider, decoder)
+
+
+def _load_video_id_codec(prefix: str) -> None:
+    """Lazy-load opaque codecs so cold-start SDK imports can decode IDs."""
+    module_name = _VIDEO_ID_CODEC_MODULES.get(prefix)
+    if module_name is not None and prefix not in _VIDEO_ID_CODECS:
+        try:
+            importlib.import_module(module_name)
+        except Exception:
+            return
 
 
 class DecodedCharacterId(dict):
@@ -80,8 +105,28 @@ def decode_video_id_with_provider(encoded_video_id: str) -> DecodedVideoId:
             video_id=encoded_video_id,
         )
 
+    for prefix, (_provider, decoder) in _VIDEO_ID_CODECS.items():
+        if encoded_video_id.startswith(prefix):
+            decoded = decoder(encoded_video_id)
+            if decoded is not None:
+                return decoded
+            # Invalid opaque IDs must never fall through to the legacy parser;
+            # doing so could turn attacker-controlled bytes into routing data.
+            return DecodedVideoId(custom_llm_provider=None, model_id=None, video_id=encoded_video_id)
+
+    for prefix in _VIDEO_ID_CODEC_MODULES:
+        if encoded_video_id.startswith(prefix):
+            _load_video_id_codec(prefix)
+            registered = _VIDEO_ID_CODECS.get(prefix)
+            if registered is None:
+                return DecodedVideoId(custom_llm_provider=None, model_id=None, video_id=encoded_video_id)
+            decoded = registered[1](encoded_video_id)
+            return decoded or DecodedVideoId(
+                custom_llm_provider=None, model_id=None, video_id=encoded_video_id
+            )
+
     try:
-        cleaned_id = encoded_video_id.replace(VIDEO_ID_PREFIX, "")
+        cleaned_id = encoded_video_id[len(VIDEO_ID_PREFIX) :]
         cleaned_id = _add_base64_padding(cleaned_id)
         decoded_id = base64.b64decode(cleaned_id.encode("utf-8")).decode("utf-8")
 

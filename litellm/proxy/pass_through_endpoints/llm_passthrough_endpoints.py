@@ -35,6 +35,7 @@ from litellm.proxy.common_utils.http_parsing_utils import (
     get_form_data,
     get_request_body,
 )
+from litellm.proxy.common_utils.public_surface_sanitization import finalize_public_response_headers
 from litellm.proxy.pass_through_endpoints.common_utils import get_litellm_virtual_key
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     HttpPassThroughEndpointHelpers,
@@ -337,23 +338,27 @@ async def vllm_proxy_route(
         )
 
         if is_streaming_request:
+            response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+                headers=result.headers,
+                custom_headers=None,
+            )
+            finalize_public_response_headers(response_headers, user_api_key_dict)
             return StreamingResponse(
                 content=result.aiter_bytes(),
                 status_code=result.status_code,
-                headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                    headers=result.headers,
-                    custom_headers=None,
-                ),
+                headers=response_headers,
             )
 
         content = await result.aread()
+        response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+            headers=result.headers,
+            custom_headers=None,
+        )
+        finalize_public_response_headers(response_headers, user_api_key_dict)
         return Response(
             content=content,
             status_code=result.status_code,
-            headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                headers=result.headers,
-                custom_headers=None,
-            ),
+            headers=response_headers,
         )
 
     return await llm_passthrough_factory_proxy_route(
@@ -1302,25 +1307,29 @@ async def azure_proxy_route(
                     else:
                         # Result is an httpx.Response, use aiter_bytes()
                         result = cast(httpx.Response, result)
+                        response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+                            headers=result.headers,
+                            custom_headers=None,
+                        )
+                        finalize_public_response_headers(response_headers, user_api_key_dict)
                         return StreamingResponse(
                             content=result.aiter_bytes(),
                             status_code=result.status_code,
-                            headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                                headers=result.headers,
-                                custom_headers=None,
-                            ),
+                            headers=response_headers,
                         )
 
                 # Non-streaming response
                 result = cast(httpx.Response, result)
                 content = await result.aread()
+                response_headers = HttpPassThroughEndpointHelpers.get_response_headers(
+                    headers=result.headers,
+                    custom_headers=None,
+                )
+                finalize_public_response_headers(response_headers, user_api_key_dict)
                 return Response(
                     content=content,
                     status_code=result.status_code,
-                    headers=HttpPassThroughEndpointHelpers.get_response_headers(
-                        headers=result.headers,
-                        custom_headers=None,
-                    ),
+                    headers=response_headers,
                 )
             elif is_vector_store_index:
                 # get the api key from the provider config

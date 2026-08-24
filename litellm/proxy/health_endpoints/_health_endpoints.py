@@ -31,7 +31,6 @@ from litellm.proxy._types import (
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.health_check import (
-    ADMIN_ONLY_HEALTH_DISPLAY_PARAMS,
     _clean_endpoint_data,
     _update_litellm_params_for_health_check,
     health_check_filter_kwargs_from_general_settings,
@@ -40,6 +39,11 @@ from litellm.proxy.health_check import (
 )
 from litellm.proxy.middleware.in_flight_requests_middleware import (
     get_in_flight_requests,
+)
+from litellm.proxy.common_utils.public_surface_sanitization import (
+    is_full_proxy_admin,
+    sanitize_health_endpoint,
+    sanitize_public_health_checks,
 )
 from litellm.proxy.shutdown.graceful_shutdown_manager import GracefulShutdownManager
 
@@ -750,13 +754,7 @@ def _strip_admin_only_fields_from_health_result(result: dict) -> dict:
     still showing them which deployments they own and whether each one is
     healthy. Proxy admins receive the unmodified result.
     """
-    out = dict(result)
-    drop = set(ADMIN_ONLY_HEALTH_DISPLAY_PARAMS)
-    for key in ("healthy_endpoints", "unhealthy_endpoints"):
-        eps = out.get(key)
-        if isinstance(eps, list):
-            out[key] = [({k: v for k, v in ep.items() if k not in drop} if isinstance(ep, dict) else ep) for ep in eps]
-    return out
+    return sanitize_health_endpoint(result)
 
 
 def _resolve_targeted_model_ids(model_list: list, model: Optional[str], model_id: Optional[str]) -> Optional[set]:
@@ -944,7 +942,7 @@ async def health_endpoint(
 
     target_model = _health_endpoint_resolve_target_model_name(model, model_id, llm_router)
 
-    is_admin = _is_proxy_admin(user_api_key_dict)
+    is_admin = is_full_proxy_admin(user_api_key_dict)
     model_specific_request = bool(model or model_id)
 
     def _post_process(result: dict) -> dict:
@@ -1104,6 +1102,8 @@ async def health_check_history_endpoint(
 
         # Convert to dict format for JSON response using helper function
         history_data = [_convert_health_check_to_dict(check) for check in history]
+        if not is_full_proxy_admin(user_api_key_dict):
+            history_data = [sanitize_health_endpoint(item) for item in history_data]
 
         return {
             "health_checks": history_data,
@@ -1138,6 +1138,8 @@ async def latest_health_checks_endpoint(
             (check.model_id if check.model_id else check.model_name): _convert_health_check_to_dict(check)
             for check in latest_checks
         }
+        if not is_full_proxy_admin(user_api_key_dict):
+            checks_data = sanitize_public_health_checks(checks_data, user_api_key_dict)
 
         return {
             "latest_health_checks": checks_data,

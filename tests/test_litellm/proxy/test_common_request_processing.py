@@ -44,12 +44,16 @@ class TestProxyBaseLLMRequestProcessing:
             passthrough_response = kwargs["fastapi_response"]
             passthrough_response.headers["x-litellm-call-id"] = "test-call-id"
             passthrough_response.headers["x-litellm-version"] = "test-version"
+            passthrough_response.headers["X-LibTV-Callback"] = "private"
+            passthrough_response.headers["x-callback-value"] = "libtv-private-value"
             return httpx.Response(
                 status_code=200,
                 content=b'{"ok":true}',
                 headers={
                     "content-type": "application/json",
                     "x-amzn-requestid": "bedrock-request-id",
+                    "X-LibTV-Upstream": "private",
+                    "x-upstream-value": "liblib-private-value",
                 },
             )
 
@@ -75,6 +79,10 @@ class TestProxyBaseLLMRequestProcessing:
         assert result.headers["x-amzn-requestid"] == "bedrock-request-id"
         assert result.headers["x-litellm-call-id"] == "test-call-id"
         assert result.headers["x-litellm-version"] == "test-version"
+        assert "x-libtv-callback" not in result.headers
+        assert "x-callback-value" not in result.headers
+        assert "x-libtv-upstream" not in result.headers
+        assert "x-upstream-value" not in result.headers
 
     @pytest.mark.asyncio
     async def test_base_passthrough_process_llm_request_returns_fastapi_response_from_guardrails(self, monkeypatch):
@@ -241,7 +249,10 @@ class TestProxyBaseLLMRequestProcessing:
 
         proxy_logging_obj.post_call_success_hook = fake_post_call_success_hook
         proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
-            return_value={"x-litellm-custom": "from-hook"}
+            return_value={
+                "x-litellm-custom": "from-hook",
+                "X-LibTV-Callback": "private",
+            }
         )
 
         result = await processing_obj._handle_non_streaming_allm_passthrough_route(
@@ -254,6 +265,7 @@ class TestProxyBaseLLMRequestProcessing:
 
         assert isinstance(result, Response)
         assert result.headers["x-litellm-custom"] == "from-hook"
+        assert "X-LibTV-Callback" not in result.headers
         assert result.headers["x-litellm-call-id"] == "test-call-id"
         proxy_logging_obj.post_call_response_headers_hook.assert_awaited_once()
         _, kwargs = proxy_logging_obj.post_call_response_headers_hook.call_args
@@ -457,7 +469,11 @@ class TestProxyBaseLLMRequestProcessing:
 
         proxy_logging_obj = MagicMock(spec=ProxyLogging)
         proxy_logging_obj.post_call_response_headers_hook = AsyncMock(
-            return_value={"x-ratelimit-remaining-requests": "999"}
+            return_value={
+                "x-ratelimit-remaining-requests": "999",
+                "X-LibTV-Callback": "private",
+                "x-custom-callback": "libtv-private-value",
+            }
         )
 
         headers = await ProxyBaseLLMRequestProcessing.build_litellm_proxy_success_headers_from_llm_response(
@@ -475,6 +491,8 @@ class TestProxyBaseLLMRequestProcessing:
         assert headers["x-litellm-version"] == "9.9.9"
         assert headers["llm_provider-ratelimit-requests"] == "1000"
         assert headers["x-ratelimit-remaining-requests"] == "999"
+        assert "X-LibTV-Callback" not in headers
+        assert "x-custom-callback" not in headers
         proxy_logging_obj.post_call_response_headers_hook.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -2914,10 +2932,16 @@ class TestHandleLLMApiExceptionRetryAfter:
             cooldown_list=[],
         )
         proxy_exc = await self._invoke(
-            exc, callback_headers={"retry-after": "", "x-custom": "1"}
+            exc,
+            callback_headers={
+                "retry-after": "",
+                "x-custom": "1",
+                "X-LibTV-Callback": "private",
+            },
         )
         assert proxy_exc.headers["retry-after"] == "43"
         assert proxy_exc.headers["x-custom"] == "1"
+        assert "X-LibTV-Callback" not in proxy_exc.headers
 
 
 class TestAsyncStreamingDataGeneratorFastPath:
@@ -3009,8 +3033,6 @@ class TestDisconnectGatherCleanup:
         self, monkeypatch
     ):
         """With cancel_on_disconnect enabled, base_process_llm_request returns 499."""
-        import asyncio
-
         import litellm.proxy.common_request_processing as cpr
         from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 
@@ -3202,8 +3224,6 @@ class TestDisconnectGatherCleanup:
     async def test_base_process_llm_request_preserves_llm_error_after_gather(
         self, monkeypatch
     ):
-        import asyncio
-
         import litellm.proxy.common_request_processing as cpr
         from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 

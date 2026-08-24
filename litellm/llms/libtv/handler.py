@@ -30,7 +30,6 @@ from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import (
     decode_video_id_with_provider,
-    encode_video_id_with_provider,
 )
 
 LIBTV_PROVIDER = "libtv"
@@ -79,6 +78,11 @@ from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentia
 from .image_upscale import ImageUpscaleReceipt
 from .persistence import get_persistence
 from .transform import _resolution_from_size, build_generation_params, build_topaz_upscale_params
+from .video_id_codec import (
+    OPAQUE_VIDEO_ID_PREFIX,
+    encode_libtv_video_id,
+    ensure_libtv_video_id_key,
+)
 
 _TOPAZ_VENDOR = "topazlabs"
 _BILLING_WARN_INTERVAL_SECONDS = 300.0
@@ -110,14 +114,26 @@ def _warn_billing_gap(key: str, message: str) -> None:
 _LIBTV_STATUS = {0: "queued", 1: "in_progress", 2: "completed", 3: "failed"}
 
 
+def _public_provider_text(value: object, fallback: str = "provider request failed") -> str:
+    """Remove vendor/domain markers from provider text at the public boundary."""
+    text = str(value or fallback)
+    return re.sub(r"libtv|liblib\.(?:tv|art)", "provider", text, flags=re.IGNORECASE)
+
+
 def _raise_normalized_libtv_error(error: LibTVError, model: str) -> None:
     """Convert provider errors once, at the shared custom-provider boundary."""
     response = httpx.Response(
         status_code=error.status_code,
         headers=error.headers,
-        request=httpx.Request("POST", "https://api.liblib.tv"),
+        request=httpx.Request("POST", "https://provider.invalid/video"),
     )
-    common = {"message": error.message, "model": model, "llm_provider": LIBTV_PROVIDER}
+    # ``llm_provider`` remains available to internal exception routing, while
+    # the public exception message is normalized at this boundary.
+    common = {
+        "message": "provider request failed",
+        "model": _public_provider_text(model, "video-provider"),
+        "llm_provider": LIBTV_PROVIDER,
+    }
     if isinstance(error, LibTVContentPolicyError):
         raise ContentPolicyViolationError(**common, response=response) from error
     if error.status_code == 400:
@@ -150,7 +166,7 @@ def normalize_libtv_errors(func):
         value = kwargs.get("model") or kwargs.get("video_id")
         if value is None and len(args) > 1:
             value = args[1]
-        return str(value or "libtv")
+        return str(value or "video-provider")
 
     if iscoroutinefunction(func):
 
@@ -173,11 +189,27 @@ def normalize_libtv_errors(func):
     return _sync
 
 
+def _decode_task_and_public_id(video_id: str) -> tuple[str, str]:
+    """Decode a routing ID and return the task ID plus its safe public form.
+
+    Legacy provider IDs remain valid as input so existing tasks can still be
+    polled.  They must never be echoed back, however: re-wrap them with the
+    authenticated v2 codec before constructing any status response.  A v2 ID
+    is already opaque and is returned byte-for-byte so clients can keep
+    polling with the same ID.
+    """
+    decoded = decode_video_id_with_provider(video_id) or {}
+    task_id = decoded.get("video_id") or ""
+    provider = decoded.get("custom_llm_provider")
+    if not task_id or (video_id.startswith(OPAQUE_VIDEO_ID_PREFIX) and provider != LIBTV_PROVIDER):
+        raise LibTVError(status_code=400, message="video id is invalid")
+    if provider == LIBTV_PROVIDER and not video_id.startswith(OPAQUE_VIDEO_ID_PREFIX):
+        return task_id, encode_libtv_video_id(task_id, decoded.get("model_id"))
+    return task_id, video_id
+
+
 def _decode_task_id(video_id: str) -> str:
-    task_id = (decode_video_id_with_provider(video_id) or {}).get("video_id") or ""
-    if not task_id:
-        raise LibTVError(status_code=400, message="libtv video id does not carry a task id")
-    return task_id
+    return _decode_task_and_public_id(video_id)[0]
 
 
 _PROJECT_NAME_POOL = ("我的项目", "未命名项目", "新建项目", "创意工坊", "日常创作")
@@ -656,11 +688,7 @@ class LibTVLLM(CustomLLM):
         # calls back to the SAME libtv account (its token+webid).
         model_info = op.get("model_info") or {}
         deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
-        video_id = encode_video_id_with_provider(
-            created["task_id"],
-            LIBTV_PROVIDER,
-            deployment_id or op.get("libtv_status_model"),
-        )
+        video_id = encode_libtv_video_id(created["task_id"], deployment_id or op.get("libtv_status_model"))
         vo = VideoObject(id=video_id, object="video", status="queued", model=model)
         forwarded_prompt_chars = created.get("forwarded_prompt_chars")
         if type(forwarded_prompt_chars) is int:
@@ -777,9 +805,9 @@ class LibTVLLM(CustomLLM):
         vo = VideoObject(id=video_id, object="video", status=status)
         if status == "completed":
             urls = state.get("urls") or []
-            vo._hidden_params = {"url": urls[0] if urls else None, "libtv_video_urls": urls}
+            vo._hidden_params = {"url": urls[0] if urls else None, "video_urls": urls}
         elif status == "failed":
-            vo.error = {"message": state.get("failed_reason") or "libtv generation failed"}
+            vo.error = {"message": _public_provider_text(state.get("failed_reason"), "video generation failed")}
         return vo
 
     async def _record_video_task_usage(
@@ -915,8 +943,9 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: HTTPHandler | None = None,
     ) -> VideoObject:
+        task_id, public_video_id = _decode_task_and_public_id(video_id)
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
-        return self._video_status(video_id, lt.poll_once(_decode_task_id(video_id), "video"))
+        return self._video_status(public_video_id, lt.poll_once(task_id, "video"))
 
     @normalize_libtv_errors
     async def avideo_status(
@@ -929,9 +958,9 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: AsyncHTTPHandler | None = None,
     ) -> VideoObject:
+        task_id, public_video_id = _decode_task_and_public_id(video_id)
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
-        task_id = _decode_task_id(video_id)
-        vo = self._video_status(video_id, await lt.apoll_once(task_id, "video"))
+        vo = self._video_status(public_video_id, await lt.apoll_once(task_id, "video"))
         if vo.status == "completed":
             await self._bill_completed_video(vo, task_id, optional_params)
         return vo
@@ -947,9 +976,10 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[HTTPHandler] = None,
     ) -> bytes:
+        task_id = _decode_task_id(video_id)
         http = client or HTTPHandler()
         lt = self._make_client(api_key, optional_params, sync_client=http)
-        return self._download(http, lt.poll_once(_decode_task_id(video_id), "video"))
+        return self._download(http, lt.poll_once(task_id, "video"))
 
     @normalize_libtv_errors
     async def avideo_content(
@@ -962,9 +992,10 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[AsyncHTTPHandler] = None,
     ) -> bytes:
+        task_id = _decode_task_id(video_id)
         http = client or AsyncHTTPHandler()
         lt = self._make_client(api_key, optional_params, async_client=http)
-        state = await lt.apoll_once(_decode_task_id(video_id), "video")
+        state = await lt.apoll_once(task_id, "video")
         if state.get("status") != 2:
             raise LibTVError(status_code=409, message="libtv video still processing")
         urls = state.get("urls") or []
@@ -1230,6 +1261,7 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[HTTPHandler] = None,
     ) -> VideoObject:
+        ensure_libtv_video_id_key()
         lt = self._make_client(api_key, optional_params, sync_client=client or HTTPHandler())
         spec = lt.resolve_model_spec(model)
         if _is_topaz_upscale(spec):
@@ -1334,6 +1366,7 @@ class LibTVLLM(CustomLLM):
         timeout: Optional[Union[float, httpx.Timeout]] = None,
         client: Optional[AsyncHTTPHandler] = None,
     ) -> VideoObject:
+        ensure_libtv_video_id_key()
         lt = self._make_client(api_key, optional_params, async_client=client or AsyncHTTPHandler())
         spec = await lt.aresolve_model_spec(model)
         if _is_topaz_upscale(spec):

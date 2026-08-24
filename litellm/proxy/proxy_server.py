@@ -308,6 +308,16 @@ from litellm.proxy.common_utils.load_config_utils import (
     get_file_contents_from_s3,
 )
 from litellm.proxy.common_utils.model_listing_utils import TeamModelNameTranslator
+from litellm.proxy.common_utils.public_model_serialization import (
+    is_provider_private_model,
+    serialize_public_provider_model,
+    serialize_public_provider_models,
+)
+from litellm.proxy.common_utils.public_surface_sanitization import (
+    finalize_public_response_headers,
+    is_full_proxy_admin,
+    sanitize_provider_names,
+)
 from litellm.proxy.common_utils.openai_endpoint_utils import (
     remove_sensitive_info_from_deployment,
 )
@@ -8472,13 +8482,21 @@ async def model_info(
     _, provider, _, _ = litellm.get_llm_provider(model=deployment.litellm_params.model)
 
     response_id = internal_to_public.get(resolved_model_id, model_id)
-    return create_model_info_response(
+    response = create_model_info_response(
         model_id=response_id,
         provider=provider,
         include_metadata=False,
         fallback_type=None,
         llm_router=llm_router,
     )
+    if (
+        user_api_key_dict.user_role not in (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.PROXY_ADMIN.value)
+        and str(provider).lower() == "libtv"
+    ):
+        # The OpenAI-compatible model object has no provider-private fields;
+        # normalize the owner for callers including PROXY_ADMIN_VIEW_ONLY.
+        response["owned_by"] = "provider"
+    return response
 
 
 def _blocked_response_usage(original_response: Optional[Any]) -> "litellm.Usage":
@@ -9192,6 +9210,7 @@ async def audio_speech(
         )
         if callback_headers:
             custom_headers.update(callback_headers)
+        finalize_public_response_headers(custom_headers, user_api_key_dict)
 
         # Determine media type based on model type
         media_type = "audio/mpeg"  # Default for OpenAI TTS
@@ -9351,6 +9370,7 @@ async def audio_transcriptions(
         )
         if callback_headers:
             fastapi_response.headers.update(callback_headers)
+        finalize_public_response_headers(fastapi_response.headers, user_api_key_dict)
 
         return response
     except Exception as e:
@@ -11825,6 +11845,8 @@ async def model_info_v2(
 
     # Translate `model_name` to the public name for team-scoped rows.
     all_models = [_translate_model_name_for_response(m) for m in all_models]
+    all_models = _serialize_public_provider_models(all_models, user_api_key_dict)
+    search_total_count = len(all_models)
 
     return _paginate_models_response(
         all_models=all_models,
@@ -12339,6 +12361,22 @@ def _translate_model_name_for_response(model: dict) -> dict:
     return {**model, "model_name": team_public}
 
 
+def _is_provider_private_model(model: dict) -> bool:
+    return is_provider_private_model(model)
+
+
+def _serialize_public_provider_model(model: dict) -> dict:
+    return serialize_public_provider_model(model, _translate_model_name_for_response)
+
+
+def _serialize_public_provider_models(models: List[dict], user_api_key_dict: UserAPIKeyAuth) -> List[dict]:
+    return serialize_public_provider_models(
+        models,
+        user_api_key_dict.user_role in (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.PROXY_ADMIN.value),
+        _translate_model_name_for_response,
+    )
+
+
 def _get_proxy_model_info(model: dict) -> dict:
     # provided model_info in config.yaml
     model_info = model.get("model_info", {})
@@ -12463,7 +12501,7 @@ async def model_info_v1(
             deployment_dict=_deployment_info_dict,
             excluded_keys={"litellm_credential_name"},
         )
-        return {"data": _deployment_info_dict}
+        return {"data": _serialize_public_provider_models([_deployment_info_dict], user_api_key_dict)[0]}
 
     if llm_model_list is None:
         raise HTTPException(
@@ -12514,7 +12552,7 @@ async def model_info_v1(
                     llm_router=llm_router,
                     user_api_key_dict=user_api_key_dict,
                 )
-        return {"data": single_model_list}
+        return {"data": _serialize_public_provider_models(single_model_list, user_api_key_dict)}
 
     # Return router deployments (same source as /v2/model/info), not wildcard-
     # expanded model names from get_complete_model_list(). Team-scoped rows
@@ -12573,6 +12611,8 @@ async def model_info_v1(
             llm_router=llm_router,
             user_api_key_dict=user_api_key_dict,
         )
+
+    all_models = _serialize_public_provider_models(all_models, user_api_key_dict)
 
     verbose_proxy_logger.debug("all_models: %s", all_models)
     return {"data": all_models}
@@ -12806,6 +12846,12 @@ async def model_group_info(
         model_groups=model_groups,
         user_api_key_dict=user_api_key_dict,
     )
+
+    if user_api_key_dict.user_role not in (LitellmUserRoles.PROXY_ADMIN, LitellmUserRoles.PROXY_ADMIN.value):
+        for group in model_groups:
+            providers = getattr(group, "providers", None)
+            if isinstance(providers, list):
+                group.providers = sanitize_provider_names(providers)
 
     return {"data": model_groups}
 
@@ -15771,10 +15817,16 @@ async def get_adaptive_router_state(
 
 
 @router.get("/routes", dependencies=[Depends(user_api_key_auth)])
-async def get_routes():
+async def get_routes(user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth)):
     """
     Get a list of available routes in the FastAPI application.
     """
+    if not is_full_proxy_admin(user_api_key_dict):
+        # Route enumeration is a control-plane diagnostic and is not part of
+        # the user/project-key surface. Keep the response indistinguishable
+        # from an unknown endpoint for non-admin callers.
+        raise HTTPException(status_code=404, detail="Not Found")
+
     from litellm.proxy.common_utils.get_routes import GetRoutes
 
     routes = []

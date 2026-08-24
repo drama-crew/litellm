@@ -337,8 +337,20 @@ async def test_content__wraps_raw_bytes_in_response(harness):
     assert resp.media_type == "video/mp4"
     assert (
         resp.headers["content-disposition"]
-        == "attachment; filename=video_video_plain.mp4"
+        == "attachment; filename=video.mp4"
     )
+
+
+@pytest.mark.asyncio
+async def test_content__legacy_provider_id_is_not_echoed_in_filename(harness):
+    harness.base_process.return_value = b"VIDEOBYTES"
+    legacy_id = encode_video_id_with_provider("legacy-task", "libtv", "legacy-deployment")
+
+    resp = await call_content(harness, legacy_id)
+
+    assert resp.headers["content-disposition"] == "attachment; filename=video.mp4"
+    assert "legacy-task" not in resp.headers["content-disposition"]
+    assert "legacy-deployment" not in resp.headers["content-disposition"]
 
 
 @pytest.mark.asyncio

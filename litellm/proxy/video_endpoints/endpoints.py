@@ -394,7 +394,8 @@ async def video_content(
         return Response(
             content=video_bytes,
             media_type="video/mp4",
-            headers={"Content-Disposition": f"attachment; filename=video_{video_id}.mp4"},
+            # Do not echo legacy or opaque provider IDs in a download filename.
+            headers={"Content-Disposition": "attachment; filename=video.mp4"},
         )
     except Exception as e:
         raise await processor._handle_llm_api_exception(
