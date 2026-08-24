@@ -63,6 +63,11 @@ class _Billing:
         self.stored_usage: dict[str, object] | None = None
         self.mark_calls: list[tuple[str, float, float]] = []
         self.marked_keys: set[str] = set()
+        self.outbox_events: list[object] = []
+
+    async def enqueue(self, _: object, event: object) -> bool:
+        self.outbox_events.append(event)
+        return True
 
     async def store_video_task_usage(
         self,
@@ -180,6 +185,7 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
         task_id_factory=lambda: TASK_ID,
         clock=lambda: 2_000_000_000.0,
         persistence_factory=lambda: billing,
+        billing_enqueue=billing.enqueue,
     )
     monkeypatch.setattr(causyn_module, "enqueue_video_generate", enqueue)
     monkeypatch.setattr(causyn_module, "fetch_video_generate_status", fetch_status)
@@ -307,11 +313,16 @@ def test_public_endpoint_create_decodes_routes_and_bills_idempotently(stack: _St
     assert second.status_code == 200, second.text
     assert first.json()["status"] == "completed"
     assert float(first.headers["x-litellm-response-cost"]) == pytest.approx(0.5)
-    assert float(second.headers.get("x-litellm-response-cost") or 0.0) == 0.0
-    assert stack.billing.marked_keys == {f"causyn:{TASK_ID}"}
-    assert len(stack.billing.mark_calls) == 2
-    assert stack.billing.mark_calls[0][2] == pytest.approx(0.5)
-    assert stack.billing.mark_calls[1][2] == pytest.approx(0.5)
+    assert float(second.headers.get("x-litellm-response-cost") or 0.0) == pytest.approx(0.5)
+    assert len(stack.billing.outbox_events) == 2
+    assert [event.event_id for event in stack.billing.outbox_events] == [
+        f"causyn-video:{TASK_ID}",
+        f"causyn-video:{TASK_ID}",
+    ]
+    assert [event.response_cost for event in stack.billing.outbox_events] == [
+        pytest.approx(0.5),
+        pytest.approx(0.5),
+    ]
 
 
 def test_public_endpoint_content_uses_real_router_and_handler(stack: _Stack) -> None:

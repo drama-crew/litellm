@@ -7,6 +7,7 @@ from typing import Any, Optional, Union
 
 import httpx
 import pytest
+import redis.exceptions as redis_exceptions
 
 import litellm
 from litellm.exceptions import BadRequestError
@@ -89,6 +90,71 @@ class FakeRedis:
         xadd = next(value for name, value in self.calls if name == "xadd")
         _, values = xadd
         return json.loads(values["payload"])
+
+
+class _TransactionalPipeline:
+    def __init__(self, redis: "TransactionalFakeRedis") -> None:
+        self.redis = redis
+        self.commands: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def __aenter__(self) -> "_TransactionalPipeline":
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        return None
+
+    async def watch(self, *_: str) -> None:
+        return None
+
+    async def unwatch(self) -> None:
+        return None
+
+    async def get(self, key: str) -> str | None:
+        return self.redis.status.get(key)
+
+    def multi(self) -> None:
+        return None
+
+    def set(self, key: str, value: str, **kwargs: object) -> "_TransactionalPipeline":
+        self.commands.append(("set", (key, value), kwargs))
+        return self
+
+    def xadd(self, key: str, values: dict[str, str]) -> "_TransactionalPipeline":
+        self.commands.append(("xadd", (key, values), {}))
+        return self
+
+    async def execute(self) -> list[object]:
+        if self.redis.watch_error:
+            raise redis_exceptions.WatchError()
+        if self.redis.execute_error is not None:
+            raise self.redis.execute_error
+        results: list[object] = []
+        for name, args, kwargs in self.commands:
+            if name == "set":
+                results.append(await self.redis.set(args[0], args[1], **kwargs))
+            else:
+                results.append(await self.redis.xadd(args[0], args[1]))
+        self.redis.pipeline_commands.append(tuple(name for name, _, _ in self.commands))
+        return results
+
+
+class TransactionalFakeRedis(FakeRedis):
+    def __init__(self) -> None:
+        super().__init__()
+        self.execute_error: Exception | None = None
+        self.watch_error = False
+        self.pipeline_commands: list[tuple[str, ...]] = []
+
+    def pipeline(self, **_: object) -> _TransactionalPipeline:
+        return _TransactionalPipeline(self)
+
+
+class MetadataFailureRedis(FakeRedis):
+    async def set(self, key: str, value: str, **kwargs: object) -> bool:
+        if key.startswith("worker:task:metadata:"):
+            self.calls.append(("set", (key, value, kwargs)))
+            return False
+        return await super().set(key, value, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -174,7 +240,8 @@ def handler(
     async def _enqueue(redis: object, event: object) -> bool:
         if billing_enqueue is not None:
             return await billing_enqueue(redis, event)
-        return await causyn_module.enqueue_causyn_billing(redis, event)  # type: ignore[arg-type]
+        # The Redis/Lua outbox contract has dedicated integration coverage.
+        return True
 
     return CausynVideoHandler(
         redis_factory=lambda: redis,
@@ -348,14 +415,26 @@ def test_worker_envelope_rejects_explicit_null_staging_upload() -> None:
 
 
 @pytest.mark.asyncio
-async def test_async_create_records_usage_for_completion_billing() -> None:
+async def test_async_create_persists_billing_metadata_without_usage_db() -> None:
     redis = FakeRedis()
     persistence = FakeBillingPersistence()
 
-    response = await handler(redis, persistence=persistence).avideo_generation(**create_kwargs())
+    response = await handler(redis, persistence=persistence).avideo_generation(
+        **create_kwargs(model_info={"id": "causyn-price-v1", "output_cost_per_second_768x512": 0.1})
+    )
 
     assert response.status == "queued"
-    assert persistence.store_calls == [(f"causyn:{TASK_ID}", 5.0, "768x512")]
+    assert persistence.store_calls == []
+    assert json.loads(redis.status[f"worker:task:metadata:{TASK_ID}"]) == {
+        "attribution": {},
+        "duration_seconds": 5.0,
+        "pricing": {
+            "id": "causyn-price-v1",
+            "model": "causyn-1.0",
+            "output_cost_per_second_768x512": 0.1,
+        },
+        "video_resolution": "768x512",
+    }
 
 
 @pytest.mark.asyncio
@@ -366,7 +445,61 @@ async def test_async_create_survives_usage_persistence_failure() -> None:
     response = await handler(redis, persistence=persistence).avideo_generation(**create_kwargs())
 
     assert response.status == "queued"
-    assert persistence.store_calls == [(f"causyn:{TASK_ID}", 5.0, "768x512")]
+    assert persistence.store_calls == []
+
+
+@pytest.mark.asyncio
+async def test_async_create_commits_status_metadata_and_stream_in_one_pipeline() -> None:
+    redis = TransactionalFakeRedis()
+
+    response = await handler(redis).avideo_generation(
+        **create_kwargs(model_info={"output_cost_per_second_768x512": 0.1})
+    )
+
+    assert response.status == "queued"
+    assert redis.pipeline_commands == [("set", "set", "xadd")]
+    assert redis.status[status_key(TASK_ID)] == "queued"
+    assert f"worker:task:metadata:{TASK_ID}" in redis.status
+    assert redis.envelope()["request"]["duration_seconds"] == 5
+
+
+@pytest.mark.asyncio
+async def test_async_create_pipeline_failure_does_not_leave_partial_task() -> None:
+    redis = TransactionalFakeRedis()
+    redis.execute_error = RuntimeError("transaction failed")
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis).avideo_generation(**create_kwargs())
+
+    assert exc_info.value.status_code == 503
+    assert status_key(TASK_ID) not in redis.status
+    assert f"worker:task:metadata:{TASK_ID}" not in redis.status
+    assert not any(name == "xadd" for name, _ in redis.calls)
+
+
+@pytest.mark.asyncio
+async def test_async_create_fallback_metadata_failure_rolls_back_status() -> None:
+    redis = MetadataFailureRedis()
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis).avideo_generation(**create_kwargs())
+
+    assert exc_info.value.status_code == 503
+    assert status_key(TASK_ID) not in redis.status
+    assert f"worker:task:metadata:{TASK_ID}" not in redis.status
+    assert not any(name == "xadd" for name, _ in redis.calls)
+
+
+@pytest.mark.asyncio
+async def test_async_create_watch_conflict_is_an_idempotent_duplicate() -> None:
+    redis = TransactionalFakeRedis()
+    redis.watch_error = True
+
+    response = await handler(redis).avideo_generation(**create_kwargs())
+
+    assert response.status == "queued"
+    assert status_key(TASK_ID) not in redis.status
+    assert not any(name in {"set", "xadd"} for name, _ in redis.calls)
 
 
 @pytest.mark.asyncio
@@ -523,25 +656,28 @@ async def test_completed_status_rejects_staging_key_for_another_task() -> None:
 
 
 @pytest.mark.asyncio
-async def test_completed_status_bills_once_from_persisted_usage() -> None:
+async def test_completed_status_uses_worker_usage_and_durable_price() -> None:
     redis = FakeRedis()
     persistence = FakeBillingPersistence(
         stored_usage={"duration_seconds": 5.0, "video_resolution": "768x512"},
         billed=True,
     )
     set_status(redis, "done", completed_result())
+    redis.status[f"worker:task:metadata:{TASK_ID}"] = json.dumps(
+        {"pricing": {"output_cost_per_second_768x512": 0.1}, "attribution": {}}
+    )
 
     response = await handler(redis, persistence=persistence).avideo_status(
         VIDEO_ID,
         None,
         None,
-        {"model_info": {"output_cost_per_second_768x512": 0.1}},
+        {},
         None,
     )
 
     assert response.usage == {"duration_seconds": 5.0, "video_resolution": "768x512"}
     assert response._hidden_params["response_cost"] == pytest.approx(0.5)
-    assert persistence.lookup_calls == [f"causyn:{TASK_ID}"]
+    assert persistence.lookup_calls == []
     assert not persistence.billing_calls
 
 
@@ -580,7 +716,7 @@ async def test_repeated_completed_status_keeps_authoritative_cost_without_duplic
         FakeBillingPersistence(stored_usage={"duration_seconds": 5.0, "video_resolution": "512x768"}),
     ],
 )
-async def test_completed_status_without_valid_persistence_usage_has_zero_cost(
+async def test_completed_status_ignores_invalid_persistence_usage(
     persistence: FakeBillingPersistence | None,
 ) -> None:
     redis = FakeRedis()
@@ -595,7 +731,7 @@ async def test_completed_status_without_valid_persistence_usage_has_zero_cost(
     )
 
     assert response.status == "completed"
-    assert response._hidden_params["response_cost"] == 0.0
+    assert response._hidden_params["response_cost"] == pytest.approx(0.5)
 
 
 @pytest.mark.asyncio
@@ -613,7 +749,7 @@ async def test_completed_status_without_price_has_zero_cost_and_does_not_mark_bi
 
 
 @pytest.mark.asyncio
-async def test_completed_status_outbox_failure_has_zero_cost() -> None:
+async def test_completed_status_outbox_failure_is_retryable() -> None:
     redis = FakeRedis()
     persistence = FakeBillingPersistence(
         stored_usage={"duration_seconds": 5.0, "video_resolution": "768x512"},
@@ -623,15 +759,126 @@ async def test_completed_status_outbox_failure_has_zero_cost() -> None:
     async def fail_enqueue(redis: object, event: object) -> bool:
         raise RuntimeError("redis unavailable")
 
-    response = await handler(redis, persistence=persistence, billing_enqueue=fail_enqueue).avideo_status(
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis, persistence=persistence, billing_enqueue=fail_enqueue).avideo_status(
+            VIDEO_ID,
+            None,
+            None,
+            {"model_info": {"output_cost_per_second_768x512": 0.1}},
+            None,
+        )
+
+    assert exc_info.value.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_completed_status_retries_after_outbox_failure() -> None:
+    redis = FakeRedis()
+    set_status(redis, "done", completed_result())
+    outcomes = iter([False, True])
+
+    async def enqueue(redis: object, event: object) -> bool:
+        return next(outcomes)
+
+    provider = handler(redis, billing_enqueue=enqueue)
+    with pytest.raises(CustomLLMError) as exc_info:
+        await provider.avideo_status(
+            VIDEO_ID,
+            None,
+            None,
+            {"model_info": {"output_cost_per_second_768x512": 0.1}},
+            None,
+        )
+    assert exc_info.value.status_code == 503
+
+    response = await provider.avideo_status(
         VIDEO_ID,
         None,
         None,
         {"model_info": {"output_cost_per_second_768x512": 0.1}},
         None,
     )
+    assert response._hidden_params["response_cost"] == pytest.approx(0.5)
 
-    assert response._hidden_params["response_cost"] == 0.0
+
+@pytest.mark.asyncio
+async def test_completed_status_uses_durable_proxy_attribution() -> None:
+    redis = FakeRedis()
+    auth_hash = "a" * 64
+    captured: list[object] = []
+
+    class Logging:
+        model_call_details = {
+            "litellm_params": {
+                "metadata": {
+                    "user_api_key_hash": auth_hash,
+                    "user_api_key_team_id": "team-1",
+                    "user_api_key_user_id": "user-1",
+                    "user_api_key_org_id": "org-1",
+                }
+            }
+        }
+
+    async def enqueue(redis: object, event: object) -> bool:
+        captured.append(event)
+        return True
+
+    create = create_kwargs(
+        model_info={"output_cost_per_second_768x512": 0.1},
+        metadata={
+            "user_api_key_hash": "b" * 64,
+            "user_api_key_team_id": "attacker-team",
+        },
+    )
+    create["logging_obj"] = Logging()
+    await handler(redis, billing_enqueue=enqueue).avideo_generation(**create)
+    metadata = json.loads(redis.status[f"worker:task:metadata:{TASK_ID}"])
+    assert metadata["attribution"] == {
+        "api_key": auth_hash,
+        "team_id": "team-1",
+        "user_id": "user-1",
+        "organization_id": "org-1",
+    }
+
+    set_status(redis, "done", completed_result())
+    response = await handler(redis, billing_enqueue=enqueue).avideo_status(
+        VIDEO_ID, None, None, {}, None
+    )
+
+    assert response._hidden_params["response_cost"] == pytest.approx(0.5)
+    assert len(captured) == 1
+    event = captured[0]
+    assert event.api_key == auth_hash
+    assert event.team_id == "team-1"
+    assert event.user_id == "user-1"
+    assert event.organization_id == "org-1"
+
+
+@pytest.mark.asyncio
+async def test_completed_status_does_not_persist_plaintext_api_key() -> None:
+    redis = FakeRedis()
+    captured: list[object] = []
+
+    class Logging:
+        model_call_details = {
+            "litellm_params": {"metadata": {"user_api_key": "sk-secret"}}
+        }
+
+    async def enqueue(redis: object, event: object) -> bool:
+        captured.append(event)
+        return True
+
+    create = create_kwargs(model_info={"output_cost_per_second_768x512": 0.1})
+    create["logging_obj"] = Logging()
+    await handler(redis, billing_enqueue=enqueue).avideo_generation(**create)
+    metadata = json.loads(redis.status[f"worker:task:metadata:{TASK_ID}"])
+    assert metadata["attribution"] == {}
+
+    set_status(redis, "done", completed_result())
+    await handler(redis, billing_enqueue=enqueue).avideo_status(
+        VIDEO_ID, None, None, {}, None
+    )
+    assert captured[0].api_key is None
 
 
 @pytest.mark.asyncio

@@ -53,6 +53,7 @@ from litellm.llms.libtv.video_generate import (
     VideoGenerateError,
     VideoGenerateSettings,
     enqueue_video_generate,  # pyright: ignore[reportUnknownVariableType]  # legacy engine has untyped Redis ports
+    fetch_video_generate_task_metadata,
     fetch_video_generate_status,  # pyright: ignore[reportUnknownVariableType]  # legacy engine returns an untyped dict
     validate_video_generate_url,
 )
@@ -315,18 +316,12 @@ class _StatusEnvelope(BaseModel):
     result: _WorkerResult | None = None
 
 
-class _StoredUsage(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
-
-    duration_seconds: float = Field(ge=3, le=8)
-    video_resolution: Literal["768x512"]
-
-
 class _Pricing(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True, strict=True)
 
     output_cost_per_second_768x512: float | None = Field(default=None, gt=0)
     output_cost_per_second: float | None = Field(default=None, gt=0)
+    id: str | None = None
 
 
 def _public_worker_error(error: _WorkerError | None) -> dict[str, str]:
@@ -349,8 +344,14 @@ def _staging_key(task_id: str) -> str:
     return f"staging/video-tasks/{task_id}.mp4"
 
 
-def _completion_cost(optional_params: dict[str, object], duration_seconds: float) -> float | None:
-    raw_model_info = optional_params.get("model_info")
+def _completion_cost(
+    optional_params: dict[str, object], duration_seconds: float, task_metadata: dict[str, object] | None = None
+) -> float | None:
+    raw_model_info: object = None
+    if task_metadata is not None:
+        raw_model_info = task_metadata.get("pricing")
+    if raw_model_info is None:
+        raw_model_info = optional_params.get("model_info")
     try:
         pricing = _Pricing.model_validate(raw_model_info)
     except ValidationError:
@@ -359,6 +360,93 @@ def _completion_cost(optional_params: dict[str, object], duration_seconds: float
     if rate is None or not math.isfinite(rate) or rate <= 0:
         return None
     return rate * duration_seconds
+
+
+def _metadata_sources(optional_params: dict[str, object], logging_obj: object) -> list[dict[str, object]]:
+    sources: list[dict[str, object]] = []
+
+    def add(value: object) -> None:
+        if isinstance(value, dict):
+            sources.append(value)
+
+    details = getattr(logging_obj, "model_call_details", None)
+    if isinstance(details, dict):
+        add(details.get("metadata"))
+        params = details.get("litellm_params")
+        if isinstance(params, dict):
+            add(params.get("metadata"))
+    params = getattr(logging_obj, "litellm_params", None)
+    if isinstance(params, dict):
+        add(params.get("metadata"))
+    # Proxy preprocessing is the authority for authenticated attribution. The
+    # request metadata is only a compatibility fallback for direct callers and
+    # must not overwrite values injected into the logging object.
+    add(optional_params.get("metadata"))
+    add(optional_params.get("litellm_metadata"))
+    return sources
+
+
+def _hashed_api_key(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    if re.fullmatch(r"[0-9a-fA-F]{64}", value) or re.fullmatch(r"hashed-jwt-[0-9a-fA-F]{64}", value):
+        return value
+    return None
+
+
+def _billing_attribution(optional_params: dict[str, object], logging_obj: object) -> dict[str, str]:
+    """Extract proxy-auth metadata, whose token value is already hashed."""
+    auth = optional_params.get("user_api_key_dict")
+    values: dict[str, object] = {}
+    for source in _metadata_sources(optional_params, logging_obj):
+        for key, value in source.items():
+            values.setdefault(key, value)
+
+    def first(*keys: str) -> object:
+        for key in keys:
+            if values.get(key) is not None:
+                return values[key]
+        return None
+
+    def auth_value(key: str) -> object:
+        if isinstance(auth, dict):
+            return auth.get(key)
+        return getattr(auth, key, None)
+
+    api_key = _hashed_api_key(first("user_api_key_hash", "user_api_key"))
+    if api_key is None:
+        api_key = _hashed_api_key(auth_value("api_key"))
+    attribution: dict[str, str] = {}
+    if api_key is not None:
+        attribution["api_key"] = api_key
+    for field, keys, auth_attr in (
+        ("team_id", ("user_api_key_team_id", "team_id"), "team_id"),
+        ("user_id", ("user_api_key_user_id", "user_id"), "user_id"),
+        ("organization_id", ("user_api_key_org_id", "org_id", "organization_id"), "org_id"),
+    ):
+        value = first(*keys)
+        if value is None:
+            value = auth_value(auth_attr)
+        if isinstance(value, str) and value:
+            attribution[field] = value
+    return attribution
+
+
+def _pricing_identity(optional_params: dict[str, object]) -> dict[str, object]:
+    raw = optional_params.get("model_info")
+    if isinstance(raw, BaseModel):
+        raw = raw.model_dump()
+    if not isinstance(raw, dict):
+        return {"model": CAUSYN_MODEL}
+    pricing: dict[str, object] = {"model": CAUSYN_MODEL}
+    model_id = raw.get("id")
+    if isinstance(model_id, str) and model_id:
+        pricing["id"] = model_id
+    for key in ("output_cost_per_second_768x512", "output_cost_per_second"):
+        value = raw.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
+            pricing[key] = float(value)
+    return pricing
 
 
 def _set_response_cost(response: VideoObject, response_cost: float) -> None:
@@ -386,59 +474,52 @@ class CausynVideoHandler(CustomLLM):
         self._persistence_factory = persistence_factory
         self._billing_enqueue = billing_enqueue
 
-    async def _record_usage(self, task_id: str, duration_seconds: float) -> None:
-        persistence = self._persistence_factory()
-        if persistence is None:
-            return
-        try:
-            await persistence.store_video_task_usage(
-                _billing_key(task_id),
-                duration_seconds,
-                CAUSYN_RESOLUTION,
-            )
-        except Exception:  # noqa: BLE001  # a failed record must not turn an accepted generation into an error
-            logger.warning("causyn video billing: failed to record task usage at create", exc_info=True)
-
     async def _bill_completed_video(
         self,
         response: VideoObject,
         task_id: str,
         optional_params: dict[str, object],
+        result: _WorkerResult,
+        logging_obj: object,
     ) -> None:
+        # The worker result is the authoritative usage fact. The Redis metadata
+        # key only carries immutable pricing/attribution captured at enqueue;
+        # neither depends on the best-effort usage DB side channel.
+        try:
+            task_metadata = await fetch_video_generate_task_metadata(
+                task_id, redis=self._redis_factory()
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise _service_error() from exc
+        response.usage = _usage(result.duration_seconds)
         _set_response_cost(response, 0.0)
-        persistence = self._persistence_factory()
-        if persistence is None:
-            return
-        try:
-            raw_usage = await persistence.get_video_task_usage(_billing_key(task_id))
-        except Exception:  # noqa: BLE001  # a failed lookup must skip charging rather than guess
-            logger.warning("causyn video billing: usage lookup failed, skipping charge", exc_info=True)
-            return
-        try:
-            usage = _StoredUsage.model_validate(raw_usage)
-        except ValidationError:
-            logger.warning("causyn video billing: no valid usage record for completed task")
-            return
-        response.usage = _usage(usage.duration_seconds)
-        cost = _completion_cost(optional_params, usage.duration_seconds)
+        cost = _completion_cost(optional_params, result.duration_seconds, task_metadata)
         if cost is None:
             logger.warning("causyn video billing: no valid price for completed task")
             return
+        attribution = _billing_attribution(optional_params, logging_obj)
+        if task_metadata is not None:
+            durable_attribution = task_metadata.get("attribution")
+            if isinstance(durable_attribution, dict):
+                for key in ("api_key", "team_id", "user_id", "organization_id"):
+                    value = durable_attribution.get(key)
+                    if isinstance(value, str) and value:
+                        attribution[key] = value
         try:
-            auth = optional_params.get("user_api_key_dict")
             event = CausynBillingEvent(
                 provider_task_id=task_id,
                 response_cost=cost,
-                team_id=getattr(auth, "team_id", None),
-                user_id=getattr(auth, "user_id", None),
-                organization_id=getattr(auth, "org_id", None),
-                api_key=getattr(auth, "api_key", None),
+                team_id=attribution.get("team_id"),
+                user_id=attribution.get("user_id"),
+                organization_id=attribution.get("organization_id"),
+                api_key=attribution.get("api_key"),
                 model=CAUSYN_MODEL,
             )
-            await self._billing_enqueue(self._redis_factory(), event)
-        except Exception:  # noqa: BLE001  # a failed idempotency check must never risk charging twice
-            logger.warning("causyn video billing: durable outbox enqueue failed, skipping charge", exc_info=True)
-            return
+            enqueued = await self._billing_enqueue(self._redis_factory(), event)
+            if not enqueued:
+                raise RuntimeError("durable outbox did not accept the billing event")
+        except Exception as exc:  # noqa: BLE001  # status must remain retryable until durable delivery succeeds
+            raise _service_error() from exc
         _set_response_cost(response, cost)
 
     def video_generation(
@@ -476,6 +557,12 @@ class CausynVideoHandler(CustomLLM):
             "model": CAUSYN_MODEL,
             "deadline_ts": self._clock() + CAUSYN_DEADLINE_SECONDS,
             "request": request,
+            "task_metadata": {
+                "duration_seconds": float(duration),
+                "video_resolution": CAUSYN_RESOLUTION,
+                "pricing": _pricing_identity(optional_params),
+                "attribution": _billing_attribution(optional_params, logging_obj),
+            },
         }
         try:
             settings = self._settings_factory()
@@ -486,7 +573,6 @@ class CausynVideoHandler(CustomLLM):
             raise CustomLLMError(status_code=status_code, message=message) from None
         except Exception:  # noqa: BLE001  # replace unknown driver details with a stable public error
             raise _service_error() from None
-        await self._record_usage(task_id, float(duration))
         response = VideoObject(
             # The public endpoint decodes this deployment id before routing a
             # status/content request.  Keep the hyphenated form stable because
@@ -588,7 +674,7 @@ class CausynVideoHandler(CustomLLM):
             usage=_usage(duration),
             object_store_result=object_store_result,
         )
-        await self._bill_completed_video(response, task_id, optional_params)
+        await self._bill_completed_video(response, task_id, optional_params, result, logging_obj)
         return response
 
     def video_content(
