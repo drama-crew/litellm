@@ -75,7 +75,8 @@ class _State:
 
 
 class _Billing:
-    def __init__(self) -> None:
+    def __init__(self, trace: list[str] | None = None) -> None:
+        self.trace = trace
         self.stored_usage: dict[str, object] | None = None
         self.mark_calls: list[tuple[str, float, float]] = []
         self.marked_keys: set[str] = set()
@@ -83,6 +84,8 @@ class _Billing:
         self.enqueue_error: Exception | None = None
 
     async def enqueue(self, _: object, event: object) -> bool:
+        if self.trace is not None:
+            self.trace.append("billing")
         if self.enqueue_error is not None:
             raise self.enqueue_error
         event_id = getattr(event, "event_id", None)
@@ -122,11 +125,29 @@ class _Billing:
 
 @dataclass
 class _ContentGet:
+    trace: list[str] | None = None
     calls: list[tuple[str, object, bool]] = field(default_factory=list)
 
     async def __call__(self, url: str, timeout: object, follow_redirects: bool) -> httpx.Response:
+        if self.trace is not None:
+            self.trace.append("download")
         self.calls.append((url, timeout, follow_redirects))
         return httpx.Response(200, content=b"video-bytes", request=httpx.Request("GET", url))
+
+
+@dataclass
+class _RefreshStagingUrl:
+    trace: list[str] | None = None
+    calls: list[tuple[str, object]] = field(default_factory=list)
+    error: Exception | None = None
+
+    async def __call__(self, task_id: str, timeout: object) -> str:
+        if self.trace is not None:
+            self.trace.append("refresh")
+        self.calls.append((task_id, timeout))
+        if self.error is not None:
+            raise self.error
+        return STAGING_URL
 
 
 class _ProxyLogging:
@@ -178,6 +199,8 @@ class _Stack:
     state: _State
     billing: _Billing
     content_get: _ContentGet
+    refresh_staging_url: _RefreshStagingUrl
+    trace: list[str]
     handler: CausynVideoHandler
     allowed_key: str
     other_model_key: str
@@ -186,8 +209,10 @@ class _Stack:
 @pytest.fixture
 def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
     state = _State()
-    billing = _Billing()
-    content_get = _ContentGet()
+    trace: list[str] = []
+    billing = _Billing(trace)
+    content_get = _ContentGet(trace=trace)
+    refresh_staging_url = _RefreshStagingUrl(trace=trace)
 
     async def enqueue(payload: dict[str, object], *, redis_factory: object, settings: object) -> str:
         state.enqueued.append(payload)
@@ -212,6 +237,7 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
         redis_factory=lambda: object(),
         settings_factory=lambda: settings,
         content_get=content_get,
+        refresh_staging_url=refresh_staging_url,
         task_id_factory=lambda: TASK_ID,
         clock=lambda: 2_000_000_000.0,
         persistence_factory=lambda: billing,
@@ -298,6 +324,8 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
         state=state,
         billing=billing,
         content_get=content_get,
+        refresh_staging_url=refresh_staging_url,
+        trace=trace,
         handler=handler,
         allowed_key=allowed_key,
         other_model_key=other_model_key,
@@ -364,6 +392,8 @@ def test_public_endpoint_content_uses_real_router_and_handler(stack: _Stack) -> 
     assert response.status_code == 200, response.text
     assert response.content == b"video-bytes"
     assert stack.content_get.calls == [(STAGING_URL, 600, False)]
+    assert stack.refresh_staging_url.calls == [(TASK_ID, 600)]
+    assert stack.trace == ["billing", "refresh", "download"]
     assert len(stack.billing.outbox_events) == 1
     assert stack.billing.outbox_events[0].response_cost == pytest.approx(0.5)
     assert stack.billing.outbox_events[0].api_key == hash_token(stack.allowed_key)
@@ -386,14 +416,20 @@ def test_public_endpoint_content_outbox_failure_is_retryable_before_download(sta
     failed = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
 
     assert failed.status_code == 503, failed.text
+    assert stack.trace == ["billing"]
+    assert stack.refresh_staging_url.calls == []
     assert stack.content_get.calls == []
     assert stack.billing.outbox_events == []
 
+    stack.trace.clear()
     stack.billing.enqueue_error = None
     recovered = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
 
     assert recovered.status_code == 200, recovered.text
     assert recovered.content == b"video-bytes"
+    assert stack.refresh_staging_url.calls == [(TASK_ID, 600)]
+    assert stack.content_get.calls == [(STAGING_URL, 600, False)]
+    assert stack.trace == ["billing", "refresh", "download"]
     assert len(stack.billing.outbox_events) == 1
 
 
@@ -435,7 +471,7 @@ def test_public_endpoint_preserves_causyn_error_statuses(
         response = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
     else:
         stack.state.status = "succeeded"
-        stack.state.result["staging_url"] = None
+        stack.refresh_staging_url.error = RuntimeError("refresh unavailable")
         response = stack.client.get(f"/v1/videos/{video_id}/content", headers=_auth_headers(stack.allowed_key))
 
     assert response.status_code == status_code, response.text
@@ -462,6 +498,12 @@ async def test_sync_and_async_public_apis_share_causyn_retrieval_contract(stack:
     assert sync_status.status == "completed"
     assert async_status.status == "completed"
     assert sync_content == async_content == b"video-bytes"
+    assert stack.refresh_staging_url.calls == [(TASK_ID, 6000.0), (TASK_ID, 6000.0)]
+    assert stack.content_get.calls == [
+        (STAGING_URL, 6000.0, False),
+        (STAGING_URL, 6000.0, False),
+    ]
+    assert stack.trace[-6:] == ["billing", "refresh", "download", "billing", "refresh", "download"]
 
 
 def test_legacy_causyn_id_and_other_provider_encoding_remain_decodable() -> None:
