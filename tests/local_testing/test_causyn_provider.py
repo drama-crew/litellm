@@ -14,7 +14,13 @@ import litellm
 from litellm.exceptions import BadRequestError
 from litellm.llms.causyn import CausynVideoHandler
 from litellm.llms.causyn import handler as causyn_module
-from litellm.llms.causyn.topaz import TopazAccount, TopazAccountPool, TopazAdvance, TopazVideoAdapter
+from litellm.llms.causyn.topaz import (
+    TopazAccount,
+    TopazAccountPool,
+    TopazAdvance,
+    TopazIndeterminateError,
+    TopazVideoAdapter,
+)
 from litellm.llms.libtv.billing_outbox import CAUSYN_BILLING_STREAM_KEY, enqueue_causyn_billing
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
 from litellm.llms.libtv.transfer import result_key, status_key
@@ -440,6 +446,35 @@ class FakeTopazAdapter:
         return b"upscaled-video"
 
 
+class FailedTopazAdapter:
+    async def advance(
+        self, task_id: str, source_url_factory: object, *, validate_source: object = None
+    ) -> TopazAdvance:
+        assert task_id == TASK_ID
+        return TopazAdvance("failed", attempt_index=4)
+
+    async def content(self, task_id: str) -> bytes:
+        assert task_id == TASK_ID
+        return b"unreachable"
+
+
+class IndeterminateTopazAdapter:
+    def __init__(self, operation: str) -> None:
+        self.operation = operation
+
+    async def advance(
+        self, task_id: str, source_url_factory: object, *, validate_source: object = None
+    ) -> TopazAdvance:
+        assert task_id == TASK_ID
+        if self.operation == "status":
+            raise TopazIndeterminateError("Topaz submission state is indeterminate")
+        return TopazAdvance("completed", provider_task_id="topaz-task", attempt_index=1)
+
+    async def content(self, task_id: str) -> bytes:
+        assert task_id == TASK_ID
+        raise TopazIndeterminateError("Topaz submission state is indeterminate")
+
+
 def set_v2_billing_metadata(redis: FakeRedis, *, requested_resolution: str = "2k") -> None:
     redis.status[f"worker:task:metadata:{TASK_ID}"] = json.dumps(
         {
@@ -632,6 +667,43 @@ async def test_2k_status_and_content_are_idempotent_and_bill_only_0_6_per_second
     assert "topaz-task" not in json.dumps(redis.billing_events[0])
     assert topaz.advance_calls == 3
     assert topaz.content_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_2k_final_failure_uses_product_neutral_public_error() -> None:
+    redis = FakeRedis()
+    set_status(redis, "done", completed_result())
+    set_v2_billing_metadata(redis)
+
+    response = await handler(redis, topaz_adapter=FailedTopazAdapter()).avideo_status(VIDEO_ID, None, None, {}, None)
+
+    serialized = json.dumps(response.model_dump())
+    assert response.status == "failed"
+    assert response.error == {"message": "causyn 2K processing failed", "kind": "provider"}
+    assert "causyn 2K processing" in serialized
+    assert all(term not in serialized.lower() for term in ("topaz", "upscale", "超分"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["status", "content"])
+async def test_2k_indeterminate_public_errors_hide_provider_implementation(
+    operation: str,
+) -> None:
+    redis = FakeRedis()
+    set_status(redis, "done", completed_result())
+    set_v2_billing_metadata(redis)
+    provider = handler(redis, topaz_adapter=IndeterminateTopazAdapter(operation))
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        if operation == "status":
+            await provider.avideo_status(VIDEO_ID, None, None, {}, None)
+        else:
+            await provider.avideo_content(VIDEO_ID, None, None, {}, None)
+
+    assert exc_info.value.status_code == 503
+    public_error = str(exc_info.value)
+    assert "causyn 2K processing indeterminate" in public_error
+    assert all(term not in public_error.lower() for term in ("topaz", "upscale", "超分"))
 
 
 @pytest.mark.asyncio
