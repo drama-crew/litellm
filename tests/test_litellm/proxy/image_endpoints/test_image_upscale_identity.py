@@ -75,3 +75,39 @@ async def test_submitter_accepts_payload_without_organization_id() -> None:
         }
     )
     assert receipt.message != "paid image upscale requires complete billing identity"
+
+
+# ── source registration parity (sync vs async) ───────────────────────────────
+
+
+def test_async_image_upscale_registers_the_source_with_libtv() -> None:
+    """The async path must register the source, exactly like the sync one.
+
+    libtv does not accept an arbitrary URL: every working path (frames2video,
+    mixed2video, video upscale) first turns the source into a libtv-hosted
+    reference via ensure_libtv_url / aensure_libtv_url. The sync image-upscale
+    path did this; the async path -- the one the proxy actually uses -- passed
+    the caller's presigned URL straight through, so production rejected every
+    submit with an upstream "invalid target URL" and the receipt stayed
+    not_submitted (fail-closed, nothing billed, but the feature was unusable).
+
+    Structural: driving the real path needs a live libtv client, and what must
+    not regress is that the async branch calls the registration helper at all.
+    """
+    import ast
+    import inspect
+
+    from litellm.llms.libtv import handler as libtv_handler
+
+    src = inspect.getsource(libtv_handler.LibTVLLM.asubmit_image_upscale)
+    tree = ast.parse(inspect.cleandoc(src))
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "aensure_libtv_url" in called, (
+        "asubmit_image_upscale never registers the source with libtv -- it "
+        "forwards the caller's raw URL, which libtv rejects as an invalid "
+        "target URL"
+    )
