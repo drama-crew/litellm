@@ -1133,7 +1133,19 @@ class LibTVLLM(CustomLLM):
         # presigned object-store link comes back as "invalid target URL" and the
         # submit stays not_submitted.
         source_url = await lt.aensure_libtv_url(
-            *source, _REF_DEFAULT_NAME["image"], require_delegated=True
+            *source,
+            _REF_DEFAULT_NAME["image"],
+            require_delegated=True,
+            # A delegated transfer validates the bytes it moves, so it HARD
+            # REQUIRES both of these: _aensure_uploaded raises
+            # LibTVError(503, "validated Topaz source requires bytes and
+            # SHA-256") without them, and that surfaces as a receipt-less submit
+            # which normalises to an unrecoverable `unknown`.
+            source_bytes=optional_params.get("source_bytes")
+            or optional_params.get("input_reference_bytes"),
+            source_sha256=optional_params.get("source_sha256")
+            or optional_params.get("input_reference_sha256"),
+            source_hard_cap=optional_params.get("source_hard_cap"),
         )
         request_id_value = optional_params.get("provider_request_id") or optional_params.get("request_id")
         if not isinstance(request_id_value, str) or not request_id_value.strip():
