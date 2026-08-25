@@ -111,3 +111,39 @@ def test_async_image_upscale_registers_the_source_with_libtv() -> None:
         "forwards the caller's raw URL, which libtv rejects as an invalid "
         "target URL"
     )
+
+
+def test_async_upscale_passes_the_validated_source_metadata() -> None:
+    """require_delegated=True hard-requires bytes + SHA-256.
+
+    client.py's _aensure_uploaded raises
+    LibTVError(503, "validated Topaz source requires bytes and SHA-256")
+    when either is missing. That exception surfaces as a submit with no durable
+    receipt, which the endpoint conservatively normalises to `unknown` (409) --
+    the severity that forbids automatic failover and leaves the platform polling
+    forever. Observed in production: four upscale nodes stuck "generating", no
+    receipt or pool record written, nothing billed.
+
+    Both values are already in optional_params (asubmit_image_upscale reads them
+    a few lines below); they simply were not forwarded to the registration call.
+    """
+    import ast
+    import inspect
+
+    from litellm.llms.libtv import handler as libtv_handler
+
+    tree = ast.parse(inspect.cleandoc(inspect.getsource(libtv_handler.LibTVLLM.asubmit_image_upscale)))
+    call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "aensure_libtv_url"
+    )
+    kwargs = {kw.arg for kw in call.keywords}
+    for required in ("require_delegated", "source_bytes", "source_sha256"):
+        assert required in kwargs, (
+            f"aensure_libtv_url is called without {required!r}; a delegated "
+            "transfer without bytes+digest raises 503 and the submit degrades "
+            "to an unrecoverable `unknown`"
+        )
