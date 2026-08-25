@@ -201,7 +201,10 @@ async def test_invalid_billing_contract_blocks_provider_create(cost):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("identity_field", ["team_id", "api_key", "user_id", "organization_id"])
+# organization_id is deliberately NOT in this list -- drama project keys carry
+# organization_id: null (an org is a LiteLLM team there), so requiring it blocked
+# 100% of real paid upscales. team/key/user still fail closed.
+@pytest.mark.parametrize("identity_field", ["team_id", "api_key", "user_id"])
 async def test_missing_billing_identity_blocks_provider_create(identity_field):
     calls = []
 

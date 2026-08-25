@@ -194,10 +194,12 @@ class _EndpointRouter:
 @pytest.mark.parametrize(
     "identity",
     [
+        # org_id intentionally absent from this matrix: drama models an org as a
+        # LiteLLM team and never mints organization rows, so requiring it rejected
+        # every real paid upscale. See _has_complete_paid_image_upscale_identity.
         {"api_key": "key-1", "user_id": "user-1", "org_id": "org-1"},
         {"team_id": "team-1", "user_id": "user-1", "org_id": "org-1"},
         {"team_id": "team-1", "api_key": "key-1", "org_id": "org-1"},
-        {"team_id": "team-1", "api_key": "key-1", "user_id": "user-1"},
     ],
 )
 async def test_image_upscale_submit_fails_closed_before_all_side_effects_for_incomplete_billing_identity(

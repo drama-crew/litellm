@@ -453,13 +453,25 @@ def _team_id(user_api_key_dict: UserAPIKeyAuth) -> str | None:
 
 
 def _has_complete_paid_image_upscale_identity(user_api_key_dict: UserAPIKeyAuth) -> bool:
+    """Attribution must be complete before a paid image upscale is submitted.
+
+    ``org_id`` is deliberately NOT required. drama models an organization as a
+    LiteLLM *team* (team_id = the Keycloak org subject; for a personal org it
+    equals the user id) and never creates LiteLLM ``organization`` rows --
+    production has zero of them, so every drama project key carries
+    ``organization_id: null``. Requiring org_id therefore rejected 100% of paid
+    upscales with "requires complete billing identity" before any provider call,
+    while adding no attribution the team already carries.
+
+    The three fields below are the ones spend is actually attributed by, and
+    they stay mandatory.
+    """
     return all(
         isinstance(value, str) and bool(value.strip())
         for value in (
             getattr(user_api_key_dict, "team_id", None),
             getattr(user_api_key_dict, "api_key", None),
             getattr(user_api_key_dict, "user_id", None),
-            getattr(user_api_key_dict, "org_id", None),
         )
     )
 
