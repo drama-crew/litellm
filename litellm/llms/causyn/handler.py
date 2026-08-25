@@ -41,7 +41,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Literal, Protocol, cast
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
@@ -63,13 +63,17 @@ from litellm.litellm_core_utils.asyncify import run_async_function  # pyright: i
 from litellm.types.utils import all_litellm_params
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
+from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
 
 CAUSYN_MODEL = "causyn-1.0"
 PROVIDER = "causyn"
 CAUSYN_VIDEO_ID_PREFIX = "causyn_"
 LEGACY_VIDEO_ID_PREFIX = CAUSYN_VIDEO_ID_PREFIX
 CAUSYN_RESOLUTION = "768x512"
+CAUSYN_2K_RESOLUTION = "2k"
+CAUSYN_RESOLUTIONS = frozenset({CAUSYN_RESOLUTION, CAUSYN_2K_RESOLUTION})
 CAUSYN_BILLING_METADATA_VERSION = "causyn-video-billing-v1"
+CAUSYN_BILLING_METADATA_VERSION_V2 = "causyn-video-billing-v2"
 CAUSYN_RATIO = "3:2"
 CAUSYN_DEADLINE_SECONDS = 1800.0
 _INTERNAL_VIDEO_FLAG = "DRAMA_INTERNAL_VIDEO_ENABLED"
@@ -80,6 +84,8 @@ _CAUSYN_SERVICE_API_KEY_ENV = "DRAMA_CAUSYN_SERVICE_API_KEY"
 _CAUSYN_REFRESH_PATH = "/api/service/causyn/tasks"
 _TASK_ID_PATTERN = re.compile(r"[0-9a-f]{32}")
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
+
+
 _STATUS_TO_OPENAI = {
     "queued": "queued",
     "claimed": "in_progress",
@@ -149,18 +155,13 @@ async def _default_content_get(
         return await client.get(url)
 
 
-def _normalize_causyn_platform_origin(value: str) -> str | None:
-    """Return a safe origin for the fixed platform refresh route.
-
-    This is deliberately stricter than a generic URL parser: this setting is
-    an origin, not a caller-controlled URL.  Rejecting authority delimiters,
-    alternate IP spellings, and non-origin components prevents the value from
-    changing either the host or the fixed refresh path.
-    """
+def _parse_causyn_platform_origin(value: str) -> tuple[SplitResult, str, int | None] | None:
     if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value) or "\\" in value:
         return None
     try:
         parsed = urlsplit(value)
+        hostname = parsed.hostname
+        port = parsed.port
     except ValueError:
         return None
     if parsed.scheme.lower() not in {"http", "https"}:
@@ -169,59 +170,71 @@ def _normalize_causyn_platform_origin(value: str) -> str | None:
         return None
     if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         return None
-    if not parsed.netloc or "%" in parsed.netloc:
-        return None
-    try:
-        hostname = parsed.hostname
-    except ValueError:
-        return None
-    if not hostname:
-        return None
-    try:
-        port = parsed.port
-    except ValueError:
+    if not parsed.netloc or "%" in parsed.netloc or not hostname:
         return None
     if port is not None and not 1 <= port <= 65535:
         return None
+    return parsed, hostname, port
 
-    authority = parsed.netloc
-    if authority.startswith("["):
-        closing = authority.find("]")
-        if closing < 0:
-            return None
-        literal = authority[1:closing]
+
+def _normalize_causyn_ipv6_authority(authority: str) -> str | None:
+    closing = authority.find("]")
+    if closing < 0:
+        return None
+    literal = authority[1:closing]
+    try:
+        normalized_host = f"[{ipaddress.IPv6Address(literal).compressed.lower()}]"
+    except ValueError:
+        return None
+    suffix = authority[closing + 1 :]
+    if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+        return None
+    return None if suffix == ":" else normalized_host
+
+
+def _normalize_causyn_hostname_authority(authority: str, hostname: str) -> str | None:
+    if "[" in authority or "]" in authority or authority.count(":") > 1:
+        return None
+    if ":" in authority and not authority.rsplit(":", 1)[1].isdigit():
+        return None
+    host_part = authority.rsplit(":", 1)[0] if ":" in authority else authority
+    if not host_part or host_part.lower() != hostname.lower():
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", hostname):
+        return None
+    if hostname.startswith(".") or hostname.endswith(".") or ".." in hostname:
+        return None
+    if all(char.isdigit() or char == "." for char in hostname):
         try:
-            normalized_host = f"[{ipaddress.IPv6Address(literal).compressed.lower()}]"
+            ipaddress.IPv4Address(hostname)
         except ValueError:
             return None
-        suffix = authority[closing + 1 :]
-        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
-            return None
-        if suffix == ":":
-            return None
-    else:
-        if "[" in authority or "]" in authority or authority.count(":") > 1:
-            return None
-        if ":" in authority and not authority.rsplit(":", 1)[1].isdigit():
-            return None
-        host_part = authority.rsplit(":", 1)[0] if ":" in authority else authority
-        if not host_part or host_part.lower() != hostname.lower():
-            return None
-        if not re.fullmatch(r"[A-Za-z0-9.-]+", hostname):
-            return None
-        if hostname.startswith(".") or hostname.endswith(".") or ".." in hostname:
-            return None
-        if all(char.isdigit() or char == "." for char in hostname):
-            try:
-                ipaddress.IPv4Address(hostname)
-            except ValueError:
-                return None
-        elif hostname.lower().startswith("0x"):
-            # Reject WHATWG-style hexadecimal IPv4 numbers instead of treating
-            # them as a DNS label that another HTTP client may reinterpret.
-            return None
-        normalized_host = hostname.lower()
+    elif hostname.lower().startswith("0x"):
+        return None
+    return hostname.lower()
 
+
+def _normalize_causyn_platform_authority(authority: str, hostname: str) -> str | None:
+    if authority.startswith("["):
+        return _normalize_causyn_ipv6_authority(authority)
+    return _normalize_causyn_hostname_authority(authority, hostname)
+
+
+def _normalize_causyn_platform_origin(value: str) -> str | None:
+    """Return a safe origin for the fixed platform refresh route.
+
+    This is deliberately stricter than a generic URL parser: this setting is
+    an origin, not a caller-controlled URL.  Rejecting authority delimiters,
+    alternate IP spellings, and non-origin components prevents the value from
+    changing either the host or the fixed refresh path.
+    """
+    parsed_origin = _parse_causyn_platform_origin(value)
+    if parsed_origin is None:
+        return None
+    parsed, hostname, port = parsed_origin
+    normalized_host = _normalize_causyn_platform_authority(parsed.netloc, hostname)
+    if normalized_host is None:
+        return None
     normalized_port = f":{port}" if port is not None else ""
     return f"{parsed.scheme.lower()}://{normalized_host}{normalized_port}"
 
@@ -251,8 +264,8 @@ def _new_task_id() -> str:
     return uuid.uuid4().hex
 
 
-def _default_redis_factory() -> object:
-    redis: object = get_transfer_redis(os.getenv("LIBTV_VIDEO_GENERATE_REDIS_URL"))
+def _default_redis_factory() -> TopazRedis:
+    redis = get_transfer_redis(os.getenv("LIBTV_VIDEO_GENERATE_REDIS_URL"))
     if redis is None:
         raise VideoGenerateError("misconfigured", "no redis URL configured for video-generate")
     return redis
@@ -353,12 +366,12 @@ def _resolution(optional_params: dict[str, object]) -> str:
     if resolution is not missing and size is not missing and resolution != size:
         raise _bad_request("resolution and size must match")
     canonical = resolution if resolution is not missing else size
-    if canonical != CAUSYN_RESOLUTION:
-        raise _bad_request(f"resolution must be {CAUSYN_RESOLUTION}")
-    return CAUSYN_RESOLUTION
+    if canonical not in CAUSYN_RESOLUTIONS:
+        raise _bad_request(f"resolution must be one of {CAUSYN_RESOLUTION}, {CAUSYN_2K_RESOLUTION}")
+    return str(canonical)
 
 
-def _request(model: str, prompt: object, optional_params: dict[str, object]) -> tuple[dict[str, object], int]:
+def _request(model: str, prompt: object, optional_params: dict[str, object]) -> tuple[dict[str, object], int, str]:
     if model != CAUSYN_MODEL:
         raise _bad_request("unsupported causyn model")
     if not isinstance(prompt, str) or not prompt.strip():
@@ -368,7 +381,7 @@ def _request(model: str, prompt: object, optional_params: dict[str, object]) -> 
     )
     if unsupported:
         raise _bad_request(f"unsupported causyn video parameter: {', '.join(unsupported)}")
-    resolution = _resolution(optional_params)
+    requested_resolution = _resolution(optional_params)
     ratio = optional_params.get("aspect_ratio")
     if ratio is not None and ratio != CAUSYN_RATIO:
         raise _bad_request(f"aspect_ratio must be {CAUSYN_RATIO}")
@@ -385,7 +398,7 @@ def _request(model: str, prompt: object, optional_params: dict[str, object]) -> 
     request: dict[str, object] = {
         "prompt": prompt,
         "duration_seconds": duration,
-        "resolution": resolution,
+        "resolution": CAUSYN_RESOLUTION,
         "ratio": CAUSYN_RATIO,
         # Materialize the platform default in the worker contract so the
         # native-audio choice cannot disappear between /v1/videos and Redis.
@@ -394,7 +407,7 @@ def _request(model: str, prompt: object, optional_params: dict[str, object]) -> 
     }
     if seed is not None:
         request["seed"] = seed
-    return request, duration
+    return request, duration, requested_resolution
 
 
 class _WorkerError(BaseModel):
@@ -430,12 +443,13 @@ class _StatusEnvelope(BaseModel):
 class _Pricing(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    model: Literal[CAUSYN_MODEL]
+    model: Literal["causyn-1.0"]
     id: str = Field(min_length=1)
     output_cost_per_second_768x512: float | None = Field(default=None, gt=0)
+    output_cost_per_second_2k: float | None = Field(default=None, gt=0)
     output_cost_per_second: float | None = Field(default=None, gt=0)
 
-    @field_validator("output_cost_per_second_768x512", "output_cost_per_second")
+    @field_validator("output_cost_per_second_768x512", "output_cost_per_second_2k", "output_cost_per_second")
     @classmethod
     def _requires_finite_rate(cls, value: float | None) -> float | None:
         if value is not None and not math.isfinite(value):
@@ -451,8 +465,12 @@ class _Pricing(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def _requires_rate(self) -> "_Pricing":
-        if self.output_cost_per_second_768x512 is None and self.output_cost_per_second is None:
+    def _requires_rate(self) -> _Pricing:
+        if (
+            self.output_cost_per_second_768x512 is None
+            and self.output_cost_per_second_2k is None
+            and self.output_cost_per_second is None
+        ):
             raise ValueError("pricing must include an output rate")
         return self
 
@@ -486,11 +504,37 @@ class _DurableAttribution(BaseModel):
 class _DurableTaskMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    version: Literal[CAUSYN_BILLING_METADATA_VERSION]
+    version: Literal["causyn-video-billing-v1"]
     duration_seconds: float = Field(ge=3, le=8)
-    video_resolution: Literal[CAUSYN_RESOLUTION]
+    video_resolution: Literal["768x512"]
     pricing: _Pricing
     attribution: _DurableAttribution
+
+    @model_validator(mode="after")
+    def _requires_native_price(self) -> _DurableTaskMetadata:
+        if self.pricing.output_cost_per_second_768x512 is None and self.pricing.output_cost_per_second is None:
+            raise ValueError("768x512 pricing rate is required")
+        return self
+
+
+class _DurableTaskMetadataV2(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version: Literal["causyn-video-billing-v2"]
+    duration_seconds: float = Field(ge=3, le=8)
+    source_resolution: Literal["768x512"]
+    requested_resolution: Literal["768x512", "2k"]
+    pricing: _Pricing
+    attribution: _DurableAttribution
+
+    @model_validator(mode="after")
+    def _requires_resolution_price(self) -> _DurableTaskMetadataV2:
+        if self.requested_resolution == "2k" and self.pricing.output_cost_per_second_2k is None:
+            raise ValueError("2k pricing rate is required")
+        if self.requested_resolution == "768x512":
+            if self.pricing.output_cost_per_second_768x512 is None and self.pricing.output_cost_per_second is None:
+                raise ValueError("768x512 pricing rate is required")
+        return self
 
 
 def _public_worker_error(error: _WorkerError | None) -> dict[str, str]:
@@ -501,8 +545,8 @@ def _public_worker_error(error: _WorkerError | None) -> dict[str, str]:
     return {"code": code, "message": "video generation failed", "kind": kind}
 
 
-def _usage(duration: float) -> dict[str, float | str]:
-    return {"duration_seconds": duration, "video_resolution": CAUSYN_RESOLUTION}
+def _usage(duration: float, resolution: str = CAUSYN_RESOLUTION) -> dict[str, float | str]:
+    return {"duration_seconds": duration, "video_resolution": resolution}
 
 
 def _billing_key(task_id: str) -> str:
@@ -513,9 +557,13 @@ def _staging_key(task_id: str) -> str:
     return f"staging/video-tasks/{task_id}.mp4"
 
 
-def _completion_cost(pricing: _Pricing, duration_seconds: float) -> float:
-    rate = pricing.output_cost_per_second_768x512 or pricing.output_cost_per_second
-    assert rate is not None
+def _completion_cost(pricing: _Pricing, duration_seconds: float, resolution: str = CAUSYN_RESOLUTION) -> float:
+    if resolution == CAUSYN_2K_RESOLUTION:
+        rate = pricing.output_cost_per_second_2k
+    else:
+        rate = pricing.output_cost_per_second_768x512 or pricing.output_cost_per_second
+    if rate is None:
+        raise ValueError("pricing rate is unavailable")
     return rate * duration_seconds
 
 
@@ -551,6 +599,26 @@ def _hashed_api_key(value: object) -> str | None:
     return None
 
 
+def _first_billing_value(values: dict[str, object], keys: tuple[str, ...]) -> object:
+    for key in keys:
+        if values.get(key) is not None:
+            return values[key]
+    return None
+
+
+def _billing_auth_value(auth: object, key: str) -> object:
+    if isinstance(auth, dict):
+        return auth.get(key)
+    return getattr(auth, key, None)
+
+
+def _billing_identifier(values: dict[str, object], auth: object, keys: tuple[str, ...], auth_attr: str) -> str | None:
+    value = _first_billing_value(values, keys)
+    if value is None:
+        value = _billing_auth_value(auth, auth_attr)
+    return value if isinstance(value, str) else None
+
+
 def _billing_attribution(optional_params: dict[str, object], logging_obj: object) -> dict[str, str]:
     """Extract proxy-auth metadata, whose token value is already hashed."""
     auth = optional_params.get("user_api_key_dict")
@@ -559,20 +627,9 @@ def _billing_attribution(optional_params: dict[str, object], logging_obj: object
         for key, value in source.items():
             values.setdefault(key, value)
 
-    def first(*keys: str) -> object:
-        for key in keys:
-            if values.get(key) is not None:
-                return values[key]
-        return None
-
-    def auth_value(key: str) -> object:
-        if isinstance(auth, dict):
-            return auth.get(key)
-        return getattr(auth, key, None)
-
-    api_key = _hashed_api_key(first("user_api_key_hash", "user_api_key"))
+    api_key = _hashed_api_key(_first_billing_value(values, ("user_api_key_hash", "user_api_key")))
     if api_key is None:
-        api_key = _hashed_api_key(auth_value("api_key"))
+        api_key = _hashed_api_key(_billing_auth_value(auth, "api_key"))
     attribution: dict[str, str] = {}
     if api_key is not None:
         attribution["api_key"] = api_key
@@ -581,15 +638,13 @@ def _billing_attribution(optional_params: dict[str, object], logging_obj: object
         ("user_id", ("user_api_key_user_id", "user_id"), "user_id"),
         ("organization_id", ("user_api_key_org_id", "org_id", "organization_id"), "org_id"),
     ):
-        value = first(*keys)
-        if value is None:
-            value = auth_value(auth_attr)
-        if isinstance(value, str):
+        value = _billing_identifier(values, auth, keys, auth_attr)
+        if value is not None:
             attribution[field] = value
     return attribution
 
 
-def _pricing_identity(optional_params: dict[str, object], logging_obj: object) -> dict[str, object]:
+def _model_info_from_logging(logging_obj: object) -> object:
     raw: object = None
     details = getattr(logging_obj, "model_call_details", None)
     if isinstance(details, dict):
@@ -597,6 +652,11 @@ def _pricing_identity(optional_params: dict[str, object], logging_obj: object) -
         params = details.get("litellm_params")
         if raw is None and isinstance(params, dict):
             raw = params.get("model_info")
+    return raw
+
+
+def _pricing_model_info(optional_params: dict[str, object], logging_obj: object) -> object:
+    raw = _model_info_from_logging(logging_obj)
     if raw is None:
         for source in _metadata_sources(optional_params, logging_obj):
             candidate = source.get("model_info")
@@ -605,6 +665,11 @@ def _pricing_identity(optional_params: dict[str, object], logging_obj: object) -
                 break
     if raw is None:
         raw = optional_params.get("model_info")
+    return raw
+
+
+def _pricing_identity(optional_params: dict[str, object], logging_obj: object) -> dict[str, object]:
+    raw = _pricing_model_info(optional_params, logging_obj)
     if isinstance(raw, BaseModel):
         raw = raw.model_dump()
     if not isinstance(raw, dict):
@@ -613,7 +678,7 @@ def _pricing_identity(optional_params: dict[str, object], logging_obj: object) -
     model_id = raw.get("id")
     if isinstance(model_id, str) and model_id:
         pricing["id"] = model_id
-    for key in ("output_cost_per_second_768x512", "output_cost_per_second"):
+    for key in ("output_cost_per_second_768x512", "output_cost_per_second_2k", "output_cost_per_second"):
         value = raw.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
             pricing[key] = float(value)
@@ -638,7 +703,7 @@ class CausynVideoHandler(CustomLLM):
     def __init__(
         self,
         *,
-        redis_factory: Callable[[], object] | None = None,
+        redis_factory: Callable[[], TopazRedis] | None = None,
         settings_factory: Callable[[], VideoGenerateSettings] = VideoGenerateSettings.from_environment,
         content_get: ContentGet = _default_content_get,
         refresh_staging_url: RefreshUrl = _default_refresh_staging_url,
@@ -646,6 +711,7 @@ class CausynVideoHandler(CustomLLM):
         clock: Callable[[], float] = time.time,
         persistence_factory: PersistenceFactory = _default_persistence_factory,
         billing_enqueue: BillingEnqueue | None = None,
+        topaz_adapter: TopazVideoAdapter | None = None,
     ) -> None:
         super().__init__()
         self._redis_factory = redis_factory or _redis_factory
@@ -656,6 +722,7 @@ class CausynVideoHandler(CustomLLM):
         self._clock = clock
         self._persistence_factory = persistence_factory
         self._billing_enqueue = billing_enqueue if billing_enqueue is not None else enqueue_causyn_billing
+        self._topaz_adapter = topaz_adapter
 
     async def _bill_completed_video(
         self,
@@ -669,16 +736,22 @@ class CausynVideoHandler(CustomLLM):
         # key only carries immutable pricing/attribution captured at enqueue;
         # neither depends on the best-effort usage DB side channel.
         try:
-            task_metadata = await fetch_video_generate_task_metadata(
-                task_id, redis=self._redis_factory()
-            )
+            task_metadata = await fetch_video_generate_task_metadata(task_id, redis=self._redis_factory())
         except Exception as exc:  # noqa: BLE001
             raise _service_error() from exc
         try:
-            durable = _DurableTaskMetadata.model_validate(task_metadata)
-        except ValidationError as exc:
-            logger.warning("causyn video billing: task metadata is missing or invalid")
-            raise _service_error() from exc
+            durable = _DurableTaskMetadataV2.model_validate(task_metadata)
+            requested_resolution = durable.requested_resolution
+            source_resolution = durable.source_resolution
+        except ValidationError:
+            try:
+                durable_v1 = _DurableTaskMetadata.model_validate(task_metadata)
+            except ValidationError as exc:
+                logger.warning("causyn video billing: task metadata is missing or invalid")
+                raise _service_error() from exc
+            durable = durable_v1
+            requested_resolution = durable_v1.video_resolution
+            source_resolution = durable_v1.video_resolution
         # Ordered durations are whole seconds (3..8), so a worker that rendered
         # something other than what was ordered is off by at least a second.
         # Anything smaller is frame quantisation, not a mismatch: the pipeline
@@ -692,15 +765,20 @@ class CausynVideoHandler(CustomLLM):
         if abs(durable.duration_seconds - result.duration_seconds) > _DURATION_RECONCILE_TOLERANCE_SECONDS:
             logger.warning("causyn video billing: task metadata duration does not match worker result")
             raise _service_error()
-        if durable.video_resolution != f"{result.width}x{result.height}":
+        if source_resolution != f"{result.width}x{result.height}":
             logger.warning("causyn video billing: task metadata resolution does not match worker result")
             raise _service_error()
-        response.usage = _usage(result.duration_seconds)
+        response.usage = _usage(result.duration_seconds, requested_resolution)
         _set_response_cost(response, 0.0)
         # Never bill above the quote. The two differ by that extra frame on every
         # single render, so billing the worker's figure charged 5.0417s against a
         # 5s quote every time.
-        cost = _completion_cost(durable.pricing, min(durable.duration_seconds, result.duration_seconds))
+        try:
+            cost = _completion_cost(
+                durable.pricing, min(durable.duration_seconds, result.duration_seconds), requested_resolution
+            )
+        except ValueError as exc:
+            raise _service_error() from exc
         attribution = durable.attribution.model_dump()
         try:
             event = CausynBillingEvent(
@@ -719,22 +797,68 @@ class CausynVideoHandler(CustomLLM):
             raise _service_error() from exc
         _set_response_cost(response, cost)
 
-    def _completed_response(self, video_id: str, task_id: str, result: _WorkerResult) -> VideoObject:
+    def _completed_response(
+        self,
+        video_id: str,
+        task_id: str,
+        result: _WorkerResult,
+        resolution: str = CAUSYN_RESOLUTION,
+        object_store_result: bool = True,
+    ) -> VideoObject:
         if result.staging_key != _staging_key(task_id):
             raise _service_error("causyn video result is unavailable")
         duration = result.duration_seconds
-        object_store_result = result.model_dump(exclude={"staging_url"}, exclude_none=True)
+        result_payload = result.model_dump(exclude={"staging_url"}, exclude_none=True)
         return VideoObject(
             id=video_id,
             object="video",
             status="completed",
             completed_at=int(self._clock()),
             seconds=str(duration),
-            size=CAUSYN_RESOLUTION,
+            size=resolution,
             model=CAUSYN_MODEL,
-            usage=_usage(duration),
-            object_store_result=object_store_result,
+            usage=_usage(duration, resolution),
+            object_store_result=result_payload if object_store_result else None,
         )
+
+    async def _task_metadata(self, task_id: str) -> _DurableTaskMetadata | _DurableTaskMetadataV2:
+        try:
+            raw = await fetch_video_generate_task_metadata(task_id, redis=self._redis_factory())
+        except Exception as exc:
+            raise _service_error() from exc
+        try:
+            return _DurableTaskMetadataV2.model_validate(raw)
+        except ValidationError:
+            try:
+                return _DurableTaskMetadata.model_validate(raw)
+            except ValidationError as exc:
+                raise _service_error() from exc
+
+    def _get_topaz_adapter(self) -> TopazVideoAdapter:
+        if self._topaz_adapter is None:
+            try:
+                self._topaz_adapter = TopazVideoAdapter.from_environment(
+                    redis_factory=self._redis_factory, now=self._clock
+                )
+            except Exception as exc:
+                raise _service_error() from exc
+        return self._topaz_adapter
+
+    async def _advance_topaz(self, task_id: str, timeout: RequestTimeout) -> TopazAdvance:
+        settings = self._settings_factory()
+
+        async def source_url(task: str) -> str:
+            return await self._refresh_staging_url(task, timeout)
+
+        def validate_source(url: str) -> None:
+            validate_video_generate_url(url, settings.target_hosts, settings, "staging source")
+
+        try:
+            return await self._get_topaz_adapter().advance(task_id, source_url, validate_source=validate_source)
+        except TopazIndeterminateError as exc:
+            raise _service_error("causyn Topaz submission state is indeterminate") from exc
+        except Exception as exc:
+            raise _service_error() from exc
 
     def video_generation(
         self,
@@ -762,22 +886,26 @@ class CausynVideoHandler(CustomLLM):
     ) -> VideoObject:
         if not _enabled():
             raise CustomLLMError(status_code=403, message="causyn video generation is disabled")
-        request, duration = _request(model, prompt, optional_params)
+        request, duration, requested_resolution = _request(model, prompt, optional_params)
         task_id = self._task_id_factory()
         if _TASK_ID_PATTERN.fullmatch(task_id) is None:
             raise _service_error()
         task_metadata = {
-            "version": CAUSYN_BILLING_METADATA_VERSION,
+            "version": CAUSYN_BILLING_METADATA_VERSION_V2,
             "duration_seconds": float(duration),
-            "video_resolution": CAUSYN_RESOLUTION,
+            "source_resolution": CAUSYN_RESOLUTION,
+            "requested_resolution": requested_resolution,
             "pricing": _pricing_identity(optional_params, logging_obj),
             "attribution": _durable_attribution(optional_params, logging_obj),
         }
         try:
-            durable_metadata = _DurableTaskMetadata.model_validate(task_metadata)
+            metadata_model: _DurableTaskMetadata | _DurableTaskMetadataV2 = _DurableTaskMetadataV2.model_validate(
+                task_metadata
+            )
         except ValidationError as exc:
             logger.warning("causyn video billing: deployment pricing metadata is missing or invalid")
             raise _service_error() from exc
+        durable_metadata = metadata_model
         serialized_metadata = durable_metadata.model_dump()
         serialized_metadata["pricing"] = durable_metadata.pricing.model_dump(exclude_none=True)
         payload = {
@@ -805,9 +933,9 @@ class CausynVideoHandler(CustomLLM):
             status="queued",
             created_at=int(self._clock()),
             seconds=str(duration),
-            size=CAUSYN_RESOLUTION,
+            size=requested_resolution,
             model=CAUSYN_MODEL,
-            usage=_usage(duration),
+            usage=_usage(duration, requested_resolution),
         )
         _set_response_cost(response, 0.0)
         return response
@@ -882,7 +1010,28 @@ class CausynVideoHandler(CustomLLM):
         if result is None:
             raise _service_error("causyn video result is unavailable")
         task_id = _decode_task_id(video_id)
-        response = self._completed_response(video_id, task_id, result)
+        base_response = self._completed_response(video_id, task_id, result)
+        metadata = await self._task_metadata(task_id)
+        requested_resolution = (
+            metadata.requested_resolution if isinstance(metadata, _DurableTaskMetadataV2) else metadata.video_resolution
+        )
+        if requested_resolution == CAUSYN_2K_RESOLUTION:
+            topaz = await self._advance_topaz(task_id, timeout)
+            if topaz.status == "in_progress":
+                return VideoObject(id=video_id, object="video", status="in_progress", model=CAUSYN_MODEL)
+            if topaz.status == "failed":
+                return VideoObject(
+                    id=video_id,
+                    object="video",
+                    status="failed",
+                    model=CAUSYN_MODEL,
+                    error={"message": "causyn Topaz upscale failed", "kind": "provider"},
+                )
+            response = self._completed_response(
+                video_id, task_id, result, resolution=CAUSYN_2K_RESOLUTION, object_store_result=False
+            )
+        else:
+            response = base_response
         await self._bill_completed_video(response, task_id, optional_params, result, logging_obj)
         return response
 
@@ -923,12 +1072,48 @@ class CausynVideoHandler(CustomLLM):
         body = await self._status(video_id)
         if body.status != "succeeded":
             raise CustomLLMError(status_code=409, message="causyn video is not ready")
-        result = body.result
         task_id = _decode_task_id(video_id)
-        if result is None or result.staging_key != _staging_key(task_id):
+        result = body.result
+        if result is None:
             raise CustomLLMError(status_code=502, message="causyn video content is unavailable")
+        if result.staging_key != _staging_key(task_id):
+            raise CustomLLMError(status_code=502, message="causyn video content is unavailable")
+        metadata = await self._task_metadata(task_id)
+        requested_resolution = (
+            metadata.requested_resolution if isinstance(metadata, _DurableTaskMetadataV2) else metadata.video_resolution
+        )
+        if requested_resolution == CAUSYN_2K_RESOLUTION:
+            return await self._topaz_content(
+                video_id, task_id, api_key, api_base, optional_params, logging_obj, timeout, client
+            )
         response = self._completed_response(video_id, task_id, result)
         await self._bill_completed_video(response, task_id, optional_params, result, logging_obj)
+        return await self._staging_content(task_id, timeout, response)
+
+    async def _topaz_content(
+        self,
+        video_id: str,
+        task_id: str,
+        api_key: str | None,
+        api_base: str | None,
+        optional_params: dict[str, object],
+        logging_obj: object,
+        timeout: RequestTimeout,
+        client: AsyncHTTPHandler | None,
+    ) -> bytes:
+        status_response = await self.avideo_status(
+            video_id, api_key, api_base, optional_params, logging_obj, timeout, client
+        )
+        if status_response.status != "completed":
+            raise CustomLLMError(status_code=409, message="causyn video is not ready")
+        try:
+            return await self._get_topaz_adapter().content(task_id)
+        except TopazIndeterminateError as exc:
+            raise _service_error("causyn Topaz submission state is indeterminate") from exc
+        except Exception as exc:
+            raise _service_error() from exc
+
+    async def _staging_content(self, task_id: str, timeout: RequestTimeout, response: VideoObject) -> bytes:
         try:
             staging_url = await self._refresh_staging_url(task_id, timeout)
         except Exception:  # noqa: BLE001  # do not expose internal service details
