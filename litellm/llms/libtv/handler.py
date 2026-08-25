@@ -1131,7 +1131,17 @@ class LibTVLLM(CustomLLM):
             raise LibTVError(status_code=422, message="paid image upscale requires request_id")
         request_id = request_id_value.strip()
         model_info = optional_params.get("model_info") or {}
+        # ``model_info`` belongs to all_litellm_params, so litellm/images/main.py
+        # strips it from non_default_params before any provider handler runs --
+        # it is always absent here in production. Fall back to the per-deployment
+        # ``libtv_status_model`` (a plain litellm_params key, therefore flattened
+        # into optional_params), exactly as the video create path already does.
+        # Without an id the submitter recorded the literal "unknown", which
+        # _client_for_receipt cannot resolve, permanently stranding billed tasks.
         deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+        if not isinstance(deployment_id, str) or not deployment_id:
+            status_model = optional_params.get("libtv_status_model")
+            deployment_id = status_model if isinstance(status_model, str) and status_model else None
         return await lt.asubmit_image_upscale(
             model,
             spec["vendor"],

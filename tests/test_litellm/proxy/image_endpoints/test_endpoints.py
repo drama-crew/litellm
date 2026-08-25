@@ -1442,3 +1442,58 @@ async def test_image_upscale_poll_maps_receipt_credential_failure_to_503(monkeyp
     )
 
     assert response.status_code == 503
+
+
+def test_image_upscale_pool_accepts_provider_declared_by_model_prefix():
+    """Production libtv deployments declare the provider via the ``model:`` prefix
+    only -- ``custom_llm_provider`` is never set in config and the Router does not
+    inject it. Requiring that key emptied the pool, which silently disabled
+    multi-account failover and degraded every receipt to deployment_id="unknown"
+    (making poll/resume permanently unavailable for already-billed tasks)."""
+    router = SimpleNamespace(
+        get_model_list=lambda **kwargs: [
+            {
+                "model_info": {"id": "libtv-topaz-image-upscaler-account-1"},
+                "litellm_params": {
+                    "model": "libtv/topaz-image-upscaler",
+                    "api_key": "os.environ/LIBTV_TOKEN",
+                    "webid": "os.environ/LIBTV_WEBID",
+                },
+            },
+            {
+                "model_info": {"id": "libtv-topaz-image-upscaler-account-2"},
+                "litellm_params": {
+                    "model": "libtv/topaz-image-upscaler",
+                    "api_key": "os.environ/LIBTV_TOKEN_2",
+                    "webid": "os.environ/LIBTV_WEBID_2",
+                },
+            },
+        ]
+    )
+    pool = endpoints._image_upscale_deployment_pool(router, "topaz-image-upscaler")
+    assert [entry["id"] for entry in pool] == [
+        "libtv-topaz-image-upscaler-account-1",
+        "libtv-topaz-image-upscaler-account-2",
+    ]
+    assert [entry["api_key"] for entry in pool] == ["os.environ/LIBTV_TOKEN", "os.environ/LIBTV_TOKEN_2"]
+    assert [entry["webid"] for entry in pool] == ["os.environ/LIBTV_WEBID", "os.environ/LIBTV_WEBID_2"]
+
+
+def test_image_upscale_pool_excludes_non_libtv_providers():
+    router = SimpleNamespace(
+        get_model_list=lambda **kwargs: [
+            {
+                "model_info": {"id": "openai-deployment"},
+                "litellm_params": {"model": "openai/topaz-image-upscaler"},
+            },
+            {
+                "model_info": {"id": "bare-model-no-provider"},
+                "litellm_params": {"model": "topaz-image-upscaler"},
+            },
+            {
+                "model_info": {"id": "wrong-model"},
+                "litellm_params": {"model": "libtv/some-other-model"},
+            },
+        ]
+    )
+    assert endpoints._image_upscale_deployment_pool(router, "topaz-image-upscaler") == []

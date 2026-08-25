@@ -5,7 +5,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, TypedDict
 from urllib.parse import urlsplit
 
 import httpx
@@ -323,6 +323,27 @@ def parse_progress(payload: Dict[str, Any], kind: str, task_id: Optional[str] = 
         result = {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
         return result
     return {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
+
+
+def select_image_upscale_providers(
+    pool_providers: Sequence[tuple[str, Any, str]],
+    deployment_id: str | None,
+    fallback: Callable[[], tuple[Any, str]],
+) -> tuple[tuple[str, Any, str], ...]:
+    """Choose which deployments a paid image upscale may be attempted against.
+
+    Every attempt is recorded in a durable receipt keyed by its deployment id,
+    and recovery (poll/resume) rebuilds the provider client from that id. An id
+    that names no deployment therefore makes an already-billed task
+    permanently unreachable, so an unidentifiable deployment yields no
+    candidates at all rather than a synthetic one.
+    """
+    if pool_providers:
+        return tuple(pool_providers)
+    if not isinstance(deployment_id, str) or not deployment_id:
+        return ()
+    provider, token = fallback()
+    return ((deployment_id, provider, token),)
 
 
 class LibTVClient:
@@ -1040,7 +1061,18 @@ class LibTVClient:
                         token,
                     )
                 )
-            selected_providers = providers or ((deployment_id or "unknown", _Provider(self), self.token),)
+            selected_providers = select_image_upscale_providers(
+                providers, deployment_id, lambda: (_Provider(self), self.token)
+            )
+            if not selected_providers:
+                # Submitting anyway would bill for a task nobody can collect:
+                # the receipt would carry a deployment id that resolves to no
+                # deployment, so every poll/resume answers 503 forever.
+                return ImageUpscaleReceipt(
+                    request_id=request_id,
+                    submission_state="not_submitted",
+                    message="image upscale deployment identity unavailable",
+                )
             return await ImageUpscaleSubmitter(
                 *selected_providers,
                 receipt_store=receipt_store,

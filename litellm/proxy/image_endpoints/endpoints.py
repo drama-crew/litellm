@@ -484,10 +484,19 @@ def _image_upscale_deployment_pool(llm_router: Any, model: str) -> list[dict[str
         model_info = deployment.get("model_info") or {}
         params = deployment.get("litellm_params") or {}
         deployment_id = model_info.get("id")
-        provider_model = str(params.get("model") or model).split("/", 1)[-1]
+        # libtv deployments declare their provider through the ``model:`` prefix
+        # ("libtv/topaz-image-upscaler"); config never sets ``custom_llm_provider``
+        # and the Router does not inject it into litellm_params. Accept either
+        # spelling -- requiring the explicit key emptied the pool in production,
+        # which disabled multi-account failover and degraded every receipt to
+        # deployment_id="unknown" (leaving billed tasks unpollable forever).
+        raw_model = str(params.get("model") or model)
+        prefix, _, remainder = raw_model.partition("/")
+        provider = params.get("custom_llm_provider") or (prefix if remainder else None)
+        provider_model = remainder or raw_model
         if not isinstance(deployment_id, str) or not deployment_id:
             continue
-        if params.get("custom_llm_provider") != "libtv" or provider_model != model:
+        if provider != "libtv" or provider_model != model:
             continue
         pool.append({"id": deployment_id, "api_key": params.get("api_key"), "webid": params.get("webid")})
     return pool
