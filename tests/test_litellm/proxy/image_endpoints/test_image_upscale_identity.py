@@ -80,52 +80,15 @@ async def test_submitter_accepts_payload_without_organization_id() -> None:
 # ── source registration parity (sync vs async) ───────────────────────────────
 
 
-def test_async_image_upscale_registers_the_source_with_libtv() -> None:
-    """The async path must register the source, exactly like the sync one.
+def test_async_image_upscale_does_not_double_register_the_source() -> None:
+    """The handler must pass the RAW caller URL to the client submitter.
 
-    libtv does not accept an arbitrary URL: every working path (frames2video,
-    mixed2video, video upscale) first turns the source into a libtv-hosted
-    reference via ensure_libtv_url / aensure_libtv_url. The sync image-upscale
-    path did this; the async path -- the one the proxy actually uses -- passed
-    the caller's presigned URL straight through, so production rejected every
-    submit with an upstream "invalid target URL" and the receipt stayed
-    not_submitted (fail-closed, nothing billed, but the feature was unusable).
-
-    Structural: driving the real path needs a live libtv client, and what must
-    not regress is that the async branch calls the registration helper at all.
-    """
-    import ast
-    import inspect
-
-    from litellm.llms.libtv import handler as libtv_handler
-
-    src = inspect.getsource(libtv_handler.LibTVLLM.asubmit_image_upscale)
-    tree = ast.parse(inspect.cleandoc(src))
-    called = {
-        node.func.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-    assert "aensure_libtv_url" in called, (
-        "asubmit_image_upscale never registers the source with libtv -- it "
-        "forwards the caller's raw URL, which libtv rejects as an invalid "
-        "target URL"
-    )
-
-
-def test_async_upscale_passes_the_validated_source_metadata() -> None:
-    """require_delegated=True hard-requires bytes + SHA-256.
-
-    client.py's _aensure_uploaded raises
-    LibTVError(503, "validated Topaz source requires bytes and SHA-256")
-    when either is missing. That exception surfaces as a submit with no durable
-    receipt, which the endpoint conservatively normalises to `unknown` (409) --
-    the severity that forbids automatic failover and leaves the platform polling
-    forever. Observed in production: four upscale nodes stuck "generating", no
-    receipt or pool record written, nothing billed.
-
-    Both values are already in optional_params (asubmit_image_upscale reads them
-    a few lines below); they simply were not forwarded to the registration call.
+    LibTVClient.asubmit_image_upscale already performs the delegated
+    registration internally. Registering in the handler too hands the client an
+    already libtv-hosted URL, which its own guard rejects with "Topaz image
+    source requires a delegated source transfer" -- observed in production, and
+    caused by an earlier attempt to "fix" a missing registration that was never
+    missing. The real defect was a target-host allowlist entry, not this.
     """
     import ast
     import inspect
@@ -133,17 +96,12 @@ def test_async_upscale_passes_the_validated_source_metadata() -> None:
     from litellm.llms.libtv import handler as libtv_handler
 
     tree = ast.parse(inspect.cleandoc(inspect.getsource(libtv_handler.LibTVLLM.asubmit_image_upscale)))
-    call = next(
-        node
+    called = {
+        node.func.attr
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "aensure_libtv_url"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "aensure_libtv_url" not in called, (
+        "asubmit_image_upscale must NOT register the source itself -- the "
+        "client submitter does it, and double registration breaks the paid submit"
     )
-    kwargs = {kw.arg for kw in call.keywords}
-    for required in ("require_delegated", "source_bytes", "source_sha256"):
-        assert required in kwargs, (
-            f"aensure_libtv_url is called without {required!r}; a delegated "
-            "transfer without bytes+digest raises 503 and the submit degrades "
-            "to an unrecoverable `unknown`"
-        )
