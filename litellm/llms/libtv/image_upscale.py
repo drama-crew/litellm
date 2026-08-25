@@ -457,7 +457,11 @@ class ImageUpscaleSubmitter:
         organization_id = self._organization_id or (
             payload.get("organization_id") if isinstance(payload.get("organization_id"), str) else None
         )
-        if not all(isinstance(value, str) and value.strip() for value in (team_id, api_key, user_id, organization_id)):
+        # organization_id is optional on purpose -- see
+        # _has_complete_paid_image_upscale_identity in
+        # litellm/proxy/image_endpoints/endpoints.py. It is still carried into
+        # the receipt when the caller supplies one.
+        if not all(isinstance(value, str) and value.strip() for value in (team_id, api_key, user_id)):
             return ImageUpscaleReceipt(
                 request_id=request_id,
                 submission_state="not_submitted",
