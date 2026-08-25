@@ -432,17 +432,25 @@ def _image_upscale_deployment_id(optional_params: dict) -> str | None:
     ``libtv_status_model``, a plain litellm_params key that is flattened into
     optional_params, exactly as the video create path already does.
 
+    The trusted config key is preferred over ``model_info``: the submit endpoint
+    accepts ``model_info`` in the request body, so a caller could otherwise name
+    its own deployment id, which would be written into the receipt and signed
+    into the resume token -- unrecoverable, and unverifiable against the real
+    deployment's secret.
+
     Returning None is deliberate: the submitter refuses rather than inventing an
     id, because a receipt whose deployment cannot be resolved leaves an
     already-billed task permanently uncollectable.
     """
+    status_model = optional_params.get("libtv_status_model")
+    if isinstance(status_model, str) and status_model:
+        return status_model
     model_info = optional_params.get("model_info")
     if isinstance(model_info, dict):
         deployment_id = model_info.get("id")
         if isinstance(deployment_id, str) and deployment_id:
             return deployment_id
-    status_model = optional_params.get("libtv_status_model")
-    return status_model if isinstance(status_model, str) and status_model else None
+    return None
 
 
 def _image_upscale_style(optional_params: dict) -> str:

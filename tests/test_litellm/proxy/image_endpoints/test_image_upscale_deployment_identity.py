@@ -77,8 +77,20 @@ async def test_deployment_id_falls_back_to_status_model_when_model_info_is_strip
 
 
 @pytest.mark.asyncio
-async def test_model_info_id_still_wins_when_present(monkeypatch):
+async def test_trusted_config_wins_over_the_caller_supplied_model_info(monkeypatch):
+    """``model_info`` is an accepted request-body field on the submit endpoint,
+    so a caller can name its own deployment id. Trust the deployment's own
+    config first: a caller-chosen id would be written into the receipt and
+    signed into the resume token, making the task unrecoverable and the token
+    unverifiable against the real deployment's secret."""
+    params = _optional_params(model_info={"id": "caller-supplied"})
+    assert await _run(monkeypatch, params) == "libtv-topaz-image-upscaler-account-1"
+
+
+@pytest.mark.asyncio
+async def test_model_info_id_is_used_when_config_carries_no_status_model(monkeypatch):
     params = _optional_params(model_info={"id": "explicit-deployment"})
+    params.pop("libtv_status_model")
     assert await _run(monkeypatch, params) == "explicit-deployment"
 
 
@@ -143,3 +155,130 @@ def test_provider_selection_never_invents_an_unresolvable_deployment(deployment_
     else:
         assert selected == ()
         assert not called
+
+
+@pytest.mark.asyncio
+async def test_client_refuses_the_provider_call_when_no_deployment_is_identifiable(monkeypatch):
+    """Wiring test for the fail-closed path, not just the selection helper.
+
+    Deleting the refusal in LibTVClient.asubmit_image_upscale leaves every
+    helper test green: ImageUpscaleSubmitter would instead raise
+    ValueError("at least one image upscale deployment is required"), which
+    surfaces as submission_state "unknown" -- i.e. "we cannot tell whether you
+    were billed", the one state that forbids failover and locks the pool. That
+    is strictly worse than refusing, so it needs its own guard.
+    """
+    from litellm.llms.libtv import client as libtv_client
+
+    calls = []
+
+    class _Store:
+        async def readiness(self):
+            return True
+
+    async def _forbidden(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("no provider work may happen without a deployment identity")
+
+    monkeypatch.setattr(libtv_client, "get_receipt_store", lambda: _Store())
+    monkeypatch.setattr(libtv_client.LibTVClient, "aensure_libtv_url", _forbidden)
+    monkeypatch.setattr(libtv_client.LibTVClient, "acreate", _forbidden)
+
+    client = libtv_client.LibTVClient(token="t", webid="w", async_client=SimpleNamespace())
+    receipt = await client.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://source.example/input.png",
+        "Standard V2",
+        2,
+        "project",
+        "req-1",
+        None,
+        team_id="team-1",
+        durable_receipts=True,
+        response_cost=0.46,
+        receipt_api_key="sk-1",
+        receipt_user_id="user-1",
+        deployment_pool=[],
+    )
+
+    assert receipt.submission_state == "not_submitted"
+    assert receipt.deployment_id != "unknown"
+    assert calls == []
+
+
+def _pool_entry(entry_id, key_var, webid_var):
+    return {"id": entry_id, "api_key": f"os.environ/{key_var}", "webid": f"os.environ/{webid_var}"}
+
+
+def test_each_pool_entry_is_paired_with_its_own_credential(monkeypatch):
+    """A deployment's provider must always hold that deployment's credential.
+
+    The routed client used to be reused for whichever entry matched the
+    *deployment id*, so if that id came from a key that named a different
+    account (``libtv_status_model`` and ``model_info.id`` are separate
+    namespaces with nothing enforcing equality), account A's token would be
+    recorded and resume-signed under account B's id: recovery then resolves B's
+    token, fails signature verification, and polls the wrong account. Matching
+    on the credential instead needs no naming convention to hold.
+    """
+    from litellm.llms.libtv.client import build_image_upscale_providers
+
+    monkeypatch.setenv("LIBTV_TOKEN", "token-1")
+    monkeypatch.setenv("LIBTV_WEBID", "webid-1")
+    monkeypatch.setenv("LIBTV_TOKEN_2", "token-2")
+    monkeypatch.setenv("LIBTV_WEBID_2", "webid-2")
+
+    pool = [_pool_entry("account-1", "LIBTV_TOKEN", "LIBTV_WEBID"), _pool_entry("account-2", "LIBTV_TOKEN_2", "LIBTV_WEBID_2")]
+    own = object()
+    built = build_image_upscale_providers(
+        pool, "token-2", lambda: own, lambda token, webid: (token, webid)
+    )
+
+    assert [(entry_id, token) for entry_id, _, token in built] == [("account-1", "token-1"), ("account-2", "token-2")]
+    # The routed client is reused for the entry whose credential it actually
+    # holds -- account-2 here -- regardless of any deployment id.
+    assert built[1][1] is own
+    assert built[0][1] == ("token-1", "webid-1")
+
+
+def test_pool_entries_without_resolvable_credentials_are_skipped(monkeypatch):
+    from litellm.llms.libtv.client import build_image_upscale_providers
+
+    monkeypatch.delenv("LIBTV_TOKEN_MISSING", raising=False)
+    monkeypatch.setenv("LIBTV_TOKEN", "token-1")
+    monkeypatch.setenv("LIBTV_WEBID", "webid-1")
+
+    pool = [
+        _pool_entry("account-1", "LIBTV_TOKEN", "LIBTV_WEBID"),
+        _pool_entry("account-missing", "LIBTV_TOKEN_MISSING", "LIBTV_WEBID"),
+        {"id": "", "api_key": "os.environ/LIBTV_TOKEN", "webid": "os.environ/LIBTV_WEBID"},
+    ]
+    built = build_image_upscale_providers(pool, "other", lambda: object(), lambda token, webid: (token, webid))
+    assert [entry_id for entry_id, _, _ in built] == ["account-1"]
+
+
+def test_sync_submit_also_refuses_without_a_deployment_identity(monkeypatch):
+    """The sync twin must not keep the defect the async path just lost.
+
+    It is unreachable from the proxy today (the route type is
+    aimage_generation), but it performs a real provider create and signs a
+    resume token, so leaving it substituting "unknown" keeps a live path that
+    can bill for an uncollectable task.
+    """
+    from litellm.llms.libtv import client as libtv_client
+
+    client = libtv_client.LibTVClient(token="t", webid="w", sync_client=SimpleNamespace())
+
+    def _forbidden(*args, **kwargs):
+        raise AssertionError("no provider work may happen without a deployment identity")
+
+    monkeypatch.setattr(libtv_client.LibTVClient, "create", _forbidden)
+
+    receipt = client.submit_image_upscale(
+        "topaz-image-upscaler", "topazlabs", "https://source.example/input.png",
+        "Standard V2", 2, "project", "req-1", None,
+    )
+    assert receipt.submission_state == "not_submitted"
+    assert receipt.deployment_id != "unknown"
+    assert receipt.resume_token is None

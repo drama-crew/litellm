@@ -477,6 +477,21 @@ def _has_complete_paid_image_upscale_identity(user_api_key_dict: UserAPIKeyAuth)
     )
 
 
+def _image_upscale_collection_identity_is_complete(receipt: StoredReceipt) -> bool:
+    """Whether a receipt carries enough identity to bill and collect.
+
+    Mirrors _has_complete_paid_image_upscale_identity deliberately. drama models
+    an organization as a LiteLLM team and never mints organization rows, so
+    ``organization_id`` is null on every real receipt; requiring it here meant a
+    task could be submitted and billed and then never collected, because this is
+    the only path that emits the billing event and persists the terminal result.
+    """
+    return all(
+        isinstance(value, str) and value.strip()
+        for value in (receipt.team_id, receipt.api_key, receipt.user_id)
+    )
+
+
 def _image_upscale_passthrough_style(data: Mapping[str, Any]) -> str:
     """Carry the requested Topaz style across the provider boundary.
 
@@ -529,15 +544,18 @@ def _client_for_receipt(receipt: StoredReceipt) -> LibTVClient:
     from litellm.proxy.proxy_server import llm_router
 
     pool = _image_upscale_deployment_pool(llm_router, receipt.model)
-    if pool:
-        deployment = next((entry for entry in pool if entry["id"] == receipt.deployment_id), None)
-        if deployment is None:
-            raise LibTVError(status_code=503, message="LibTV deployment credential is unavailable for receipt")
+    deployment = next((entry for entry in pool if entry["id"] == receipt.deployment_id), None)
+    if deployment is not None:
         token = _resolve_receipt_credential(deployment.get("api_key"))
         webid = _resolve_receipt_credential(deployment.get("webid"))
-        if not token or not webid:
-            raise LibTVError(status_code=503, message="LibTV deployment credential is unavailable for receipt")
-        return LibTVClient(token=token, webid=webid, async_client=AsyncHTTPHandler())
+        if token and webid:
+            return LibTVClient(token=token, webid=webid, async_client=AsyncHTTPHandler())
+    # No matching pool entry: fall through to the environment credentials rather
+    # than refusing. The pool used to be empty for every request, so receipts
+    # written then -- including ones carrying the old literal "unknown" -- name
+    # no current deployment, and a deployment can also be retired from config
+    # while its tasks are still in flight. Refusing here would strand exactly
+    # the already-billed tasks this recovery path exists to collect.
 
     suffix = "_2" if receipt.deployment_id and receipt.deployment_id.endswith("account-2") else ""
     token = os.getenv(f"LIBTV_TOKEN{suffix}")
@@ -716,7 +734,7 @@ async def _poll_image_upscale(action: ImageUpscaleActionRequest, user_api_key_di
             status_code=503,
             content={"error": "authoritative image upscale cost unavailable", "receipt": _receipt_body(receipt)},
         )
-    if not receipt.api_key or not receipt.user_id or not receipt.organization_id:
+    if not _image_upscale_collection_identity_is_complete(receipt):
         return ORJSONResponse(
             status_code=503,
             content={"error": "durable image upscale identity unavailable", "receipt": _receipt_body(receipt)},

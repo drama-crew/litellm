@@ -325,6 +325,39 @@ def parse_progress(payload: Dict[str, Any], kind: str, task_id: Optional[str] = 
     return {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
 
 
+def build_image_upscale_providers(
+    pool: Sequence[Mapping[str, Any]] | None,
+    own_token: str,
+    own_provider: Callable[[], Any],
+    make_provider: Callable[[str, str], Any],
+) -> list[tuple[str, Any, str]]:
+    """Pair every usable deployment in the pool with its own credential.
+
+    The routed client is reused for the entry whose credential it actually
+    holds, identified by comparing tokens rather than deployment ids. Matching
+    by id meant that if the id came from a key naming a different account, one
+    account's token was recorded -- and the resume token signed -- under
+    another account's id: recovery then resolves the other account's token,
+    fails signature verification, and polls the wrong account.
+
+    Entries whose credentials do not resolve are skipped: an account we cannot
+    authenticate is not a usable failover target, and admitting it would only
+    move the failure past the point where money is committed.
+    """
+    providers: list[tuple[str, Any, str]] = []
+    for entry in pool or ():
+        entry_id = entry.get("id")
+        if not isinstance(entry_id, str) or not entry_id:
+            continue
+        token = _resolve_pool_credential(entry.get("api_key"))
+        webid = _resolve_pool_credential(entry.get("webid"))
+        if not token or not webid:
+            continue
+        provider = own_provider() if token == own_token else make_provider(token, webid)
+        providers.append((entry_id, provider, token))
+    return providers
+
+
 def select_image_upscale_providers(
     pool_providers: Sequence[tuple[str, Any, str]],
     deployment_id: str | None,
@@ -612,6 +645,15 @@ class LibTVClient:
         deployment_id: str | None = None,
     ) -> ImageUpscaleReceipt:
         params = TopazImageUpscaleBuilder().build(source_url=source_url, style=style, scale=scale)
+        if not isinstance(deployment_id, str) or not deployment_id:
+            # Same reason as the async path: a receipt whose deployment cannot
+            # be resolved leaves an already-billed task uncollectable, so refuse
+            # before the create rather than invent an id.
+            return ImageUpscaleReceipt(
+                request_id=request_id,
+                submission_state="not_submitted",
+                message="image upscale deployment identity unavailable",
+            )
         created = self.create(model_key, vendor, "image", params, project_name)
         task_id = created["task_id"]
         return ImageUpscaleReceipt(
@@ -619,7 +661,7 @@ class LibTVClient:
             submission_state="submitted",
             deployment_id=deployment_id,
             provider_task_id=task_id,
-            resume_token=make_resume_token(deployment_id or "unknown", task_id, self.token),
+            resume_token=make_resume_token(deployment_id, task_id, self.token),
         )
 
     def poll_image_upscale(self, provider_task_id: str) -> dict[str, Any]:
@@ -1035,32 +1077,14 @@ class LibTVClient:
                     except LibTVError as error:
                         raise ProviderTransportError(str(error), crossed_create_boundary=False) from error
 
-            pool = tuple(deployment_pool or ())
-            providers = []
-            for entry in pool:
-                entry_id = entry.get("id")
-                if not isinstance(entry_id, str) or not entry_id:
-                    continue
-                if entry_id == str(deployment_id):
-                    providers.append((entry_id, _Provider(self), self.token))
-                    continue
-                token = _resolve_pool_credential(entry.get("api_key"))
-                webid = _resolve_pool_credential(entry.get("webid"))
-                if not token or not webid:
-                    continue
-                providers.append(
-                    (
-                        entry_id,
-                        _Provider(
-                            LibTVClient(
-                                token=token,
-                                webid=webid,
-                                async_client=AsyncHTTPHandler(),
-                            )
-                        ),
-                        token,
-                    )
-                )
+            providers = build_image_upscale_providers(
+                deployment_pool,
+                self.token,
+                lambda: _Provider(self),
+                lambda token, webid: _Provider(
+                    LibTVClient(token=token, webid=webid, async_client=AsyncHTTPHandler())
+                ),
+            )
             selected_providers = select_image_upscale_providers(
                 providers, deployment_id, lambda: (_Provider(self), self.token)
             )
