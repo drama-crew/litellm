@@ -423,6 +423,43 @@ def _is_topaz_image_upscale(spec: dict) -> bool:
     )
 
 
+def _image_upscale_deployment_id(optional_params: dict) -> str | None:
+    """Identify the deployment a paid upscale runs on.
+
+    ``model_info`` belongs to all_litellm_params, so litellm/images/main.py
+    strips it from non_default_params before any provider handler runs -- it is
+    always absent here in production. Fall back to the per-deployment
+    ``libtv_status_model``, a plain litellm_params key that is flattened into
+    optional_params, exactly as the video create path already does.
+
+    Returning None is deliberate: the submitter refuses rather than inventing an
+    id, because a receipt whose deployment cannot be resolved leaves an
+    already-billed task permanently uncollectable.
+    """
+    model_info = optional_params.get("model_info")
+    if isinstance(model_info, dict):
+        deployment_id = model_info.get("id")
+        if isinstance(deployment_id, str) and deployment_id:
+            return deployment_id
+    status_model = optional_params.get("libtv_status_model")
+    return status_model if isinstance(status_model, str) and status_model else None
+
+
+def _image_upscale_style(optional_params: dict) -> str:
+    """The caller's style, preferring the passthrough alias.
+
+    litellm drops the native ``style`` key for providers without an image
+    generation config (libtv has none), so the proxy also sends it as
+    ``image_upscale_style``. Prefer the alias, fall back to the native key for
+    direct callers that bypass the proxy.
+    """
+    for key in ("image_upscale_style", "style"):
+        value = optional_params.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return "Standard V2"
+
+
 def _topaz_source_images(optional_params: dict) -> list:
     if optional_params.get("source_url") is not None:
         return [optional_params["source_url"]]
@@ -1096,17 +1133,16 @@ class LibTVLLM(CustomLLM):
         if not isinstance(request_id_value, str) or not request_id_value.strip():
             raise LibTVError(status_code=422, message="paid image upscale requires request_id")
         request_id = request_id_value.strip()
-        model_info = optional_params.get("model_info") or {}
-        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
+        deployment_id = _image_upscale_deployment_id(optional_params)
         return lt.submit_image_upscale(
             model,
             spec["vendor"],
             source_url,
-            str(optional_params.get("style", "Standard V2")),
+            _image_upscale_style(optional_params),
             int(optional_params.get("scale", 2)),
             _project_name(model),
             request_id,
-            str(deployment_id) if deployment_id is not None else None,
+            deployment_id,
         )
 
     async def asubmit_image_upscale(
@@ -1130,18 +1166,7 @@ class LibTVLLM(CustomLLM):
         if not isinstance(request_id_value, str) or not request_id_value.strip():
             raise LibTVError(status_code=422, message="paid image upscale requires request_id")
         request_id = request_id_value.strip()
-        model_info = optional_params.get("model_info") or {}
-        # ``model_info`` belongs to all_litellm_params, so litellm/images/main.py
-        # strips it from non_default_params before any provider handler runs --
-        # it is always absent here in production. Fall back to the per-deployment
-        # ``libtv_status_model`` (a plain litellm_params key, therefore flattened
-        # into optional_params), exactly as the video create path already does.
-        # Without an id the submitter recorded the literal "unknown", which
-        # _client_for_receipt cannot resolve, permanently stranding billed tasks.
-        deployment_id = model_info.get("id") if isinstance(model_info, dict) else None
-        if not isinstance(deployment_id, str) or not deployment_id:
-            status_model = optional_params.get("libtv_status_model")
-            deployment_id = status_model if isinstance(status_model, str) and status_model else None
+        deployment_id = _image_upscale_deployment_id(optional_params)
         return await lt.asubmit_image_upscale(
             model,
             spec["vendor"],
@@ -1151,7 +1176,7 @@ class LibTVLLM(CustomLLM):
             # libtv-hosted URL, which its guard rejects with "Topaz image source
             # requires a delegated source transfer".
             source[1],
-            str(optional_params.get("style", "Standard V2")),
+            _image_upscale_style(optional_params),
             int(optional_params.get("scale", 2)),
             _project_name(model),
             request_id,

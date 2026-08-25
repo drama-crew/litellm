@@ -5,7 +5,7 @@ import math
 import os
 import traceback
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Mapping
 from urllib.parse import urlsplit
 
 import orjson
@@ -325,6 +325,7 @@ async def libtv_image_upscale_submit(
         data.setdefault("prompt", "")
         data["model"] = data.get("model") or user_model or "topaz-image-upscaler"
         data["image_upscale_deployment_pool"] = _image_upscale_deployment_pool(llm_router, data["model"])
+        data["image_upscale_style"] = _image_upscale_passthrough_style(data)
         data["libtv_image_upscale_submit"] = True
         data["user_api_key_dict"] = user_api_key_dict
         data = await add_litellm_data_to_request(
@@ -474,6 +475,20 @@ def _has_complete_paid_image_upscale_identity(user_api_key_dict: UserAPIKeyAuth)
             getattr(user_api_key_dict, "user_id", None),
         )
     )
+
+
+def _image_upscale_passthrough_style(data: Mapping[str, Any]) -> str:
+    """Carry the requested Topaz style across the provider boundary.
+
+    ``style`` is an OpenAI image parameter, so litellm hands it to
+    ``get_optional_params_image_gen`` as a named argument and keeps it only for
+    providers that declare support. libtv declares none, so the caller's style
+    was dropped before the handler ran and every upscale silently used the
+    default. Passthrough keys (like the deployment pool alongside it) do cross
+    that boundary intact.
+    """
+    style = data.get("style")
+    return style if isinstance(style, str) and style else "Standard V2"
 
 
 def _image_upscale_deployment_pool(llm_router: Any, model: str) -> list[dict[str, Any]]:

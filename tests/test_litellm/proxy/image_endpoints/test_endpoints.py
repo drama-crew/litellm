@@ -1497,3 +1497,81 @@ def test_image_upscale_pool_excludes_non_libtv_providers():
         ]
     )
     assert endpoints._image_upscale_deployment_pool(router, "topaz-image-upscaler") == []
+
+
+@pytest.mark.asyncio
+async def test_image_upscale_submit_carries_the_requested_style_across_the_provider_boundary(monkeypatch):
+    """The user's Topaz style must survive litellm's optional-param assembly.
+
+    ``style`` is an OpenAI image parameter, so litellm keeps it only for
+    providers whose image-generation config declares support. libtv has none,
+    so the native key is dropped and every upscale silently ran the default --
+    verified in production, where a 4x "CGI" request and a 4x "Standard V2"
+    request produced the identical request fingerprint.
+
+    The fake router below reproduces that drop, so this test passes only if the
+    style genuinely travels as a passthrough alias.
+    """
+    store = _EndpointReceiptStore()
+    seen_style = {}
+
+    async def fake_add_litellm_data_to_request(**kwargs):
+        return kwargs["data"]
+
+    async def fake_pre_call_hook(*, user_api_key_dict, data, call_type):
+        return data
+
+    async def fake_post_call_success_hook(**kwargs):
+        return kwargs["response"]
+
+    async def fake_route_request(*, data, **kwargs):
+        # Mirror get_optional_params_image_gen: the native OpenAI ``style`` key
+        # never reaches a libtv handler.
+        data.pop("style", None)
+        return _EndpointRouter().aimage_generation(**data)
+
+    async def fake_resolve_model_spec(self, model):
+        return {"model_key": model, "vendor": "topazlabs", "task_type": "image"}
+
+    async def fake_ensure_libtv_url(self, kind, url, data, *args, **kwargs):
+        return url
+
+    async def fake_acreate(self, model_key, vendor, task_type, params, project_name, **kwargs):
+        seen_style["value"] = params.get("style")
+        return {"task_id": "task-1"}
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.add_litellm_data_to_request", fake_add_litellm_data_to_request)
+    monkeypatch.setattr(
+        "litellm.proxy.proxy_server.proxy_logging_obj",
+        SimpleNamespace(pre_call_hook=fake_pre_call_hook, post_call_success_hook=fake_post_call_success_hook),
+    )
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_model", None)
+    monkeypatch.setattr("litellm.proxy.image_endpoints.endpoints.route_request", fake_route_request)
+    monkeypatch.setattr("litellm.llms.libtv.persistence.get_receipt_store", lambda: store)
+    monkeypatch.setattr("litellm.llms.libtv.client.get_receipt_store", lambda: store)
+    monkeypatch.setenv("LIBTV_RECEIPTS_REDIS_URL", "redis://receipt-test")
+    monkeypatch.setenv("LIBTV_TOKEN", "test-token")
+    monkeypatch.setenv("LIBTV_WEBID", "test-webid")
+    monkeypatch.setattr("litellm.llms.libtv.client.LibTVClient.aresolve_model_spec", fake_resolve_model_spec)
+    monkeypatch.setattr("litellm.llms.libtv.client.LibTVClient.aensure_libtv_url", fake_ensure_libtv_url)
+    monkeypatch.setattr("litellm.llms.libtv.client.LibTVClient.acreate", fake_acreate)
+
+    result = await endpoints.libtv_image_upscale_submit(
+        request=_request(
+            orjson.dumps(
+                {
+                    "request_id": "style-request-1",
+                    "source_url": "https://source.example/input.png",
+                    "source_bytes": 3,
+                    "source_sha256": "a" * 64,
+                    "style": "CGI",
+                    "model_info": {"id": "primary"},
+                }
+            )
+        ),
+        user_api_key_dict=UserAPIKeyAuth(team_id="team-1", api_key="key-1", user_id="user-1"),
+    )
+
+    assert result.status_code == 202, json.loads(result.body)
+    assert seen_style["value"] == "CGI"
