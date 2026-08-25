@@ -1126,6 +1126,15 @@ class LibTVLLM(CustomLLM):
         if len(images) != 1:
             raise LibTVError(status_code=400, message="Topaz image upscale requires exactly one source image")
         source = _topaz_source_payload(images[0])
+        # Register the source with libtv before the paid create, exactly like
+        # the sync path above and like every other working libtv reference path
+        # (frames2video / mixed2video / video upscale all go through
+        # ensure_libtv_url). libtv will not fetch an arbitrary caller URL: a
+        # presigned object-store link comes back as "invalid target URL" and the
+        # submit stays not_submitted.
+        source_url = await lt.aensure_libtv_url(
+            *source, _REF_DEFAULT_NAME["image"], require_delegated=True
+        )
         request_id_value = optional_params.get("provider_request_id") or optional_params.get("request_id")
         if not isinstance(request_id_value, str) or not request_id_value.strip():
             raise LibTVError(status_code=422, message="paid image upscale requires request_id")
@@ -1135,7 +1144,7 @@ class LibTVLLM(CustomLLM):
         return await lt.asubmit_image_upscale(
             model,
             spec["vendor"],
-            source[1],
+            source_url,
             str(optional_params.get("style", "Standard V2")),
             int(optional_params.get("scale", 2)),
             _project_name(model),
