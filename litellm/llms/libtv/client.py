@@ -1356,6 +1356,12 @@ class LibTVClient:
             )
             return parse_upload_url(complete)
         except BaseException:
+            # Log the PRIMARY failure before attempting the abort. Without this
+            # the only traceback that reaches the logs is the abort's own error
+            # (libtv's bridge has no multipart abort endpoint, so that is always
+            # a 404), which masks the real cause completely: the paid submit
+            # surfaces as a receipt-less `unknown` with nothing explaining why.
+            logger.warning("libtv delegated upload failed", exc_info=True)
             try:
                 await self.async_client.post(
                     url=self._bridge_url("abort"),
