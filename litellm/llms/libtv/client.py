@@ -44,6 +44,7 @@ from .persistence import (
     normalize_source_key,
     url_alive,
 )
+from .receipts import ReceiptStoreError
 from .transfer import PartTarget, ValidatedDelegatedTransfer, build_transfer_strategy, get_transfer_redis
 
 
@@ -798,7 +799,7 @@ class LibTVClient:
                 return None
             team_id = meta.get("team_id")
             return meta["project_uuid"], int(team_id) if team_id is not None else None
-        except Exception:
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError, OSError):
             logger.warning("libtv project cache: cached_project failed", exc_info=True)
             return None
 
@@ -809,13 +810,13 @@ class LibTVClient:
             await persistence.store_project(
                 self._account_key, day, project_uuid, str(team_id) if team_id is not None else None
             )
-        except Exception:
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError, OSError):
             logger.warning("libtv project cache: store_project failed", exc_info=True)
 
     async def _project_cache_invalidate(self, persistence: "LibTVPersistence", day: str) -> None:
         try:
             await persistence.invalidate_project(self._account_key, day)
-        except Exception:
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError, RuntimeError, OSError):
             logger.warning("libtv project cache: invalidate_project failed", exc_info=True)
 
     async def acreate(
@@ -970,12 +971,12 @@ class LibTVClient:
                         deployment_id=deployment_id,
                         message="receipt store is not durable",
                     )
-            except Exception as error:
+            except ReceiptStoreError:
                 return ImageUpscaleReceipt(
                     request_id=request_id,
                     submission_state="not_submitted",
                     deployment_id=deployment_id,
-                    message=f"receipt store unavailable: {error}",
+                    message="receipt store unavailable",
                 )
 
             class _Provider:
@@ -1123,6 +1124,9 @@ class LibTVClient:
     async def _afetch_bytes(self, url: str) -> bytes:
         return await asyncio.to_thread(self._fetch_bytes, url)
 
+    async def afetch_content(self, url: str) -> bytes:
+        return await self._afetch_bytes(url)
+
     def _probe_size(self, url: str) -> int:
         # Same bare-httpx rationale as _fetch_bytes/_put_bytes: a presigned object-store
         # url must not pick up the litellm http wrapper's default headers.
@@ -1159,6 +1163,7 @@ class LibTVClient:
         source_bytes: int | None = None,
         source_sha256: str | None = None,
         source_hard_cap: int | None = None,
+        allow_cache: bool = True,
     ) -> str:
         if require_delegated and kind == "url" and "libtv-res.liblib.art" in url:
             raise LibTVError(status_code=503, message="Topaz image source requires a delegated source transfer")
@@ -1166,7 +1171,7 @@ class LibTVClient:
             return url
         # Paid Topaz submissions must always pass through the validated worker;
         # a cache hit would bypass byte/digest validation and source transfer.
-        cache_target = None if require_delegated else self._resolve_cache_target(kind, url, data)
+        cache_target = None if require_delegated or not allow_cache else self._resolve_cache_target(kind, url, data)
         if cache_target is not None:
             persistence, source_key = cache_target
             cached_url = await self._cache_lookup(persistence, source_key)
@@ -1193,7 +1198,7 @@ class LibTVClient:
         try:
             persistence = self._get_persistence()
             source_key = normalize_source_key(kind, url, data) if persistence is not None else None
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, OSError):
             logger.warning("libtv upload cache: persistence/source-key resolution failed", exc_info=True)
             return None
         if persistence is None or source_key is None:
@@ -1203,21 +1208,21 @@ class LibTVClient:
     async def _cache_lookup(self, persistence: "LibTVPersistence", source_key: str) -> str | None:
         try:
             cdn_url = await persistence.cached_upload(self._account_key, source_key)
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, OSError):
             logger.warning("libtv upload cache: cached_upload failed", exc_info=True)
             return None
         if not cdn_url:
             return None
         try:
             alive = await url_alive(cdn_url)
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, OSError):
             logger.warning("libtv upload cache: url_alive failed", exc_info=True)
             alive = False
         if alive:
             return cdn_url
         try:
             await persistence.delete_upload(self._account_key, source_key)
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, OSError):
             logger.warning("libtv upload cache: delete_upload failed", exc_info=True)
         return None
 
@@ -1226,7 +1231,7 @@ class LibTVClient:
     ) -> None:
         try:
             await persistence.store_upload(self._account_key, source_key, cdn_url, size_bytes)
-        except Exception:
+        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, OSError):
             logger.warning("libtv upload cache: store_upload failed", exc_info=True)
 
     async def _aensure_uploaded(
@@ -1358,7 +1363,7 @@ class LibTVClient:
                     headers=build_bridge_headers(self.token),
                     timeout=self.request_timeout,
                 )
-            except Exception:
+            except (httpx.HTTPError, OSError, RuntimeError):
                 logger.warning("libtv upload abort failed", exc_info=True)
             raise
 
