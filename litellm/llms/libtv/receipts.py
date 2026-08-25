@@ -7,6 +7,8 @@ from urllib.parse import urlsplit
 
 from redis.exceptions import RedisError, ResponseError
 
+ReceiptStoreError = RedisError
+
 ReceiptState = Literal["not_submitted", "rejected", "unknown", "submitted", "submitting"]
 TaskState = Literal["active", "succeeded", "failed", "resolved"]
 ClaimOutcome = Literal["owner", "existing", "rejected", "missing", "mismatch"]

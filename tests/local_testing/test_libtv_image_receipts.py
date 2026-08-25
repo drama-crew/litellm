@@ -474,6 +474,75 @@ async def test_durable_client_fails_closed_when_receipt_redis_is_not_ready(monke
 
 
 @pytest.mark.asyncio
+async def test_durable_client_fails_closed_when_receipt_readiness_raises_redis_error(monkeypatch):
+    class BrokenStore:
+        async def readiness(self):
+            raise RedisError("redis unavailable")
+
+    provider_calls = []
+
+    async def unexpected_create(*args, **kwargs):
+        provider_calls.append(1)
+        return {"task_id": "task-1"}
+
+    monkeypatch.setattr("litellm.llms.libtv.client.get_receipt_store", lambda: BrokenStore())
+    client = LibTVClient(token="token", webid="webid")
+    monkeypatch.setattr(client, "acreate", unexpected_create)
+
+    receipt = await client.asubmit_image_upscale(
+        "topaz-image-upscaler",
+        "topazlabs",
+        "https://source.example/input.png",
+        "Standard V2",
+        2,
+        "project",
+        "request-readiness-error",
+        "primary",
+        team_id="team-1",
+        source_sha256="a" * 64,
+        durable_receipts=True,
+    )
+
+    assert provider_calls == []
+    assert receipt.submission_state == "not_submitted"
+    assert receipt.message == "receipt store unavailable"
+
+
+@pytest.mark.asyncio
+async def test_durable_client_does_not_swallow_receipt_readiness_programming_errors(monkeypatch):
+    class BrokenStore:
+        async def readiness(self):
+            raise RuntimeError("programming failure")
+
+    provider_calls = []
+
+    async def unexpected_create(*args, **kwargs):
+        provider_calls.append(1)
+        return {"task_id": "task-1"}
+
+    monkeypatch.setattr("litellm.llms.libtv.client.get_receipt_store", lambda: BrokenStore())
+    client = LibTVClient(token="token", webid="webid")
+    monkeypatch.setattr(client, "acreate", unexpected_create)
+
+    with pytest.raises(RuntimeError, match="programming failure"):
+        await client.asubmit_image_upscale(
+            "topaz-image-upscaler",
+            "topazlabs",
+            "https://source.example/input.png",
+            "Standard V2",
+            2,
+            "project",
+            "request-readiness-programming-error",
+            "primary",
+            team_id="team-1",
+            source_sha256="a" * 64,
+            durable_receipts=True,
+        )
+
+    assert provider_calls == []
+
+
+@pytest.mark.asyncio
 async def test_unknown_eval_command_fails_closed_without_provider_create():
     class NoLuaRedis:
         async def eval(self, *args):

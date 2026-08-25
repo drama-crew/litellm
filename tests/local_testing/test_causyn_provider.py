@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ import litellm
 from litellm.exceptions import BadRequestError
 from litellm.llms.causyn import CausynVideoHandler
 from litellm.llms.causyn import handler as causyn_module
+from litellm.llms.causyn.topaz import TopazAccount, TopazAccountPool, TopazAdvance, TopazVideoAdapter
+from litellm.llms.libtv.billing_outbox import CAUSYN_BILLING_STREAM_KEY, enqueue_causyn_billing
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
 from litellm.llms.libtv.transfer import result_key, status_key
 from litellm.llms.libtv import video_generate as video_generate_module
@@ -36,6 +39,7 @@ class FakeRedis:
         self.capacity: dict[str, int] = {}
         self.status: dict[str, str] = {}
         self.results: dict[str, str] = {}
+        self.billing_events: list[dict[str, object]] = []
         self.calls: list[tuple[str, object]] = []
         self.xadd_error: Exception | None = None
 
@@ -60,6 +64,17 @@ class FakeRedis:
 
     async def eval(self, script: str, numkeys: int, *args: object) -> list[str]:
         self.calls.append(("eval", (script, numkeys, args)))
+        if numkeys == 2 and args[0] == CAUSYN_BILLING_STREAM_KEY:
+            stream_key, marker_key, payload, event_id = args
+            assert isinstance(stream_key, str)
+            assert isinstance(marker_key, str)
+            assert isinstance(payload, str)
+            assert isinstance(event_id, str)
+            if marker_key in self.status:
+                return ["existing", self.status[marker_key]]
+            self.status[marker_key] = event_id
+            self.billing_events.append(json.loads(payload))
+            return ["enqueued", event_id]
         stream_key, marker_key, payload, event_id = args
         assert isinstance(marker_key, str)
         if marker_key in self.status:
@@ -93,11 +108,11 @@ class FakeRedis:
 
 
 class _TransactionalPipeline:
-    def __init__(self, redis: "TransactionalFakeRedis") -> None:
+    def __init__(self, redis: TransactionalFakeRedis) -> None:
         self.redis = redis
         self.commands: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
 
-    async def __aenter__(self) -> "_TransactionalPipeline":
+    async def __aenter__(self) -> _TransactionalPipeline:
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -115,11 +130,11 @@ class _TransactionalPipeline:
     def multi(self) -> None:
         return None
 
-    def set(self, key: str, value: str, **kwargs: object) -> "_TransactionalPipeline":
+    def set(self, key: str, value: str, **kwargs: object) -> _TransactionalPipeline:
         self.commands.append(("set", (key, value), kwargs))
         return self
 
-    def xadd(self, key: str, values: dict[str, str]) -> "_TransactionalPipeline":
+    def xadd(self, key: str, values: dict[str, str]) -> _TransactionalPipeline:
         self.commands.append(("xadd", (key, values), {}))
         return self
 
@@ -155,6 +170,28 @@ class MetadataFailureRedis(FakeRedis):
             self.calls.append(("set", (key, value, kwargs)))
             return False
         return await super().set(key, value, **kwargs)
+
+
+class ExplodingRedis(FakeRedis):
+    def __init__(self, operation: str) -> None:
+        super().__init__()
+        self.operation = operation
+        self.secret = "redis://user:secret@internal.example:6379/0"
+
+    async def get(self, key: str) -> str | None:
+        if self.operation == "get":
+            raise RuntimeError(self.secret)
+        return await super().get(key)
+
+    async def set(self, key: str, value: str, **kwargs: object) -> bool:
+        if self.operation == "set":
+            raise RuntimeError(self.secret)
+        return await super().set(key, value, **kwargs)
+
+    async def eval(self, script: str, numkeys: int, *args: object) -> list[str]:
+        if self.operation == "eval":
+            raise RuntimeError(self.secret)
+        return await super().eval(script, numkeys, *args)
 
 
 @dataclass(frozen=True)
@@ -236,6 +273,7 @@ def handler(
     content_get: FakeContentGet | None = None,
     persistence: FakeBillingPersistence | None = None,
     billing_enqueue: Any | None = None,
+    topaz_adapter: object | None = None,
 ) -> CausynVideoHandler:
     async def _enqueue(redis: object, event: object) -> bool:
         if billing_enqueue is not None:
@@ -252,6 +290,7 @@ def handler(
         clock=lambda: 2_000_000_000.0,
         persistence_factory=lambda: persistence,
         billing_enqueue=_enqueue,
+        topaz_adapter=topaz_adapter,
     )
 
 
@@ -381,6 +420,237 @@ def set_billing_metadata(
     redis.status[f"worker:task:metadata:{TASK_ID}"] = raw
 
 
+class FakeTopazAdapter:
+    def __init__(self) -> None:
+        self.advance_calls = 0
+        self.content_calls = 0
+
+    async def advance(
+        self, task_id: str, source_url_factory: object, *, validate_source: object = None
+    ) -> TopazAdvance:
+        assert task_id == TASK_ID
+        self.advance_calls += 1
+        return TopazAdvance(
+            "completed", provider_task_id="topaz-task", result_url="https://topaz/result.mp4", attempt_index=1
+        )
+
+    async def content(self, task_id: str) -> bytes:
+        assert task_id == TASK_ID
+        self.content_calls += 1
+        return b"upscaled-video"
+
+
+def set_v2_billing_metadata(redis: FakeRedis, *, requested_resolution: str = "2k") -> None:
+    redis.status[f"worker:task:metadata:{TASK_ID}"] = json.dumps(
+        {
+            "version": causyn_module.CAUSYN_BILLING_METADATA_VERSION_V2,
+            "duration_seconds": 5.0,
+            "source_resolution": "768x512",
+            "requested_resolution": requested_resolution,
+            "pricing": {
+                "model": "causyn-1.0",
+                "id": "causyn-price-v2",
+                "output_cost_per_second_768x512": 0.1,
+                "output_cost_per_second_2k": 0.6,
+            },
+            "attribution": {
+                "api_key": None,
+                "team_id": None,
+                "user_id": None,
+                "organization_id": None,
+            },
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_create_2k_keeps_worker_768_and_persists_strict_v2_metadata() -> None:
+    redis = FakeRedis()
+    response = await handler(redis).avideo_generation(
+        **create_kwargs(
+            resolution="2k",
+            model_info={
+                "id": "causyn-price-v2",
+                "output_cost_per_second_768x512": 0.1,
+                "output_cost_per_second_2k": 0.6,
+            },
+        )
+    )
+
+    assert response.size == "2k"
+    assert redis.envelope()["request"]["resolution"] == "768x512"
+    metadata = json.loads(redis.status[f"worker:task:metadata:{TASK_ID}"])
+    assert metadata["version"] == causyn_module.CAUSYN_BILLING_METADATA_VERSION_V2
+    assert metadata["source_resolution"] == "768x512"
+    assert metadata["requested_resolution"] == "2k"
+    assert "video_resolution" not in metadata
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolution", "model_info"),
+    [
+        ("768x512", {"id": "only-2k", "output_cost_per_second_2k": 0.6}),
+        ("2k", {"id": "only-native", "output_cost_per_second_768x512": 0.1}),
+    ],
+)
+async def test_create_rejects_pricing_without_requested_resolution_rate(
+    resolution: str,
+    model_info: dict[str, object],
+) -> None:
+    redis = FakeRedis()
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis).avideo_generation(**create_kwargs(resolution=resolution, model_info=model_info))
+
+    assert exc_info.value.status_code == 503
+    assert redis.status == {}
+
+
+@pytest.mark.asyncio
+async def test_legacy_v1_metadata_with_only_2k_rate_is_retryable_not_assertion_error() -> None:
+    redis = FakeRedis()
+    set_status(redis, "done", completed_result())
+    set_billing_metadata(
+        redis,
+        pricing={"model": "causyn-1.0", "id": "only-2k", "output_cost_per_second_2k": 0.6},
+    )
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis).avideo_status(VIDEO_ID, None, None, {}, None)
+
+    assert exc_info.value.status_code == 503
+    assert "only-2k" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["get", "set"])
+async def test_handler_redis_failures_are_stable_retryable_errors(operation: str) -> None:
+    redis = ExplodingRedis(operation)
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        if operation == "get":
+            await handler(redis).avideo_status(VIDEO_ID, None, None, {}, None)
+        else:
+            await handler(redis).avideo_generation(**create_kwargs())
+
+    assert exc_info.value.status_code == 503
+    assert "redis://" not in str(exc_info.value)
+    assert "secret" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_handler_adapter_ordinary_failure_is_stable_retryable_error() -> None:
+    class ExplodingAdapter:
+        async def advance(self, *_args: object, **_kwargs: object) -> TopazAdvance:
+            raise RuntimeError("redis://user:secret@internal.example:6379/0")
+
+        async def content(self, *_args: object, **_kwargs: object) -> bytes:
+            raise RuntimeError("redis://user:secret@internal.example:6379/0")
+
+    redis = FakeRedis()
+    set_status(redis, "done", completed_result())
+    set_v2_billing_metadata(redis)
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis, topaz_adapter=ExplodingAdapter()).avideo_status(VIDEO_ID, None, None, {}, None)
+
+    assert exc_info.value.status_code == 503
+    assert "redis://" not in str(exc_info.value)
+    assert "secret" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_handler_state_store_eval_failure_is_stable_retryable_error() -> None:
+    class StateClient:
+        async def aensure_libtv_url(
+            self,
+            kind: str,
+            url: str,
+            data: bytes | None,
+            default_name: str,
+            *,
+            allow_cache: bool = True,
+        ) -> str:
+            return "https://libtv.example/imported.mp4"
+
+        async def acreate(
+            self,
+            model_key: str,
+            vendor: str,
+            task_type: str,
+            params: dict[str, object],
+            project_name: str,
+            *,
+            allow_cached_project_retry: bool,
+            paid_submission: bool,
+        ) -> dict[str, object]:
+            return {"task_id": "topaz-state"}
+
+        async def apoll_once(self, task_id: str, task_type: str) -> dict[str, object]:
+            return {"status": 1}
+
+    redis = ExplodingRedis("eval")
+    set_status(redis, "done", completed_result())
+    set_v2_billing_metadata(redis)
+    adapter = TopazVideoAdapter(
+        TopazAccountPool((TopazAccount("account-1", "token", "webid"),)),
+        client_factory=lambda _account: StateClient(),
+        redis_factory=lambda: redis,
+        now=lambda: 100.0,
+    )
+
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(redis, topaz_adapter=adapter).avideo_status(VIDEO_ID, None, None, {}, None)
+
+    assert exc_info.value.status_code == 503
+    assert "redis://" not in str(exc_info.value)
+    assert "secret" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_2k_status_and_content_are_idempotent_and_bill_only_0_6_per_second() -> None:
+    redis = FakeRedis()
+    set_status(redis, "done", completed_result())
+    set_v2_billing_metadata(redis)
+    topaz = FakeTopazAdapter()
+    provider = handler(redis, billing_enqueue=enqueue_causyn_billing, topaz_adapter=topaz)
+    first, second, content = await asyncio.gather(
+        provider.avideo_status(VIDEO_ID, None, None, {}, None),
+        provider.avideo_status(VIDEO_ID, None, None, {}, None),
+        provider.avideo_content(VIDEO_ID, None, None, {}, None),
+    )
+
+    assert first.status == second.status == "completed"
+    assert first.size == second.size == "2k"
+    assert first.object_store_result is None
+    assert content == b"upscaled-video"
+    assert len(redis.billing_events) == 1
+    assert redis.billing_events[0]["request_id"] == f"causyn:{TASK_ID}"
+    assert redis.billing_events[0]["provider_task_id"] == TASK_ID
+    assert redis.billing_events[0]["response_cost"] == pytest.approx(3.0)
+    assert "topaz-task" not in json.dumps(redis.billing_events[0])
+    assert topaz.advance_calls == 3
+    assert topaz.content_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_native_status_keeps_0_1_per_second_outer_spend() -> None:
+    redis = FakeRedis()
+    set_status(redis, "done", completed_result())
+    set_v2_billing_metadata(redis, requested_resolution="768x512")
+
+    response = await handler(redis, billing_enqueue=enqueue_causyn_billing).avideo_status(
+        VIDEO_ID, None, None, {}, None
+    )
+
+    assert response.size == "768x512"
+    assert response._hidden_params["response_cost"] == pytest.approx(0.5)
+    assert len(redis.billing_events) == 1
+    assert redis.billing_events[0]["request_id"] == f"causyn:{TASK_ID}"
+    assert redis.billing_events[0]["response_cost"] == pytest.approx(0.5)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("generate_audio", [True, False])
 async def test_async_create_preserves_generate_audio_in_worker_envelope(generate_audio: bool) -> None:
@@ -479,8 +749,9 @@ async def test_async_create_persists_billing_metadata_without_usage_db() -> None
             "model": "causyn-1.0",
             "output_cost_per_second_768x512": 0.1,
         },
-        "version": causyn_module.CAUSYN_BILLING_METADATA_VERSION,
-        "video_resolution": "768x512",
+        "version": causyn_module.CAUSYN_BILLING_METADATA_VERSION_V2,
+        "source_resolution": "768x512",
+        "requested_resolution": "768x512",
     }
 
 
@@ -489,9 +760,7 @@ async def test_async_create_rejects_incomplete_pricing_before_enqueue() -> None:
     redis = FakeRedis()
 
     with pytest.raises(CustomLLMError) as exc_info:
-        await handler(redis).avideo_generation(
-            **create_kwargs(model_info={"output_cost_per_second_768x512": 0.1})
-        )
+        await handler(redis).avideo_generation(**create_kwargs(model_info={"output_cost_per_second_768x512": 0.1}))
 
     assert exc_info.value.status_code == 503
     assert redis.status == {}
@@ -954,9 +1223,7 @@ async def test_content_outbox_failure_is_retryable_and_does_not_download() -> No
         raise RuntimeError("redis unavailable")
 
     with pytest.raises(CustomLLMError) as exc_info:
-        await handler(redis, content_get, billing_enqueue=fail_enqueue).avideo_content(
-            VIDEO_ID, None, None, {}, None
-        )
+        await handler(redis, content_get, billing_enqueue=fail_enqueue).avideo_content(VIDEO_ID, None, None, {}, None)
 
     assert exc_info.value.status_code == 503
     assert content_get.calls == []
@@ -1086,9 +1353,7 @@ async def test_completed_status_does_not_persist_plaintext_api_key() -> None:
     captured: list[object] = []
 
     class Logging:
-        model_call_details = {
-            "litellm_params": {"metadata": {"user_api_key": "sk-secret"}}
-        }
+        model_call_details = {"litellm_params": {"metadata": {"user_api_key": "sk-secret"}}}
 
     async def enqueue(redis: object, event: object) -> bool:
         captured.append(event)
@@ -1106,9 +1371,7 @@ async def test_completed_status_does_not_persist_plaintext_api_key() -> None:
     }
 
     set_status(redis, "done", completed_result())
-    await handler(redis, billing_enqueue=enqueue).avideo_status(
-        VIDEO_ID, None, None, {}, None
-    )
+    await handler(redis, billing_enqueue=enqueue).avideo_status(VIDEO_ID, None, None, {}, None)
     assert captured[0].api_key is None
 
 
