@@ -13,6 +13,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 import litellm.llms.causyn.handler as mod
 from litellm.llms.custom_llm import CustomLLMError
@@ -780,3 +781,59 @@ async def test_a_real_duration_mismatch_is_still_a_hard_stop(monkeypatch):
         )
 
 
+# --------------------------------------------------------------------------
+# The worker's duration is an observation, not a request
+# --------------------------------------------------------------------------
+
+
+def test_worker_result_accepts_the_frame_overshoot_at_the_top_of_the_range():
+    """8 seconds is the longest thing that can be ordered, and the pipeline
+    renders duration*24 + 1 frames -- so a top-of-range order comes back as
+    8.041667 every single time, by construction.
+
+    _WorkerResult carried Field(ge=3, le=8), copied from the ORDER bounds. That
+    made every 8-second job fail validation, which surfaces as a 503 on the
+    status poll, which the platform reads as terminal -- so a finished video
+    sitting in the object store was reported as a failure. 100% of 8-second
+    jobs, silently, because `raise _service_error() from None` discards the
+    ValidationError and logs only "service unavailable".
+
+    3s and 5s came back as 3.04/5.04 and stayed inside the bound, which is why
+    only the top of the range was affected and why it took a user report to
+    find.
+    """
+    result = mod._WorkerResult.model_validate(_valid_worker_result(duration_seconds=8.041667))
+    assert result.duration_seconds == pytest.approx(8.041667)
+
+
+def test_worker_result_still_rejects_a_nonsensically_short_duration():
+    """The lower bound stays: it catches a garbled report, and nothing about
+    frame quantisation makes a result SHORTER than ordered."""
+    with pytest.raises(ValidationError):
+        mod._WorkerResult.model_validate(_valid_worker_result(duration_seconds=0.5))
+
+
+@pytest.mark.parametrize("cls_name", ["_DurableTaskMetadata", "_DurableTaskMetadataV2"])
+def test_ordered_duration_keeps_its_upper_bound(cls_name):
+    """Deliberately NOT relaxed. These carry what the user asked for and what
+    the price was quoted against, so 8 really is the ceiling; dropping it here
+    would let an out-of-range order through to the pipeline."""
+    field = getattr(mod, cls_name).model_fields["duration_seconds"]
+    bounds = {type(m).__name__: getattr(m, "le", None) for m in field.metadata}
+    assert bounds.get("Le") == 8, f"{cls_name} lost its ordered-duration ceiling"
+
+
+@pytest.mark.asyncio
+async def test_a_top_of_range_video_reaches_completed(monkeypatch):
+    """End to end through avideo_status: the shape that returned 503."""
+    _stub_status_real_frames(monkeypatch, ordered=8.0, actual=8.041667)
+
+    async def _enqueue(redis, event):
+        return True
+
+    handler = CausynVideoHandler(billing_enqueue=_enqueue)
+    video = await handler.avideo_status(
+        video_id=VALID_LEGACY_ID, api_key=None, api_base=None, optional_params={}, logging_obj=None
+    )
+    assert video.status == "completed"
+    assert video.seconds == "8.041667"

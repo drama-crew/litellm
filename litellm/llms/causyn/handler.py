@@ -426,7 +426,15 @@ class _WorkerResult(BaseModel):
     etag: str = Field(min_length=1)
     bytes: int = Field(gt=0)
     content_type: Literal["video/mp4"]
-    duration_seconds: float = Field(ge=3, le=8)
+    # No upper bound: this is what the device produced, not what was ordered.
+    # The pipeline renders duration*24 + 1 frames, so the top of the orderable
+    # range (8s) always comes back as 8.041667 -- the le=8 copied from the order
+    # bounds therefore rejected 100% of 8-second jobs. A rejection here raises a
+    # 503 on the status poll, which the platform treats as terminal, so a video
+    # already sitting in the object store was reported to the user as a failure.
+    # The lower bound stays: a shorter-than-ordered result is a garbled report,
+    # and nothing about frame quantisation shortens a render.
+    duration_seconds: float = Field(ge=3)
     width: Literal[768]
     height: Literal[512]
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -976,7 +984,18 @@ class CausynVideoHandler(CustomLLM):
             raise _service_error() from None
         try:
             body = _StatusEnvelope.model_validate(raw_body)
-        except ValidationError:
+        except ValidationError as exc:
+            # The public error stays deliberately opaque, but swallowing the
+            # cause entirely made this class of bug near-undiagnosable: an
+            # out-of-range duration produced 3272 identical "service
+            # unavailable" lines in fifteen minutes with nothing naming the
+            # field. Log the reason; keep `from None` so no driver detail
+            # reaches the caller.
+            logger.warning(
+                "causyn status envelope failed validation for task %s: %s",
+                task_id,
+                exc,
+            )
             raise _service_error() from None
         if body.status is None:
             raise CustomLLMError(status_code=404, message="causyn video was not found")
