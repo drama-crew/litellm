@@ -1,9 +1,12 @@
 import asyncio
 import json
-from datetime import datetime
+import os
+import uuid
+from datetime import datetime, timezone
 
 import pytest
 
+import litellm.llms.libtv.billing_outbox as billing_outbox
 from litellm.llms.libtv.billing_outbox import (
     BILLING_STREAM_KEY,
     CAUSYN_BILLING_MARKER_PREFIX,
@@ -177,12 +180,29 @@ async def test_billing_event_uses_utc_timestamp_cast_for_image_and_causyn(
 
     query, args = transaction.sql[0]
     assert query.count("$5::timestamp") == 2
+    assert "$8::jsonb" in query
     assert args[1] == expected_call_type
     assert args[4] == expected_time
 
 
 def test_event_time_assumes_utc_for_naive_iso_timestamp():
     assert _event_time("2026-08-27T04:00:00") == datetime(2026, 8, 27, 4, 0)
+
+
+def test_event_time_uses_deterministic_utc_now_for_invalid_iso_timestamp(monkeypatch):
+    class FrozenDatetime:
+        @classmethod
+        def fromisoformat(cls, value):
+            raise ValueError(value)
+
+        @classmethod
+        def now(cls, tz):
+            assert tz is timezone.utc
+            return datetime(2026, 8, 27, 12, 34, 56, 789, tzinfo=tz)
+
+    monkeypatch.setattr(billing_outbox, "datetime", FrozenDatetime)
+
+    assert _event_time("not-an-iso-timestamp") == datetime(2026, 8, 27, 12, 34, 56, 789)
 
 
 class FakeTransaction:
@@ -215,6 +235,79 @@ class FakeDB:
 class FakePrisma:
     def __init__(self, transaction):
         self.db = FakeDB(transaction)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    not os.getenv("LIBTV_BILLING_POSTGRES_URL"),
+    reason="Set LIBTV_BILLING_POSTGRES_URL to an isolated PostgreSQL 17 database",
+)
+async def test_billing_event_executes_against_isolated_postgres():
+    from prisma import Prisma
+
+    database_url = os.environ["LIBTV_BILLING_POSTGRES_URL"]
+    db = Prisma(datasource={"url": database_url})
+    await db.connect()
+    team_id = f"billing-outbox-test-{uuid.uuid4().hex}"
+    image_event = ImageBillingEvent(
+        deployment_id=f"pg-{team_id}",
+        provider_task_id="image-task",
+        response_cost=1.25,
+        team_id=team_id,
+        occurred_at="2026-08-27T04:00:00+08:00",
+    )
+    causyn_event = CausynBillingEvent(
+        provider_task_id=f"pg-{team_id}",
+        response_cost=2.5,
+        team_id=team_id,
+        occurred_at="2026-08-27T04:00:00-05:00",
+    )
+    try:
+        await db.execute_raw(
+            'CREATE TABLE "LiteLLM_SpendLogs" ('
+            "request_id TEXT PRIMARY KEY, call_type TEXT NOT NULL, api_key TEXT NOT NULL, "
+            "spend DOUBLE PRECISION NOT NULL, total_tokens INTEGER NOT NULL, prompt_tokens INTEGER NOT NULL, "
+            'completion_tokens INTEGER NOT NULL, "startTime" TIMESTAMP WITHOUT TIME ZONE NOT NULL, '
+            '"endTime" TIMESTAMP WITHOUT TIME ZONE NOT NULL, model TEXT NOT NULL, "user" TEXT NOT NULL, '
+            "metadata JSONB NOT NULL, team_id TEXT, organization_id TEXT)"
+        )
+        await db.execute_raw(
+            'CREATE TABLE "LiteLLM_TeamTable" ('
+            "team_id TEXT PRIMARY KEY, spend DOUBLE PRECISION NOT NULL DEFAULT 0)"
+        )
+        await db.execute_raw('INSERT INTO "LiteLLM_TeamTable" (team_id, spend) VALUES ($1, 0)', team_id)
+        reconciler = LibTVBillingReconciler(FakeStreamRedis([]), db)
+        await reconciler._reconcile_event(image_event)
+        await reconciler._reconcile_event(image_event)
+        await reconciler._reconcile_event(causyn_event)
+        await reconciler._reconcile_event(causyn_event)
+
+        rows = await db.query_raw(
+            'SELECT call_type, spend, '
+            'to_char("startTime", \'YYYY-MM-DD"T"HH24:MI:SS.US\') AS start_time, '
+            'to_char("endTime", \'YYYY-MM-DD"T"HH24:MI:SS.US\') AS end_time '
+            'FROM "LiteLLM_SpendLogs" ORDER BY call_type'
+        )
+        assert rows == [
+            {
+                "call_type": "image_upscale",
+                "spend": 1.25,
+                "start_time": "2026-08-26T20:00:00.000000",
+                "end_time": "2026-08-26T20:00:00.000000",
+            },
+            {
+                "call_type": "video_generation",
+                "spend": 2.5,
+                "start_time": "2026-08-27T09:00:00.000000",
+                "end_time": "2026-08-27T09:00:00.000000",
+            },
+        ]
+        team_rows = await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable" WHERE team_id = $1', team_id)
+        assert team_rows == [{"spend": 3.75}]
+    finally:
+        await db.execute_raw('DROP TABLE IF EXISTS "LiteLLM_SpendLogs"')
+        await db.execute_raw('DROP TABLE IF EXISTS "LiteLLM_TeamTable"')
+        await db.disconnect()
 
 
 class FakeStreamRedis:

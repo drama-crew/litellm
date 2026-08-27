@@ -285,7 +285,7 @@ class LibTVBillingReconciler:
                 "(request_id, call_type, api_key, spend, total_tokens, prompt_tokens, "
                 'completion_tokens, "startTime", "endTime", model, "user", metadata, '
                 "team_id, organization_id) "
-                "VALUES ($1, $2, $3, $4, 0, 0, 0, $5::timestamp, $5::timestamp, $6, $7, $8, $9, $10) "
+                "VALUES ($1, $2, $3, $4, 0, 0, 0, $5::timestamp, $5::timestamp, $6, $7, $8::jsonb, $9, $10) "
                 "ON CONFLICT (request_id) DO NOTHING",
                 event.request_id,
                 call_type,
