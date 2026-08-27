@@ -285,7 +285,7 @@ class LibTVBillingReconciler:
                 "(request_id, call_type, api_key, spend, total_tokens, prompt_tokens, "
                 'completion_tokens, "startTime", "endTime", model, "user", metadata, '
                 "team_id, organization_id) "
-                "VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5, $6, $7, $8, $9, $10) "
+                "VALUES ($1, $2, $3, $4, 0, 0, 0, $5::timestamp, $5::timestamp, $6, $7, $8, $9, $10) "
                 "ON CONFLICT (request_id) DO NOTHING",
                 event.request_id,
                 call_type,
@@ -356,7 +356,9 @@ def _event_time(value: str) -> datetime:
         parsed = datetime.fromisoformat(value)
     except (TypeError, ValueError):
         parsed = datetime.now(timezone.utc)
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 async def _increment_spend(

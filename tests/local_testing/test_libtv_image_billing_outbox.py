@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime
 
 import pytest
 
@@ -10,6 +11,7 @@ from litellm.llms.libtv.billing_outbox import (
     CausynBillingEvent,
     ImageBillingEvent,
     LibTVBillingReconciler,
+    _event_time,
     _ENQUEUE_SCRIPT,
     enqueue_causyn_billing,
 )
@@ -138,6 +140,49 @@ async def test_billing_event_persists_narrow_upscale_attribution_in_spend_logs()
         "artifact_id": "artifact-1",
         "user_id": "owner-1",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event", "expected_call_type", "expected_time"),
+    (
+        (
+            ImageBillingEvent(
+                deployment_id="dep-1",
+                provider_task_id="task-1",
+                response_cost=1.25,
+                occurred_at="2026-08-27T04:00:00+08:00",
+            ),
+            "image_upscale",
+            datetime(2026, 8, 26, 20, 0),
+        ),
+        (
+            CausynBillingEvent(
+                provider_task_id="task-1",
+                response_cost=1.25,
+                occurred_at="2026-08-27T04:00:00-05:00",
+            ),
+            "video_generation",
+            datetime(2026, 8, 27, 9, 0),
+        ),
+    ),
+)
+async def test_billing_event_uses_utc_timestamp_cast_for_image_and_causyn(
+    event, expected_call_type, expected_time
+):
+    transaction = FakeTransaction(inserted=True)
+    reconciler = LibTVBillingReconciler(FakeStreamRedis([]), FakePrisma(transaction))
+
+    await reconciler._reconcile_event(event)
+
+    query, args = transaction.sql[0]
+    assert query.count("$5::timestamp") == 2
+    assert args[1] == expected_call_type
+    assert args[4] == expected_time
+
+
+def test_event_time_assumes_utc_for_naive_iso_timestamp():
+    assert _event_time("2026-08-27T04:00:00") == datetime(2026, 8, 27, 4, 0)
 
 
 class FakeTransaction:
