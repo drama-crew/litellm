@@ -3,6 +3,7 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pytest
 
@@ -246,24 +247,42 @@ async def test_billing_event_executes_against_isolated_postgres():
     from prisma import Prisma
 
     database_url = os.environ["LIBTV_BILLING_POSTGRES_URL"]
-    db = Prisma(datasource={"url": database_url})
-    await db.connect()
-    team_id = f"billing-outbox-test-{uuid.uuid4().hex}"
+    if os.getenv("LIBTV_BILLING_POSTGRES_ISOLATED") != "1":
+        pytest.fail("Set LIBTV_BILLING_POSTGRES_ISOLATED=1 to confirm this is an isolated database")
+
+    schema_name = f"libtv_billing_test_{uuid.uuid4().hex}"
+    url_parts = urlsplit(database_url)
+    query = [
+        (key, value)
+        for key, value in parse_qsl(url_parts.query, keep_blank_values=True)
+        if key not in {"schema", "connection_limit"}
+    ] + [("schema", schema_name), ("connection_limit", "1")]
+    schema_url = urlunsplit(url_parts._replace(query=urlencode(query)))
+    control_db = Prisma(datasource={"url": database_url})
+    schema_db = Prisma(datasource={"url": schema_url})
+    schema_created = False
     image_event = ImageBillingEvent(
-        deployment_id=f"pg-{team_id}",
+        deployment_id=f"pg-{schema_name}",
         provider_task_id="image-task",
         response_cost=1.25,
-        team_id=team_id,
+        team_id=f"billing-outbox-test-{schema_name}",
         occurred_at="2026-08-27T04:00:00+08:00",
     )
     causyn_event = CausynBillingEvent(
-        provider_task_id=f"pg-{team_id}",
+        provider_task_id=f"pg-{schema_name}",
         response_cost=2.5,
-        team_id=team_id,
+        team_id=f"billing-outbox-test-{schema_name}",
         occurred_at="2026-08-27T04:00:00-05:00",
     )
+    team_id = f"billing-outbox-test-{schema_name}"
     try:
-        await db.execute_raw(
+        await control_db.connect()
+        await control_db.execute_raw(f'CREATE SCHEMA "{schema_name}"')
+        schema_created = True
+        await schema_db.connect()
+        current_schema_rows = await schema_db.query_raw("SELECT current_schema() AS current_schema")
+        assert current_schema_rows == [{"current_schema": schema_name}]
+        await schema_db.execute_raw(
             'CREATE TABLE "LiteLLM_SpendLogs" ('
             "request_id TEXT PRIMARY KEY, call_type TEXT NOT NULL, api_key TEXT NOT NULL, "
             "spend DOUBLE PRECISION NOT NULL, total_tokens INTEGER NOT NULL, prompt_tokens INTEGER NOT NULL, "
@@ -271,18 +290,18 @@ async def test_billing_event_executes_against_isolated_postgres():
             '"endTime" TIMESTAMP WITHOUT TIME ZONE NOT NULL, model TEXT NOT NULL, "user" TEXT NOT NULL, '
             "metadata JSONB NOT NULL, team_id TEXT, organization_id TEXT)"
         )
-        await db.execute_raw(
+        await schema_db.execute_raw(
             'CREATE TABLE "LiteLLM_TeamTable" ('
             "team_id TEXT PRIMARY KEY, spend DOUBLE PRECISION NOT NULL DEFAULT 0)"
         )
-        await db.execute_raw('INSERT INTO "LiteLLM_TeamTable" (team_id, spend) VALUES ($1, 0)', team_id)
-        reconciler = LibTVBillingReconciler(FakeStreamRedis([]), db)
+        await schema_db.execute_raw('INSERT INTO "LiteLLM_TeamTable" (team_id, spend) VALUES ($1, 0)', team_id)
+        reconciler = LibTVBillingReconciler(FakeStreamRedis([]), schema_db)
         await reconciler._reconcile_event(image_event)
         await reconciler._reconcile_event(image_event)
         await reconciler._reconcile_event(causyn_event)
         await reconciler._reconcile_event(causyn_event)
 
-        rows = await db.query_raw(
+        rows = await schema_db.query_raw(
             'SELECT call_type, spend, '
             'to_char("startTime", \'YYYY-MM-DD"T"HH24:MI:SS.US\') AS start_time, '
             'to_char("endTime", \'YYYY-MM-DD"T"HH24:MI:SS.US\') AS end_time '
@@ -302,12 +321,15 @@ async def test_billing_event_executes_against_isolated_postgres():
                 "end_time": "2026-08-27T09:00:00.000000",
             },
         ]
-        team_rows = await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable" WHERE team_id = $1', team_id)
+        team_rows = await schema_db.query_raw('SELECT spend FROM "LiteLLM_TeamTable" WHERE team_id = $1', team_id)
         assert team_rows == [{"spend": 3.75}]
     finally:
-        await db.execute_raw('DROP TABLE IF EXISTS "LiteLLM_SpendLogs"')
-        await db.execute_raw('DROP TABLE IF EXISTS "LiteLLM_TeamTable"')
-        await db.disconnect()
+        if schema_db.is_connected():
+            await schema_db.disconnect()
+        if control_db.is_connected():
+            if schema_created:
+                await control_db.execute_raw(f'DROP SCHEMA "{schema_name}" CASCADE')
+            await control_db.disconnect()
 
 
 class FakeStreamRedis:
