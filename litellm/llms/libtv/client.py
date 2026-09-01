@@ -36,6 +36,11 @@ from .image_upscale import (
     TopazImageUpscaleBuilder,
     make_resume_token,
 )
+from .asset_registry import (
+    asset_cache_ttl_seconds,
+    dedupe_preserving_order,
+    get_third_asset_limiter,
+)
 from .persistence import (
     LibTVPersistence,
     account_key,
@@ -740,15 +745,13 @@ class LibTVClient:
         so the caller can fall back to another provider."""
         cdn_urls = [self.ensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
         passed = parse_verify_passed(self._post("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify"))
-        resolved: List[CompliantAssetRef] = []
         for cdn_url in cdn_urls:
             if not passed.get(cdn_url):
                 raise LibTVError(
                     status_code=400,
                     message="libtv portrait compliance check did not pass for a reference image",
                 )
-            resolved.append(self._register_compliant_asset(cdn_url, "image"))
-        return resolved
+        return self._resolve_asset_refs_sync(cdn_urls, "image")
 
     def resolve_compliant_video_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
         """Companion to resolve_compliant_image_refs for reference videos in a mixed2video
@@ -756,10 +759,25 @@ class LibTVClient:
         error), so a reference video that itself shows a real person never clears moderation
         while it stays a raw cdn url and libtv rejects the whole generation. Registering it as
         a third_asset yields the same verified asset id libtv accepts for portraits."""
-        return [
-            self._register_compliant_asset(self.ensure_libtv_url(kind, url, data), "video")
-            for (kind, url, data) in refs
-        ]
+        return self._resolve_asset_refs_sync(
+            [self.ensure_libtv_url(kind, url, data) for (kind, url, data) in refs], "video"
+        )
+
+    def _resolve_asset_refs_sync(self, cdn_urls: List[str], asset_type: str) -> List[CompliantAssetRef]:
+        """Sync counterpart of ``_aresolve_asset_refs`` -- dedupe ONLY.
+
+        Deliberate asymmetry: the cross-request cache lives on prisma's async
+        ``db.execute_raw`` and the shared rate-limit window on redis.asyncio, and
+        neither has a sync face. litellm proxy (all of causyn production) reaches
+        libtv exclusively through the async path, so a synchronous cache/limiter
+        would be a second, unexercised implementation of the trickiest logic in
+        this file. Dedupe is pure and costs nothing, so the sync path gets that
+        much. If a sync caller ever needs pacing, give it the SAME limiter with a
+        threading window rather than forking the semantics.
+        """
+        unique, index_for = dedupe_preserving_order(cdn_urls)
+        resolved = [self._register_compliant_asset(cdn_url, asset_type) for cdn_url in unique]
+        return [dict(resolved[index_for[u]]) for u in cdn_urls]  # type: ignore[misc]
 
     # ---------- async ----------
     async def _apost(self, path: str, body: Dict[str, Any], step: str, *, submit_once: bool = False) -> Dict[str, Any]:
@@ -1429,7 +1447,19 @@ class LibTVClient:
                 logger.warning("libtv upload abort failed", exc_info=True)
             raise
 
-    async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> CompliantAssetRef:
+    async def _aregister_compliant_asset_terminal(
+        self, cdn_url: str, asset_type: str
+    ) -> tuple[CompliantAssetRef, bool]:
+        """Register one asset; second element says whether libtv actually answered.
+
+        The caller needs that flag because the two ``assetId: None`` outcomes are
+        NOT the same thing: ``_asset_ref_from_item`` returning a ref with no id
+        means libtv reached a terminal state and exempted the image, while
+        falling out of the poll loop means we gave up waiting. Caching the second
+        as if it were the first would pin "exempt" onto an asset libtv never
+        ruled on, for the whole cache TTL.
+        """
+        await get_third_asset_limiter().acquire(self._account_key)
         asset_uuid = parse_third_asset_uuid(
             await self._apost(
                 "/api/third_asset/create",
@@ -1446,28 +1476,68 @@ class LibTVClient:
                 cdn_url,
             )
             if ref:
-                return ref
+                return ref, True
             await asyncio.sleep(self.poll_interval)
-        return {"url": cdn_url, "assetId": None}
+        return {"url": cdn_url, "assetId": None}, False
+
+    async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> CompliantAssetRef:
+        ref, _terminal = await self._aregister_compliant_asset_terminal(cdn_url, asset_type)
+        return ref
+
+    async def _aresolve_asset_refs(self, cdn_urls: List[str], asset_type: str) -> List[CompliantAssetRef]:
+        """Registrations for ``cdn_urls``, one per input position.
+
+        Three savings stack here, cheapest first (2026-09-01 causyn.cn incident:
+        10 shots x ~10 references = 97 registrations in 12s against libtv's
+        15/min cap, so every shot failed with code=10026):
+
+        1. dedupe -- a shot naming the same character sheet twice pays once;
+        2. cross-request cache -- the 97 collapse to the 30 distinct assets, and
+           a reused id has already aged past the upstream deep audit that makes
+           freshly registered ids fail (see handler._is_fresh_asset_aging_failure);
+        3. rate limiter (inside the register call) -- paces whatever is left.
+        """
+        unique, index_for = dedupe_preserving_order(cdn_urls)
+        ttl = asset_cache_ttl_seconds()
+        persistence = self._get_persistence() if ttl > 0 else None
+        resolved: List[CompliantAssetRef] = []
+        for cdn_url in unique:
+            cached = None
+            if persistence is not None:
+                try:
+                    cached = await persistence.cached_asset(
+                        self._account_key, cdn_url, asset_type, ttl_seconds=ttl
+                    )
+                except Exception:  # noqa: BLE001  # a cache fault must degrade to a fresh registration, not a failure
+                    logger.warning("libtv asset cache lookup failed", exc_info=True)
+                    cached = None
+            if cached is not None:
+                resolved.append({"url": cdn_url, "assetId": cached.get("assetId")})
+                continue
+            ref, terminal = await self._aregister_compliant_asset_terminal(cdn_url, asset_type)
+            if terminal and persistence is not None:
+                try:
+                    await persistence.store_asset(
+                        self._account_key, cdn_url, asset_type, ref.get("assetId")
+                    )
+                except Exception:  # noqa: BLE001  # best-effort write; worst case is no reuse next time
+                    logger.warning("libtv asset cache store failed", exc_info=True)
+            resolved.append(ref)
+        return [dict(resolved[index_for[u]]) for u in cdn_urls]  # type: ignore[misc]
 
     async def aresolve_compliant_image_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
         cdn_urls = [await self.aensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
         passed = parse_verify_passed(
             await self._apost("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify")
         )
-        resolved: List[CompliantAssetRef] = []
         for cdn_url in cdn_urls:
             if not passed.get(cdn_url):
                 raise LibTVError(
                     status_code=400,
                     message="libtv portrait compliance check did not pass for a reference image",
                 )
-            resolved.append(await self._aregister_compliant_asset(cdn_url, "image"))
-        return resolved
+        return await self._aresolve_asset_refs(cdn_urls, "image")
 
     async def aresolve_compliant_video_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
-        resolved: List[CompliantAssetRef] = []
-        for kind, url, data in refs:
-            cdn_url = await self.aensure_libtv_url(kind, url, data)
-            resolved.append(await self._aregister_compliant_asset(cdn_url, "video"))
-        return resolved
+        cdn_urls = [await self.aensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
+        return await self._aresolve_asset_refs(cdn_urls, "video")
