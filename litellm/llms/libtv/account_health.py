@@ -285,13 +285,43 @@ class LibTVAccountHealthProber:
     # ---------- loop ----------
 
     async def run_once(self) -> None:
-        for account in discover_libtv_accounts(self._router):
+        accounts = discover_libtv_accounts(self._router)
+        for account in accounts:
             try:
                 await self.probe_and_publish(account)
             except Exception:  # noqa: BLE001  # one bad account must not stop the rest of the sweep
                 logger.warning(
                     "libtv account health: probe cycle failed for %s", account.label, exc_info=True
                 )
+        await self._prune_registry(accounts)
+
+    async def _prune_registry(self, accounts: Sequence[LibTVAccount]) -> None:
+        """Drop registry entries for accounts that no longer exist.
+
+        Rotating a credential changes its account_key, so without this the
+        retired key would sit in the registry forever, its sample would expire,
+        and the monitor would report a permanently missing account: FIXING a
+        dead token would itself create a permanent false alarm.
+
+        An empty discovery prunes nothing. A router that has not loaded yet
+        looks exactly like a pool that vanished, and wiping the registry in that
+        case would hide a real outage precisely when it matters.
+        """
+        if self._redis is None or not accounts:
+            return
+        live = {a.account_key for a in accounts}
+        try:
+            registered = await self._redis.zrange(ACCOUNT_HEALTH_SEEN_KEY, 0, -1)
+            stale = [
+                (k.decode() if isinstance(k, bytes) else k)
+                for k in (registered or [])
+                if (k.decode() if isinstance(k, bytes) else k) not in live
+            ]
+            if stale:
+                await self._redis.zrem(ACCOUNT_HEALTH_SEEN_KEY, *stale)
+                logger.info("libtv account health: pruned %d retired account(s)", len(stale))
+        except Exception:  # noqa: BLE001  # housekeeping must never break the probe cycle
+            logger.warning("libtv account health: registry prune failed", exc_info=True)
 
     async def _loop(self) -> None:
         while True:

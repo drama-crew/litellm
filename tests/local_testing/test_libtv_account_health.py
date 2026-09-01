@@ -201,6 +201,13 @@ class _FakeRedis:
         items = sorted(self.zsets.get(key, {}).items(), key=lambda kv: kv[1])
         return items if withscores else [k for k, _ in items]
 
+    async def zrem(self, key, *members):
+        bucket = self.zsets.get(key, {})
+        removed = 0
+        for member in members:
+            removed += bucket.pop(member, None) is not None
+        return removed
+
 
 @pytest.mark.asyncio
 async def test_publish_writes_a_sample_and_registers_the_account():
@@ -386,3 +393,61 @@ async def test_prober_enabled_respects_explicit_off_values(monkeypatch):
     for value in ("1", "true", "yes", "on", ""):
         monkeypatch.setenv("LIBTV_ACCOUNT_HEALTH_ENABLED", value)
         assert prober_enabled() is True
+
+
+# ---------- registry pruning ----------
+
+
+@pytest.mark.asyncio
+async def test_run_once_prunes_accounts_that_no_longer_exist():
+    """Rotating a token changes its account_key.
+
+    Without pruning, the retired key stays in the registry forever, its sample
+    expires, and the monitor reports a permanently missing account -- so the
+    very act of FIXING the 2026-09-01 dead token would have created a
+    permanent false alarm.
+    """
+    redis = _FakeRedis()
+    redis.zsets[ACCOUNT_HEALTH_SEEN_KEY] = {"retired-key": 1.0}
+    router = _Router([_deployment("acct-1", "libtv/star-video2.5", "tok-1", "web-1")])
+    prober = LibTVAccountHealthProber(
+        redis_client=redis,
+        http_client_factory=lambda: _ProbeClient(payload={"code": 0, "data": {"uuid": "u"}}),
+        router=router,
+    )
+    await prober.run_once()
+    assert set(redis.zsets[ACCOUNT_HEALTH_SEEN_KEY]) == {account_key("tok-1")}
+
+
+@pytest.mark.asyncio
+async def test_run_once_does_not_prune_when_discovery_comes_back_empty():
+    # An empty discovery is far more likely to be a router that has not loaded
+    # than a pool that genuinely vanished. Wiping the registry there would hide
+    # a real outage precisely when visibility matters most.
+    redis = _FakeRedis()
+    redis.zsets[ACCOUNT_HEALTH_SEEN_KEY] = {"k1": 1.0}
+    prober = LibTVAccountHealthProber(
+        redis_client=redis,
+        http_client_factory=lambda: _ProbeClient(payload={"code": 0, "data": {"uuid": "u"}}),
+        router=_Router([]),
+    )
+    await prober.run_once()
+    assert set(redis.zsets[ACCOUNT_HEALTH_SEEN_KEY]) == {"k1"}
+
+
+@pytest.mark.asyncio
+async def test_pruning_failure_does_not_break_the_cycle():
+    class _NoZrem(_FakeRedis):
+        async def zrem(self, *a, **k):
+            raise RuntimeError("redis down")
+
+    redis = _NoZrem()
+    redis.zsets[ACCOUNT_HEALTH_SEEN_KEY] = {"retired-key": 1.0}
+    router = _Router([_deployment("acct-1", "libtv/star-video2.5", "tok-1", "web-1")])
+    prober = LibTVAccountHealthProber(
+        redis_client=redis,
+        http_client_factory=lambda: _ProbeClient(payload={"code": 0, "data": {"uuid": "u"}}),
+        router=router,
+    )
+    await prober.run_once()  # must not raise
+    assert account_key("tok-1") in redis.zsets[ACCOUNT_HEALTH_SEEN_KEY]
