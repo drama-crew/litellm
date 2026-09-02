@@ -44,8 +44,8 @@ RUN for attempt in 1 2 3 4 5; do \
         apk add --no-cache \
             bash \
             gcc \
-            python3 \
-            python3-dev \
+            python-3.13 \
+            python-3.13-dev \
             rust \
             openssl \
             openssl-dev \
@@ -117,6 +117,20 @@ COPY enterprise/pyproject.toml enterprise/
 COPY litellm-proxy-extras/pyproject.toml litellm-proxy-extras/
 
 # Install third-party dependencies (cached unless pyproject.toml/uv.lock change)
+#
+# `--python /usr/bin/python3.13`, not `python3`: a bare name is a REQUEST, and
+# uv satisfies it with the newest CPython it can find -- including one it
+# downloads. Once Wolfi's `python3` alias advanced past this project's
+# `requires-python = ">=3.10, <3.14"`, every build died on
+#   error: The requested interpreter resolved to Python 3.14.4, which is
+#   incompatible with the project's Python requirement
+# after helpfully downloading 3.14.4 first (2026-09-02: this broke the litellm
+# image for everyone, not just one branch).
+#
+# The absolute path also protects the runtime stage: it copies /app/.venv
+# wholesale, and that venv hard-codes `home = /usr/bin` plus a 3.13
+# site-packages layout. A uv-managed interpreter would leave the venv pointing
+# at a path the runtime image does not have.
 RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.org/|${PYPI_FILES_MIRROR}|g" uv.lock; fi && \
     if [ -n "$PYPI_INDEX_MIRROR" ]; then export UV_DEFAULT_INDEX="$PYPI_INDEX_MIRROR"; fi && \
     uv sync --frozen --no-install-project --no-install-workspace --no-default-groups --no-editable \
@@ -124,7 +138,7 @@ RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.or
     --extra proxy-runtime \
     --extra extra_proxy \
     --extra semantic-router \
-    --python python3
+    --python /usr/bin/python3.13
 
 # Copy full source tree
 COPY . .
@@ -147,7 +161,7 @@ RUN if [ -n "$PYPI_FILES_MIRROR" ]; then sed -i "s|https://files.pythonhosted.or
     --extra proxy-runtime \
     --extra extra_proxy \
     --extra semantic-router \
-    --python python3
+    --python /usr/bin/python3.13
 
 RUN prisma generate --schema=./schema.prisma
 
@@ -161,7 +175,7 @@ USER root
 
 # node (without npm) is required by the prisma CLI at runtime
 RUN for attempt in 1 2 3 4 5; do \
-        apk add --no-cache bash openssl tzdata nodejs python3 libsndfile && exit 0; \
+        apk add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile && exit 0; \
         echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
         sleep 5; \
     done; \
