@@ -25,6 +25,14 @@ TOPAZ_RESOLUTION = "2K"
 TOPAZ_CREATE_PARAMS = {"resolution": TOPAZ_RESOLUTION, "specifiedModel": "prob-4", "slowmo": "1"}
 TOPAZ_LEASE_SECONDS = 900
 MAX_ATTEMPTS = 4
+# Placeholder kept for the case where the provider raises with no text at all.
+# `_optional_state_string` rejects an empty string, so writing "" would produce
+# a state that cannot be re-loaded and would strand the task.
+GENERIC_FAILURE_MESSAGE = "provider_failure"
+# The reason is provider-authored and unbounded; the state is a Redis value
+# re-serialized on every attempt, so cap it. Long enough for a real upstream
+# body, short enough to keep the state small.
+MAX_FAILURE_MESSAGE_CHARS = 500
 TOPAZ_STATE_PREFIX = "causyn:topaz:"
 logger = logging.getLogger(__name__)
 TopazPhase = Literal["preparing", "creating", "submitted", "completed", "retryable_failure", "indeterminate", "failed"]
@@ -110,6 +118,16 @@ def _validate_state_identity(value: dict[str, object]) -> tuple[str, str | None,
     provider_task_id = _optional_state_string(value["provider_task_id"], "provider task id")
     failure_message = _optional_state_string(value["failure_message"], "failure message")
     return account_ref, provider_task_id, phase, failure_message
+
+
+def _bounded_failure_message(message: str) -> str:
+    """Provider text, trimmed and capped; blank falls back to the placeholder."""
+    text = (message or "").strip()
+    if not text:
+        return GENERIC_FAILURE_MESSAGE
+    if len(text) <= MAX_FAILURE_MESSAGE_CHARS:
+        return text
+    return text[: MAX_FAILURE_MESSAGE_CHARS - 1] + "\u2026"
 
 
 def _optional_state_string(value: object, field: str) -> str | None:
@@ -532,16 +550,40 @@ class TopazVideoAdapter:
             return next_state, True
         return await _reload_or_raise(store, task_id), False
 
-    async def _retryable(self, store: TopazStateStore, task_id: str, state: TopazState, _message: str) -> TopazAdvance:
+    async def _retryable(self, store: TopazStateStore, task_id: str, state: TopazState, message: str) -> TopazAdvance:
+        # `message` is the provider's own text. It used to be accepted as
+        # `_message` and dropped on the floor in favour of the placeholder, and
+        # nothing else on this path logged it -- the only warnings in this
+        # module are about a corrupt/missing state machine. A 2026-09-01
+        # production 2K failure therefore ended up with three stacked layers of
+        # generic text (this state's "provider_failure", the handler's "causyn
+        # 2K processing failed", and the platform's user message) and the cause
+        # nowhere at all.
+        #
+        # Keep it INTERNAL: it goes into the Redis state and the log only.
+        # `TopazAdvance` deliberately does not carry it, and the caller-visible
+        # strings stay vendor-free -- see 6214f3e1 ("hide 2K provider details in
+        # errors"), which is the constraint this must not undo.
+        failure_message = _bounded_failure_message(message)
+        logger.warning(
+            "causyn Topaz attempt failed",
+            extra={
+                "causyn_task_id": task_id,
+                "attempt_index": state.attempt_index,
+                "account_ref": state.account_ref,
+                "confirmed_submission_count": state.confirmed_submission_count,
+                "failure_message": failure_message,
+            },
+        )
         if state.attempt_index >= MAX_ATTEMPTS:
             failed = replace(
-                state, phase="failed", updated_at=self.now(), lease_until=0, failure_message="provider_failure"
+                state, phase="failed", updated_at=self.now(), lease_until=0, failure_message=failure_message
             )
             if await store.compare_set(task_id, state, failed):
                 return TopazAdvance("failed", attempt_index=state.attempt_index)
             return await _after_cas_failure(store, task_id)
         retryable = replace(
-            state, phase="retryable_failure", updated_at=self.now(), lease_until=0, failure_message="provider_failure"
+            state, phase="retryable_failure", updated_at=self.now(), lease_until=0, failure_message=failure_message
         )
         if await store.compare_set(task_id, state, retryable):
             return TopazAdvance("in_progress", attempt_index=state.attempt_index)

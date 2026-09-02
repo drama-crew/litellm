@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
 from pydantic import TypeAdapter
 
 from litellm.llms.causyn.topaz import (
     MAX_ATTEMPTS,
+    MAX_FAILURE_MESSAGE_CHARS,
     TopazAccount,
+    TopazAdvance,
     TopazAccountPool,
     TopazClient,
     TopazIndeterminateError,
@@ -533,7 +536,10 @@ async def test_terminal_provider_failure_preserves_submission_evidence_before_ne
         "account_ref": "account-1",
         "attempt_index": 1,
         "confirmed_submission_count": 1,
-        "failure_message": "provider_failure",
+        # The provider's own poll `failed_reason`, kept verbatim. This used to
+        # assert the "provider_failure" placeholder, i.e. it pinned the very
+        # discard that made the 2026-09-01 production failure undiagnosable.
+        "failure_message": "provider failed",
         "lease_until": 0,
         "phase": "retryable_failure",
         "provider_task_id": "topaz-1",
@@ -893,3 +899,181 @@ async def _source_url() -> str:
 
 def assert_source(url: str) -> None:
     assert url.startswith("https://platform.example/source-")
+
+
+# --- failure-reason preservation (2026-09-02) -------------------------------
+#
+# `_retryable` used to take the provider's error text as `_message` and throw it
+# away, writing the literal "provider_failure" into the state instead. Nothing
+# else logged it either -- topaz.py's only warnings are about a corrupt/missing
+# state machine. So a production 2K failure left three layers of generic text
+# and no cause anywhere: the platform's `error_message`, litellm's "causyn 2K
+# processing failed", and this state's "provider_failure".
+#
+# The reason now survives IN THE STATE AND THE LOG ONLY. The API-facing string
+# must stay generic -- see 6214f3e146 ("hide 2K provider details in errors"),
+# which deliberately renamed "Topaz" out of the caller-visible messages.
+
+
+@pytest.mark.asyncio
+async def test_create_rejection_keeps_the_provider_reason_in_state() -> None:
+    redis = FakeRedis()
+    client = FakeClient([ProviderRejected("算力不足")])
+    adapter = TopazVideoAdapter(
+        TopazAccountPool((TopazAccount("account-1", "token-1", "webid-1"),)),
+        client_factory=lambda _account: client,
+        redis_factory=lambda: redis,
+        now=lambda: 100.0,
+        state_ttl=3600,
+    )
+
+    await adapter.advance(
+        "base-reason-create", lambda _task_id: _source_url(), validate_source=lambda _: None
+    )
+
+    state = _state(redis.values["causyn:topaz:base-reason-create"])
+    assert "算力不足" in str(state["failure_message"])
+
+
+@pytest.mark.asyncio
+async def test_source_import_failure_keeps_the_provider_reason_in_state() -> None:
+    # The branch production actually hit: confirmed_submission_count stayed 0
+    # and provider_task_id stayed null, so the failure was at source import or
+    # create -- never at poll.
+    redis = FakeRedis()
+    # RuntimeError is in _TOPAZ_SOURCE_ERRORS; the import branch never sees a
+    # ProviderRejected/ProviderTransportError (those come from acreate).
+    client = FakeClient([], import_outcomes=[RuntimeError("source import refused")])
+    adapter = TopazVideoAdapter(
+        TopazAccountPool((TopazAccount("account-1", "token-1", "webid-1"),)),
+        client_factory=lambda _account: client,
+        redis_factory=lambda: redis,
+        now=lambda: 100.0,
+        state_ttl=3600,
+    )
+
+    await adapter.advance(
+        "base-reason-import", lambda _task_id: _source_url(), validate_source=lambda _: None
+    )
+
+    state = _state(redis.values["causyn:topaz:base-reason-import"])
+    assert "source import refused" in str(state["failure_message"])
+    assert state["confirmed_submission_count"] == 0
+    assert state["provider_task_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_reason_is_logged_with_enough_context_to_act_on(caplog) -> None:
+    redis = FakeRedis()
+    client = FakeClient([ProviderRejected("算力不足")])
+    adapter = TopazVideoAdapter(
+        TopazAccountPool((TopazAccount("account-1", "token-1", "webid-1"),)),
+        client_factory=lambda _account: client,
+        redis_factory=lambda: redis,
+        now=lambda: 100.0,
+        state_ttl=3600,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await adapter.advance(
+            "base-reason-log", lambda _task_id: _source_url(), validate_source=lambda _: None
+        )
+
+    records = [r for r in caplog.records if r.message == "causyn Topaz attempt failed"]
+    assert records, "the retryable path must log the provider reason"
+    extra = records[0]
+    # Enough context to act without a second query: which task, which attempt,
+    # which account, and what the provider actually said.
+    assert getattr(extra, "causyn_task_id") == "base-reason-log"
+    assert getattr(extra, "attempt_index") == 1
+    assert getattr(extra, "account_ref") == "account-1"
+    assert "算力不足" in getattr(extra, "failure_message")
+
+
+@pytest.mark.asyncio
+async def test_exhausted_attempts_keep_the_last_reason_not_a_placeholder() -> None:
+    redis = FakeRedis()
+    accounts = TopazAccountPool(
+        (
+            TopazAccount("account-1", "token-1", "webid-1"),
+            TopazAccount("account-2", "token-2", "webid-2"),
+        )
+    )
+    client = FakeClient([ProviderRejected("算力不足")] * MAX_ATTEMPTS)
+    adapter = TopazVideoAdapter(
+        accounts,
+        client_factory=lambda _account: client,
+        redis_factory=lambda: redis,
+        now=lambda: 100.0,
+        state_ttl=3600,
+    )
+
+    for _ in range(MAX_ATTEMPTS):
+        advance = await adapter.advance(
+            "base-reason-exhausted", lambda _task_id: _source_url(), validate_source=lambda _: None
+        )
+
+    state = _state(redis.values["causyn:topaz:base-reason-exhausted"])
+    assert advance.status == "failed"
+    assert state["phase"] == "failed"
+    # The terminal state is the one an operator reads after the fact; a
+    # placeholder here is exactly what made the production incident unreadable.
+    assert "算力不足" in str(state["failure_message"])
+
+
+@pytest.mark.asyncio
+async def test_a_blank_provider_reason_falls_back_to_the_placeholder() -> None:
+    # `_optional_state_string` rejects an empty string, so a provider that
+    # raises with no text must not be able to write an unloadable state.
+    redis = FakeRedis()
+    client = FakeClient([ProviderRejected("")])
+    adapter = TopazVideoAdapter(
+        TopazAccountPool((TopazAccount("account-1", "token-1", "webid-1"),)),
+        client_factory=lambda _account: client,
+        redis_factory=lambda: redis,
+        now=lambda: 100.0,
+        state_ttl=3600,
+    )
+
+    await adapter.advance(
+        "base-reason-blank", lambda _task_id: _source_url(), validate_source=lambda _: None
+    )
+
+    state = _state(redis.values["causyn:topaz:base-reason-blank"])
+    assert state["failure_message"] == "provider_failure"
+    # Must round-trip: a state that cannot be re-loaded strands the task.
+    assert TopazState.from_json(redis.values["causyn:topaz:base-reason-blank"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_a_pathological_provider_reason_is_bounded() -> None:
+    redis = FakeRedis()
+    client = FakeClient([ProviderRejected("x" * 50_000)])
+    adapter = TopazVideoAdapter(
+        TopazAccountPool((TopazAccount("account-1", "token-1", "webid-1"),)),
+        client_factory=lambda _account: client,
+        redis_factory=lambda: redis,
+        now=lambda: 100.0,
+        state_ttl=3600,
+    )
+
+    await adapter.advance(
+        "base-reason-long", lambda _task_id: _source_url(), validate_source=lambda _: None
+    )
+
+    state = _state(redis.values["causyn:topaz:base-reason-long"])
+    assert len(str(state["failure_message"])) <= MAX_FAILURE_MESSAGE_CHARS
+
+
+def test_the_advance_result_cannot_carry_the_provider_reason() -> None:
+    """Structural guard on the internal/external boundary.
+
+    The reason is allowed to live in the Redis state and the log. `TopazAdvance`
+    is what crosses back into `handler.py`, which turns it into a caller-visible
+    error -- so if the reason ever became a field here, the next well-meaning
+    change would plumb it into that message and undo 6214f3e1 ("hide 2K provider
+    details in errors").
+    """
+    fields = set(TopazAdvance.__dataclass_fields__)
+
+    assert fields == {"status", "provider_task_id", "result_url", "attempt_index"}
