@@ -1,10 +1,24 @@
 # syntax=docker/dockerfile:1.7
 
 # Base image for building
-ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:42df77a9974d6ec8b17a5ee8bc23b532600a44d705acef2409e0933c1251b45f
+#
+# The wolfi-base digest and the apk packages installed below MUST be bumped
+# together. The base is pinned by digest (frozen), but every `apk add` resolves
+# against the LIVE Wolfi repository, so the two drift apart on their own. When
+# Wolfi moved glibc 2.43 -> 2.44 and rebuilt python against it, the frozen base
+# kept shipping glibc 2.43 while `apk add python-3.13` installed a 2.44 build:
+#
+#   ImportError: /usr/lib/libm.so.6: version `GLIBC_2.44' not found
+#     (required by .../math.cpython-313-x86_64-linux-gnu.so)
+#
+# apk does not catch this -- it resolves `so:libm.so.6` by NAME and never looks
+# at symbol versions, so it happily installs a package the base cannot run.
+# 2026-09-02: bumped to a base carrying glibc 2.44 (verified: python-3.13
+# 3.13.15-r4 installs and imports math/subprocess/selectors on it).
+ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:7e62cecd3c5712dba6e52c5260afb8f9d7a23b9bbcdd26ad7508a811e74b766d
 
 # Runtime image
-ARG LITELLM_RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:42df77a9974d6ec8b17a5ee8bc23b532600a44d705acef2409e0933c1251b45f
+ARG LITELLM_RUNTIME_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:7e62cecd3c5712dba6e52c5260afb8f9d7a23b9bbcdd26ad7508a811e74b766d
 ARG UV_IMAGE=ghcr.io/astral-sh/uv:0.11.7@sha256:240fb85ab0f263ef12f492d8476aa3a2e4e1e333f7d67fbdd923d00a506a516a
 # Pinned by digest like the other base images; bump explicitly on Node upgrades.
 ARG UI_BUILD_IMAGE=node:20.18-alpine3.20@sha256:3488b10bf958af7125a176419d2d8a9937d895bf124012aae811651988d2ffe6
