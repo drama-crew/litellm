@@ -65,6 +65,30 @@ THIRD_ASSET_POLL_ATTEMPTS = 30
 logger = logging.getLogger(__name__)
 
 
+# libtv 业务码里表示"你来得太快了"的那些。分开列而不是按码段判断：这些码没有
+# 公开的分段约定，按段猜会把不相关的失败也说成限流。
+#
+# 10026 = "当前素材检测提交较频繁，请控制在每分钟 15 个以内"（2026-09-01
+# causyn.cn 事故：97 次 third_asset/create 打在 12 秒里）。此前只有
+# 1200000136 被判 429，10026 落到 502，于是平台 user_error.py 的 429 分支
+# 落空、塌缩成通用文案，用户与 agent 都看不出该等一等。
+_RATE_LIMIT_CODES = frozenset({10026, 1200000136})
+
+
+def _is_rate_limit_code(code: object) -> bool:
+    """上游偶有把 code 序列化成字符串；纯表示差异不该改变判定。"""
+    if isinstance(code, bool):
+        return False
+    if isinstance(code, int):
+        return code in _RATE_LIMIT_CODES
+    if isinstance(code, str):
+        try:
+            return int(code.strip()) in _RATE_LIMIT_CODES
+        except ValueError:
+            return False
+    return False
+
+
 def _resolve_pool_credential(value: object) -> str:
     if not isinstance(value, str) or not value:
         return ""
@@ -573,7 +597,7 @@ class LibTVClient:
             )
         payload = response.json()
         if payload.get("code") not in (0, None):
-            status_code = 429 if payload.get("code") == 1200000136 else 502
+            status_code = 429 if _is_rate_limit_code(payload.get("code")) else 502
             raise LibTVError(
                 status_code=status_code,
                 message=f"libtv {step} code={payload.get('code')} msg={payload.get('msg')}",
