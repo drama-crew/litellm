@@ -32,6 +32,18 @@ CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVUploadCache" (
 )
 """
 
+CREATE_ASSET_REGISTRY_TABLE = """
+CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVAssetRegistry" (
+  account_key TEXT NOT NULL,
+  cdn_url TEXT NOT NULL,
+  asset_type TEXT NOT NULL,
+  asset_id TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_key, cdn_url, asset_type)
+)
+"""
+
 CREATE_PROJECTS_TABLE = """
 CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVProjects" (
   account_key TEXT NOT NULL,
@@ -118,6 +130,7 @@ class LibTVPersistence:
         try:
             await self.db.execute_raw(CREATE_UPLOAD_CACHE_TABLE)
             await self.db.execute_raw(CREATE_PROJECTS_TABLE)
+            await self.db.execute_raw(CREATE_ASSET_REGISTRY_TABLE)
             await self.db.execute_raw(CREATE_VIDEO_TASK_USAGE_TABLE)
             await self.db.execute_raw(CREATE_BILLED_VIDEO_TASKS_TABLE)
             _tables_ready = True
@@ -174,6 +187,77 @@ class LibTVPersistence:
             )
         except Exception:  # noqa: BLE001  # eviction is best-effort; a failed delete just leaves a stale row
             _warn("libtv persistence: delete_upload failed", exc_info=True)
+
+
+    async def cached_asset(
+        self, account_key: str, cdn_url: str, asset_type: str, *, ttl_seconds: float
+    ) -> dict | None:
+        """A previously completed third_asset registration, or None.
+
+        Returns libtv's own ``CompliantAssetRef`` shape. ``assetId`` of None is a
+        HIT, not a miss: libtv answers "no real person in this image, exempt" by
+        reaching a terminal state without issuing an id, and remembering that is
+        exactly what stops us re-submitting exempt scenery on every shot. Only
+        terminal outcomes are ever written here (see store_asset's caller), so a
+        row can be trusted without re-checking.
+
+        Reuse also side-steps the fresh-asset aging failure documented in
+        handler._is_fresh_asset_aging_failure: an id that already survived its
+        upstream deep audit does not need the retry cycle a brand-new one does.
+
+        ttl_seconds <= 0 disables reuse entirely and skips the query.
+        """
+        if ttl_seconds <= 0:
+            return None
+        try:
+            await self.ensure_tables()
+            rows = await self.db.query_raw(
+                'SELECT asset_id FROM "LiteLLM_LibTVAssetRegistry" '
+                "WHERE account_key=$1 AND cdn_url=$2 AND asset_type=$3 "
+                "AND created_at > now() - make_interval(secs => $4)",
+                account_key,
+                cdn_url,
+                asset_type,
+                float(ttl_seconds),
+            )
+            if not rows:
+                return None
+            asset_id = rows[0]["asset_id"]
+            try:
+                await self.db.execute_raw(
+                    'UPDATE "LiteLLM_LibTVAssetRegistry" SET last_used_at=now() '
+                    "WHERE account_key=$1 AND cdn_url=$2 AND asset_type=$3",
+                    account_key,
+                    cdn_url,
+                    asset_type,
+                )
+            except Exception:  # noqa: BLE001  # touching last_used_at is housekeeping; the hit above must still return
+                _warn("libtv persistence: failed to touch asset last_used_at", exc_info=True)
+            return {"url": cdn_url, "assetId": str(asset_id) if asset_id is not None else None}
+        except Exception:  # noqa: BLE001  # any read failure degrades to a cache miss, never breaks registration
+            _warn("libtv persistence: cached_asset failed", exc_info=True)
+            return None
+
+    async def store_asset(
+        self, account_key: str, cdn_url: str, asset_type: str, asset_id: str | None
+    ) -> None:
+        """Remember a terminal registration. created_at is refreshed on conflict so
+        a re-registered asset restarts its TTL rather than expiring on the original
+        row's clock."""
+        try:
+            await self.ensure_tables()
+            await self.db.execute_raw(
+                'INSERT INTO "LiteLLM_LibTVAssetRegistry" '
+                "(account_key, cdn_url, asset_type, asset_id) VALUES ($1, $2, $3, $4) "
+                "ON CONFLICT (account_key, cdn_url, asset_type) DO UPDATE SET "
+                "asset_id=EXCLUDED.asset_id, created_at=now(), last_used_at=now()",
+                account_key,
+                cdn_url,
+                asset_type,
+                asset_id,
+            )
+        except Exception:  # noqa: BLE001  # cache write is best-effort; a failed insert just means no reuse next time
+            _warn("libtv persistence: store_asset failed", exc_info=True)
 
     async def cached_project(self, account_key: str, day: str) -> ProjectCacheEntry | None:
         try:

@@ -1090,7 +1090,7 @@ class CausynVideoHandler(CustomLLM):
         try:
             return await self._get_topaz_adapter().advance(task_id, source_url, validate_source=validate_source)
         except TopazIndeterminateError as exc:
-            raise _service_error("causyn Topaz submission state is indeterminate") from exc
+            raise _service_error("causyn 2K processing indeterminate") from exc
         except Exception as exc:
             raise _service_error() from exc
 
@@ -1286,7 +1286,7 @@ class CausynVideoHandler(CustomLLM):
                     object="video",
                     status="failed",
                     model=spec.model,
-                    error={"message": "causyn Topaz upscale failed", "kind": "provider"},
+                    error={"message": "causyn 2K processing failed", "kind": "provider"},
                 )
             response = self._completed_response(
                 video_id,
@@ -1375,7 +1375,7 @@ class CausynVideoHandler(CustomLLM):
         try:
             return await self._get_topaz_adapter().content(task_id)
         except TopazIndeterminateError as exc:
-            raise _service_error("causyn Topaz submission state is indeterminate") from exc
+            raise _service_error("causyn 2K processing indeterminate") from exc
         except Exception as exc:
             raise _service_error() from exc
 

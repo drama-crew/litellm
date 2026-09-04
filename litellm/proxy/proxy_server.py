@@ -758,8 +758,15 @@ def cleanup_router_config_variables():
 
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate, user_custom_key_update
-    global _libtv_billing_reconciler, _causyn_billing_reconciler
+    global _libtv_billing_reconciler, _causyn_billing_reconciler, _libtv_account_health_prober
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
+    if _libtv_account_health_prober is not None:
+        try:
+            await _libtv_account_health_prober.stop()
+        except Exception:
+            verbose_proxy_logger.exception("Failed to stop libtv account health prober")
+        finally:
+            _libtv_account_health_prober = None
     if _libtv_billing_reconciler is not None:
         try:
             await _libtv_billing_reconciler.stop()
@@ -860,7 +867,8 @@ async def proxy_startup_event(app: FastAPI):
         proxy_batch_polling_interval, \
         shared_aiohttp_session, \
         _libtv_billing_reconciler, \
-        _causyn_billing_reconciler
+        _causyn_billing_reconciler, \
+        _libtv_account_health_prober
     import json
 
     init_verbose_loggers()
@@ -1098,6 +1106,18 @@ async def proxy_startup_event(app: FastAPI):
     except Exception:
         # Causyn uses a separate Redis stream and must not block libtv startup.
         verbose_proxy_logger.exception("Failed to start Causyn billing outbox reconciler")
+
+    from litellm.llms.libtv.account_health import start_libtv_account_health_prober
+
+    try:
+        # Watches every libtv credential the router can route to. A dead vendor
+        # token is otherwise invisible until the surviving pool member fails
+        # (2026-09-01: seedance-2.5's account-2 had been 401 "No login" for an
+        # unknown length of time with no signal anywhere).
+        _libtv_account_health_prober = await start_libtv_account_health_prober(llm_router)
+    except Exception:
+        # Monitoring must never be able to keep the proxy from serving traffic.
+        verbose_proxy_logger.exception("Failed to start libtv account health prober")
 
     # End of startup event
     yield
@@ -1937,6 +1957,7 @@ prisma_client: Optional[PrismaClient] = None
 shared_aiohttp_session: Optional["ClientSession"] = None  # Global shared session for connection reuse
 _libtv_billing_reconciler = None
 _causyn_billing_reconciler = None
+_libtv_account_health_prober = None
 user_api_key_cache: UserApiKeyCache = UserApiKeyCache(
     default_in_memory_ttl=UserAPIKeyCacheTTLEnum.in_memory_cache_ttl.value
 )

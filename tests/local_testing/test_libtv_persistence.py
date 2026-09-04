@@ -420,7 +420,7 @@ async def test_invalidate_project_execute_raw_raises_is_noop():
 
 
 @pytest.mark.asyncio
-async def test_ensure_tables_creates_both_tables_once():
+async def test_ensure_tables_creates_every_table_once():
     db = FakeDb()
     p = LibTVPersistence(db)
 
@@ -429,13 +429,14 @@ async def test_ensure_tables_creates_both_tables_once():
     await p.cached_upload("acct1", "cdn.example.com/g.png")
 
     create_calls = [c for c in db.execute_calls if "CREATE TABLE" in c[0]]
-    assert len(create_calls) == 4
+    assert len(create_calls) == 5
     assert any("LiteLLM_LibTVUploadCache" in c[0] for c in create_calls)
+    assert any("LiteLLM_LibTVAssetRegistry" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVProjects" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVVideoTaskUsage" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVBilledVideoTasks" in c[0] for c in create_calls)
-    assert calls_after_first == 4
-    assert len(db.execute_calls) == 4
+    assert calls_after_first == 5
+    assert len(db.execute_calls) == 5
 
 
 @pytest.mark.asyncio
@@ -635,3 +636,85 @@ async def test_url_alive_uses_ranged_get_with_redirects(monkeypatch):
     assert captured["url"] == "https://cdn.example.com/f.png"
     assert captured["headers"] == {"Range": "bytes=0-0"}
     assert captured["follow_redirects"] is True
+
+
+# ---------- third_asset registration cache (2026-09-01 incident) ----------
+#
+# Mirrors the upload cache next to it: the 2026-09-01 causyn.cn burst re-registered
+# the same 30 reference images 97 times because nothing remembered a registration
+# across requests.
+
+
+@pytest.mark.asyncio
+async def test_cached_asset_returns_the_stored_registration():
+    db = FakeDb(query_rows=[{"asset_id": "asset-AAA"}])
+    p = LibTVPersistence(db)
+    assert await p.cached_asset("acct", "https://cdn/a.png", "image", ttl_seconds=3600) == {
+        "url": "https://cdn/a.png",
+        "assetId": "asset-AAA",
+    }
+    sql, params = db.query_calls[0]
+    assert "LiteLLM_LibTVAssetRegistry" in sql
+    assert params[:3] == ("acct", "https://cdn/a.png", "image")
+
+
+@pytest.mark.asyncio
+async def test_cached_asset_preserves_an_exempt_registration():
+    # assetId NULL is a real terminal answer from libtv ("no real person here"),
+    # not a miss -- caching it is what stops us re-checking exempt scenery forever.
+    db = FakeDb(query_rows=[{"asset_id": None}])
+    p = LibTVPersistence(db)
+    assert await p.cached_asset("acct", "https://cdn/a.png", "image", ttl_seconds=3600) == {
+        "url": "https://cdn/a.png",
+        "assetId": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_cached_asset_misses_when_nothing_is_stored():
+    db = FakeDb(query_rows=[])
+    p = LibTVPersistence(db)
+    assert await p.cached_asset("acct", "https://cdn/a.png", "image", ttl_seconds=3600) is None
+
+
+@pytest.mark.asyncio
+async def test_cached_asset_ttl_zero_never_reads():
+    db = FakeDb(query_rows=[{"asset_id": "asset-AAA"}])
+    p = LibTVPersistence(db)
+    assert await p.cached_asset("acct", "https://cdn/a.png", "image", ttl_seconds=0) is None
+    assert db.query_calls == []
+
+
+@pytest.mark.asyncio
+async def test_cached_asset_passes_the_ttl_as_a_bound_not_a_filter_in_python():
+    db = FakeDb(query_rows=[])
+    p = LibTVPersistence(db)
+    await p.cached_asset("acct", "https://cdn/a.png", "image", ttl_seconds=1800)
+    sql, params = db.query_calls[0]
+    assert "created_at" in sql
+    assert 1800 in params or 1800.0 in params
+
+
+@pytest.mark.asyncio
+async def test_cached_asset_degrades_to_a_miss_when_the_db_is_down():
+    db = FakeDb(raise_on="query_raw")
+    p = LibTVPersistence(db)
+    assert await p.cached_asset("acct", "https://cdn/a.png", "image", ttl_seconds=3600) is None
+
+
+@pytest.mark.asyncio
+async def test_store_asset_upserts_and_refreshes_created_at():
+    db = FakeDb()
+    p = LibTVPersistence(db)
+    await p.store_asset("acct", "https://cdn/a.png", "image", "asset-AAA")
+    sql, params = db.execute_calls[-1]
+    assert "LiteLLM_LibTVAssetRegistry" in sql
+    assert "ON CONFLICT" in sql
+    assert params == ("acct", "https://cdn/a.png", "image", "asset-AAA")
+
+
+@pytest.mark.asyncio
+async def test_store_asset_survives_a_db_failure():
+    db = FakeDb(raise_on="execute_raw")
+    p = LibTVPersistence(db)
+    await p.store_asset("acct", "https://cdn/a.png", "image", "asset-AAA")  # must not raise
