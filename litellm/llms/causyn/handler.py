@@ -39,8 +39,10 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Awaitable, Callable
-from typing import Literal, Protocol, cast
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Literal, Protocol, TypeAlias, cast
 from urllib.parse import SplitResult, urlsplit
 
 import httpx
@@ -66,18 +68,24 @@ from litellm.types.videos.utils import decode_video_id_with_provider, encode_vid
 from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
 
 CAUSYN_MODEL = "causyn-1.0"
+CAUSYN_H3_MODEL = "causyn-1.1"
 PROVIDER = "causyn"
 CAUSYN_VIDEO_ID_PREFIX = "causyn_"
 LEGACY_VIDEO_ID_PREFIX = CAUSYN_VIDEO_ID_PREFIX
 CAUSYN_RESOLUTION = "768x512"
 CAUSYN_2K_RESOLUTION = "2k"
 CAUSYN_RESOLUTIONS = frozenset({CAUSYN_RESOLUTION, CAUSYN_2K_RESOLUTION})
+CAUSYN_H3_RESOLUTION = "768p"
+CAUSYN_H3_RATIOS = frozenset({"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"})
 CAUSYN_BILLING_METADATA_VERSION = "causyn-video-billing-v1"
 CAUSYN_BILLING_METADATA_VERSION_V2 = "causyn-video-billing-v2"
+CAUSYN_BILLING_METADATA_VERSION_V3 = "causyn-video-billing-v3"
 CAUSYN_RATIO = "3:2"
 CAUSYN_DEADLINE_SECONDS = 1800.0
 _INTERNAL_VIDEO_FLAG = "DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_FLAG_ALIAS = "OH_DRAMA_INTERNAL_VIDEO_ENABLED"
+_CAUSYN_H3_FLAG = "DRAMA_CAUSYN_1_1_ENABLED"
+_CAUSYN_H3_FLAG_ALIAS = "OH_DRAMA_CAUSYN_1_1_ENABLED"
 _INTERNAL_VIDEO_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _CAUSYN_PLATFORM_URL_ENV = "DRAMA_CAUSYN_PLATFORM_URL"
 _CAUSYN_SERVICE_API_KEY_ENV = "DRAMA_CAUSYN_SERVICE_API_KEY"
@@ -100,6 +108,8 @@ _CAUSYN_USER_PARAMS = frozenset(
         "aspect_ratio",
         "reference_images",
         "references",
+        "image",
+        "last_image",
         "generate_audio",
         "seed",
         # LiteLLM exposes this standard request field, but it is not sent to the
@@ -111,6 +121,56 @@ _CAUSYN_FRAMEWORK_PARAMS = frozenset(all_litellm_params)
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class _ModelSpec:
+    model: str
+    deployment_id: str
+    flag: str
+    flag_alias: str
+    resolutions: frozenset[str]
+    ratios: frozenset[str]
+    duration_min: int
+    duration_max: int
+    deadline_seconds: float
+    native_audio_required: bool
+    supports_topaz: bool
+
+
+_MODEL_SPECS: Mapping[str, _ModelSpec] = MappingProxyType(
+    {
+        CAUSYN_MODEL: _ModelSpec(
+            model=CAUSYN_MODEL,
+            deployment_id="causyn-1-0",
+            flag=_INTERNAL_VIDEO_FLAG,
+            flag_alias=_INTERNAL_VIDEO_FLAG_ALIAS,
+            resolutions=CAUSYN_RESOLUTIONS,
+            ratios=frozenset({CAUSYN_RATIO}),
+            duration_min=3,
+            duration_max=8,
+            deadline_seconds=CAUSYN_DEADLINE_SECONDS,
+            native_audio_required=False,
+            supports_topaz=True,
+        ),
+        CAUSYN_H3_MODEL: _ModelSpec(
+            model=CAUSYN_H3_MODEL,
+            deployment_id="causyn-1-1",
+            flag=_CAUSYN_H3_FLAG,
+            flag_alias=_CAUSYN_H3_FLAG_ALIAS,
+            resolutions=frozenset({CAUSYN_H3_RESOLUTION}),
+            ratios=CAUSYN_H3_RATIOS,
+            duration_min=4,
+            duration_max=15,
+            deadline_seconds=CAUSYN_DEADLINE_SECONDS,
+            native_audio_required=True,
+            supports_topaz=False,
+        ),
+    }
+)
+_MODEL_SPECS_BY_DEPLOYMENT: Mapping[str, _ModelSpec] = MappingProxyType(
+    {spec.deployment_id: spec for spec in _MODEL_SPECS.values()}
+)
+
+
 class ContentResponse(Protocol):
     @property
     def status_code(self) -> int: ...
@@ -119,7 +179,7 @@ class ContentResponse(Protocol):
     def content(self) -> bytes: ...
 
 
-RequestTimeout = float | httpx.Timeout | None
+RequestTimeout: TypeAlias = float | httpx.Timeout | None
 ContentGet = Callable[[str, RequestTimeout, bool], Awaitable[ContentResponse]]
 RefreshUrl = Callable[[str, RequestTimeout], Awaitable[str]]
 
@@ -280,14 +340,22 @@ def _default_persistence_factory() -> VideoTaskPersistence | None:
     return get_persistence()
 
 
-def _enabled() -> bool:
-    # Keep this precedence byte-for-byte aligned with the platform admission
-    # gate.  Presence matters: an explicitly empty canonical value must not
-    # silently fall through to a stale OH_ alias in this separate process.
-    if _INTERNAL_VIDEO_FLAG in os.environ:
-        raw = os.environ[_INTERNAL_VIDEO_FLAG]
-    elif _INTERNAL_VIDEO_FLAG_ALIAS in os.environ:
-        raw = os.environ[_INTERNAL_VIDEO_FLAG_ALIAS]
+def _model_spec(model: str) -> _ModelSpec:
+    normalized = model.split("/", 1)[-1]
+    spec = _MODEL_SPECS.get(normalized)
+    if spec is None:
+        raise _bad_request("unsupported causyn model")
+    return spec
+
+
+def _enabled(model: str = CAUSYN_MODEL) -> bool:
+    spec = _MODEL_SPECS.get(model)
+    if spec is None:
+        return False
+    if spec.flag in os.environ:
+        raw = os.environ[spec.flag]
+    elif spec.flag_alias in os.environ:
+        raw = os.environ[spec.flag_alias]
     else:
         return False
     return raw.strip().lower() in _INTERNAL_VIDEO_TRUE_VALUES
@@ -307,34 +375,45 @@ def _service_error(message: str = "causyn video service unavailable") -> CustomL
     return CustomLLMError(status_code=503, message=message)
 
 
-def _decode_task_id(video_id: str) -> str:
+def _decode_video_identity(video_id: str) -> tuple[str, _ModelSpec]:
     # Keep the original opaque form readable for tasks issued before provider
     # encoding was introduced. The shared decoder intentionally recognizes that
     # legacy prefix too, so inspect it first to avoid treating the whole legacy
     # id as the task id.
     if video_id.startswith(CAUSYN_VIDEO_ID_PREFIX):
         task_id = video_id[len(CAUSYN_VIDEO_ID_PREFIX) :]
+        spec = _MODEL_SPECS[CAUSYN_MODEL]
     else:
         decoded = decode_video_id_with_provider(video_id)
         if decoded.get("custom_llm_provider") != PROVIDER:
             raise _bad_request("invalid causyn video id")
         task_id = decoded.get("video_id") or ""
+        decoded_spec = _MODEL_SPECS_BY_DEPLOYMENT.get(decoded.get("model_id") or "")
+        if decoded_spec is None:
+            raise _bad_request("invalid causyn video id")
+        spec = decoded_spec
     if _TASK_ID_PATTERN.fullmatch(task_id) is None:
         raise _bad_request("invalid causyn video id")
-    return task_id
+    return task_id, spec
 
 
-def _duration(optional_params: dict[str, object]) -> int:
+def _decode_task_id(video_id: str) -> str:
+    return _decode_video_identity(video_id)[0]
+
+
+def _duration(optional_params: dict[str, object], spec: _ModelSpec) -> int:
     raw = optional_params.get("seconds")
     if not isinstance(raw, str) or not raw.isascii() or not raw.isdigit():
-        raise _bad_request("seconds must be an integer string from 3 through 8")
+        raise _bad_request(f"seconds must be an integer string from {spec.duration_min} through {spec.duration_max}")
     value = int(raw)
-    if value < 3 or value > 8:
-        raise _bad_request("seconds must be from 3 through 8")
+    if value < spec.duration_min or value > spec.duration_max:
+        raise _bad_request(f"seconds must be from {spec.duration_min} through {spec.duration_max}")
     return value
 
 
-def _references(optional_params: dict[str, object]) -> tuple[dict[str, str], ...]:
+def _legacy_references(
+    optional_params: dict[str, object],
+) -> tuple[dict[str, str], ...]:
     shaped = optional_params.get("references")
     if shaped is not None:
         try:
@@ -356,7 +435,55 @@ def _references(optional_params: dict[str, object]) -> tuple[dict[str, str], ...
     return tuple({"role": "reference", "media_type": "image", "url": url} for url in urls)
 
 
-def _resolution(optional_params: dict[str, object]) -> str:
+def _h3_shaped_references(value: object) -> tuple[dict[str, str], ...]:
+    try:
+        references = TypeAdapter(list[dict[str, str]]).validate_python(value, strict=True)
+    except ValidationError:
+        raise _bad_request("references must contain first_frame and optional last_frame") from None
+    allowed = {"role", "media_type", "url"}
+    if any(set(reference) != allowed for reference in references):
+        raise _bad_request("references must contain first_frame and optional last_frame")
+    by_role: dict[str, dict[str, str]] = {}
+    for reference in references:
+        role = reference["role"]
+        if (
+            role not in {"first_frame", "last_frame"}
+            or role in by_role
+            or reference["media_type"] != "image"
+            or not reference["url"]
+        ):
+            raise _bad_request("references must contain first_frame and optional last_frame")
+        by_role[role] = reference
+    if "last_frame" in by_role and "first_frame" not in by_role:
+        raise _bad_request("last_image requires image")
+    return tuple(by_role[role] for role in ("first_frame", "last_frame") if role in by_role)
+
+
+def _h3_references(optional_params: dict[str, object]) -> tuple[dict[str, str], ...]:
+    reference_images = optional_params.get("reference_images")
+    if reference_images not in (None, []):
+        raise _bad_request("reference_images is not supported")
+    shaped = optional_params.get("references")
+    image = optional_params.get("image")
+    last_image = optional_params.get("last_image")
+    if shaped is not None:
+        if image is not None or last_image is not None:
+            raise _bad_request("references cannot be combined with image or last_image")
+        return _h3_shaped_references(shaped)
+    for name, value in (("image", image), ("last_image", last_image)):
+        if value is not None and (not isinstance(value, str) or not value):
+            raise _bad_request(f"{name} must be a non-empty URL string")
+    if last_image is not None and image is None:
+        raise _bad_request("last_image requires image")
+    references: list[dict[str, str]] = []
+    if isinstance(image, str):
+        references.append({"role": "first_frame", "media_type": "image", "url": image})
+    if isinstance(last_image, str):
+        references.append({"role": "last_frame", "media_type": "image", "url": last_image})
+    return tuple(references)
+
+
+def _resolution(optional_params: dict[str, object], spec: _ModelSpec) -> str:
     missing = object()
     resolution = optional_params.get("resolution", missing)
     size = optional_params.get("size", missing)
@@ -366,14 +493,34 @@ def _resolution(optional_params: dict[str, object]) -> str:
     if resolution is not missing and size is not missing and resolution != size:
         raise _bad_request("resolution and size must match")
     canonical = resolution if resolution is not missing else size
-    if canonical not in CAUSYN_RESOLUTIONS:
-        raise _bad_request(f"resolution must be one of {CAUSYN_RESOLUTION}, {CAUSYN_2K_RESOLUTION}")
+    if canonical not in spec.resolutions:
+        offered = ", ".join(sorted(spec.resolutions))
+        raise _bad_request(f"resolution must be one of {offered}")
     return str(canonical)
 
 
-def _request(model: str, prompt: object, optional_params: dict[str, object]) -> tuple[dict[str, object], int, str]:
-    if model != CAUSYN_MODEL:
-        raise _bad_request("unsupported causyn model")
+def _h3_source_resolution(ratio: str) -> str:
+    width_ratio, height_ratio = (int(value) for value in ratio.split(":"))
+    short_edge = 768
+    if width_ratio >= height_ratio:
+        height = short_edge
+        width = int(short_edge * width_ratio / height_ratio) // 32 * 32
+    else:
+        width = short_edge
+        height = int(short_edge * height_ratio / width_ratio) // 32 * 32
+    return f"{width}x{height}"
+
+
+def _source_resolution(spec: _ModelSpec, ratio: str) -> str:
+    if spec.model == CAUSYN_H3_MODEL:
+        return _h3_source_resolution(ratio)
+    return CAUSYN_RESOLUTION
+
+
+def _request(
+    model: str, prompt: object, optional_params: dict[str, object]
+) -> tuple[dict[str, object], int, str, str, _ModelSpec]:
+    spec = _model_spec(model)
     if not isinstance(prompt, str) or not prompt.strip():
         raise _bad_request("prompt must be a non-empty string")
     unsupported = sorted(
@@ -381,33 +528,46 @@ def _request(model: str, prompt: object, optional_params: dict[str, object]) -> 
     )
     if unsupported:
         raise _bad_request(f"unsupported causyn video parameter: {', '.join(unsupported)}")
-    requested_resolution = _resolution(optional_params)
+    requested_resolution = _resolution(optional_params, spec)
     ratio = optional_params.get("aspect_ratio")
-    if ratio is not None and ratio != CAUSYN_RATIO:
-        raise _bad_request(f"aspect_ratio must be {CAUSYN_RATIO}")
+    if not isinstance(ratio, str) or ratio not in spec.ratios:
+        offered = ", ".join(sorted(spec.ratios))
+        raise _bad_request(f"aspect_ratio must be one of {offered}")
     generate_audio = optional_params.get("generate_audio")
     if generate_audio is not None and not isinstance(generate_audio, bool):
         raise _bad_request("generate_audio must be a boolean")
-    for unsupported in ("input_reference", "reference_audios", "reference_videos", "image", "last_image"):
-        if optional_params.get(unsupported) is not None:
-            raise _bad_request(f"{unsupported} is not supported")
+    if spec.native_audio_required and generate_audio is False:
+        raise _bad_request("generate_audio must be true")
+    for unsupported_param in (
+        "input_reference",
+        "reference_audios",
+        "reference_videos",
+    ):
+        if optional_params.get(unsupported_param) is not None:
+            raise _bad_request(f"{unsupported_param} is not supported")
+    if spec.model == CAUSYN_MODEL:
+        for unsupported_param in ("image", "last_image"):
+            if optional_params.get(unsupported_param) is not None:
+                raise _bad_request(f"{unsupported_param} is not supported")
     seed = optional_params.get("seed")
     if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
         raise _bad_request("seed must be an integer")
-    duration = _duration(optional_params)
+    duration = _duration(optional_params, spec)
+    references = (
+        _h3_references(optional_params) if spec.model == CAUSYN_H3_MODEL else _legacy_references(optional_params)
+    )
+    source_resolution = _source_resolution(spec, ratio)
     request: dict[str, object] = {
         "prompt": prompt,
         "duration_seconds": duration,
-        "resolution": CAUSYN_RESOLUTION,
-        "ratio": CAUSYN_RATIO,
-        # Materialize the platform default in the worker contract so the
-        # native-audio choice cannot disappear between /v1/videos and Redis.
+        "resolution": CAUSYN_H3_RESOLUTION if spec.model == CAUSYN_H3_MODEL else CAUSYN_RESOLUTION,
+        "ratio": ratio,
         "generate_audio": True if generate_audio is None else generate_audio,
-        "references": list(_references(optional_params)),
+        "references": list(references),
     }
     if seed is not None:
         request["seed"] = seed
-    return request, duration, requested_resolution
+    return request, duration, requested_resolution, source_resolution, spec
 
 
 class _WorkerError(BaseModel):
@@ -435,8 +595,8 @@ class _WorkerResult(BaseModel):
     # The lower bound stays: a shorter-than-ordered result is a garbled report,
     # and nothing about frame quantisation shortens a render.
     duration_seconds: float = Field(ge=3)
-    width: Literal[768]
-    height: Literal[512]
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
@@ -451,13 +611,19 @@ class _StatusEnvelope(BaseModel):
 class _Pricing(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    model: Literal["causyn-1.0"]
+    model: Literal["causyn-1.0", "causyn-1.1"]
     id: str = Field(min_length=1)
     output_cost_per_second_768x512: float | None = Field(default=None, gt=0)
+    output_cost_per_second_768p: float | None = Field(default=None, gt=0)
     output_cost_per_second_2k: float | None = Field(default=None, gt=0)
     output_cost_per_second: float | None = Field(default=None, gt=0)
 
-    @field_validator("output_cost_per_second_768x512", "output_cost_per_second_2k", "output_cost_per_second")
+    @field_validator(
+        "output_cost_per_second_768x512",
+        "output_cost_per_second_768p",
+        "output_cost_per_second_2k",
+        "output_cost_per_second",
+    )
     @classmethod
     def _requires_finite_rate(cls, value: float | None) -> float | None:
         if value is not None and not math.isfinite(value):
@@ -476,6 +642,7 @@ class _Pricing(BaseModel):
     def _requires_rate(self) -> _Pricing:
         if (
             self.output_cost_per_second_768x512 is None
+            and self.output_cost_per_second_768p is None
             and self.output_cost_per_second_2k is None
             and self.output_cost_per_second is None
         ):
@@ -520,6 +687,8 @@ class _DurableTaskMetadata(BaseModel):
 
     @model_validator(mode="after")
     def _requires_native_price(self) -> _DurableTaskMetadata:
+        if self.pricing.model != CAUSYN_MODEL:
+            raise ValueError("pricing model must match task model")
         if self.pricing.output_cost_per_second_768x512 is None and self.pricing.output_cost_per_second is None:
             raise ValueError("768x512 pricing rate is required")
         return self
@@ -537,12 +706,52 @@ class _DurableTaskMetadataV2(BaseModel):
 
     @model_validator(mode="after")
     def _requires_resolution_price(self) -> _DurableTaskMetadataV2:
+        if self.pricing.model != CAUSYN_MODEL:
+            raise ValueError("pricing model must match task model")
         if self.requested_resolution == "2k" and self.pricing.output_cost_per_second_2k is None:
             raise ValueError("2k pricing rate is required")
         if self.requested_resolution == "768x512":
             if self.pricing.output_cost_per_second_768x512 is None and self.pricing.output_cost_per_second is None:
                 raise ValueError("768x512 pricing rate is required")
         return self
+
+
+class _DurableTaskMetadataV3(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version: Literal["causyn-video-billing-v3"]
+    model: Literal["causyn-1.1"]
+    duration_seconds: float = Field(ge=4, le=15)
+    source_resolution: str = Field(pattern=r"^[1-9][0-9]*x[1-9][0-9]*$")
+    requested_resolution: Literal["768p"]
+    ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"]
+    pricing: _Pricing
+    attribution: _DurableAttribution
+
+    @model_validator(mode="after")
+    def _requires_h3_contract(self) -> _DurableTaskMetadataV3:
+        if self.pricing.model != self.model:
+            raise ValueError("pricing model must match task model")
+        if self.pricing.output_cost_per_second_768p is None:
+            raise ValueError("768p pricing rate is required")
+        if self.source_resolution != _h3_source_resolution(self.ratio):
+            raise ValueError("source resolution must match ratio")
+        return self
+
+
+_TaskMetadata = _DurableTaskMetadata | _DurableTaskMetadataV2 | _DurableTaskMetadataV3
+
+
+def _metadata_model(metadata: _TaskMetadata) -> str:
+    if isinstance(metadata, _DurableTaskMetadataV3):
+        return metadata.model
+    return CAUSYN_MODEL
+
+
+def _metadata_resolution(metadata: _TaskMetadata) -> tuple[str, str]:
+    if isinstance(metadata, _DurableTaskMetadata):
+        return metadata.video_resolution, metadata.video_resolution
+    return metadata.requested_resolution, metadata.source_resolution
 
 
 def _public_worker_error(error: _WorkerError | None) -> dict[str, str]:
@@ -568,6 +777,8 @@ def _staging_key(task_id: str) -> str:
 def _completion_cost(pricing: _Pricing, duration_seconds: float, resolution: str = CAUSYN_RESOLUTION) -> float:
     if resolution == CAUSYN_2K_RESOLUTION:
         rate = pricing.output_cost_per_second_2k
+    elif resolution == CAUSYN_H3_RESOLUTION:
+        rate = pricing.output_cost_per_second_768p
     else:
         rate = pricing.output_cost_per_second_768x512 or pricing.output_cost_per_second
     if rate is None:
@@ -676,17 +887,24 @@ def _pricing_model_info(optional_params: dict[str, object], logging_obj: object)
     return raw
 
 
-def _pricing_identity(optional_params: dict[str, object], logging_obj: object) -> dict[str, object]:
+def _pricing_identity(
+    optional_params: dict[str, object], logging_obj: object, model: str = CAUSYN_MODEL
+) -> dict[str, object]:
     raw = _pricing_model_info(optional_params, logging_obj)
     if isinstance(raw, BaseModel):
         raw = raw.model_dump()
     if not isinstance(raw, dict):
-        return {"model": CAUSYN_MODEL}
-    pricing: dict[str, object] = {"model": CAUSYN_MODEL}
+        return {"model": model}
+    pricing: dict[str, object] = {"model": model}
     model_id = raw.get("id")
     if isinstance(model_id, str) and model_id:
         pricing["id"] = model_id
-    for key in ("output_cost_per_second_768x512", "output_cost_per_second_2k", "output_cost_per_second"):
+    for key in (
+        "output_cost_per_second_768x512",
+        "output_cost_per_second_768p",
+        "output_cost_per_second_2k",
+        "output_cost_per_second",
+    ):
         value = raw.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0:
             pricing[key] = float(value)
@@ -739,6 +957,7 @@ class CausynVideoHandler(CustomLLM):
         optional_params: dict[str, object],
         result: _WorkerResult,
         logging_obj: object,
+        spec: _ModelSpec,
     ) -> None:
         # The worker result is the authoritative usage fact. The Redis metadata
         # key only carries immutable pricing/attribution captured at enqueue;
@@ -748,18 +967,19 @@ class CausynVideoHandler(CustomLLM):
         except Exception as exc:  # noqa: BLE001
             raise _service_error() from exc
         try:
-            durable = _DurableTaskMetadataV2.model_validate(task_metadata)
-            requested_resolution = durable.requested_resolution
-            source_resolution = durable.source_resolution
+            durable: _TaskMetadata = _DurableTaskMetadataV3.model_validate(task_metadata)
         except ValidationError:
             try:
-                durable_v1 = _DurableTaskMetadata.model_validate(task_metadata)
-            except ValidationError as exc:
-                logger.warning("causyn video billing: task metadata is missing or invalid")
-                raise _service_error() from exc
-            durable = durable_v1
-            requested_resolution = durable_v1.video_resolution
-            source_resolution = durable_v1.video_resolution
+                durable = _DurableTaskMetadataV2.model_validate(task_metadata)
+            except ValidationError:
+                try:
+                    durable = _DurableTaskMetadata.model_validate(task_metadata)
+                except ValidationError as exc:
+                    logger.warning("causyn video billing: task metadata is missing or invalid")
+                    raise _service_error() from exc
+        if _metadata_model(durable) != spec.model:
+            raise _service_error()
+        requested_resolution, source_resolution = _metadata_resolution(durable)
         # Ordered durations are whole seconds (3..8), so a worker that rendered
         # something other than what was ordered is off by at least a second.
         # Anything smaller is frame quantisation, not a mismatch: the pipeline
@@ -796,7 +1016,7 @@ class CausynVideoHandler(CustomLLM):
                 user_id=attribution.get("user_id"),
                 organization_id=attribution.get("organization_id"),
                 api_key=attribution.get("api_key"),
-                model=CAUSYN_MODEL,
+                model=spec.model,
             )
             enqueued = await self._billing_enqueue(self._redis_factory(), event)
             if not enqueued:
@@ -810,12 +1030,15 @@ class CausynVideoHandler(CustomLLM):
         video_id: str,
         task_id: str,
         result: _WorkerResult,
-        resolution: str = CAUSYN_RESOLUTION,
+        spec: _ModelSpec,
+        resolution: str | None = None,
         object_store_result: bool = True,
     ) -> VideoObject:
         if result.staging_key != _staging_key(task_id):
             raise _service_error("causyn video result is unavailable")
         duration = result.duration_seconds
+        if resolution is None:
+            resolution = CAUSYN_H3_RESOLUTION if spec.model == CAUSYN_H3_MODEL else CAUSYN_RESOLUTION
         result_payload = result.model_dump(exclude={"staging_url"}, exclude_none=True)
         return VideoObject(
             id=video_id,
@@ -824,23 +1047,26 @@ class CausynVideoHandler(CustomLLM):
             completed_at=int(self._clock()),
             seconds=str(duration),
             size=resolution,
-            model=CAUSYN_MODEL,
+            model=spec.model,
             usage=_usage(duration, resolution),
             object_store_result=result_payload if object_store_result else None,
         )
 
-    async def _task_metadata(self, task_id: str) -> _DurableTaskMetadata | _DurableTaskMetadataV2:
+    async def _task_metadata(self, task_id: str) -> _TaskMetadata:
         try:
             raw = await fetch_video_generate_task_metadata(task_id, redis=self._redis_factory())
         except Exception as exc:
             raise _service_error() from exc
         try:
-            return _DurableTaskMetadataV2.model_validate(raw)
+            return _DurableTaskMetadataV3.model_validate(raw)
         except ValidationError:
             try:
-                return _DurableTaskMetadata.model_validate(raw)
-            except ValidationError as exc:
-                raise _service_error() from exc
+                return _DurableTaskMetadataV2.model_validate(raw)
+            except ValidationError:
+                try:
+                    return _DurableTaskMetadata.model_validate(raw)
+                except ValidationError as exc:
+                    raise _service_error() from exc
 
     def _get_topaz_adapter(self) -> TopazVideoAdapter:
         if self._topaz_adapter is None:
@@ -892,24 +1118,35 @@ class CausynVideoHandler(CustomLLM):
         timeout: RequestTimeout = None,
         client: AsyncHTTPHandler | None = None,
     ) -> VideoObject:
-        if not _enabled():
+        spec = _model_spec(model)
+        if not _enabled(spec.model):
             raise CustomLLMError(status_code=403, message="causyn video generation is disabled")
-        request, duration, requested_resolution = _request(model, prompt, optional_params)
+        request, duration, requested_resolution, source_resolution, spec = _request(model, prompt, optional_params)
         task_id = self._task_id_factory()
         if _TASK_ID_PATTERN.fullmatch(task_id) is None:
             raise _service_error()
-        task_metadata = {
+        task_metadata: dict[str, object] = {
             "version": CAUSYN_BILLING_METADATA_VERSION_V2,
             "duration_seconds": float(duration),
-            "source_resolution": CAUSYN_RESOLUTION,
+            "source_resolution": source_resolution,
             "requested_resolution": requested_resolution,
-            "pricing": _pricing_identity(optional_params, logging_obj),
+            "pricing": _pricing_identity(optional_params, logging_obj, spec.model),
             "attribution": _durable_attribution(optional_params, logging_obj),
         }
-        try:
-            metadata_model: _DurableTaskMetadata | _DurableTaskMetadataV2 = _DurableTaskMetadataV2.model_validate(
-                task_metadata
+        metadata_type: type[_DurableTaskMetadataV2] | type[_DurableTaskMetadataV3]
+        if spec.model == CAUSYN_H3_MODEL:
+            task_metadata.update(
+                {
+                    "version": CAUSYN_BILLING_METADATA_VERSION_V3,
+                    "model": spec.model,
+                    "ratio": request["ratio"],
+                }
             )
+            metadata_type = _DurableTaskMetadataV3
+        else:
+            metadata_type = _DurableTaskMetadataV2
+        try:
+            metadata_model: _TaskMetadata = metadata_type.model_validate(task_metadata)
         except ValidationError as exc:
             logger.warning("causyn video billing: deployment pricing metadata is missing or invalid")
             raise _service_error() from exc
@@ -918,8 +1155,8 @@ class CausynVideoHandler(CustomLLM):
         serialized_metadata["pricing"] = durable_metadata.pricing.model_dump(exclude_none=True)
         payload = {
             "task_id": task_id,
-            "model": CAUSYN_MODEL,
-            "deadline_ts": self._clock() + CAUSYN_DEADLINE_SECONDS,
+            "model": spec.model,
+            "deadline_ts": self._clock() + spec.deadline_seconds,
             "request": request,
             "task_metadata": serialized_metadata,
         }
@@ -936,13 +1173,13 @@ class CausynVideoHandler(CustomLLM):
             # The public endpoint decodes this deployment id before routing a
             # status/content request.  Keep the hyphenated form stable because
             # it is also the deployment id used by the router and auth layer.
-            id=encode_video_id_with_provider(task_id, PROVIDER, "causyn-1-0"),
+            id=encode_video_id_with_provider(task_id, PROVIDER, spec.deployment_id),
             object="video",
             status="queued",
             created_at=int(self._clock()),
             seconds=str(duration),
             size=requested_resolution,
-            model=CAUSYN_MODEL,
+            model=spec.model,
             usage=_usage(duration, requested_resolution),
         )
         _set_response_cost(response, 0.0)
@@ -1011,47 +1248,57 @@ class CausynVideoHandler(CustomLLM):
         timeout: RequestTimeout = None,
         client: AsyncHTTPHandler | None = None,
     ) -> VideoObject:
+        task_id, spec = _decode_video_identity(video_id)
         body = await self._status(video_id)
         status = body.status
         if status == "queued":
-            return VideoObject(id=video_id, object="video", status="queued", model=CAUSYN_MODEL)
+            return VideoObject(id=video_id, object="video", status="queued", model=spec.model)
         if status == "claimed":
-            return VideoObject(id=video_id, object="video", status="in_progress", model=CAUSYN_MODEL)
+            return VideoObject(id=video_id, object="video", status="in_progress", model=spec.model)
         if status != "succeeded":
             return VideoObject(
                 id=video_id,
                 object="video",
                 status="failed",
-                model=CAUSYN_MODEL,
+                model=spec.model,
                 error=_public_worker_error(body.error),
             )
         result = body.result
         if result is None:
             raise _service_error("causyn video result is unavailable")
-        task_id = _decode_task_id(video_id)
-        base_response = self._completed_response(video_id, task_id, result)
+        base_response = self._completed_response(video_id, task_id, result, spec)
         metadata = await self._task_metadata(task_id)
-        requested_resolution = (
-            metadata.requested_resolution if isinstance(metadata, _DurableTaskMetadataV2) else metadata.video_resolution
-        )
-        if requested_resolution == CAUSYN_2K_RESOLUTION:
+        if _metadata_model(metadata) != spec.model:
+            raise _service_error()
+        requested_resolution, _source_resolution = _metadata_resolution(metadata)
+        if spec.supports_topaz and requested_resolution == CAUSYN_2K_RESOLUTION:
             topaz = await self._advance_topaz(task_id, timeout)
             if topaz.status == "in_progress":
-                return VideoObject(id=video_id, object="video", status="in_progress", model=CAUSYN_MODEL)
+                return VideoObject(
+                    id=video_id,
+                    object="video",
+                    status="in_progress",
+                    model=spec.model,
+                )
             if topaz.status == "failed":
                 return VideoObject(
                     id=video_id,
                     object="video",
                     status="failed",
-                    model=CAUSYN_MODEL,
+                    model=spec.model,
                     error={"message": "causyn Topaz upscale failed", "kind": "provider"},
                 )
             response = self._completed_response(
-                video_id, task_id, result, resolution=CAUSYN_2K_RESOLUTION, object_store_result=False
+                video_id,
+                task_id,
+                result,
+                spec,
+                resolution=CAUSYN_2K_RESOLUTION,
+                object_store_result=False,
             )
         else:
             response = base_response
-        await self._bill_completed_video(response, task_id, optional_params, result, logging_obj)
+        await self._bill_completed_video(response, task_id, optional_params, result, logging_obj, spec)
         return response
 
     def video_content(
@@ -1088,25 +1335,25 @@ class CausynVideoHandler(CustomLLM):
         timeout: RequestTimeout = None,
         client: AsyncHTTPHandler | None = None,
     ) -> bytes:
+        task_id, spec = _decode_video_identity(video_id)
         body = await self._status(video_id)
         if body.status != "succeeded":
             raise CustomLLMError(status_code=409, message="causyn video is not ready")
-        task_id = _decode_task_id(video_id)
         result = body.result
         if result is None:
             raise CustomLLMError(status_code=502, message="causyn video content is unavailable")
         if result.staging_key != _staging_key(task_id):
             raise CustomLLMError(status_code=502, message="causyn video content is unavailable")
         metadata = await self._task_metadata(task_id)
-        requested_resolution = (
-            metadata.requested_resolution if isinstance(metadata, _DurableTaskMetadataV2) else metadata.video_resolution
-        )
-        if requested_resolution == CAUSYN_2K_RESOLUTION:
+        if _metadata_model(metadata) != spec.model:
+            raise _service_error()
+        requested_resolution, _source_resolution = _metadata_resolution(metadata)
+        if spec.supports_topaz and requested_resolution == CAUSYN_2K_RESOLUTION:
             return await self._topaz_content(
                 video_id, task_id, api_key, api_base, optional_params, logging_obj, timeout, client
             )
-        response = self._completed_response(video_id, task_id, result)
-        await self._bill_completed_video(response, task_id, optional_params, result, logging_obj)
+        response = self._completed_response(video_id, task_id, result, spec)
+        await self._bill_completed_video(response, task_id, optional_params, result, logging_obj, spec)
         return await self._staging_content(task_id, timeout, response)
 
     async def _topaz_content(
