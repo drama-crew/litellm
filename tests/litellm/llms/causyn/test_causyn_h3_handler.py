@@ -56,7 +56,7 @@ def _params(**overrides: object) -> dict[str, object]:
 
 @pytest.mark.asyncio
 async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -> None:
-    video = await CausynVideoHandler(task_id_factory=lambda: TASK_ID).avideo_generation(
+    video = await CausynVideoHandler(task_id_factory=lambda: TASK_ID, clock=lambda: 2_000_000_000.0).avideo_generation(
         model="causyn-1.1",
         prompt="a cat crosses the room",
         api_key=None,
@@ -66,6 +66,7 @@ async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -
     )
     payload = enqueued.payloads[0]
     assert payload["model"] == "causyn-1.1"
+    assert payload["deadline_ts"] == 2_000_001_800.0
     assert payload["request"] == {
         "prompt": "a cat crosses the room",
         "duration_seconds": 5,
@@ -97,6 +98,11 @@ async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -
     assert decoded["model_id"] == "causyn-1-1"
     assert video.model == "causyn-1.1"
     assert video.size == "768p"
+
+
+def test_h3_uses_an_independent_deadline_constant() -> None:
+    assert mod._MODEL_SPECS[mod.CAUSYN_H3_MODEL].deadline_seconds == mod.CAUSYN_H3_DEADLINE_SECONDS
+    assert mod._MODEL_SPECS[mod.CAUSYN_MODEL].deadline_seconds == mod.CAUSYN_DEADLINE_SECONDS
 
 
 @pytest.mark.asyncio
