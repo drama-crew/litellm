@@ -21,6 +21,7 @@ from litellm.llms.libtv.client import (
     parse_progress,
     parse_task_id,
     parse_upload_url,
+    parse_verify_passed,
 )
 from litellm.llms.libtv.common import (
     LibTVError,
@@ -1831,6 +1832,114 @@ def _compliance_routes(verify_passed=True):
             },
         },
     }
+
+
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize("reference_count", [1, 2], ids=["single", "repeated"])
+@pytest.mark.parametrize(
+    "review",
+    [
+        {"result": False, "riskLabels": json.dumps({"riskDescription": "正常", "label": 0, "status": 2})},
+        {"result": False},
+        {"riskLabels": json.dumps({"passed": True, "needsReview": False})},
+        {"riskLabels": {"passed": True}},
+        {"result": False, "riskLabels": {"passed": True}},
+    ],
+    ids=["current-result", "result-only", "legacy-json", "legacy-object", "both-agree"],
+)
+@pytest.mark.asyncio
+async def test_portrait_review_formats_submit_registered_asset(use_async, reference_count, review):
+    routes = _compliance_routes()
+    routes["/api/community/image/verify"]["data"]["list"] = [{"url": _LIBTV_REF, **review}]
+    fake = (FakeAsyncClient if use_async else FakeSyncClient)(post_by_path=routes, get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    args = (
+        "star-video2",
+        "subtle motion",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF] * reference_count},
+        None,
+    )
+    result = await llm.avideo_generation(*args, client=fake) if use_async else llm.video_generation(*args, client=fake)
+    assert result.status == "queued"
+    paths = [path for path, _ in fake.calls]
+    assert paths.index("/api/community/image/verify") < paths.index("/api/third_asset/create")
+    assert paths.index("/api/third_asset/check") < paths.index("/api/task/generation/create")
+    assert paths.count("/api/task/generation/create") == 1
+    verify_body = next(body for path, body in fake.calls if path == "/api/community/image/verify")
+    assert verify_body == {"urlList": [_LIBTV_REF]}
+    params = next(body["params"] for path, body in fake.calls if path == "/api/task/generation/create")
+    assert params["mixedList"] == [{"url": "asset://asset-AAA", "type": "image"}] * reference_count
+
+
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "items,status_code",
+    [
+        ([{"url": _LIBTV_REF, "result": True}], 400),
+        ([{"url": _LIBTV_REF, "riskLabels": {"passed": False}}], 400),
+        ([{"url": _LIBTV_REF, "result": True, "riskLabels": {"passed": False}}], 400),
+        ([{"url": _LIBTV_REF, "result": True, "riskLabels": {"passed": True}}], 502),
+        ([{"url": _LIBTV_REF, "result": False, "riskLabels": {"passed": False}}], 502),
+        ([{"url": _LIBTV_REF, "riskLabels": {"riskDescription": "正常"}}], 502),
+        ([{"url": _LIBTV_REF, "result": "false"}], 502),
+        ([{"url": _LIBTV_REF, "result": 0}], 502),
+        ([{"url": _LIBTV_REF, "riskLabels": {"passed": "true"}}], 502),
+        ([{"url": _LIBTV_REF, "result": None, "riskLabels": {"passed": True}}], 502),
+        ([{"url": _LIBTV_REF, "result": False, "riskLabels": "{broken"}], 502),
+        ([{"url": _LIBTV_REF, "result": False, "riskLabels": []}], 502),
+        ([{"url": _LIBTV_REF, "result": False, "riskLabels": {"needsReview": True}}], 502),
+        ([{"url": _LIBTV_REF, "result": False, "riskLabels": {"needsReview": "false"}}], 502),
+        ([{"url": "https://example.invalid/other.png", "result": False}], 502),
+        ([{"url": _LIBTV_REF, "result": False}, {"url": _LIBTV_REF, "result": False}], 502),
+        ([{"url": _LIBTV_REF, "result": False}, {"url": "https://example.invalid/extra.png", "result": False}], 502),
+        ([{"result": False}], 502),
+        ([None], 502),
+        ([], 502),
+    ],
+)
+@pytest.mark.asyncio
+async def test_portrait_review_rejection_or_uncertainty_never_submits(use_async, items, status_code):
+    routes = _compliance_routes()
+    routes["/api/community/image/verify"]["data"]["list"] = items
+    fake = (FakeAsyncClient if use_async else FakeSyncClient)(post_by_path=routes, get_payload=_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    args = ("star-video2", "subtle motion", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None)
+    with pytest.raises(BadRequestError if status_code == 400 else BadGatewayError) as exc:
+        if use_async:
+            await llm.avideo_generation(*args, client=fake)
+        else:
+            llm.video_generation(*args, client=fake)
+    assert exc.value.status_code == status_code
+    paths = [path for path, _ in fake.calls]
+    assert "/api/community/image/verify" in paths
+    assert "/api/third_asset/create" not in paths
+    assert "/api/task/generation/create" not in paths
+    assert _LIBTV_REF not in str(exc.value.__cause__)
+
+
+def test_image_review_matches_all_requested_urls_without_requiring_response_order():
+    other = "https://example.invalid/other.png"
+    payload = {
+        "code": 0,
+        "data": {
+            "list": [
+                {"url": other, "riskLabels": {"passed": True}},
+                {"url": _LIBTV_REF, "result": False},
+            ]
+        },
+    }
+    assert parse_verify_passed(payload, [_LIBTV_REF, other, _LIBTV_REF]) == {other: True, _LIBTV_REF: True}
+    with pytest.raises(LibTVError, match="mismatched image results"):
+        parse_verify_passed(payload, [_LIBTV_REF, other, "https://example.invalid/missing.png"])
+
+
+@pytest.mark.parametrize("payload", [{}, {"code": 0, "data": None}, {"code": 0, "data": {"list": {}}}])
+def test_image_review_invalid_envelope_is_a_protocol_error(payload):
+    with pytest.raises(LibTVError) as exc:
+        parse_verify_passed(payload, [_LIBTV_REF])
+    assert exc.value.status_code == 502
 
 
 def test_portrait_compliance_converts_image_to_asset_and_sets_flag():
@@ -4262,7 +4371,12 @@ async def test_topaz_strict_source_transfer_uses_local_router_without_legacy_mod
     class Fake:
         async def post(self, url, json=None, headers=None, timeout=None):
             if url.endswith("/init/4"):
-                return FakeResponse({"code": 0, "data": {"uploadId": "up-1", "parts": [{"partNumber": 1, "url": "https://put.example/1"}]}})
+                return FakeResponse(
+                    {
+                        "code": 0,
+                        "data": {"uploadId": "up-1", "parts": [{"partNumber": 1, "url": "https://put.example/1"}]},
+                    }
+                )
             if url.endswith("/complete/4"):
                 return FakeResponse({"code": 0, "data": {"cdnUrl": "https://cdn.example/result.png"}})
             raise AssertionError(f"unexpected bridge request: {url}")
@@ -5267,7 +5381,7 @@ def test_video_generation_rejects_reference_key_present_but_empty():
         LibTVLLM(poll_interval=0).video_generation(
             "star-video2", "a fox", "tok", None, {"webid": "w", "reference_images": []}, None, client=fake
         )
-    assert "reference keys present" in str(ei.value)
+    assert "reference keys present" in str(ei.value.__cause__)
     assert "/api/task/generation/create" not in [c[0] for c in fake.calls]
 
 
@@ -5287,7 +5401,7 @@ async def test_avideo_generation_rejects_reference_key_present_but_empty():
         await LibTVLLM(poll_interval=0).avideo_generation(
             "star-video2", "a fox", "tok", None, {"webid": "w", "reference_videos": []}, None, client=fake
         )
-    assert "reference keys present" in str(ei.value)
+    assert "reference keys present" in str(ei.value.__cause__)
     assert "/api/task/generation/create" not in [c[0] for c in fake.calls]
 
 

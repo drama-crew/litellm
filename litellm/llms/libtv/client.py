@@ -221,20 +221,55 @@ def _forwarded_prompt_chars(params: dict[str, Any], task_type: str) -> int | Non
     return len(prompt)
 
 
-def parse_verify_passed(payload: Dict[str, Any]) -> Dict[str, bool]:
-    out: Dict[str, bool] = {}
-    for item in (payload.get("data") or {}).get("list") or []:
-        url = item.get("url")
-        if not url:
-            continue
-        risk = item.get("riskLabels")
-        if isinstance(risk, str) and risk.strip():
-            try:
-                risk = json.loads(risk)
-            except json.JSONDecodeError:
-                risk = {}
-        out[str(url)] = bool(isinstance(risk, dict) and risk.get("passed"))
-    return out
+def _parse_image_review(item: object) -> tuple[str, bool] | str:
+    if not isinstance(item, dict):
+        return "invalid result item"
+    url = item.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return "missing image URL"
+    raw_risk = item.get("riskLabels")
+    try:
+        risk = json.loads(raw_risk) if isinstance(raw_risk, str) and raw_risk.strip() else raw_risk
+    except json.JSONDecodeError:
+        return "invalid riskLabels JSON"
+    if risk is not None and risk != "" and not isinstance(risk, dict):
+        return "invalid riskLabels type"
+    labels = risk if isinstance(risk, dict) else {}
+    has_result = "result" in item
+    has_passed = "passed" in labels
+    result = item.get("result")
+    passed = labels.get("passed")
+    if has_result and not isinstance(result, bool):
+        return "invalid result type"
+    if has_passed and not isinstance(passed, bool):
+        return "invalid passed type"
+    if not has_result and not has_passed:
+        return "missing review decision"
+    if has_result and has_passed and result == passed:
+        return "conflicting review decisions"
+    if "needsReview" in labels and not isinstance(labels["needsReview"], bool):
+        return "invalid needsReview type"
+    allowed = result is False if has_result else passed is True
+    if allowed and labels.get("needsReview") is True:
+        return "review still pending"
+    return url, allowed
+
+
+def parse_verify_passed(payload: Mapping[str, object], expected_urls: Sequence[str] | None = None) -> dict[str, bool]:
+    data = payload.get("data")
+    items = data.get("list") if isinstance(data, dict) else None
+    if payload.get("code") != 0 or not isinstance(items, list) or not items:
+        raise LibTVError(status_code=502, message="libtv image/verify returned an invalid review response")
+    reviews = tuple(_parse_image_review(item) for item in items)
+    errors = tuple(review for review in reviews if isinstance(review, str))
+    if errors:
+        raise LibTVError(status_code=502, message=f"libtv image/verify invalid review response: {errors[0]}")
+    decisions = dict(review for review in reviews if isinstance(review, tuple))
+    if len(decisions) != len(reviews):
+        raise LibTVError(status_code=502, message="libtv image/verify returned duplicate image results")
+    if expected_urls is not None and set(decisions) != set(expected_urls):
+        raise LibTVError(status_code=502, message="libtv image/verify returned mismatched image results")
+    return decisions
 
 
 def parse_third_asset_uuid(payload: Dict[str, Any]) -> str:
@@ -768,7 +803,10 @@ class LibTVClient:
         contract, never an ``asset://`` pseudo-url. Raises if any reference fails moderation
         so the caller can fall back to another provider."""
         cdn_urls = [self.ensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
-        passed = parse_verify_passed(self._post("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify"))
+        verify_urls, _ = dedupe_preserving_order(cdn_urls)
+        passed = parse_verify_passed(
+            self._post("/api/community/image/verify", {"urlList": verify_urls}, "image/verify"), verify_urls
+        )
         for cdn_url in cdn_urls:
             if not passed.get(cdn_url):
                 raise LibTVError(
@@ -1123,9 +1161,7 @@ class LibTVClient:
                 deployment_pool,
                 self.token,
                 lambda: _Provider(self),
-                lambda token, webid: _Provider(
-                    LibTVClient(token=token, webid=webid, async_client=AsyncHTTPHandler())
-                ),
+                lambda token, webid: _Provider(LibTVClient(token=token, webid=webid, async_client=AsyncHTTPHandler())),
             )
             selected_providers = select_image_upscale_providers(
                 providers, deployment_id, lambda: (_Provider(self), self.token)
@@ -1529,9 +1565,7 @@ class LibTVClient:
             cached = None
             if persistence is not None:
                 try:
-                    cached = await persistence.cached_asset(
-                        self._account_key, cdn_url, asset_type, ttl_seconds=ttl
-                    )
+                    cached = await persistence.cached_asset(self._account_key, cdn_url, asset_type, ttl_seconds=ttl)
                 except Exception:  # noqa: BLE001  # a cache fault must degrade to a fresh registration, not a failure
                     logger.warning("libtv asset cache lookup failed", exc_info=True)
                     cached = None
@@ -1541,9 +1575,7 @@ class LibTVClient:
             ref, terminal = await self._aregister_compliant_asset_terminal(cdn_url, asset_type)
             if terminal and persistence is not None:
                 try:
-                    await persistence.store_asset(
-                        self._account_key, cdn_url, asset_type, ref.get("assetId")
-                    )
+                    await persistence.store_asset(self._account_key, cdn_url, asset_type, ref.get("assetId"))
                 except Exception:  # noqa: BLE001  # best-effort write; worst case is no reuse next time
                     logger.warning("libtv asset cache store failed", exc_info=True)
             resolved.append(ref)
@@ -1551,8 +1583,9 @@ class LibTVClient:
 
     async def aresolve_compliant_image_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
         cdn_urls = [await self.aensure_libtv_url(kind, url, data) for (kind, url, data) in refs]
+        verify_urls, _ = dedupe_preserving_order(cdn_urls)
         passed = parse_verify_passed(
-            await self._apost("/api/community/image/verify", {"urlList": cdn_urls}, "image/verify")
+            await self._apost("/api/community/image/verify", {"urlList": verify_urls}, "image/verify"), verify_urls
         )
         for cdn_url in cdn_urls:
             if not passed.get(cdn_url):
