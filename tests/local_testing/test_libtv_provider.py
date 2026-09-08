@@ -1784,7 +1784,12 @@ def test_resolve_model_spec_indexes_tool_spec():
 
 
 def _tool_spec_payload(
-    model_key="star-video2", auto_compliance=True, frames2video=False, image2video=None, settings=None
+    model_key="star-video2",
+    auto_compliance=True,
+    frames2video=False,
+    image2video=None,
+    settings=None,
+    single_image2video=None,
 ):
     props = {
         "ratio": {"default": "9:16", "enum": ["16:9", "9:16"]},
@@ -1800,6 +1805,8 @@ def _tool_spec_payload(
         mode_items["mixed2video"] = []
     if image2video is not None:
         mode_items["image2video"] = image2video
+    if single_image2video is not None:
+        mode_items["singleImage2video"] = single_image2video
     if mode_items:
         props["modeType"] = {"items": mode_items}
     meta = {
@@ -5835,3 +5842,215 @@ def test_video_object_exposes_forwarded_prompt_chars_without_prompt_content():
     assert "project_uuid" not in dumped
     assert "task-forwarded" not in json.dumps(dumped)
     assert "4001" in json.dumps(dumped)
+
+
+# ---------------------------------------------------------------------------
+# Single-image first-frame mode selection.
+#
+# Vendor schemas distinguish "singleImage2video" (exactly 1 image -> that image
+# IS the first frame) from "image2video" (1..N reference images that only steer
+# the content). Every seedance model advertises BOTH, and the eligibility check
+# used to match on the literal "image2video" key alone, so a caller sending one
+# first frame silently got the multi-image reference mode and the output never
+# started from their frame (production report, seedance-2.5 / 2.0 family).
+# ---------------------------------------------------------------------------
+
+
+def test_single_reference_image_prefers_single_image2video_when_schema_offers_it():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(image2video=[1, 9], single_image2video=[1, 1]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "she turns to camera", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "singleImage2video"
+    assert gen_params["imageList"] == ["asset://asset-ONE"]
+    assert "mixedList" not in gen_params
+
+
+def test_two_reference_images_keep_image2video_even_when_single_mode_exists():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]),
+        get_payload=_tool_spec_payload(image2video=[1, 9], single_image2video=[1, 1]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "keep both people",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "image2video"
+
+
+def test_single_image_keeps_image2video_when_schema_has_no_single_mode():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(image2video=[1, 9]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "image2video"
+
+
+def test_explicit_single_image2video_override_is_not_downgraded_to_mixed2video():
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(image2video=[1, 9], single_image2video=[1, 1]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "modeType": "singleImage2video"},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "singleImage2video"
+    assert gen_params["imageList"] == ["asset://asset-ONE"]
+
+
+@pytest.mark.asyncio
+async def test_single_reference_image_prefers_single_image2video_async():
+    fake = FakeAsyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(image2video=[1, 9], single_image2video=[1, 1]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = await llm.avideo_generation(
+        "star-video2", "she turns to camera", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "singleImage2video"
+    assert gen_params["imageList"] == ["asset://asset-ONE"]
+
+
+def test_single_image_non_compliance_model_uses_single_image_mode_from_mode_items():
+    # hailuo-h3 shape: config.settings advertises "image2video" but modeType.items
+    # does not, so sending "image2video" pushes a value the vendor enum rejects.
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    }
+    fake = _FullSyncFake(
+        routes,
+        get_payload=_tool_spec_payload(
+            model_key="MiniMax-Hailuo-H3",
+            auto_compliance=False,
+            single_image2video=[1, 1],
+            settings={
+                "text2video": ["ratio", "resolution", "duration"],
+                "image2video": ["ratio", "resolution", "duration"],
+                "singleImage2video": ["ratio", "resolution", "duration"],
+            },
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "MiniMax-Hailuo-H3", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "singleImage2video"
+    assert gen_params["imageList"] == [_LIBTV_REF]
+
+
+def _audit_payloads(caplog):
+    from litellm.llms.libtv.observability import AUDIT_LOGGER_NAME
+
+    return [
+        json.loads(r.getMessage().split("libtv video submission ", 1)[1])
+        for r in caplog.records
+        if r.name == AUDIT_LOGGER_NAME and "libtv video submission " in r.getMessage()
+    ]
+
+
+def test_video_generation_emits_submission_audit_with_task_id_and_resolved_mode(caplog):
+    from litellm.llms.libtv.observability import AUDIT_LOGGER_NAME
+
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(image2video=[1, 9], single_image2video=[1, 1]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        llm.video_generation(
+            "star-video2", "she turns", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+        )
+    payloads = _audit_payloads(caplog)
+    assert payloads, "no submission audit record was emitted"
+    assert payloads[-1]["task_id"] == "t1"
+    assert payloads[-1]["mode"] == "singleImage2video"
+    assert payloads[-1]["reference_keys"] == ["image"]
+    assert payloads[-1]["reference_images"] == 1
+
+
+@pytest.mark.asyncio
+async def test_avideo_generation_emits_submission_audit_with_task_id_and_resolved_mode(caplog):
+    from litellm.llms.libtv.observability import AUDIT_LOGGER_NAME
+
+    fake = FakeAsyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF, _LIBTV_REF_2], ["asset-ONE", "asset-TWO"]),
+        get_payload=_tool_spec_payload(image2video=[1, 9], single_image2video=[1, 1]),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        await llm.avideo_generation(
+            "star-video2",
+            "two people",
+            "tok",
+            None,
+            {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2]},
+            None,
+            client=fake,
+        )
+    payloads = _audit_payloads(caplog)
+    assert payloads, "no submission audit record was emitted"
+    assert payloads[-1]["mode"] == "image2video"
+    assert payloads[-1]["reference_images"] == 2
+    assert payloads[-1]["task_id"] == "t1"
+
+
+def test_single_image_mode_is_skipped_when_settings_bucket_is_missing():
+    # _allowed_setting_keys returns [] for a dict settings map with no bucket for
+    # the mode, which would silently drop ratio/resolution/duration from the
+    # payload. _image2video_eligible already guards image2video this way; the
+    # one-image mode must not be reachable without the same guard.
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(
+            image2video=[1, 9],
+            single_image2video=[1, 1],
+            settings={
+                "image2video": ["ratio", "resolution", "duration"],
+                "mixed2video": ["ratio", "resolution", "duration"],
+            },
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2", "x", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None, client=fake
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "image2video"
+    assert gen_params["resolution"] == "720p"

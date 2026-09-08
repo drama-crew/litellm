@@ -77,6 +77,7 @@ from litellm.llms.openai.cost_calculation import _video_output_cost_per_second
 from .client import LibTVClient
 from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
 from .image_upscale import ImageUpscaleReceipt
+from .observability import audit_logger, record_video_submission
 from .persistence import get_persistence
 from .transform import _resolution_from_size, build_generation_params, build_topaz_upscale_params
 from .video_id_codec import (
@@ -397,8 +398,11 @@ def _guard_reference_intent(model: str, optional_params: dict, images: list, vid
 def _log_reference_collection(
     model: str, optional_params: dict, images: list, videos: list, audios: list, branch: str
 ) -> None:
+    # Emitted before create, so it is the only record when a submission fails on
+    # the way out. It goes to the audit logger (level pinned to INFO) because the
+    # production root is WARNING and dropped this line entirely.
     key_presence = " ".join(f"{key}_present={key in optional_params}" for key in _REFERENCE_KEYS)
-    logger.info(
+    audit_logger.info(
         "libtv reference_collection model=%s %s images=%d videos=%d audios=%d branch=%s",
         model,
         key_presence,
@@ -587,6 +591,57 @@ def _image2video_eligible(optional_params: dict, spec: dict, images: list, video
     if isinstance(cfg_settings, dict) and "image2video" not in cfg_settings:
         return False
     return lo <= len(images) <= hi
+
+
+SINGLE_IMAGE_MODE = "singleImage2video"
+
+
+def _schema_offers_single_image_mode(spec: dict) -> bool:
+    items = ((spec.get("properties") or {}).get("modeType") or {}).get("items")
+    if not (isinstance(items, dict) and SINGLE_IMAGE_MODE in items):
+        return False
+    # _allowed_setting_keys returns [] for a dict settings map with no bucket for
+    # the mode, which would strip ratio/resolution/duration from the payload and
+    # silently hand the vendor its own defaults. _image2video_eligible guards
+    # image2video the same way.
+    cfg_settings = (spec.get("config") or {}).get("settings")
+    if isinstance(cfg_settings, dict) and SINGLE_IMAGE_MODE not in cfg_settings:
+        return False
+    return True
+
+
+def _resolve_image_mode(mode: str, spec: dict, images: list, videos: list, audios: list, optional_params: dict) -> str:
+    """Pick the vendor's one-image mode when exactly one image IS the request.
+
+    Vendor schemas separate ``singleImage2video`` (bounds [1, 1] -- that image is
+    the first frame the clip animates from) from ``image2video`` (bounds [1, N] --
+    reference images that only steer content). The seedance family advertises
+    both, so matching on the literal "image2video" key alone sent every
+    single-first-frame request into the multi-reference mode and the output never
+    started from the caller's frame. Anything that is not a bare one-image request
+    (extra media, a last frame, an already-specific mode) is left untouched.
+    """
+    if mode != "image2video":
+        return mode
+    if videos or audios or optional_params.get("last_image") or len(images) != 1:
+        return mode
+    return SINGLE_IMAGE_MODE if _schema_offers_single_image_mode(spec) else mode
+
+
+def _image_branch_mode(spec: dict, images: list, videos: list, audios: list, optional_params: dict) -> str | None:
+    """Mode for the compliance image branch, or None when the caller's explicit
+    modeType override does not belong on that branch."""
+    default_mode = _resolve_image_mode("image2video", spec, images, videos, audios, optional_params)
+    resolved = _resolve_mode(optional_params, default_mode)
+    if resolved == "image2video":
+        return resolved
+    # An explicit singleImage2video override used to fall through to the
+    # mixed2video branch, which silently replaced the caller's mode with
+    # "mixed2video" -- the opposite of what they asked for. Honour it, but only
+    # for the one-image shape the vendor bounds allow.
+    if resolved == SINGLE_IMAGE_MODE and not videos and not audios and len(images) == 1:
+        return resolved
+    return None
 
 
 def _asset_ref_to_string(ref: dict) -> str:
@@ -1336,8 +1391,10 @@ class LibTVLLM(CustomLLM):
             and not wants_frames
             and _image2video_eligible(optional_params, spec, images, videos, audios)
         )
-        default_mode = "image2video" if image2video_eligible else "mixed2video"
-        wants_image2video = image2video_eligible and _resolve_mode(optional_params, default_mode) == "image2video"
+        image_branch_mode = (
+            _image_branch_mode(spec, images, videos, audios, optional_params) if image2video_eligible else None
+        )
+        wants_image2video = image_branch_mode is not None
         _log_reference_collection(
             model,
             optional_params,
@@ -1347,7 +1404,7 @@ class LibTVLLM(CustomLLM):
             branch=(
                 "frames2video"
                 if wants_frames
-                else "image2video"
+                else image_branch_mode
                 if wants_image2video
                 else "mixed2video"
                 if images and auto_compliance
@@ -1371,7 +1428,7 @@ class LibTVLLM(CustomLLM):
                 params["audioList"] = [url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
         elif wants_image2video:
             image_refs = lt.resolve_compliant_image_refs([_reference_payload(r) for r in images])
-            params = build_generation_params(prompt, optional_params, spec, "image2video")
+            params = build_generation_params(prompt, optional_params, spec, image_branch_mode)
             params["autoCompliance"] = 1
             params["imageList"] = [_asset_ref_to_string(ref) for ref in image_refs]
         elif images and auto_compliance:
@@ -1385,7 +1442,14 @@ class LibTVLLM(CustomLLM):
                 + [{"url": url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
             )
         else:
-            mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
+            mode = _resolve_image_mode(
+                _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios)),
+                spec,
+                images,
+                videos,
+                audios,
+                optional_params,
+            )
             params = build_generation_params(prompt, optional_params, spec, mode)
             self._apply_video_references(
                 params,
@@ -1399,6 +1463,16 @@ class LibTVLLM(CustomLLM):
             self._create_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
             if wants_fresh_asset_retry
             else lt.create(model, spec["vendor"], "video", params, _project_name(model))
+        )
+        record_video_submission(
+            model=model,
+            mode=params.get("modeType"),
+            images=images,
+            videos=videos,
+            audios=audios,
+            optional_params=optional_params,
+            task_id=created.get("task_id"),
+            prompt=prompt,
         )
         return self._build_video_object(model, created, optional_params)
 
@@ -1444,8 +1518,10 @@ class LibTVLLM(CustomLLM):
             and not wants_frames
             and _image2video_eligible(optional_params, spec, images, videos, audios)
         )
-        default_mode = "image2video" if image2video_eligible else "mixed2video"
-        wants_image2video = image2video_eligible and _resolve_mode(optional_params, default_mode) == "image2video"
+        image_branch_mode = (
+            _image_branch_mode(spec, images, videos, audios, optional_params) if image2video_eligible else None
+        )
+        wants_image2video = image_branch_mode is not None
         _log_reference_collection(
             model,
             optional_params,
@@ -1455,7 +1531,7 @@ class LibTVLLM(CustomLLM):
             branch=(
                 "frames2video"
                 if wants_frames
-                else "image2video"
+                else image_branch_mode
                 if wants_image2video
                 else "mixed2video"
                 if images and auto_compliance
@@ -1479,7 +1555,7 @@ class LibTVLLM(CustomLLM):
                 params["audioList"] = [await url_for(r, _REF_DEFAULT_NAME["audio"]) for r in audios]
         elif wants_image2video:
             image_refs = await lt.aresolve_compliant_image_refs([_reference_payload(r) for r in images])
-            params = build_generation_params(prompt, optional_params, spec, "image2video")
+            params = build_generation_params(prompt, optional_params, spec, image_branch_mode)
             params["autoCompliance"] = 1
             params["imageList"] = [_asset_ref_to_string(ref) for ref in image_refs]
         elif images and auto_compliance:
@@ -1493,7 +1569,14 @@ class LibTVLLM(CustomLLM):
                 + [{"url": await url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
             )
         else:
-            mode = _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios))
+            mode = _resolve_image_mode(
+                _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios)),
+                spec,
+                images,
+                videos,
+                audios,
+                optional_params,
+            )
             params = build_generation_params(prompt, optional_params, spec, mode)
             self._apply_video_references(
                 params,
@@ -1507,6 +1590,16 @@ class LibTVLLM(CustomLLM):
             await self._acreate_with_fresh_asset_retry(lt, model, spec["vendor"], params, _project_name(model))
             if wants_fresh_asset_retry
             else await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
+        )
+        record_video_submission(
+            model=model,
+            mode=params.get("modeType"),
+            images=images,
+            videos=videos,
+            audios=audios,
+            optional_params=optional_params,
+            task_id=created.get("task_id"),
+            prompt=prompt,
         )
         vo = self._build_video_object(model, created, optional_params)
         await self._record_video_task_usage(created["task_id"], optional_params, params)
