@@ -596,18 +596,27 @@ def _image2video_eligible(optional_params: dict, spec: dict, images: list, video
 SINGLE_IMAGE_MODE = "singleImage2video"
 
 
-def _schema_offers_single_image_mode(spec: dict) -> bool:
+def _schema_mode_items(spec: dict) -> Optional[dict]:
     items = ((spec.get("properties") or {}).get("modeType") or {}).get("items")
-    if not (isinstance(items, dict) and SINGLE_IMAGE_MODE in items):
-        return False
+    return items if isinstance(items, dict) else None
+
+
+def _mode_keeps_its_settings(spec: dict, mode: str) -> bool:
     # _allowed_setting_keys returns [] for a dict settings map with no bucket for
     # the mode, which would strip ratio/resolution/duration from the payload and
     # silently hand the vendor its own defaults. _image2video_eligible guards
     # image2video the same way.
     cfg_settings = (spec.get("config") or {}).get("settings")
-    if isinstance(cfg_settings, dict) and SINGLE_IMAGE_MODE not in cfg_settings:
-        return False
-    return True
+    return not (isinstance(cfg_settings, dict) and mode not in cfg_settings)
+
+
+def _schema_offers(spec: dict, mode: str) -> bool:
+    items = _schema_mode_items(spec)
+    return items is not None and mode in items and _mode_keeps_its_settings(spec, mode)
+
+
+def _schema_offers_single_image_mode(spec: dict) -> bool:
+    return _schema_offers(spec, SINGLE_IMAGE_MODE)
 
 
 def _resolve_image_mode(mode: str, spec: dict, images: list, videos: list, audios: list, optional_params: dict) -> str:
@@ -623,9 +632,20 @@ def _resolve_image_mode(mode: str, spec: dict, images: list, videos: list, audio
     """
     if mode != "image2video":
         return mode
-    if videos or audios or optional_params.get("last_image") or len(images) != 1:
-        return mode
-    return SINGLE_IMAGE_MODE if _schema_offers_single_image_mode(spec) else mode
+    bare_single_image = not videos and not audios and not optional_params.get("last_image") and len(images) == 1
+    if bare_single_image and _schema_offers_single_image_mode(spec):
+        return SINGLE_IMAGE_MODE
+    # "image2video" is derived from the reference shape, not read off the schema,
+    # so a model that does not list it needs a mode that exists. Without this,
+    # kling (no image2video anywhere) fell through transform's alias table into
+    # singleImage2video and dropped every image but the first, and hailuo (listed
+    # in config.settings, absent from modeType.items) was sent a value outside
+    # its own enum -- the two cases the public API guide tells callers to work
+    # around by passing modeType by hand.
+    items = _schema_mode_items(spec)
+    if items is not None and "image2video" not in items and _schema_offers(spec, "mixed2video"):
+        return "mixed2video"
+    return mode
 
 
 def _image_branch_mode(spec: dict, images: list, videos: list, audios: list, optional_params: dict) -> str | None:

@@ -6054,3 +6054,120 @@ def test_single_image_mode_is_skipped_when_settings_bucket_is_missing():
     gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
     assert gen_params["modeType"] == "image2video"
     assert gen_params["resolution"] == "720p"
+
+
+# ---------------------------------------------------------------------------
+# A reference mode must exist in the schema's modeType.items.
+#
+# The non-compliance branch derives "image2video" from the reference shape and
+# then canonicalizes against config.settings only. Two models disagree with
+# their own settings map: kling has no image2video anywhere in items, so the
+# alias fallback squeezed N images into singleImage2video (bounds [1,1] -- only
+# the first image survives); hailuo lists image2video in settings but not in
+# items, so it received a mode outside its own enum. The public API guide works
+# around both by telling callers to pass modeType by hand.
+# ---------------------------------------------------------------------------
+
+
+def test_two_images_pick_mixed2video_when_schema_has_no_multi_image_mode():
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    }
+    fake = _FullSyncFake(
+        routes,
+        get_payload=_tool_spec_payload(
+            model_key="kling-v3-omni",
+            auto_compliance=False,
+            frames2video=True,  # also puts mixed2video in items
+            single_image2video=[1, 1],
+            settings={
+                "text2video": ["ratio", "duration"],
+                "singleImage2video": ["ratio", "duration"],
+                "frames2video": ["ratio", "duration"],
+                "mixed2video": ["ratio", "duration"],
+            },
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "kling-v3-omni",
+        "two people meet",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = _gen_params(fake.calls)
+    assert gen_params["modeType"] == "mixed2video"
+    assert [item["url"] for item in gen_params["mixedList"]] == [_LIBTV_REF, _LIBTV_REF_2]
+
+
+def test_two_images_pick_mixed2video_when_settings_advertise_a_mode_items_does_not():
+    # hailuo shape: settings has an image2video bucket, items does not.
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    }
+    fake = _FullSyncFake(
+        routes,
+        get_payload=_tool_spec_payload(
+            model_key="MiniMax-Hailuo-H3",
+            auto_compliance=False,
+            frames2video=True,
+            single_image2video=[1, 1],
+            settings={
+                "text2video": ["ratio", "duration"],
+                "image2video": ["ratio", "duration"],
+                "singleImage2video": ["ratio", "duration"],
+                "frames2video": ["ratio", "duration"],
+                "mixed2video": ["ratio", "duration"],
+            },
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "MiniMax-Hailuo-H3",
+        "two people meet",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    assert _gen_params(fake.calls)["modeType"] == "mixed2video"
+
+
+def test_native_image2video_model_keeps_its_own_multi_image_mode():
+    # happy-horse lists image2video in items; it must not be pushed to mixed2video.
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    }
+    fake = _FullSyncFake(
+        routes,
+        get_payload=_tool_spec_payload(
+            model_key="happy-horse-1.1",
+            auto_compliance=False,
+            image2video=[1, 9],
+            settings={"text2video": ["ratio"], "image2video": ["ratio", "duration"]},
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "happy-horse-1.1",
+        "a horse",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2]},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    assert _gen_params(fake.calls)["modeType"] == "image2video"
