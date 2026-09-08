@@ -5844,18 +5844,6 @@ def test_video_object_exposes_forwarded_prompt_chars_without_prompt_content():
     assert "4001" in json.dumps(dumped)
 
 
-# ---------------------------------------------------------------------------
-# Single-image first-frame mode selection.
-#
-# Vendor schemas distinguish "singleImage2video" (exactly 1 image -> that image
-# IS the first frame) from "image2video" (1..N reference images that only steer
-# the content). Every seedance model advertises BOTH, and the eligibility check
-# used to match on the literal "image2video" key alone, so a caller sending one
-# first frame silently got the multi-image reference mode and the output never
-# started from their frame (production report, seedance-2.5 / 2.0 family).
-# ---------------------------------------------------------------------------
-
-
 def test_single_reference_image_prefers_single_image2video_when_schema_offers_it():
     fake = FakeSyncClient(
         post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
@@ -6247,3 +6235,77 @@ def test_explicit_single_image2video_is_refused_when_it_would_lose_every_setting
     assert gen_params["modeType"] == "mixed2video"
     assert gen_params["resolution"] == "720p"
     assert gen_params["duration"] == 5
+
+
+@pytest.mark.parametrize("model", ["star-video2", "star-video2-fast", "star-video2-mini", "star-video2.5", "seedance2.0", "kling-v3-omni", "MiniMax-Hailuo-H3", "happy-horse-1.1"])
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_single_first_frame_uses_frames_payload(model, explicit, asynchronous):
+    fake_cls = FakeAsyncClient if asynchronous else FakeSyncClient
+    fake = fake_cls(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(model_key=model, frames2video=True, image2video=[1, 9], single_image2video=[1, 1]),
+    )
+    params = {"webid": "w", "image": _LIBTV_REF, "seconds": "4", "resolution": "720p"}
+    if explicit:
+        params["modeType"] = "frames2video"
+    llm = LibTVLLM(poll_interval=0)
+    if asynchronous:
+        await llm.avideo_generation(model, "waterfall", "tok", None, params, None, client=fake)
+    else:
+        llm.video_generation(model, "waterfall", "tok", None, params, None, client=fake)
+    body = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert body["modeType"] == "frames2video"
+    assert body["imageList"] == ["asset://asset-ONE"]
+    assert body["duration"] == 4
+    assert body["resolution"] == "720p"
+    assert "mixedList" not in body
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({"image": _LIBTV_REF, "modeType": "singleImage2video"}, "singleImage2video"),
+    ({"reference_images": [_LIBTV_REF]}, "singleImage2video"),
+    ({"reference_images": [_LIBTV_REF, _LIBTV_REF_2]}, "image2video"),
+])
+def test_frames_default_preserves_explicit_and_reference_modes(overrides, expected):
+    refs = overrides.get("reference_images", [_LIBTV_REF])
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes(refs, ["asset-ONE", "asset-TWO"][:len(refs)]),
+        get_payload=_tool_spec_payload(frames2video=True, image2video=[1, 9], single_image2video=[1, 1]),
+    )
+    LibTVLLM(poll_interval=0).video_generation("star-video2", "x", "tok", None, {"webid": "w", **overrides}, None, client=fake)
+    body = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert body["modeType"] == expected
+
+
+@pytest.mark.parametrize("model,bounds", [("seedance-1.5-pro", None), ("doubao-seedance-pro", [0, 0]), ("doubao-seedance-lite", [0, 0])])
+def test_seedance_legacy_without_single_frame_support_keeps_single_image(model, bounds):
+    from litellm.llms.libtv.handler import _wants_frames2video
+    modes = {"singleImage2video": [1, 1]}
+    if bounds is not None:
+        modes["frames2video"] = bounds
+    spec = {"model_key": model, "properties": {"modeType": {"items": modes}}, "config": {"settings": ["duration", "resolution"]}}
+    assert not _wants_frames2video({"image": _LIBTV_REF}, spec)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_single_first_frame_without_compliance_uses_frames(asynchronous):
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    }
+    fake_cls = FakeAsyncClient if asynchronous else FakeSyncClient
+    fake = fake_cls(post_by_path=routes, get_payload=_tool_spec_payload(model_key="other-video", auto_compliance=False, frames2video=True))
+    params = {"webid": "w", "image": _LIBTV_REF, "seconds": "4", "resolution": "720p"}
+    llm = LibTVLLM(poll_interval=0)
+    if asynchronous:
+        await llm.avideo_generation("other-video", "waterfall", "tok", None, params, None, client=fake)
+    else:
+        llm.video_generation("other-video", "waterfall", "tok", None, params, None, client=fake)
+    body = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert body["modeType"] == "frames2video"
+    assert body["imageList"] == [_LIBTV_REF]
+    assert body["duration"] == 4

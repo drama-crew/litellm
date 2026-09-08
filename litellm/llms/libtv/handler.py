@@ -552,19 +552,26 @@ def _auto_compliance_enabled(spec: dict) -> bool:
 
 
 def _wants_frames2video(optional_params: dict, spec: dict) -> bool:
-    # A first/last-frame request (image + last_image) must not be flattened into
-    # mixed2video reference-image soup: that loses the first/last ordering entirely.
-    # Only take the frames2video path when the model schema actually advertises support
-    # for it, so unsupported models keep getting the existing mixed2video behavior
-    # instead of a 400.
-    if not optional_params.get("last_image"):
-        return False
-    # An explicit modeType override always wins; only frames2video (or no override)
-    # takes this branch, so the mode and the payload shape never disagree.
     if _resolve_mode(optional_params, "frames2video") != "frames2video":
         return False
-    mode_items = ((spec.get("properties") or {}).get("modeType") or {}).get("items")
-    return isinstance(mode_items, dict) and "frames2video" in mode_items
+    if not _schema_offers(spec, "frames2video"):
+        return False
+    if optional_params.get("last_image"):
+        return True
+    if not optional_params.get("image"):
+        return False
+    images, videos, audios = _collect_reference_groups(optional_params)
+    if len(images) != 1 or videos or audios:
+        return False
+    bounds = _schema_mode_items(spec).get("frames2video")
+    if (
+        not isinstance(bounds, (list, tuple))
+        or len(bounds) != 2
+        or not all(isinstance(value, int) for value in bounds)
+        or not bounds[0] <= 1 <= bounds[1]
+    ):
+        return False
+    return True
 
 
 def _image2video_eligible(optional_params: dict, spec: dict, images: list, videos: list, audios: list) -> bool:
@@ -612,16 +619,6 @@ def _schema_offers_single_image_mode(spec: dict) -> bool:
 
 
 def _resolve_image_mode(mode: str, spec: dict, images: list, videos: list, audios: list, optional_params: dict) -> str:
-    """Pick the vendor's one-image mode when exactly one image IS the request.
-
-    Vendor schemas separate ``singleImage2video`` (bounds [1, 1] -- that image is
-    the first frame the clip animates from) from ``image2video`` (bounds [1, N] --
-    reference images that only steer content). The seedance family advertises
-    both, so matching on the literal "image2video" key alone sent every
-    single-first-frame request into the multi-reference mode and the output never
-    started from the caller's frame. Anything that is not a bare one-image request
-    (extra media, a last frame, an already-specific mode) is left untouched.
-    """
     if mode != "image2video":
         return mode
     bare_single_image = not videos and not audios and not optional_params.get("last_image") and len(images) == 1
@@ -1488,7 +1485,10 @@ class LibTVLLM(CustomLLM):
                 audios,
                 optional_params,
             )
-            mode = _resolve_mode(optional_params, derived_mode)
+            mode = _resolve_mode(
+                optional_params,
+                "frames2video" if _wants_frames2video(optional_params, spec) else derived_mode,
+            )
             params = build_generation_params(prompt, optional_params, spec, mode)
             self._apply_video_references(
                 params,
@@ -1631,7 +1631,10 @@ class LibTVLLM(CustomLLM):
                 audios,
                 optional_params,
             )
-            mode = _resolve_mode(optional_params, derived_mode)
+            mode = _resolve_mode(
+                optional_params,
+                "frames2video" if _wants_frames2video(optional_params, spec) else derived_mode,
+            )
             params = build_generation_params(prompt, optional_params, spec, mode)
             self._apply_video_references(
                 params,
