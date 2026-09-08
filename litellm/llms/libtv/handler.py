@@ -1400,6 +1400,16 @@ class LibTVLLM(CustomLLM):
                 lt.ensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["video"]) for r in source_videos
             ]
             created = lt.create(model, spec["vendor"], "video", params, _project_name(model))
+            record_video_submission(
+                model=model,
+                mode=params.get("modeType"),
+                images=[],
+                videos=source_videos,
+                audios=[],
+                optional_params=optional_params,
+                task_id=created.get("task_id"),
+                prompt=prompt,
+            )
             return self._build_video_object(model, created, {**optional_params, "resolution": params["resolution"]})
         images, videos, audios = _collect_reference_groups(optional_params)
         _guard_reference_intent(model, optional_params, images, videos, audios)
@@ -1524,6 +1534,16 @@ class LibTVLLM(CustomLLM):
                 await lt.aensure_libtv_url(*_reference_payload(r), _REF_DEFAULT_NAME["video"]) for r in source_videos
             ]
             created = await lt.acreate(model, spec["vendor"], "video", params, _project_name(model))
+            record_video_submission(
+                model=model,
+                mode=params.get("modeType"),
+                images=[],
+                videos=source_videos,
+                audios=[],
+                optional_params=optional_params,
+                task_id=created.get("task_id"),
+                prompt=prompt,
+            )
             op = {**optional_params, "resolution": params["resolution"]}
             vo = self._build_video_object(model, created, op)
             await self._record_video_task_usage(created["task_id"], op, params)

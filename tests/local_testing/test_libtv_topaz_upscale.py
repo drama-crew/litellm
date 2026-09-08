@@ -1028,3 +1028,39 @@ async def test_avideo_generation_topaz_upscale_sets_no_mode_type_and_uploads_sou
     gen_params = _gen_params(fake.calls)
     assert "modeType" not in gen_params
     assert gen_params["videoList"] == [_TOPAZ_SOURCE_URL]
+
+
+def _audit_payloads(caplog):
+    import json as _json
+
+    from litellm.llms.libtv.observability import AUDIT_LOGGER_NAME
+
+    return [
+        _json.loads(r.getMessage().split("libtv video submission ", 1)[1])
+        for r in caplog.records
+        if r.name == AUDIT_LOGGER_NAME and "libtv video submission " in r.getMessage()
+    ]
+
+
+def test_topaz_upscale_submission_is_audited_like_every_other_video_submission(caplog):
+    import logging
+
+    from litellm.llms.libtv.observability import AUDIT_LOGGER_NAME
+
+    fake = FakeSyncClient(post_by_path=_CREATE_ROUTES, get_payload=_topaz_tool_spec_payload())
+    llm = LibTVLLM(poll_interval=0)
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        llm.video_generation(
+            "topaz-video-upscaler",
+            "upscale this",
+            "tok",
+            None,
+            {"webid": "w", "video_references": _TOPAZ_SOURCE_URL},
+            None,
+            client=fake,
+        )
+    payloads = _audit_payloads(caplog)
+    assert payloads, "topaz submissions leave no audit record"
+    assert payloads[-1]["model"] == "topaz-video-upscaler"
+    assert payloads[-1]["reference_videos"] == 1
+    assert payloads[-1]["mode"] is None  # topaz has no modeType by design
