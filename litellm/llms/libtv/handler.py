@@ -56,21 +56,13 @@ _STALE_CONNECT_WINDOW_SECONDS = 2.0
 
 _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio": "reference.mp3"}
 
-# Keep in sync with the keys _collect_reference_groups reads: the guard below must
-# recognize exactly the keys that can contribute a reference, native libtv or
-# wavespeed-shaped, so it neither misses a caller's reference intent nor false-alarms
-# on a plain text2video request that never mentioned references at all.
-_REFERENCE_KEYS = (
-    "input_reference",
-    "image_references",
-    "reference_images",
-    "image",
-    "last_image",
-    "video_references",
-    "reference_videos",
-    "audio_references",
-    "reference_audios",
-)
+# The keys _collect_reference_groups reads: the guard below must recognize exactly
+# the keys that can contribute a reference, native libtv or wavespeed-shaped, so it
+# neither misses a caller's reference intent nor false-alarms on a plain text2video
+# request that never mentioned references at all. Owned by .observability, which
+# reports them per submission -- one tuple, so the audit can never disagree with
+# what the handler actually inspected.
+from .observability import REFERENCE_KEYS as _REFERENCE_KEYS
 
 from litellm.llms.openai.cost_calculation import _video_output_cost_per_second
 
@@ -659,7 +651,18 @@ def _image_branch_mode(spec: dict, images: list, videos: list, audios: list, opt
     # mixed2video branch, which silently replaced the caller's mode with
     # "mixed2video" -- the opposite of what they asked for. Honour it, but only
     # for the one-image shape the vendor bounds allow.
-    if resolved == SINGLE_IMAGE_MODE and not videos and not audios and len(images) == 1:
+    # ...and only when the schema really offers it, settings bucket included:
+    # _allowed_setting_keys returns [] for a dict settings map with no bucket, so
+    # an unguarded override would ship a payload with no duration -- which
+    # _record_video_task_usage then cannot bill. Refusing here restores the
+    # previous behaviour (fall through to mixed2video), which is billable.
+    if (
+        resolved == SINGLE_IMAGE_MODE
+        and not videos
+        and not audios
+        and len(images) == 1
+        and _schema_offers_single_image_mode(spec)
+    ):
         return resolved
     return None
 
@@ -1472,14 +1475,20 @@ class LibTVLLM(CustomLLM):
                 + [{"url": url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
             )
         else:
-            mode = _resolve_image_mode(
-                _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios)),
+            # Conform the DERIVED mode, then let an explicit modeType override it.
+            # Doing it the other way round would rewrite the caller's own choice --
+            # the very workaround the public API guide tells callers to use -- and
+            # silently swap which settings bucket (so which duration/resolution
+            # gets billed) applies.
+            derived_mode = _resolve_image_mode(
+                _infer_video_mode(optional_params, images, videos, audios),
                 spec,
                 images,
                 videos,
                 audios,
                 optional_params,
             )
+            mode = _resolve_mode(optional_params, derived_mode)
             params = build_generation_params(prompt, optional_params, spec, mode)
             self._apply_video_references(
                 params,
@@ -1609,14 +1618,20 @@ class LibTVLLM(CustomLLM):
                 + [{"url": await url_for(r, _REF_DEFAULT_NAME["audio"]), "type": "audio"} for r in audios]
             )
         else:
-            mode = _resolve_image_mode(
-                _resolve_mode(optional_params, _infer_video_mode(optional_params, images, videos, audios)),
+            # Conform the DERIVED mode, then let an explicit modeType override it.
+            # Doing it the other way round would rewrite the caller's own choice --
+            # the very workaround the public API guide tells callers to use -- and
+            # silently swap which settings bucket (so which duration/resolution
+            # gets billed) applies.
+            derived_mode = _resolve_image_mode(
+                _infer_video_mode(optional_params, images, videos, audios),
                 spec,
                 images,
                 videos,
                 audios,
                 optional_params,
             )
+            mode = _resolve_mode(optional_params, derived_mode)
             params = build_generation_params(prompt, optional_params, spec, mode)
             self._apply_video_references(
                 params,

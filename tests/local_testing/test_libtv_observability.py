@@ -174,3 +174,58 @@ def test_record_video_submission_uses_the_global_tracer_provider_when_none_is_pa
     spans = exporter.get_finished_spans()
     assert [s.name for s in spans] == ["libtv.video.submit"]
     assert dict(spans[0].attributes)["libtv.task_id"] == "t-global"
+
+
+def test_audit_never_raises_on_a_value_it_cannot_serialize(caplog):
+    # The record carries raw caller-supplied resolution/quality/seconds/ratio.
+    # A value the vendor never sees (its settings bucket excludes it) can still
+    # reach the record, and this runs AFTER the vendor create has been charged --
+    # raising here destroys a paid task and, on the async path, its billing row.
+    class Unserializable:
+        pass
+
+    with caplog.at_level(logging.INFO, logger=AUDIT_LOGGER_NAME):
+        record_video_submission(
+            model="star-video2-fast",
+            mode="singleImage2video",
+            images=["https://x/a.png"],
+            videos=[],
+            audios=[],
+            optional_params={"image": "https://x/a.png", "quality": Unserializable()},
+            task_id="t-unserializable",
+            prompt="hello",
+        )
+    lines = [r.getMessage() for r in caplog.records if "libtv video submission " in r.getMessage()]
+    assert len(lines) == 1
+    payload = json.loads(lines[0].split("libtv video submission ", 1)[1])
+    assert payload["task_id"] == "t-unserializable"
+
+
+def test_audit_logger_does_not_stomp_an_operator_configured_level():
+    import importlib
+
+    import litellm.llms.libtv.observability as obs
+
+    logging.getLogger(AUDIT_LOGGER_NAME).setLevel(logging.WARNING)
+    try:
+        importlib.reload(obs)
+        assert logging.getLogger(AUDIT_LOGGER_NAME).level == logging.WARNING
+    finally:
+        logging.getLogger(AUDIT_LOGGER_NAME).setLevel(logging.NOTSET)
+        importlib.reload(obs)
+    assert logging.getLogger(AUDIT_LOGGER_NAME).level == logging.INFO
+
+
+def test_reference_keys_are_the_handler_tuple_not_a_copy():
+    # The audit's whole job is answering "which key did the caller send"; a
+    # silent drift between two hand-kept tuples deletes exactly that answer.
+    from litellm.llms.libtv import handler as libtv_handler
+    from litellm.llms.libtv.observability import REFERENCE_KEYS
+
+    # Equality, not identity: a sibling test reloads this module, which rebinds
+    # the tuple object while the handler keeps its import. Equality is what the
+    # drift this guards against would actually break.
+    assert REFERENCE_KEYS == libtv_handler._REFERENCE_KEYS
+    # And the handler must not grow its own literal back.
+    handler_src = open(libtv_handler.__file__, encoding="utf-8").read()
+    assert "_REFERENCE_KEYS = (" not in handler_src

@@ -6171,3 +6171,79 @@ def test_native_image2video_model_keeps_its_own_multi_image_mode():
     )
     assert vo.status == "queued"
     assert _gen_params(fake.calls)["modeType"] == "image2video"
+
+
+def test_explicit_image2video_override_is_never_rewritten_by_schema_conformance():
+    # Conformance exists to fix a mode DERIVED from the reference shape. An
+    # explicit modeType is the caller's decision and the module's stated
+    # invariant ("an explicit modeType override always wins"); rewriting it would
+    # silently break the exact workaround the public API guide tells callers to
+    # use, and swap which settings bucket -- so which duration/resolution gets
+    # billed -- underneath them.
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    }
+    fake = _FullSyncFake(
+        routes,
+        get_payload=_tool_spec_payload(
+            model_key="kling-v3-omni",
+            auto_compliance=False,
+            frames2video=True,
+            single_image2video=[1, 1],
+            settings={
+                "text2video": ["ratio"],
+                "singleImage2video": ["ratio"],
+                "frames2video": ["ratio"],
+                "mixed2video": ["ratio"],
+                "image2video": ["ratio"],
+            },
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "kling-v3-omni",
+        "two people",
+        "tok",
+        None,
+        {"webid": "w", "reference_images": [_LIBTV_REF, _LIBTV_REF_2], "modeType": "image2video"},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    assert _gen_params(fake.calls)["modeType"] == "image2video"
+
+
+def test_explicit_single_image2video_is_refused_when_it_would_lose_every_setting():
+    # Honouring the override here is new behaviour (it used to fall through to
+    # mixed2video). _allowed_setting_keys returns [] when a dict settings map has
+    # no bucket for the mode, so honouring it unguarded ships a payload with no
+    # duration -- which _record_video_task_usage then cannot bill, the same gap
+    # that let the kling billing hole run for 15 days.
+    fake = FakeSyncClient(
+        post_by_path=_image2video_compliance_routes([_LIBTV_REF], ["asset-ONE"]),
+        get_payload=_tool_spec_payload(
+            image2video=[1, 9],
+            single_image2video=[1, 1],
+            settings={
+                "image2video": ["ratio", "resolution", "duration"],
+                "mixed2video": ["ratio", "resolution", "duration"],
+            },
+        ),
+    )
+    llm = LibTVLLM(poll_interval=0)
+    vo = llm.video_generation(
+        "star-video2",
+        "x",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "modeType": "singleImage2video"},
+        None,
+        client=fake,
+    )
+    assert vo.status == "queued"
+    gen_params = next(body for path, body in fake.calls if path == "/api/task/generation/create")["params"]
+    assert gen_params["modeType"] == "mixed2video"
+    assert gen_params["resolution"] == "720p"
+    assert gen_params["duration"] == 5

@@ -23,12 +23,18 @@ SPAN_NAME = "libtv.video.submit"
 
 # Production runs a WARNING root, so a logger that leaves its own level unset
 # never even creates the record. Pin INFO here: the handler's root already owns
-# a stdout handler, and this line is an audit trail, not a warning.
+# a stdout handler, and this line is an audit trail, not a warning. Only when the
+# level is still NOTSET, so an operator who deliberately quieted this logger
+# keeps their setting -- provider modules import lazily, i.e. after startup
+# logging config has run.
 audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
-audit_logger.setLevel(logging.INFO)
+if audit_logger.level == logging.NOTSET:
+    audit_logger.setLevel(logging.INFO)
 
-# Keep in sync with handler._REFERENCE_KEYS: which key a caller reached for is
-# exactly the thing under dispute when a mode looks wrong.
+# The handler imports this as its own _REFERENCE_KEYS rather than keeping a
+# parallel copy: which key a caller reached for is exactly the thing under
+# dispute when a mode looks wrong, and a silent drift between two hand-kept
+# tuples would delete that answer from the record.
 REFERENCE_KEYS = (
     "input_reference",
     "image_references",
@@ -107,7 +113,18 @@ def record_video_submission(
         logging.getLogger(__name__).warning("libtv audit record build failed", exc_info=True)
         return
 
-    audit_logger.info("libtv video submission %s", json.dumps(record, sort_keys=True, ensure_ascii=False))
+    try:
+        # default=str: the record carries raw caller-supplied resolution/quality/
+        # seconds/ratio values, which need not be JSON-serializable (a value the
+        # resolved mode's settings bucket excludes never reaches the vendor, so
+        # the create succeeded). This runs after that paid create, and on the
+        # async path before the billing record is written, so a raise here would
+        # destroy a charged task.
+        audit_logger.info(
+            "libtv video submission %s", json.dumps(record, sort_keys=True, ensure_ascii=False, default=str)
+        )
+    except Exception:  # pragma: no cover - defensive
+        logging.getLogger(__name__).warning("libtv audit log failed", exc_info=True)
 
     try:
         if tracer is None:
