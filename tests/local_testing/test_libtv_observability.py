@@ -135,3 +135,42 @@ def test_record_video_submission_is_a_no_op_when_tracing_is_unconfigured():
         task_id=None,
         prompt=None,
     )
+
+
+def test_record_video_submission_uses_the_global_tracer_provider_when_none_is_passed(monkeypatch):
+    # Production relies on this: litellm's otel callback calls
+    # trace.set_tracer_provider at startup, so the global provider is the SDK one
+    # and our span exports. If this stopped going through opentelemetry.trace,
+    # every submission span would silently vanish.
+    pytest.importorskip("opentelemetry.sdk")
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    asked = []
+
+    def fake_get_tracer(name, *args, **kwargs):
+        asked.append(name)
+        return provider.get_tracer(name)
+
+    monkeypatch.setattr(trace, "get_tracer", fake_get_tracer)
+
+    record_video_submission(
+        model="star-video2-fast",
+        mode="singleImage2video",
+        images=["https://x/a.png"],
+        videos=[],
+        audios=[],
+        optional_params={"image": "https://x/a.png"},
+        task_id="t-global",
+        prompt="hello",
+    )
+
+    assert asked == ["litellm.libtv"]
+    spans = exporter.get_finished_spans()
+    assert [s.name for s in spans] == ["libtv.video.submit"]
+    assert dict(spans[0].attributes)["libtv.task_id"] == "t-global"
