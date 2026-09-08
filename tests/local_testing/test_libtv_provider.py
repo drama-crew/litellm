@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -1821,6 +1822,42 @@ def _tool_spec_payload(
 
 
 _LIBTV_REF = "https://libtv-res.liblib.art/upload-images/uid/abc.png"
+
+
+@pytest.mark.parametrize("image_count", [0, 1, 2])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_h3_max_real_schema_preserves_modes_settings_and_frame_order(image_count, asynchronous, monkeypatch):
+    monkeypatch.setenv("LITELLM_VIDEO_ID_SECRET", "unit-test-h3-max-video-id-secret")
+    spec = json.loads((Path(__file__).parent / "fixtures/libtv_h3_max_tool_spec.json").read_text())
+    metadata = {**spec, "modelKey": spec["model_key"], "modelVendor": spec["vendor"]}
+    payload = {"data": {"tools": [{"type": "video", "metadata": json.dumps(metadata)}]}}
+    routes = {
+        "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
+        "/api/canvas/nodes/batch": {"code": 0, "data": {}},
+        "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
+    }
+    fake_class = _FullAsyncFake if asynchronous else _FullSyncFake
+    fake = fake_class(routes, get_payload=payload)
+    refs = [_LIBTV_REF, _LIBTV_REF.replace("abc.png", "last.png")][:image_count]
+    options = {
+        "webid": "w", "seconds": "8", "resolution": "768p", "ratio": "16:9",
+        **({"image": refs[0]} if refs else {}),
+        **({"last_image": refs[1]} if len(refs) == 2 else {}),
+    }
+    llm = LibTVLLM(poll_interval=0)
+    if asynchronous:
+        result = await llm.avideo_generation(spec["model_key"], "paper kite", "tok", None, options, None, client=fake)
+    else:
+        result = llm.video_generation(spec["model_key"], "paper kite", "tok", None, options, None, client=fake)
+    body = _gen_params(fake.calls)
+    assert result.status == "queued"
+    assert body["modeType"] == ("frames2video" if refs else "text2video")
+    assert body["imageList"] == refs
+    assert body["duration"] == 8
+    assert body["resolution"] == "768P"
+    assert body["ratio" if refs else "ratio_t2v"] == "16:9"
+    assert "mixedList" not in body
 
 
 def _compliance_routes(verify_passed=True):

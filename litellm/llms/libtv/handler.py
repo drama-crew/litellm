@@ -71,7 +71,7 @@ from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentia
 from .image_upscale import ImageUpscaleReceipt
 from .observability import audit_logger, record_video_submission
 from .persistence import get_persistence
-from .transform import _resolution_from_size, build_generation_params, build_topaz_upscale_params
+from .transform import _allowed_setting_keys, _resolution_from_size, build_generation_params, build_topaz_upscale_params
 from .video_id_codec import (
     OPAQUE_VIDEO_ID_PREFIX,
     encode_libtv_video_id,
@@ -606,7 +606,7 @@ def _mode_keeps_its_settings(spec: dict, mode: str) -> bool:
     # silently hand the vendor its own defaults. _image2video_eligible guards
     # image2video the same way.
     cfg_settings = (spec.get("config") or {}).get("settings")
-    return not (isinstance(cfg_settings, dict) and mode not in cfg_settings)
+    return not (isinstance(cfg_settings, dict) and mode not in cfg_settings and not _allowed_setting_keys(spec, mode))
 
 
 def _schema_offers(spec: dict, mode: str) -> bool:

@@ -88,6 +88,13 @@ def _canonicalize_mode(mode: str, spec: Dict[str, Any]) -> str:
 def _allowed_setting_keys(spec: Dict[str, Any], mode: str) -> List[str]:
     cfg_settings = (spec.get("config") or {}).get("settings")
     if isinstance(cfg_settings, dict):
+        if (
+            mode == "frames2video"
+            and mode not in cfg_settings
+            and spec.get("model_key") in ("MiniMax-Hailuo-H3", "MiniMax-Hailuo-H3-Max")
+            and mode in (((spec.get("properties") or {}).get("modeType") or {}).get("items") or {})
+        ):
+            return list(cfg_settings.get("image2video") or [])
         return list(cfg_settings.get(mode) or [])
     if isinstance(cfg_settings, list):
         return list(cfg_settings)
