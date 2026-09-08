@@ -55,7 +55,7 @@ COPY --from=uvbin /uvx /usr/local/bin/uvx
 # HTTP 403/5xx,apk 会把它映射成 errno 打印成 "Permission denied"/"IO ERROR"
 # 并整体失败。重试是幂等的:已装好的包会被跳过,只补拉失败的那一个。
 RUN for attempt in 1 2 3 4 5; do \
-        apk add --no-cache \
+        timeout -k 30s 900s apk --timeout 60 add --no-cache \
             bash \
             gcc \
             python-3.13 \
@@ -189,7 +189,7 @@ USER root
 
 # node (without npm) is required by the prisma CLI at runtime
 RUN for attempt in 1 2 3 4 5; do \
-        apk add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile && exit 0; \
+        timeout -k 30s 900s apk --timeout 60 add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile && exit 0; \
         echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
         sleep 5; \
     done; \
