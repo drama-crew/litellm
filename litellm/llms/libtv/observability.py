@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from typing import Any, Optional
 
 AUDIT_LOGGER_NAME = "litellm.libtv.audit"
@@ -30,6 +31,35 @@ SPAN_NAME = "libtv.video.submit"
 audit_logger = logging.getLogger(AUDIT_LOGGER_NAME)
 if audit_logger.level == logging.NOTSET:
     audit_logger.setLevel(logging.INFO)
+
+
+def _ensure_audit_handler() -> None:
+    """Give the audit logger a handler of its own.
+
+    Measured on the live proxy: the root logger has level WARNING and ZERO
+    handlers, so an INFO record that only propagates upward lands on
+    logging.lastResort (level WARNING) and is discarded -- which is exactly how
+    the pre-existing reference_collection line managed to be invisible in
+    production while its sibling warnings showed up fine. Setting this logger's
+    own level is necessary but not sufficient; it needs somewhere to write.
+
+    Propagation is deliberately left ON: ancestors have no handler in production
+    (so no duplicate), while in tests it is what lets caplog see these records.
+    Tagged and idempotent so a module reload cannot stack handlers, and skipped
+    entirely when an operator has already attached their own.
+    """
+    if any(getattr(h, "_libtv_audit", False) for h in audit_logger.handlers):
+        return
+    if audit_logger.handlers:  # operator-configured; leave it alone
+        return
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    handler._libtv_audit = True  # type: ignore[attr-defined]
+    audit_logger.addHandler(handler)
+
+
+_ensure_audit_handler()
 
 # The handler imports this as its own _REFERENCE_KEYS rather than keeping a
 # parallel copy: which key a caller reached for is exactly the thing under

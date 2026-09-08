@@ -229,3 +229,53 @@ def test_reference_keys_are_the_handler_tuple_not_a_copy():
     # And the handler must not grow its own literal back.
     handler_src = open(libtv_handler.__file__, encoding="utf-8").read()
     assert "_REFERENCE_KEYS = (" not in handler_src
+
+
+def test_audit_line_is_emitted_even_when_the_root_logger_has_no_handler():
+    # Production reality, measured on the live proxy: root level is WARNING with
+    # ZERO handlers, so an INFO record propagating up falls to logging.lastResort
+    # (level WARNING) and is discarded. Pinning the logger's own level is not
+    # enough -- the audit needs a handler of its own or it is invisible exactly
+    # where it matters.
+    import io
+
+    from litellm.llms.libtv.observability import audit_logger
+
+    handler = next((h for h in audit_logger.handlers if getattr(h, "_libtv_audit", False)), None)
+    assert handler is not None, "audit logger owns no handler; the line dies at lastResort"
+
+    saved_stream = handler.stream
+    handler.stream = io.StringIO()
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers, root.level = [], logging.WARNING
+    try:
+        record_video_submission(
+            model="star-video2-fast",
+            mode="singleImage2video",
+            images=["https://x/a.png"],
+            videos=[],
+            audios=[],
+            optional_params={"image": "https://x/a.png"},
+            task_id="t-no-root-handler",
+            prompt="hello",
+        )
+        written = handler.stream.getvalue()
+    finally:
+        handler.stream = saved_stream
+        root.handlers, root.level = saved_handlers, saved_level
+
+    assert "libtv video submission" in written
+    assert "t-no-root-handler" in written
+
+
+def test_audit_handler_is_added_once_not_per_import():
+    import importlib
+
+    import litellm.llms.libtv.observability as obs
+
+    before = len([h for h in obs.audit_logger.handlers if getattr(h, "_libtv_audit", False)])
+    importlib.reload(obs)
+    after = len([h for h in obs.audit_logger.handlers if getattr(h, "_libtv_audit", False)])
+    assert before == 1
+    assert after == 1
