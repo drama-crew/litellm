@@ -520,6 +520,7 @@ from litellm.proxy.utils import (
     update_spend,
 )
 from litellm.proxy.video_endpoints.endpoints import router as video_router
+from litellm.proxy.video_endpoints.minimax_h3_endpoints import router as minimax_h3_router
 from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.router import (
     AssistantsTypedDict,
@@ -15899,6 +15900,7 @@ app.include_router(rerank_router)
 app.include_router(ocr_router)
 app.include_router(rag_router)
 app.include_router(video_router)
+app.include_router(minimax_h3_router)
 app.include_router(container_router)
 app.include_router(search_router)
 app.include_router(image_router)

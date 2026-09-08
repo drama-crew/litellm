@@ -6119,6 +6119,125 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/internal/v1/image-upscale/finalize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Libtv Image Upscale Finalize */
+        post: operations["libtv_image_upscale_finalize_internal_v1_image_upscale_finalize_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/v1/image-upscale/poll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Libtv Image Upscale Poll */
+        post: operations["libtv_image_upscale_poll_internal_v1_image_upscale_poll_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/v1/image-upscale/receipt/{request_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Libtv Image Upscale Receipt */
+        get: operations["libtv_image_upscale_receipt_internal_v1_image_upscale_receipt__request_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/v1/image-upscale/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Libtv Image Upscale Resolve */
+        post: operations["libtv_image_upscale_resolve_internal_v1_image_upscale_resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/v1/image-upscale/submit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Libtv Image Upscale Submit */
+        post: operations["libtv_image_upscale_submit_internal_v1_image_upscale_submit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/v1/validated-media-transfer": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Libtv Validated Media Transfer */
+        post: operations["libtv_validated_media_transfer_internal_v1_validated_media_transfer_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/v1/validated-media-transfer/readiness": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Libtv Validated Media Transfer Readiness */
+        get: operations["libtv_validated_media_transfer_readiness_internal_v1_validated_media_transfer_readiness_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/invitation/delete": {
         parameters: {
             query?: never;
@@ -18809,6 +18928,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/query/video_generation/{video_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Query Video */
+        get: operations["query_video_v2_query_video_generation__video_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/rerank": {
         parameters: {
             query?: never;
@@ -18895,6 +19031,23 @@ export interface paths {
         get: operations["user_info_v2_v2_user_info_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/video_generation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Video */
+        post: operations["create_video_v2_video_generation_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -24221,6 +24374,8 @@ export interface components {
         };
         /** ImageUpscaleReceiptResponse */
         ImageUpscaleReceiptResponse: {
+            /** Billing Event Id */
+            billing_event_id?: string | null;
             /** Deployment Id */
             deployment_id?: string | null;
             /** Message */
@@ -24231,6 +24386,12 @@ export interface components {
             provider_task_id?: string | null;
             /** Request Id */
             request_id: string;
+            /** Resolution Tombstone */
+            resolution_tombstone?: {
+                [key: string]: unknown;
+            } | null;
+            /** Response Cost */
+            response_cost?: number | null;
             /** Resume Token */
             resume_token?: string | null;
             /**
@@ -24238,6 +24399,12 @@ export interface components {
              * @enum {string}
              */
             submission_state: "not_submitted" | "rejected" | "unknown" | "submitted";
+            /**
+             * Task State
+             * @default active
+             * @enum {string}
+             */
+            task_state: "active" | "succeeded" | "failed" | "resolved";
         };
         /** IndexCreateLiteLLMParams */
         IndexCreateLiteLLMParams: {
@@ -33208,6 +33375,8 @@ export interface components {
             db_model: boolean;
             /** Id */
             id: string | null;
+            /** Managed Resource Public Model Name */
+            managed_resource_public_model_name?: string | null;
             /** Team Id */
             team_id?: string | null;
             /** Team Public Model Name */
@@ -41607,6 +41776,227 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    libtv_image_upscale_finalize_internal_v1_image_upscale_finalize_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    libtv_image_upscale_poll_internal_v1_image_upscale_poll_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    libtv_image_upscale_receipt_internal_v1_image_upscale_receipt__request_id__get: {
+        parameters: {
+            query?: {
+                model?: string;
+            };
+            header?: never;
+            path: {
+                request_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    libtv_image_upscale_resolve_internal_v1_image_upscale_resolve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    libtv_image_upscale_submit_internal_v1_image_upscale_submit_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** Input Reference */
+                    input_reference?: string | null;
+                    /** Model */
+                    model?: string | null;
+                    /** Model Info */
+                    model_info?: {
+                        [key: string]: unknown;
+                    } | null;
+                    /** Request Id */
+                    request_id: string;
+                    /**
+                     * Scale
+                     * @default 2
+                     * @enum {integer}
+                     */
+                    scale?: 2 | 4 | 6;
+                    /** Source Bytes */
+                    source_bytes: number;
+                    /** Source Hard Cap */
+                    source_hard_cap?: number | null;
+                    /** Source Sha256 */
+                    source_sha256: string;
+                    /** Source Url */
+                    source_url?: string | null;
+                    /**
+                     * Style
+                     * @default Standard V2
+                     */
+                    style?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Provider task submitted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageUpscaleAcceptedResponse"];
+                };
+            };
+            /** @description Submission outcome is unknown */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
+                };
+            };
+            /** @description A stable request_id is required before a paid submission */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Provider explicitly rejected submission */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
+                };
+            };
+            /** @description Submission was not sent */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImageUpscaleErrorResponse"];
+                };
+            };
+        };
+    };
+    libtv_validated_media_transfer_internal_v1_validated_media_transfer_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    libtv_validated_media_transfer_readiness_internal_v1_validated_media_transfer_readiness_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
                 };
             };
         };
@@ -57208,6 +57598,39 @@ export interface operations {
             };
         };
     };
+    query_video_v2_query_video_generation__video_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                video_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     rerank_v2_rerank_post: {
         parameters: {
             query?: never;
@@ -57306,6 +57729,28 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_video_v2_video_generation_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
                 };
             };
         };

@@ -1248,6 +1248,7 @@ _MODEL_ROUTING_ROUTE_MARKERS = (
     "/evals",
     "/fine_tuning",
     "/videos",
+    "/video_generation",
 )
 _MODEL_ROUTING_HEADER_OR_QUERY_ROUTE_MARKERS = (
     "/files",
@@ -1298,6 +1299,7 @@ _VIDEO_RETRIEVAL_ROUTES = frozenset(
         "/videos/{video_id}",
         "/v1/videos/{video_id}/content",
         "/videos/{video_id}/content",
+        "/v2/query/video_generation/{video_id}",
     }
 )
 
@@ -1306,6 +1308,9 @@ def _is_video_retrieval_route(route: str) -> bool:
     normalized_route = route.rstrip("/")
     if normalized_route in _VIDEO_RETRIEVAL_ROUTES:
         return True
+    if normalized_route.startswith("/v2/query/video_generation/"):
+        suffix = normalized_route.removeprefix("/v2/query/video_generation/")
+        return bool(suffix) and "/" not in suffix
 
     # FastAPI's request-route helper may expose the concrete path instead of
     # the route template. Only a single video-id segment, optionally followed
@@ -1322,12 +1327,17 @@ def _is_video_retrieval_route(route: str) -> bool:
             "remix",
         }:
             return bool(segments[0])
-        if len(segments) == 2 and segments[1] == "content" and segments[0] not in {
-            "characters",
-            "edits",
-            "extensions",
-            "remix",
-        }:
+        if (
+            len(segments) == 2
+            and segments[1] == "content"
+            and segments[0]
+            not in {
+                "characters",
+                "edits",
+                "extensions",
+                "remix",
+            }
+        ):
             return bool(segments[0])
     return False
 
@@ -1337,6 +1347,8 @@ def _is_video_mutation_route(route: str, method: str = "POST") -> bool:
     if method.upper() != "POST":
         return False
     normalized_route = route.rstrip("/")
+    if normalized_route == "/v2/video_generation":
+        return True
     for prefix in ("/v1/videos", "/videos"):
         if normalized_route == prefix:
             return True
@@ -1549,13 +1561,12 @@ def _get_managed_resource_public_model_owner(model_id: str, llm_router: Router) 
     return None
 
 
-def _is_retrieve_only_managed_resource_model(
-    model: Any, llm_router: Optional[Router]
-) -> bool:
+def _is_retrieve_only_managed_resource_model(model: Any, llm_router: Optional[Router]) -> bool:
     """Return whether ``model`` names a hidden managed-resource-only group."""
     if not isinstance(model, str) or llm_router is None:
         return False
     try:
+
         def _is_retrieve_only_deployment(deployment: Any) -> bool:
             return (
                 _get_model_info_value(deployment, "hidden") is True
@@ -1563,9 +1574,7 @@ def _is_retrieve_only_managed_resource_model(
                     _get_model_info_value(deployment, "managed_resource_public_model_name"),
                     str,
                 )
-                and bool(
-                    _get_model_info_value(deployment, "managed_resource_public_model_name").strip()
-                )
+                and bool(_get_model_info_value(deployment, "managed_resource_public_model_name").strip())
             )
 
         # Router resolution gives an exact deployment ID precedence over a
@@ -1578,9 +1587,7 @@ def _is_retrieve_only_managed_resource_model(
         deployments = llm_router.get_model_list(model_name=model) or []
         return any(_is_retrieve_only_deployment(deployment) for deployment in deployments)
     except Exception as e:
-        verbose_proxy_logger.debug(
-            "Unable to inspect retrieve-only managed-resource model: %s", str(e)
-        )
+        verbose_proxy_logger.debug("Unable to inspect retrieve-only managed-resource model: %s", str(e))
         return False
 
 

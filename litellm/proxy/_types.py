@@ -301,6 +301,8 @@ class LiteLLMRoutes(enum.Enum):
         # video generation
         "/videos",
         "/v1/videos",
+        "/v2/video_generation",
+        "/v2/query/video_generation/{video_id}",
         "/videos/{video_id}",
         "/v1/videos/{video_id}",
         "/videos/{video_id}/content",
