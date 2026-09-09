@@ -279,13 +279,13 @@ def _asset_ref_from_item(item: Optional[Dict[str, Any]], cdn_url: str) -> Option
     # A verified asset id once the backend issues one (portrait); assetId=None once the
     # asset reaches a terminal state without one (non-portrait, exempt); None while the
     # check is still pending so the caller keeps polling.
-    if not item:
+    if not item or item.get("found") is not True:
         return None
-    if item.get("assetId"):
-        return {"url": cdn_url, "assetId": str(item["assetId"])}
-    if item.get("status") == 1:
-        return {"url": cdn_url, "assetId": None}
-    return None
+    if item.get("status") == 2:
+        raise LibTVError(status_code=400, message="libtv reference asset processing failed")
+    if item.get("status") != 1:
+        return None
+    return {"url": cdn_url, "assetId": str(item["assetId"]) if item.get("assetId") else None}
 
 
 def _pick_item_url(item: Dict[str, Any]) -> Optional[str]:
@@ -903,7 +903,7 @@ class LibTVClient:
                 self._remember_canvas_asset(ref, asset_type, terminal=True)
                 return ref
             time.sleep(self.poll_interval)
-        return {"url": cdn_url, "assetId": None}
+        raise LibTVError(status_code=504, message="libtv reference asset is still processing after readiness timeout")
 
     def resolve_compliant_image_refs(self, refs: List[tuple]) -> List[CompliantAssetRef]:
         """For an auto-compliance (portrait-capable) model: ensure each image reference
@@ -1625,18 +1625,7 @@ class LibTVClient:
                 logger.warning("libtv upload abort failed", exc_info=True)
             raise
 
-    async def _aregister_compliant_asset_terminal(
-        self, cdn_url: str, asset_type: str
-    ) -> tuple[CompliantAssetRef, bool]:
-        """Register one asset; second element says whether libtv actually answered.
-
-        The caller needs that flag because the two ``assetId: None`` outcomes are
-        NOT the same thing: ``_asset_ref_from_item`` returning a ref with no id
-        means libtv reached a terminal state and exempted the image, while
-        falling out of the poll loop means we gave up waiting. Caching the second
-        as if it were the first would pin "exempt" onto an asset libtv never
-        ruled on, for the whole cache TTL.
-        """
+    async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> CompliantAssetRef:
         await get_third_asset_limiter().acquire(self._account_key)
         asset_uuid = parse_third_asset_uuid(
             await self._apost(
@@ -1654,13 +1643,9 @@ class LibTVClient:
                 cdn_url,
             )
             if ref:
-                return ref, True
+                return ref
             await asyncio.sleep(self.poll_interval)
-        return {"url": cdn_url, "assetId": None}, False
-
-    async def _aregister_compliant_asset(self, cdn_url: str, asset_type: str) -> CompliantAssetRef:
-        ref, _terminal = await self._aregister_compliant_asset_terminal(cdn_url, asset_type)
-        return ref
+        raise LibTVError(status_code=504, message="libtv reference asset is still processing after readiness timeout")
 
     async def _aresolve_asset_refs(self, cdn_urls: List[str], asset_type: str) -> List[CompliantAssetRef]:
         """Registrations for ``cdn_urls``, one per input position.
@@ -1670,20 +1655,22 @@ class LibTVClient:
         15/min cap, so every shot failed with code=10026):
 
         1. dedupe -- a shot naming the same character sheet twice pays once;
-        2. cross-request cache -- the 97 collapse to the 30 distinct assets, and
-           a reused id has already aged past the upstream deep audit that makes
-           freshly registered ids fail (see handler._is_fresh_asset_aging_failure);
+        2. cross-request cache -- the 97 collapse to the 30 distinct assets;
+           ready-v1 keys exclude older registrations cached before status=1;
         3. rate limiter (inside the register call) -- paces whatever is left.
         """
         unique, index_for = dedupe_preserving_order(cdn_urls)
         ttl = asset_cache_ttl_seconds()
+        cache_asset_type = f"ready-v1:{asset_type}"
         persistence = self._get_persistence() if ttl > 0 else None
         resolved: List[CompliantAssetRef] = []
         for cdn_url in unique:
             cached = None
             if persistence is not None:
                 try:
-                    cached = await persistence.cached_asset(self._account_key, cdn_url, asset_type, ttl_seconds=ttl)
+                    cached = await persistence.cached_asset(
+                        self._account_key, cdn_url, cache_asset_type, ttl_seconds=ttl
+                    )
                 except Exception:  # noqa: BLE001  # a cache fault must degrade to a fresh registration, not a failure
                     logger.warning("libtv asset cache lookup failed", exc_info=True)
                     cached = None
@@ -1692,13 +1679,13 @@ class LibTVClient:
                 self._remember_canvas_asset(ref, asset_type, terminal=True)
                 resolved.append(ref)
                 continue
-            ref, terminal = await self._aregister_compliant_asset_terminal(cdn_url, asset_type)
-            if terminal and persistence is not None:
+            ref = await self._aregister_compliant_asset(cdn_url, asset_type)
+            if persistence is not None:
                 try:
-                    await persistence.store_asset(self._account_key, cdn_url, asset_type, ref.get("assetId"))
+                    await persistence.store_asset(self._account_key, cdn_url, cache_asset_type, ref.get("assetId"))
                 except Exception:  # noqa: BLE001  # best-effort write; worst case is no reuse next time
                     logger.warning("libtv asset cache store failed", exc_info=True)
-            self._remember_canvas_asset(ref, asset_type, terminal=terminal)
+            self._remember_canvas_asset(ref, asset_type, terminal=True)
             resolved.append(ref)
         return [dict(resolved[index_for[u]]) for u in cdn_urls]  # type: ignore[misc]
 

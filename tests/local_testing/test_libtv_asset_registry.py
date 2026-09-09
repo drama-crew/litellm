@@ -289,9 +289,9 @@ class _AssetFakeAsyncClient:
             uid = json["uuids"][0]
             if not self.terminal:
                 # status 0 == still pending: never a terminal answer.
-                return _Resp({"code": 0, "data": {"list": [{"uuid": uid, "status": 0}]}})
+                return _Resp({"code": 0, "data": {"list": [{"uuid": uid, "found": True, "status": 0}]}})
             return _Resp(
-                {"code": 0, "data": {"list": [{"uuid": uid, "assetId": f"asset-{uid}", "status": 1}]}}
+                {"code": 0, "data": {"list": [{"uuid": uid, "assetId": f"asset-{uid}", "found": True, "status": 1}]}}
             )
         raise AssertionError(f"unexpected path {path}")
 
@@ -367,7 +367,7 @@ async def test_async_image_refs_cache_an_exempt_registration():
             path = url.split("api.liblib.tv", 1)[-1]
             if path == "/api/third_asset/check":
                 self.calls.append((path, json))
-                return _Resp({"code": 0, "data": {"list": [{"uuid": json["uuids"][0], "status": 1}]}})
+                return _Resp({"code": 0, "data": {"list": [{"uuid": json["uuids"][0], "found": True, "status": 1}]}})
             return await super().post(url, json, headers, timeout)
 
     exempt = _ExemptClient()
@@ -375,7 +375,7 @@ async def test_async_image_refs_cache_an_exempt_registration():
     assert refs[0]["assetId"] is None
     # "exempt" is a terminal answer and must be remembered, or exempt scenery is
     # re-submitted on every single shot.
-    assert persistence.stored_calls == [(account_key_of("tok"), _REF_A, "image", None)]
+    assert persistence.stored_calls == [(account_key_of("tok"), _REF_A, "ready-v1:image", None)]
 
 
 def account_key_of(token):
@@ -388,10 +388,9 @@ def account_key_of(token):
 async def test_async_image_refs_do_not_cache_a_poll_that_never_reached_a_terminal_state():
     persistence = _FakePersistence()
     fake = _AssetFakeAsyncClient(terminal=False)
-    refs = await _client(fake, persistence).aresolve_compliant_image_refs(_payloads([_REF_A]))
-    # Poll exhaustion returns assetId=None as a give-up, NOT as libtv saying
-    # "exempt". Caching it would pin a wrong answer for the whole TTL.
-    assert refs[0]["assetId"] is None
+    with pytest.raises(LibTVError, match="still processing") as error:
+        await _client(fake, persistence).aresolve_compliant_image_refs(_payloads([_REF_A]))
+    assert error.value.status_code == 504
     assert persistence.stored_calls == []
 
 
@@ -419,7 +418,7 @@ async def test_async_video_refs_dedupe_and_cache_too():
     fake = _AssetFakeAsyncClient()
     await _client(fake, persistence).aresolve_compliant_video_refs(_payloads([_REF_C, _REF_C]))
     assert fake.creates() == [_REF_C]
-    assert persistence.stored_calls == [(account_key_of("tok"), _REF_C, "video", "asset-u1")]
+    assert persistence.stored_calls == [(account_key_of("tok"), _REF_C, "ready-v1:video", "asset-u1")]
 
 
 @pytest.mark.asyncio
@@ -463,7 +462,10 @@ def test_sync_image_refs_register_each_distinct_url_once():
                 self._seq += 1
                 return _Resp({"code": 0, "data": {"uuid": f"u{self._seq}"}})
             return _Resp(
-                {"code": 0, "data": {"list": [{"uuid": json["uuids"][0], "assetId": "asset-X", "status": 1}]}}
+                {
+                    "code": 0,
+                    "data": {"list": [{"uuid": json["uuids"][0], "assetId": "asset-X", "found": True, "status": 1}]},
+                }
             )
 
         def creates(self):
@@ -474,3 +476,15 @@ def test_sync_image_refs_register_each_distinct_url_once():
     refs = lt.resolve_compliant_image_refs(_payloads([_REF_A, _REF_B, _REF_A]))
     assert fake.creates() == [_REF_A, _REF_B]
     assert [r["url"] for r in refs] == [_REF_A, _REF_B, _REF_A]
+
+
+@pytest.mark.asyncio
+async def test_async_image_refs_ignore_legacy_cache_without_readiness_confirmation():
+    persistence = _FakePersistence(
+        {(account_key_of("tok"), _REF_A, "image"): {"url": _REF_A, "assetId": "asset-pending"}}
+    )
+    fake = _AssetFakeAsyncClient()
+    refs = await _client(fake, persistence).aresolve_compliant_image_refs(_payloads([_REF_A]))
+    assert fake.creates() == [_REF_A]
+    assert refs[0]["assetId"] == "asset-u1"
+    assert persistence.stored_calls == [(account_key_of("tok"), _REF_A, "ready-v1:image", "asset-u1")]

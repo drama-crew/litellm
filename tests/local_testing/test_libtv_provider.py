@@ -1879,7 +1879,10 @@ def _compliance_routes(verify_passed=True):
     return {
         "/api/community/image/verify": {"code": 0, "data": {"list": [{"url": _LIBTV_REF, "riskLabels": risk}]}},
         "/api/third_asset/create": {"code": 0, "data": {"uuid": "u1"}},
-        "/api/third_asset/check": {"code": 0, "data": {"list": [{"uuid": "u1", "assetId": "asset-AAA", "status": 1}]}},
+        "/api/third_asset/check": {
+            "code": 0,
+            "data": {"list": [{"uuid": "u1", "assetId": "asset-AAA", "found": True, "status": 1}]},
+        },
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
         "/api/task/generation/create": {"code": 0, "data": {"taskId": "t1"}},
@@ -2096,7 +2099,7 @@ def test_compliance_exempt_image_keeps_cdn_url_not_asset():
     routes = _compliance_routes(verify_passed=True)
     routes["/api/third_asset/check"] = {
         "code": 0,
-        "data": {"list": [{"uuid": "u1", "assetId": None, "status": 1}]},
+        "data": {"list": [{"uuid": "u1", "assetId": None, "found": True, "status": 1}]},
     }
     fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload())
     llm = LibTVLLM(poll_interval=0)
@@ -2118,8 +2121,9 @@ def _mixed_compliance_routes():
             {"code": 0, "data": {"uuid": "u-vid"}},
         ],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": "u-img", "assetId": "asset-IMG", "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "status": 0}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-img", "assetId": "asset-IMG", "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "found": True, "status": 0}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "found": True, "status": 1}]}},
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
@@ -2208,9 +2212,10 @@ def _two_images_one_video_compliance_routes():
             {"code": 0, "data": {"uuid": "u-vid"}},
         ],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": "u-img1", "assetId": "asset-IMG1", "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-img2", "assetId": "asset-IMG2", "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "status": 0}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-img1", "assetId": "asset-IMG1", "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-img2", "assetId": "asset-IMG2", "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "found": True, "status": 0}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "found": True, "status": 1}]}},
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
@@ -2294,8 +2299,11 @@ def _mixed_exempt_and_compliant_routes():
             {"code": 0, "data": {"uuid": "u-compliant"}},
         ],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": "u-exempt", "assetId": None, "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-compliant", "assetId": "asset-REAL", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-exempt", "assetId": None, "found": True, "status": 1}]}},
+            {
+                "code": 0,
+                "data": {"list": [{"uuid": "u-compliant", "assetId": "asset-REAL", "found": True, "status": 1}]},
+            },
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
@@ -2350,8 +2358,8 @@ def _frames2video_compliance_routes():
             {"code": 0, "data": {"uuid": "u-last"}},
         ],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": "u-first", "assetId": "asset-FIRST", "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-last", "assetId": "asset-LAST", "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-first", "assetId": "asset-FIRST", "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-last", "assetId": "asset-LAST", "found": True, "status": 1}]}},
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
@@ -2515,7 +2523,7 @@ def test_frames2video_compliance_last_image_only_single_frame():
     routes["/api/third_asset/create"] = {"code": 0, "data": {"uuid": "u-last"}}
     routes["/api/third_asset/check"] = {
         "code": 0,
-        "data": {"list": [{"uuid": "u-last", "assetId": "asset-LAST", "status": 1}]},
+        "data": {"list": [{"uuid": "u-last", "assetId": "asset-LAST", "found": True, "status": 1}]},
     }
     fake = FakeSyncClient(post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True))
     llm = LibTVLLM(poll_interval=0)
@@ -2546,9 +2554,10 @@ def test_frames2video_compliance_exempt_frame_and_reference_video_use_asset_stri
             {"code": 0, "data": {"uuid": "u-vid"}},
         ],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": "u-first", "assetId": "asset-FIRST", "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-last", "assetId": None, "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "status": 0}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-first", "assetId": "asset-FIRST", "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-last", "assetId": None, "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "found": True, "status": 0}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "found": True, "status": 1}]}},
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
@@ -2591,7 +2600,7 @@ def _image2video_compliance_routes(urls, asset_ids):
         },
         "/api/third_asset/create": [{"code": 0, "data": {"uuid": f"u{i}"}} for i in range(len(urls))],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": f"u{i}", "assetId": asset_ids[i], "status": 1}]}}
+            {"code": 0, "data": {"list": [{"uuid": f"u{i}", "assetId": asset_ids[i], "found": True, "status": 1}]}}
             for i in range(len(urls))
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
@@ -2676,7 +2685,8 @@ def test_image2video_images_above_schema_max_falls_back_to_mixed2video():
         },
         "/api/third_asset/create": [{"code": 0, "data": {"uuid": f"u{i}"}} for i in range(10)],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": f"u{i}", "assetId": asset_ids[i], "status": 1}]}} for i in range(10)
+            {"code": 0, "data": {"list": [{"uuid": f"u{i}", "assetId": asset_ids[i], "found": True, "status": 1}]}}
+            for i in range(10)
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
@@ -3462,10 +3472,11 @@ def _mixed2video_three_images_one_video_fresh_retry_routes(create_ids, progress_
             {"code": 0, "data": {"uuid": "u-vid"}},
         ],
         "/api/third_asset/check": [
-            {"code": 0, "data": {"list": [{"uuid": "u-a", "assetId": "asset-A", "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-b", "assetId": "asset-B", "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-c", "assetId": "asset-C", "status": 1}]}},
-            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "status": 0}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-a", "assetId": "asset-A", "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-b", "assetId": "asset-B", "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-c", "assetId": "asset-C", "found": True, "status": 1}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "found": True, "status": 0}]}},
+            {"code": 0, "data": {"list": [{"uuid": "u-vid", "assetId": "asset-VID", "found": True, "status": 1}]}},
         ],
         "/api/canvas/project/create": {"code": 0, "data": {"projectMeta": {"uuid": "p1"}}},
         "/api/canvas/nodes/batch": {"code": 0, "data": {}},
@@ -6388,3 +6399,78 @@ async def test_single_first_frame_without_compliance_uses_frames(asynchronous):
     assert body["modeType"] == "frames2video"
     assert body["imageList"] == [_LIBTV_REF]
     assert body["duration"] == 4
+
+
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.asyncio
+async def test_first_frame_waits_for_asset_readiness_before_generation(use_async):
+    routes = _compliance_routes()
+    routes["/api/third_asset/check"] = [
+        {"code": 0, "data": {"list": [{"uuid": "u1", "found": True, "status": status, "assetId": "asset-AAA"}]}}
+        for status in [0, 1]
+    ]
+    spec = _tool_spec_payload(model_key="star-video2.5", frames2video=True)
+    metadata = json.loads(spec["data"]["tools"][0]["metadata"])
+    metadata["properties"]["ratio"]["enum"].append("adaptive")
+    metadata["properties"]["resolution"]["enum"].append({"value": "480p"})
+    spec["data"]["tools"][0]["metadata"] = json.dumps(metadata)
+    fake = (FakeAsyncClient if use_async else FakeSyncClient)(post_by_path=routes, get_payload=spec)
+    llm = LibTVLLM(poll_interval=0)
+    args = (
+        "star-video2.5",
+        "eat pizza",
+        "tok",
+        None,
+        {"webid": "w", "image": _LIBTV_REF, "ratio": "adaptive", "resolution": "480p", "seconds": "4"},
+        None,
+    )
+    result = await llm.avideo_generation(*args, client=fake) if use_async else llm.video_generation(*args, client=fake)
+    assert result.status == "queued"
+    paths = [path for path, _ in fake.calls]
+    assert paths.count("/api/third_asset/check") == 2
+    assert paths.count("/api/task/generation/create") == 1
+    assert max(i for i, path in enumerate(paths) if path == "/api/third_asset/check") < paths.index(
+        "/api/task/generation/create"
+    )
+    params = next(body["params"] for path, body in fake.calls if path == "/api/task/generation/create")
+    assert {key: params[key] for key in ("modeType", "ratio", "resolution", "duration", "imageList")} == {
+        "modeType": "frames2video",
+        "ratio": "adaptive",
+        "resolution": "480p",
+        "duration": 4,
+        "imageList": ["asset://asset-AAA"],
+    }
+
+
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"found": True, "status": 0, "assetId": "asset-AAA"},
+        {"found": True, "status": 0},
+        {"found": True, "status": 2, "assetId": "asset-AAA"},
+        {"found": True, "status": 2},
+        {"found": False, "status": 1, "assetId": "asset-AAA"},
+        {"status": 1, "assetId": "asset-AAA"},
+    ],
+)
+@pytest.mark.asyncio
+async def test_unready_asset_never_submits_generation(use_async, item):
+    routes = _compliance_routes()
+    routes["/api/third_asset/check"] = {"code": 0, "data": {"list": [{"uuid": "u1", **item}]}}
+    fake = (FakeAsyncClient if use_async else FakeSyncClient)(
+        post_by_path=routes, get_payload=_tool_spec_payload(frames2video=True)
+    )
+    llm = LibTVLLM(poll_interval=0)
+    args = ("star-video2", "eat pizza", "tok", None, {"webid": "w", "image": _LIBTV_REF}, None)
+    expected_error = BadRequestError if item.get("status") == 2 else Timeout
+    with pytest.raises(expected_error) as error:
+        if use_async:
+            await llm.avideo_generation(*args, client=fake)
+        else:
+            llm.video_generation(*args, client=fake)
+    assert isinstance(error.value.__cause__, LibTVError)
+    assert "processing" in str(error.value.__cause__)
+    paths = [path for path, _ in fake.calls]
+    assert "/api/task/generation/create" not in paths
+    assert paths.count("/api/third_asset/check") == (1 if item.get("status") == 2 else 30)
