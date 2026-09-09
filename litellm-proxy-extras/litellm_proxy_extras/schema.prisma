@@ -1409,3 +1409,38 @@ model LiteLLM_WorkflowMessage {
   @@unique([run_id, sequence_number])
   @@index([run_id])
 }
+
+// Task history is independent from accounting and never participates in billing.
+model LiteLLM_OpenApiLog {
+  id String @id
+  owner String
+  user_id String
+  endpoint String
+  model String
+  task_id String?
+  public_task_id String?
+  billing_request_id String?
+  status String
+  started_at DateTime @client.Timestamptz(3)
+  observed_at DateTime @client.Timestamptz(3)
+  finished_at DateTime? @client.Timestamptz(3)
+  elapsed_estimated Boolean @default(false)
+  historical Boolean @default(false)
+  input Json?
+  result Json?
+  error String?
+  @@index([user_id, started_at, id])
+  @@index([user_id, status, started_at, id])
+  @@index([user_id, endpoint, started_at, id])
+  @@index([user_id, model, started_at, id])
+  @@index([user_id, public_task_id])
+  @@index([owner, task_id])
+}
+
+model LiteLLM_OpenApiLogSpend {
+  id String @id
+  owner String
+  task_id String
+  amount Float
+  @@index([owner, task_id])
+}
