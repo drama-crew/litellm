@@ -26,6 +26,8 @@ from litellm.types.videos.utils import (
     decode_video_id_with_provider,
 )
 
+from litellm.proxy.video_endpoints import openapi_log_capture
+
 router = APIRouter()
 
 
@@ -85,10 +87,15 @@ async def video_generation(
         if input_reference_file:
             data["input_reference"] = input_reference_file[0]
 
+    history_id = await openapi_log_capture.start(
+        request,
+        user_api_key_dict,
+        {k: v for k, v in data.items() if k != "input_reference" or isinstance(v, (str, dict, list, type(None)))},
+    )
     # Process request using ProxyBaseLLMRequestProcessing
     processor = ProxyBaseLLMRequestProcessing(data=data)
     try:
-        return await processor.base_process_llm_request(
+        result = await processor.base_process_llm_request(
             request=request,
             fastapi_response=fastapi_response,
             user_api_key_dict=user_api_key_dict,
@@ -106,7 +113,10 @@ async def video_generation(
             user_api_base=user_api_base,
             version=version,
         )
+        await openapi_log_capture.submitted(history_id, result)
+        return result
     except Exception as e:
+        await openapi_log_capture.failed(history_id, e)
         raise await processor._handle_llm_api_exception(
             e=e,
             user_api_key_dict=user_api_key_dict,
@@ -272,7 +282,7 @@ async def video_status(
     # Process request using ProxyBaseLLMRequestProcessing
     processor = ProxyBaseLLMRequestProcessing(data=data)
     try:
-        return await processor.base_process_llm_request(
+        result = await processor.base_process_llm_request(
             request=request,
             fastapi_response=fastapi_response,
             user_api_key_dict=user_api_key_dict,
@@ -290,6 +300,8 @@ async def video_status(
             user_api_base=user_api_base,
             version=version,
         )
+        await openapi_log_capture.observe(user_api_key_dict, result)
+        return result
     except Exception as e:
         raise await processor._handle_llm_api_exception(
             e=e,

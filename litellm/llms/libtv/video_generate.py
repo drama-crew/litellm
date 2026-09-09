@@ -21,6 +21,8 @@ from urllib.parse import urlsplit
 
 import redis.exceptions as redis_exceptions
 
+from litellm.llms.causyn.video_admission import admit_video
+
 from .transfer import STATUS_TTL_SECONDS, WORKER_HEARTBEAT_WINDOW_SECONDS, result_key, status_key
 
 # Task-type namespace for this worker task type. Status/result keys are
@@ -53,9 +55,7 @@ _STATUS_TO_PUBLIC = {
     STATUS_CLAIMED: "claimed",
 }
 
-_ALLOWED_TOP_LEVEL_KEYS = frozenset(
-    {"task_id", "model", "deadline_ts", "request", "staging_upload", "task_metadata"}
-)
+_ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload", "task_metadata"})
 
 # The allowed set doubled as the required set until 2026-08-23, which made
 # staging_upload mandatory at enqueue. It is now injected later, by the
@@ -401,7 +401,6 @@ async def enqueue_video_generate(
     alive = await _alive_workers(redis, TASK_TYPE_VIDEO_GENERATE)
     if not alive:
         raise VideoGenerateError("no_worker_available", "no live video_generate worker")
-    await _check_capacity(redis, TASK_TYPE_VIDEO_GENERATE, alive)
 
     envelope = {
         "type": TASK_TYPE_VIDEO_GENERATE,
@@ -429,6 +428,19 @@ async def enqueue_video_generate(
     # permits re-claiming from "claimed" (cas.py:83), so it never de-dupes.
     task_metadata = payload.get("task_metadata")
     metadata_payload = json.dumps(task_metadata, separators=(",", ":"), sort_keys=True) if task_metadata else None
+
+    if payload["model"] == "causyn-1.1":
+        if not await admit_video(
+            redis,
+            task_id=task_id,
+            metadata=metadata_payload or "{}",
+            envelope=json.dumps(envelope),
+            deadline=payload["deadline_ts"],
+        ):
+            raise VideoGenerateError("no_capacity_available", "Causyn video queue is full")
+        return task_id
+
+    await _check_capacity(redis, TASK_TYPE_VIDEO_GENERATE, alive)
 
     # Causyn's billing facts must survive a requester crash after submission.
     # Redis transactions keep the metadata, status marker, and stream entry in
