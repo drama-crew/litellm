@@ -12,15 +12,14 @@ import httpx
 
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 
+from .canvas import build_canvas_batch, generation_params, node_with_task
 from .common import (
     BRIDGE_BIZ_CODE,
     BRIDGE_PART_SIZE,
     LIBTV_API_BASE,
     LIBTV_BRIDGE_BASE,
     LIBTV_PASSPORT_BASE,
-    NODE_ACTION,
     NODE_DEFAULT_NAME,
-    NODE_TYPE_BACKEND,
     LibTVContentPolicyError,
     LibTVError,
     build_bridge_headers,
@@ -144,31 +143,10 @@ def build_node_batch_body(
     name: str,
     model_key: str,
     params: Dict[str, Any],
+    spec: Optional[Dict[str, Any]] = None,
+    asset_refs: Optional[Dict[Any, Any]] = None,
 ) -> Dict[str, Any]:
-    node_data: Dict[str, Any] = {
-        "type": node_kind,
-        "name": name,
-        "url": [],
-        "action": NODE_ACTION[node_kind],
-        "generatorType": "default",
-        "params": {**params, "model": model_key},
-    }
-    if node_kind == "video":
-        node_data["poster"] = ""
-    canvas_node = {
-        "nodeKey": node_key,
-        "projectUuid": project_uuid,
-        "type": NODE_TYPE_BACKEND[node_kind],
-        "name": name,
-        "position": {"positionX": "0", "positionY": "0"},
-        "parentKey": "",
-        "data": json.dumps(node_data, ensure_ascii=False),
-    }
-    return {
-        "projectUuid": project_uuid,
-        "nodes": {"create": [canvas_node]},
-        "connections": {},
-    }
+    return build_canvas_batch(project_uuid, node_kind, node_key, name, model_key, params, spec, asset_refs)
 
 
 def build_generation_body(
@@ -181,7 +159,7 @@ def build_generation_body(
     team_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {
-        "params": params,
+        "params": generation_params(model_key, params),
         "metadata": {"node_id": node_key, "project_id": project_uuid},
         "provider": vendor,
         "model": model_key,
@@ -385,8 +363,23 @@ def parse_progress(payload: Dict[str, Any], kind: str, task_id: Optional[str] = 
             parsed = raw
         urls = _extract_urls(parsed, kind)
         result = {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
+        result.update(
+            {
+                key: last[source]
+                for key, source in (("progress_percent", "progressPercent"), ("failed_category", "failedCategory"))
+                if source in last
+            }
+        )
         return result
-    return {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
+    result = {"status": status, "urls": urls, "failed_reason": last.get("failedReason")}
+    result.update(
+        {
+            key: last[source]
+            for key, source in (("progress_percent", "progressPercent"), ("failed_category", "failedCategory"))
+            if source in last
+        }
+    )
+    return result
 
 
 def build_image_upscale_providers(
@@ -481,6 +474,121 @@ class LibTVClient:
         self._account_key = account_key(token)
         self._tool_spec_cache: Optional[Dict[str, Dict[str, Any]]] = None
         self._user_uuid: Optional[str] = None
+        self._canvas_asset_refs: dict[tuple[str, str], dict] = {}
+        self._canvas_tasks: dict[str, dict] = {}
+
+    def _remember_canvas_asset(self, ref: dict, asset_type: str, terminal: bool = False) -> None:
+        value = dict(ref)
+        if terminal and asset_type == "image" and not value.get("assetId"):
+            value["compliantExempt"] = True
+        self._canvas_asset_refs[(asset_type, ref["url"])] = value
+        if ref.get("assetId"):
+            self._canvas_asset_refs[(asset_type, f"asset://{ref['assetId']}")] = value
+
+    def _canvas_batch(self, project_uuid: str, task_type: str, node_key: str, model_key: str, params: dict) -> dict:
+        spec = (self._tool_spec_cache or {}).get(model_key)
+        return build_node_batch_body(
+            project_uuid,
+            task_type,
+            node_key,
+            NODE_DEFAULT_NAME[task_type],
+            model_key,
+            params,
+            spec=spec,
+            asset_refs=self._canvas_asset_refs,
+        )
+
+    @staticmethod
+    def _canvas_update_body(node: dict, version: Any = None) -> dict:
+        body = {"projectUuid": node["projectUuid"], "nodes": {"update": [node]}, "connections": {}}
+        if version is not None:
+            body["version"] = version
+        return body
+
+    @staticmethod
+    def _current_canvas_node(detail: dict, node_key: str, task_id: str) -> dict | None:
+        for node in (detail.get("data") or {}).get("nodeList") or []:
+            if node.get("nodeKey") != node_key:
+                continue
+            data = json.loads(node["data"])
+            current_task = (data.get("taskInfo") or {}).get("taskId")
+            if current_task and str(current_task) != task_id:
+                return None  # the user has submitted a newer generation on this node
+            return {
+                key: value
+                for key, value in node.items()
+                if key in ("nodeKey", "projectUuid", "type", "name", "position", "parentKey", "measured", "data")
+            }
+        return None  # deleted by the user; never recreate it from a stale snapshot
+
+    def _sync_canvas_task(self, task_id: str, state: dict | None = None) -> None:
+        node = self._canvas_tasks.get(task_id)
+        if node is None or (state is not None and state.get("status") is None):
+            return
+        try:
+            version = None
+            if state is not None:
+                assert self.sync_client is not None
+                detail = self._check(
+                    self.sync_client.get(
+                        url=f"{self.api_base}/api/canvas/project/detail",
+                        params={"uuid": node["projectUuid"]},
+                        headers=self.headers,
+                    ),
+                    "project/detail/task",
+                )
+                version = (detail.get("data") or {}).get("syncVersion")
+                node = self._current_canvas_node(detail, node["nodeKey"], task_id)
+                if node is None:
+                    return
+            updated = node_with_task(node, task_id, state)
+            self._post("/api/canvas/nodes/batch", self._canvas_update_body(updated, version), "nodes/batch/task")
+            self._canvas_tasks[task_id] = updated
+        except Exception:
+            # A paid task already exists. Canvas sync must not erase its receipt
+            # or turn an auxiliary write failure into another paid create.
+            logger.warning("libtv canvas task sync failed for %s", task_id, exc_info=True)
+
+    async def _async_canvas_task(self, task_id: str, state: dict | None = None) -> None:
+        if state is not None and state.get("status") is None:
+            return
+        try:
+            version = None
+            node = self._canvas_tasks.get(task_id)
+            persistence = self._get_persistence()
+            location = None
+            if node is None and persistence is not None:
+                location = await persistence.canvas_task(self._account_key, task_id)
+            elif node is not None:
+                location = {"project_uuid": node["projectUuid"], "node_key": node["nodeKey"]}
+            if location is None:
+                return
+            if state is None and persistence is not None:
+                try:
+                    await persistence.store_canvas_task(
+                        self._account_key, task_id, location["project_uuid"], location["node_key"]
+                    )
+                except Exception:
+                    logger.warning("libtv canvas receipt persistence failed for %s", task_id, exc_info=True)
+            if state is not None:
+                assert self.async_client is not None
+                detail = self._check(
+                    await self.async_client.get(
+                        url=f"{self.api_base}/api/canvas/project/detail",
+                        params={"uuid": location["project_uuid"]},
+                        headers=self.headers,
+                    ),
+                    "project/detail/task",
+                )
+                version = (detail.get("data") or {}).get("syncVersion")
+                node = self._current_canvas_node(detail, location["node_key"], task_id)
+            if node is None:
+                return
+            updated = node_with_task(node, task_id, state)
+            await self._apost("/api/canvas/nodes/batch", self._canvas_update_body(updated, version), "nodes/batch/task")
+            self._canvas_tasks[task_id] = updated
+        except Exception:
+            logger.warning("libtv canvas task sync failed for %s", task_id, exc_info=True)
 
     def _get_persistence(self) -> Optional["LibTVPersistence"]:
         return self._persistence if self._persistence is not None else get_persistence()
@@ -660,14 +768,14 @@ class LibTVClient:
         meta = parse_project(project)
         project_uuid, team_id = meta["project_uuid"], meta["team_id"]
         node_key = str(uuid.uuid4())
-        self._post(
-            "/api/canvas/nodes/batch",
-            build_node_batch_body(project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params),
-            "nodes/batch",
-        )
+        batch = self._canvas_batch(project_uuid, task_type, node_key, model_key, params)
+        self._post("/api/canvas/nodes/batch", batch, "nodes/batch")
         generation_body = build_generation_body(model_key, vendor, task_type, params, node_key, project_uuid, team_id)
         forwarded_prompt_chars = _forwarded_prompt_chars(generation_body["params"], task_type)
         created = self._post("/api/task/generation/create", generation_body, "generation/create")
+        task_id = parse_task_id(created)
+        self._canvas_tasks[task_id] = batch["nodes"]["create"][0]
+        self._sync_canvas_task(task_id)
         return {
             "task_id": parse_task_id(created),
             "project_uuid": project_uuid,
@@ -677,7 +785,9 @@ class LibTVClient:
 
     def poll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
         progress = self._post("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
-        return parse_progress(progress, task_type, task_id)
+        state = parse_progress(progress, task_type, task_id)
+        self._sync_canvas_task(task_id, state)
+        return state
 
     def generate(
         self,
@@ -790,6 +900,7 @@ class LibTVClient:
                 cdn_url,
             )
             if ref:
+                self._remember_canvas_asset(ref, asset_type, terminal=True)
                 return ref
             time.sleep(self.poll_interval)
         return {"url": cdn_url, "assetId": None}
@@ -897,13 +1008,8 @@ class LibTVClient:
     ) -> tuple[dict[str, Any], str, int | None]:
         node_key = str(uuid.uuid4())
         try:
-            await self._apost(
-                "/api/canvas/nodes/batch",
-                build_node_batch_body(
-                    project_uuid, task_type, node_key, NODE_DEFAULT_NAME[task_type], model_key, params
-                ),
-                "nodes/batch",
-            )
+            batch = self._canvas_batch(project_uuid, task_type, node_key, model_key, params)
+            await self._apost("/api/canvas/nodes/batch", batch, "nodes/batch")
         except ProviderTransportError:
             raise
         except Exception as error:
@@ -933,6 +1039,16 @@ class LibTVClient:
                     raise ProviderRejected(str(error), provider_code="429") from error
                 raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
             raise
+        # Parse before optional writes: once this succeeds, always return the same
+        # upstream receipt even if saving its canvas state fails.
+        try:
+            task_id = parse_task_id(created)
+        except LibTVError as error:
+            if paid_submission:
+                raise ProviderTransportError(str(error), crossed_create_boundary=True) from error
+            raise
+        self._canvas_tasks[task_id] = batch["nodes"]["create"][0]
+        await self._async_canvas_task(task_id)
         return created, node_key, forwarded_prompt_chars
 
     async def _project_cache_lookup(self, persistence: "LibTVPersistence", day: str) -> tuple[str, int | None] | None:
@@ -1051,7 +1167,9 @@ class LibTVClient:
 
     async def apoll_once(self, task_id: str, task_type: str) -> Dict[str, Any]:
         progress = await self._apost("/api/task/generation/progress", {"taskIds": [task_id]}, "generation/progress")
-        return parse_progress(progress, task_type, task_id)
+        state = parse_progress(progress, task_type, task_id)
+        await self._async_canvas_task(task_id, state)
+        return state
 
     async def agenerate(
         self,
@@ -1570,7 +1688,9 @@ class LibTVClient:
                     logger.warning("libtv asset cache lookup failed", exc_info=True)
                     cached = None
             if cached is not None:
-                resolved.append({"url": cdn_url, "assetId": cached.get("assetId")})
+                ref = {"url": cdn_url, "assetId": cached.get("assetId")}
+                self._remember_canvas_asset(ref, asset_type, terminal=True)
+                resolved.append(ref)
                 continue
             ref, terminal = await self._aregister_compliant_asset_terminal(cdn_url, asset_type)
             if terminal and persistence is not None:
@@ -1578,6 +1698,7 @@ class LibTVClient:
                     await persistence.store_asset(self._account_key, cdn_url, asset_type, ref.get("assetId"))
                 except Exception:  # noqa: BLE001  # best-effort write; worst case is no reuse next time
                     logger.warning("libtv asset cache store failed", exc_info=True)
+            self._remember_canvas_asset(ref, asset_type, terminal=terminal)
             resolved.append(ref)
         return [dict(resolved[index_for[u]]) for u in cdn_urls]  # type: ignore[misc]
 
