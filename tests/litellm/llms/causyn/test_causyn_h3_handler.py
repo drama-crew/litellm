@@ -84,7 +84,7 @@ def _params(**overrides: object) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -> None:
+async def test_h3_enqueues_text_to_video_with_v4_metadata(enqueued: _Recorder) -> None:
     video = await CausynVideoHandler(
         prompt_submit=fake_submit, task_id_factory=lambda: TASK_ID, clock=lambda: 2_000_000_000.0
     ).avideo_generation(
@@ -107,12 +107,12 @@ async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -
         "references": [],
     }
     assert payload["task_metadata"] == {
-        "version": "causyn-video-billing-v3",
+        "version": "causyn-video-billing-v4",
         "context_ir_task_id": "h3_ir_" + TASK_ID,
         "prompt_rewrite_model": "qwen/qwen3.8-flash",
         "prompt_rewrite_system_sha256": "a" * 64,
         "duration_seconds": 5.0,
-        "source_resolution": "1344x768",
+        "source_resolution": "1344x756",
         "requested_resolution": "768p",
         "pricing": {
             "model": "causyn-1.1",
@@ -126,6 +126,7 @@ async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -
             "organization_id": None,
         },
         "model": "causyn-1.1",
+        "geometry_profile": "vdn-adaptive-v1",
         "ratio": "16:9",
     }
     decoded = decode_video_id_with_provider(video.id)
@@ -243,8 +244,13 @@ async def test_h3_flag_is_independent_from_causyn_1_0(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("version", "ratio", "source", "width", "height"), [
+    ("causyn-video-billing-v3", "16:9", "1344x768", 1344, 768),
+    ("causyn-video-billing-v4", "16:9", "1344x756", 1344, 756),
+    ("causyn-video-billing-v4", "adaptive", "adaptive", 768, 1024),
+])
 async def test_h3_completed_status_restores_model_and_billing(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, version, ratio, source, width, height,
 ) -> None:
     async def fetch_status(task_id: str, *, redis: object) -> dict[str, object]:
         return {
@@ -258,20 +264,20 @@ async def test_h3_completed_status_restores_model_and_billing(
                 "bytes": 100,
                 "content_type": "video/mp4",
                 "duration_seconds": 5.0 + 1 / 24,
-                "width": 1344,
-                "height": 768,
+                "width": width,
+                "height": height,
                 "sha256": "a" * 64,
             },
         }
 
     async def fetch_metadata(task_id: str, *, redis: object) -> dict[str, object]:
         return {
-            "version": "causyn-video-billing-v3",
+            "version": version,
             "model": "causyn-1.1",
             "duration_seconds": 5.0,
-            "source_resolution": "1344x768",
+            "source_resolution": source,
             "requested_resolution": "768p",
-            "ratio": "16:9",
+            "ratio": ratio,
             "pricing": {
                 "model": "causyn-1.1",
                 "id": "causyn-1-1",
@@ -304,3 +310,32 @@ async def test_h3_completed_status_restores_model_and_billing(
     assert video._hidden_params["response_cost"] == 25.0
     assert len(billed) == 1
     assert billed[0].model == "causyn-1.1"
+
+
+@pytest.mark.parametrize("ratio", [None, "adaptive", "16:9", "9:16", "21:9"])
+@pytest.mark.parametrize("last", [False, True])
+def test_keyframe_requests_normalize_valid_ratios_to_adaptive(ratio, last):
+    params = _params(aspect_ratio=ratio, image="https://source.example/first.png")
+    if last:
+        params["last_image"] = "https://source.example/last.png"
+    request, _, _, source, _ = mod._request("causyn-1.1", "prompt", params)
+    assert request["ratio"] == "adaptive"
+    assert source == "adaptive"
+
+
+@pytest.mark.parametrize("ratio", [None, "adaptive", "21:9"])
+def test_text_only_requires_one_of_five_deployed_ratios(ratio):
+    with pytest.raises(CustomLLMError) as error:
+        mod._request("causyn-1.1", "prompt", _params(aspect_ratio=ratio))
+    assert error.value.status_code == 400
+
+
+def test_duration_budget_does_not_change_billing_profile():
+    request, duration, requested, source, _ = mod._request(
+        "causyn-1.1", "prompt", _params(seconds="15")
+    )
+    assert duration == 15
+    assert requested == request["resolution"] == "768p"
+    width, height = map(int, source.split("x"))
+    assert width < 1344 and height < 756
+    assert width * 9 == height * 16
