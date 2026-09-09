@@ -100,6 +100,7 @@ async def submit_video_prompt(payload: VideoSubmission, billing: BillingIdentity
         VideoPromptInput.model_validate(payload.request).context_ir(),
         owner=f"video:{payload.task_id}",
         billing=billing,
+        price=0.0,
         task_id=PREFIX + payload.task_id,
         listed=False,
         video_payload=payload.model_dump(mode="json"),

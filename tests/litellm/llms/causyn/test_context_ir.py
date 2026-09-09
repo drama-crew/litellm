@@ -206,6 +206,34 @@ def test_fixed_price_and_poll_has_no_reservation():
     assert estimate_request_max_cost({"model": "causyn-h3-context-ir"}, "/v2/query/video_generation/x", None) is None
 
 
+@pytest.mark.asyncio
+async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, monkeypatch):
+    import time
+    import litellm.llms.causyn.context_ir as context_ir
+    from litellm.llms.causyn.video_prompt import VideoSubmission, submit_video_prompt
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, deliver=no_settle)
+    monkeypatch.setattr(context_ir, "get_context_ir_service", lambda: service)
+    monkeypatch.setattr(context_ir, "get_transfer_redis", lambda url: redis)
+    video_id = "0123456789abcdef0123456789abcdef"
+    await submit_video_prompt(VideoSubmission(
+        task_id=video_id, model="causyn-1.1", deadline_ts=time.time() + 300,
+        request={"prompt": "A cat walks.", "duration_seconds": 5, "ratio": "16:9"},
+        task_metadata={},
+    ), BillingIdentity())
+    await service.process("h3_ir_" + video_id)
+    automatic = await service.store.get("h3_ir_" + video_id)
+    assert automatic.status == "succeeded"
+    assert automatic.price == 0
+    assert automatic.settled
+    assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 0
+
+    standalone = await service.create(spec(), owner="owner", billing=BillingIdentity())
+    await service.process(standalone.id)
+    assert (await service.store.get(standalone.id)).price == 4
+    assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 1
+
+
 def test_mixed_media_indexes_and_audio_rejection():
     request = spec(
         content=[
