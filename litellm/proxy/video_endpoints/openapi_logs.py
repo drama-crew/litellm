@@ -41,6 +41,14 @@ class VideoSnapshot(BaseModel):
     error: JsonValue = None
 
 
+def completion_time(snapshot: VideoSnapshot) -> int | None:
+    # Causyn returns the current poll time as completed_at, not the worker's
+    # finish time. Preserve it in the payload, but mark elapsed time estimated.
+    if decode_video_id_with_provider(snapshot.id).get("custom_llm_provider") == "causyn":
+        return None
+    return snapshot.completed_at
+
+
 def key_owner(identity: str) -> str:
     return identity if re.fullmatch(r"[0-9a-f]{64}", identity) else hashlib.sha256(identity.encode()).hexdigest()
 
@@ -122,7 +130,7 @@ async def submitted(db: Database, log_id: str, response: dict[str, JsonValue]) -
         snap.id or None,
         normalized_status(snap.status),
         encode_payload(response),
-        snap.completed_at,
+        completion_time(snap),
         billing_id,
         normalized_status(snap.status) in TERMINAL,
         safe_error(encode_payload(snap.error)) if snap.error is not None else None,
@@ -144,7 +152,7 @@ async def observe(db: Database, *, task_id: str, owner: str, response: dict[str,
         encode_payload(response),
         safe_error(encode_payload(snap.error)) if snap.error is not None else None,
         state in TERMINAL,
-        snap.completed_at,
+        completion_time(snap),
     )
 
 

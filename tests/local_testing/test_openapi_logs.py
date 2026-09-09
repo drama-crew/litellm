@@ -121,3 +121,12 @@ async def test_history_failure_is_not_an_api_failure():
         raise RuntimeError("database offline")
 
     await persist(broken_storage())
+
+
+def test_causyn_poll_timestamp_is_not_an_authoritative_finish_time():
+    from litellm.proxy.video_endpoints.openapi_logs import VideoSnapshot, completion_time
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    video = VideoSnapshot(id=encode_video_id_with_provider("native-task", "causyn"), completed_at=1700000000)
+    assert completion_time(video) is None
+    assert completion_time(VideoSnapshot(id="other-task", completed_at=1700000000)) == 1700000000
