@@ -52,6 +52,7 @@ from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
 from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask, task_key, PREFIX as CONTEXT_IR_PREFIX
 from litellm.llms.causyn.h3_prompt import RewriteError
+from litellm.llms.causyn.vdn_geometry import pixel_budget, resolve_geometry
 from litellm.llms.causyn.video_prompt import VideoPromptInput, VideoSubmission, submit_video_prompt
 from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
 from litellm.llms.libtv.persistence import get_persistence
@@ -79,10 +80,11 @@ CAUSYN_RESOLUTION = "768x512"
 CAUSYN_2K_RESOLUTION = "2k"
 CAUSYN_RESOLUTIONS = frozenset({CAUSYN_RESOLUTION, CAUSYN_2K_RESOLUTION})
 CAUSYN_H3_RESOLUTION = "768p"
-CAUSYN_H3_RATIOS = frozenset({"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"})
+CAUSYN_H3_RATIOS = frozenset({"16:9", "9:16", "1:1", "4:3", "3:4"})
 CAUSYN_BILLING_METADATA_VERSION = "causyn-video-billing-v1"
 CAUSYN_BILLING_METADATA_VERSION_V2 = "causyn-video-billing-v2"
 CAUSYN_BILLING_METADATA_VERSION_V3 = "causyn-video-billing-v3"
+CAUSYN_BILLING_METADATA_VERSION_V4 = "causyn-video-billing-v4"
 CAUSYN_RATIO = "3:2"
 CAUSYN_DEADLINE_SECONDS = 1800.0
 CAUSYN_H3_DEADLINE_SECONDS = 1800.0
@@ -526,6 +528,14 @@ def _source_resolution(spec: _ModelSpec, ratio: str) -> str:
     return CAUSYN_RESOLUTION
 
 
+def _vdn_source_resolution(ratio: str, duration: int) -> str:
+    if ratio == "adaptive":
+        return "adaptive"
+    frames = duration * 24 + (5 - duration * 24) % 17
+    geometry = resolve_geometry(ratio=ratio, frames=frames)
+    return f"{geometry.output_width}x{geometry.output_height}"
+
+
 def _request(
     model: str, prompt: object, optional_params: dict[str, object]
 ) -> tuple[dict[str, object], int, str, str, _ModelSpec]:
@@ -538,8 +548,15 @@ def _request(
     if unsupported:
         raise _bad_request(f"unsupported causyn video parameter: {', '.join(unsupported)}")
     requested_resolution = _resolution(optional_params, spec)
+    references = (
+        _h3_references(optional_params) if spec.model == CAUSYN_H3_MODEL else _legacy_references(optional_params)
+    )
     ratio = optional_params.get("aspect_ratio")
-    if not isinstance(ratio, str) or ratio not in spec.ratios:
+    if spec.model == CAUSYN_H3_MODEL and references:
+        if ratio is not None and (not isinstance(ratio, str) or ratio not in {*spec.ratios, "adaptive", "21:9"}):
+            raise _bad_request("unsupported aspect_ratio for keyframe generation")
+        ratio = "adaptive"
+    elif not isinstance(ratio, str) or ratio not in spec.ratios:
         offered = ", ".join(sorted(spec.ratios))
         raise _bad_request(f"aspect_ratio must be one of {offered}")
     generate_audio = optional_params.get("generate_audio")
@@ -562,10 +579,9 @@ def _request(
     if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
         raise _bad_request("seed must be an integer")
     duration = _duration(optional_params, spec)
-    references = (
-        _h3_references(optional_params) if spec.model == CAUSYN_H3_MODEL else _legacy_references(optional_params)
+    source_resolution = (
+        _vdn_source_resolution(ratio, duration) if spec.model == CAUSYN_H3_MODEL else _source_resolution(spec, ratio)
     )
-    source_resolution = _source_resolution(spec, ratio)
     request: dict[str, object] = {
         "prompt": prompt,
         "duration_seconds": duration,
@@ -752,11 +768,39 @@ class _DurableTaskMetadataV3(BaseModel):
         return self
 
 
-_TaskMetadata = _DurableTaskMetadata | _DurableTaskMetadataV2 | _DurableTaskMetadataV3
+class _DurableTaskMetadataV4(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    version: Literal["causyn-video-billing-v4"]
+    geometry_profile: Literal["vdn-adaptive-v1"] = "vdn-adaptive-v1"
+    model: Literal["causyn-1.1"]
+    duration_seconds: float = Field(ge=4, le=15)
+    source_resolution: str = Field(pattern=r"^(adaptive|[1-9][0-9]*x[1-9][0-9]*)$")
+    requested_resolution: Literal["768p"]
+    ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "adaptive"]
+    pricing: _Pricing
+    attribution: _DurableAttribution
+    context_ir_task_id: str | None = None
+    prompt_rewrite_model: str | None = None
+    prompt_rewrite_system_sha256: str | None = None
+
+    @model_validator(mode="after")
+    def _requires_h3_contract(self) -> _DurableTaskMetadataV4:
+        if self.pricing.model != self.model or self.pricing.output_cost_per_second_768p is None:
+            raise ValueError("matching 768p pricing is required")
+        if not self.duration_seconds.is_integer():
+            raise ValueError("ordered duration must be whole seconds")
+        if self.source_resolution != _vdn_source_resolution(self.ratio, int(self.duration_seconds)):
+            raise ValueError("source resolution must match the admitted geometry profile")
+        return self
+
+
+_TaskMetadata = _DurableTaskMetadata | _DurableTaskMetadataV2 | _DurableTaskMetadataV3 | _DurableTaskMetadataV4
+_TASK_METADATA_ADAPTER: TypeAdapter[_TaskMetadata] = TypeAdapter(_TaskMetadata)
 
 
 def _metadata_model(metadata: _TaskMetadata) -> str:
-    if isinstance(metadata, _DurableTaskMetadataV3):
+    if isinstance(metadata, (_DurableTaskMetadataV3, _DurableTaskMetadataV4)):
         return metadata.model
     return CAUSYN_MODEL
 
@@ -765,6 +809,22 @@ def _metadata_resolution(metadata: _TaskMetadata) -> tuple[str, str]:
     if isinstance(metadata, _DurableTaskMetadata):
         return metadata.video_resolution, metadata.video_resolution
     return metadata.requested_resolution, metadata.source_resolution
+
+
+def _result_geometry_matches(metadata: _TaskMetadata, result: _WorkerResult) -> bool:
+    _, source_resolution = _metadata_resolution(metadata)
+    if not isinstance(metadata, _DurableTaskMetadataV4) or metadata.ratio != "adaptive":
+        return source_resolution == f"{result.width}x{result.height}"
+    width, height = result.width, result.height
+    frames = int(metadata.duration_seconds) * 24
+    frames += (5 - frames) % 17
+    budget = pixel_budget(frames)
+    return (
+        all(256 <= value <= 1536 and value % 2 == 0 for value in (width, height))
+        and 0.399 <= width / height <= 2.506
+        and math.ceil(width / 32) * math.ceil(height / 32) * 1024 <= budget
+        and width * height >= 0.9 * min(768 * 768, budget)
+    )
 
 
 def _public_worker_error(error: _WorkerError | None) -> dict[str, str]:
@@ -982,19 +1042,13 @@ class CausynVideoHandler(CustomLLM):
         except Exception as exc:  # noqa: BLE001
             raise _service_error() from exc
         try:
-            durable: _TaskMetadata = _DurableTaskMetadataV3.model_validate(task_metadata)
-        except ValidationError:
-            try:
-                durable = _DurableTaskMetadataV2.model_validate(task_metadata)
-            except ValidationError:
-                try:
-                    durable = _DurableTaskMetadata.model_validate(task_metadata)
-                except ValidationError as exc:
-                    logger.warning("causyn video billing: task metadata is missing or invalid")
-                    raise _service_error() from exc
+            durable = _TASK_METADATA_ADAPTER.validate_python(task_metadata)
+        except ValidationError as exc:
+            logger.warning("causyn video billing: task metadata is missing or invalid")
+            raise _service_error() from exc
         if _metadata_model(durable) != spec.model:
             raise _service_error()
-        requested_resolution, source_resolution = _metadata_resolution(durable)
+        requested_resolution, _ = _metadata_resolution(durable)
         # Ordered durations are whole seconds (3..8), so a worker that rendered
         # something other than what was ordered is off by at least a second.
         # Anything smaller is frame quantisation, not a mismatch: the pipeline
@@ -1008,7 +1062,7 @@ class CausynVideoHandler(CustomLLM):
         if abs(durable.duration_seconds - result.duration_seconds) > _DURATION_RECONCILE_TOLERANCE_SECONDS:
             logger.warning("causyn video billing: task metadata duration does not match worker result")
             raise _service_error()
-        if source_resolution != f"{result.width}x{result.height}":
+        if not _result_geometry_matches(durable, result):
             logger.warning("causyn video billing: task metadata resolution does not match worker result")
             raise _service_error()
         response.usage = _usage(result.duration_seconds, requested_resolution)
@@ -1073,15 +1127,9 @@ class CausynVideoHandler(CustomLLM):
         except Exception as exc:
             raise _service_error() from exc
         try:
-            return _DurableTaskMetadataV3.model_validate(raw)
-        except ValidationError:
-            try:
-                return _DurableTaskMetadataV2.model_validate(raw)
-            except ValidationError:
-                try:
-                    return _DurableTaskMetadata.model_validate(raw)
-                except ValidationError as exc:
-                    raise _service_error() from exc
+            return _TASK_METADATA_ADAPTER.validate_python(raw)
+        except ValidationError as exc:
+            raise _service_error() from exc
 
     def _get_topaz_adapter(self) -> TopazVideoAdapter:
         if self._topaz_adapter is None:
@@ -1148,16 +1196,16 @@ class CausynVideoHandler(CustomLLM):
             "pricing": _pricing_identity(optional_params, logging_obj, spec.model),
             "attribution": _durable_attribution(optional_params, logging_obj),
         }
-        metadata_type: type[_DurableTaskMetadataV2] | type[_DurableTaskMetadataV3]
+        metadata_type: type[_DurableTaskMetadataV2] | type[_DurableTaskMetadataV4]
         if spec.model == CAUSYN_H3_MODEL:
             task_metadata.update(
                 {
-                    "version": CAUSYN_BILLING_METADATA_VERSION_V3,
+                    "version": CAUSYN_BILLING_METADATA_VERSION_V4,
                     "model": spec.model,
                     "ratio": request["ratio"],
                 }
             )
-            metadata_type = _DurableTaskMetadataV3
+            metadata_type = _DurableTaskMetadataV4
         else:
             metadata_type = _DurableTaskMetadataV2
         try:
