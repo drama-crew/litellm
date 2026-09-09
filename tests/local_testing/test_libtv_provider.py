@@ -6314,6 +6314,34 @@ async def test_single_first_frame_uses_frames_payload(model, explicit, asynchron
     assert "mixedList" not in body
 
 
+@pytest.mark.parametrize("reference_key", ["input_reference", "image_references", "reference_images"])
+@pytest.mark.parametrize("frame_count", [1, 2])
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.asyncio
+async def test_explicit_frames_mode_accepts_public_reference_aliases(reference_key, frame_count, asynchronous):
+    refs = [_LIBTV_REF, _LIBTV_REF_2][:frame_count]
+    fake_cls = FakeAsyncClient if asynchronous else FakeSyncClient
+    fake = fake_cls(
+        post_by_path=_image2video_compliance_routes(refs, ["asset-ONE", "asset-TWO"][:frame_count]),
+        get_payload=_tool_spec_payload(model_key="star-video2.5", frames2video=True, image2video=[1, 9]),
+    )
+    params = {
+        "webid": "w", reference_key: refs[0] if frame_count == 1 else refs,
+        "modeType": "frames2video", "seconds": "5", "resolution": "720p", "aspect_ratio": "16:9",
+    }
+    llm = LibTVLLM(poll_interval=0)
+    if asynchronous:
+        await llm.avideo_generation("star-video2.5", "waterfall", "tok", None, params, None, client=fake)
+    else:
+        llm.video_generation("star-video2.5", "waterfall", "tok", None, params, None, client=fake)
+    body = _gen_params(fake.calls)
+    assert body["modeType"] == "frames2video"
+    assert body["imageList"] == ["asset://asset-ONE", "asset://asset-TWO"][:frame_count]
+    assert body["resolution"] == "720p"
+    assert body["ratio"] == "16:9"
+    assert "mixedList" not in body
+
+
 @pytest.mark.parametrize("overrides,expected", [
     ({"image": _LIBTV_REF, "modeType": "singleImage2video"}, "singleImage2video"),
     ({"reference_images": [_LIBTV_REF]}, "singleImage2video"),

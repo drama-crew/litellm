@@ -10,6 +10,7 @@ Implementation scope:
 4. Verify sync/async contracts, first/last ordering, mixed references, model aliases, canvas reload state and task recovery with targeted unit tests.
 5. The account 1 Seedance 2.5 frames2video single-first-frame A/B completed: native CLI and the adapter prototype both failed with 16:9 and succeeded with adaptive, with identical remaining inputs (480p, 5 seconds, sound on, search off, automatic compliance on). The resulting LibTV canvas displays the reference and preserves the requested mode/settings.
 6. Keep structured failure categories in progress parsing. INVALID_PARAMS must not trigger fresh-asset generation resubmissions just because its generic message says to retry; retain compatibility for the older uncategorized aging failure only.
+7. Honor explicit `frames2video` for every accepted image reference key, including public API `input_reference`. Resolve those images through the same compliance flow and preserve their first/last order. Requests without an explicit mode keep their existing inference behavior.
 
 Verification: 741 LibTV tests passed, one opt-in integration test skipped. Production deployment and Causyn public API/canvas acceptance follow main integration.
 

@@ -556,6 +556,8 @@ def _wants_frames2video(optional_params: dict, spec: dict) -> bool:
         return False
     if not _schema_offers(spec, "frames2video"):
         return False
+    if _resolve_mode(optional_params, "") == "frames2video":
+        return True
     if optional_params.get("last_image"):
         return True
     if not optional_params.get("image"):
@@ -736,9 +738,8 @@ def _log_terminal_rejection(task_id: str, state: dict) -> None:
 
 
 def _frame_payloads(optional_params: dict) -> list:
-    # [first, last] in order; image may be absent (libtv frames2video accepts 1-2
-    # frames, and the non-compliance branch already sends a single-image imageList).
-    payloads = [_reference_payload(optional_params.get("image")), _reference_payload(optional_params.get("last_image"))]
+    images, _, _ = _collect_reference_groups(optional_params)
+    payloads = [_reference_payload(ref) for ref in images]
     return [p for p in payloads if p is not None]
 
 
