@@ -16,7 +16,6 @@ from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.video_endpoints import openapi_logs as logs
 from litellm.types.videos.main import VideoObject
 
-
 RAW_METHOD = TypeAdapter[Callable[..., Awaitable[object]]](Callable[..., Awaitable[object]])
 INTEGER = TypeAdapter(int)
 
@@ -33,6 +32,10 @@ class RawDatabase:
         return INTEGER.validate_python(await self.write(query, *args))
 
 
+def raw_method(client: object, name: str) -> Callable[..., Awaitable[object]]:
+    return RAW_METHOD.validate_python(getattr(client, name))
+
+
 def database() -> logs.Database | None:
     from litellm.proxy.proxy_server import prisma_client
 
@@ -41,8 +44,8 @@ def database() -> logs.Database | None:
     # PrismaWrapper delegates generated methods dynamically. Validate callables
     # at this boundary instead of pretending the wrapper declares those methods.
     return RawDatabase(
-        RAW_METHOD.validate_python(getattr(prisma_client.db, "query_raw")),
-        RAW_METHOD.validate_python(getattr(prisma_client.db, "execute_raw")),
+        raw_method(prisma_client.db, "query_raw"),
+        raw_method(prisma_client.db, "execute_raw"),
     )
 
 

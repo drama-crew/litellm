@@ -51,7 +51,7 @@ def safe_json(value: JsonValue, depth: int = 0) -> JsonValue:
         return "[nested content omitted]"
     if isinstance(value, dict):
         return {
-            k: safe_json(v, depth + 1)
+            k: safe_error(json.dumps(v, ensure_ascii=False)) if k.lower() == "error" else safe_json(v, depth + 1)
             for k, v in tuple(value.items())[:100]
             if not SECRET.search(k) and k.lower() not in ("headers", "metadata")
         }
@@ -125,7 +125,7 @@ async def submitted(db: Database, log_id: str, response: dict[str, JsonValue]) -
         snap.completed_at,
         billing_id,
         normalized_status(snap.status) in TERMINAL,
-        encode_payload(snap.error) if snap.error is not None else None,
+        safe_error(encode_payload(snap.error)) if snap.error is not None else None,
     )
 
 
@@ -142,7 +142,7 @@ async def observe(db: Database, *, task_id: str, owner: str, response: dict[str,
         task_id,
         state,
         encode_payload(response),
-        encode_payload(snap.error) if snap.error is not None else None,
+        safe_error(encode_payload(snap.error)) if snap.error is not None else None,
         state in TERMINAL,
         snap.completed_at,
     )
