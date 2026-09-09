@@ -189,7 +189,9 @@ async def create_video(
         image_count=sum(isinstance(item, ImageItem) for item in spec.content),
         owner=owner,
     )
-    return {"task_id": encode_task(task)}
+    public_task_id = encode_task(task)
+    await endpoints.openapi_log_capture.public_id(request, public_task_id)
+    return {"task_id": public_task_id}
 
 
 @router.get("/v2/query/video_generation/{video_id}", tags=["MiniMax H3"])

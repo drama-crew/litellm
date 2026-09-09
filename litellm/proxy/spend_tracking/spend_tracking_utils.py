@@ -470,7 +470,16 @@ def get_logging_payload(kwargs, response_obj, start_time, end_time) -> SpendLogs
             user=metadata.get("user_api_key_user_id", "") or "",
             team_id=metadata.get("user_api_key_team_id", "") or "",
             organization_id=metadata.get("user_api_key_org_id") or "",
-            metadata=safe_dumps(clean_metadata),
+            metadata=safe_dumps(
+                {
+                    **clean_metadata,
+                    **(
+                        {"open_api_task_id": response_obj_dict.get("id")}
+                        if call_type in ("avideo_generation", "avideo_status", "video_generation", "video_status")
+                        else {}
+                    ),
+                }
+            ),
             cache_key=cache_key,
             spend=kwargs.get("response_cost", 0),
             total_tokens=usage.get("total_tokens", standard_logging_total_tokens),

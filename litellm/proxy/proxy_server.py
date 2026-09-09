@@ -15910,6 +15910,8 @@ app.include_router(ocr_router)
 app.include_router(rag_router)
 app.include_router(video_router)
 app.include_router(minimax_h3_router)
+from litellm.proxy.video_endpoints.openapi_log_query import router as openapi_log_router
+app.include_router(openapi_log_router)
 app.include_router(context_ir_router)
 app.include_router(container_router)
 app.include_router(search_router)

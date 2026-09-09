@@ -738,6 +738,24 @@ class DBSpendUpdateWriter:
         else:
             verbose_proxy_logger.debug("prisma_client is None. Skipping writing spend logs to db.")
 
+        if prisma_client is not None and payload.get("call_type") in (
+            "avideo_generation",
+            "avideo_status",
+            "video_generation",
+            "video_status",
+        ):
+            from litellm.proxy.video_endpoints.openapi_log_capture import persist
+            from litellm.proxy.video_endpoints.openapi_logs import JSON_OBJECT, record_spend
+
+            await persist(
+                record_spend(
+                    prisma_client.db,
+                    JSON_OBJECT.validate_python(
+                        {k: payload.get(k) for k in ("request_id", "api_key", "spend", "metadata")}
+                    ),
+                )
+            )
+
         return prisma_client
 
     async def db_update_spend_transaction_handler(
