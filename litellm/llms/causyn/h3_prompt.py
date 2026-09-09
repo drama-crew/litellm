@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import random
 import re
@@ -12,7 +13,7 @@ from importlib.resources import files
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 from typing_extensions import Self
 
 from litellm.proxy.video_endpoints.minimax_h3_models import (
@@ -171,6 +172,13 @@ class _Choice(BaseModel):
     message: _Message
     finish_reason: Literal["stop"]
 
+    @field_validator("finish_reason", mode="before")
+    @classmethod
+    def reject_interruption(cls, value: JsonValue) -> JsonValue:
+        if value == "error":
+            raise RewriteError("H3 prompt rewrite provider interrupted generation", retryable=True)
+        return value
+
 
 class _Completion(BaseModel):
     model: Literal["qwen/qwen3.8-flash"]
@@ -259,7 +267,10 @@ class H3PromptRewriter:
                 retryable=response.status_code in RETRYABLE_STATUS_CODES,
                 retry_after=response.headers.get("retry-after"),
             )
-        completed = _Completion.model_validate(response.json())
+        try:
+            completed = _Completion.model_validate(response.json())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise RewriteError("H3 prompt rewrite provider returned an incomplete response", retryable=True) from exc
         prompt = completed.choices[0].message.content.strip()
         validate_prompt(prompt, spec)
         return RewriteResult(

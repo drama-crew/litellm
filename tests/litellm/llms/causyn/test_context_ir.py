@@ -529,7 +529,7 @@ async def test_ir_admission_refunds_only_if_task_was_not_persisted(redis, monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [429, 500, 502, 503, 504, 408, "read", "timeout", "protocol"])
+@pytest.mark.parametrize("failure", [429, 500, 502, 503, 504, 408, "read", "timeout", "protocol", "json", "provider_error"])
 async def test_provider_interruptions_retry_then_settle_once(redis, failure):
     from litellm.llms.causyn.h3_prompt import H3PromptRewriter, MODEL
 
@@ -544,6 +544,10 @@ async def test_provider_interruptions_retry_then_settle_once(redis, failure):
                 raise httpx.ReadTimeout("interrupted")
             if failure == "protocol":
                 raise httpx.RemoteProtocolError("incomplete body")
+            if failure == "json":
+                return httpx.Response(200, content=b'{"choices":[')
+            if failure == "provider_error":
+                return httpx.Response(200, json={"choices": [{"message": {"content": None}, "finish_reason": "error"}]})
             return httpx.Response(failure, headers={"Retry-After": "3"})
         return httpx.Response(
             200,
