@@ -57,8 +57,6 @@ async def persist(operation: Awaitable[None]) -> None:
 
 
 async def start(request: Request, auth: UserAPIKeyAuth, body: object) -> str | None:
-    if not auth.user_id:
-        return None
     log_id = str(uuid.uuid4())
     request.scope["openapi_log_id"] = log_id
 
@@ -73,10 +71,10 @@ async def start(request: Request, auth: UserAPIKeyAuth, body: object) -> str | N
             db,
             log_id=log_id,
             owner=logs.key_owner(auth.api_key or auth.token or ""),
-            user_id=auth.user_id or "",
+            user_id=auth.user_id or "__video_monitor__",
             endpoint="minimax_h3" if spec is not None else "videos",
             model=str(data.get("model") or ""),
-            payload=payload,
+            payload=payload if auth.user_id else {},
             started_at=datetime.now(timezone.utc),
         )
 

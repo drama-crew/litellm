@@ -96,3 +96,21 @@ async def test_causyn_cancel_and_pending_upscale_are_passive():
         _redis_factory=lambda: redis,
     )
     assert (await monitor.read_causyn(cancelled, "opaque", "abc")).status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_key_without_user_still_has_minimal_monitor_record(monkeypatch):
+    from starlette.requests import Request
+    from litellm.proxy.video_endpoints import openapi_log_capture as capture
+
+    db = SimpleNamespace(execute_raw=AsyncMock(), query_raw=AsyncMock())
+    monkeypatch.setattr(capture, "database", lambda: db)
+    request = Request({"type": "http", "method": "POST", "path": "/videos", "headers": []})
+    log_id = await capture.start(
+        request, UserAPIKeyAuth(api_key="test-monitor-key"), {"model": "causyn-1.1", "prompt": "private user input"}
+    )
+    assert log_id == request.scope["openapi_log_id"]
+    args = db.execute_raw.call_args.args
+    assert "__video_monitor__" in args
+    assert args[-1] == "{}"
+    assert "private user input" not in str(args)
