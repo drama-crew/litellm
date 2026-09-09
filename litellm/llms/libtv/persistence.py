@@ -55,6 +55,17 @@ CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVProjects" (
 )
 """
 
+CREATE_CANVAS_TASKS_TABLE = """
+CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVCanvasTasks" (
+  account_key TEXT NOT NULL,
+  task_id TEXT NOT NULL,
+  project_uuid TEXT NOT NULL,
+  node_key TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (account_key, task_id)
+)
+"""
+
 CREATE_VIDEO_TASK_USAGE_TABLE = """
 CREATE TABLE IF NOT EXISTS "LiteLLM_LibTVVideoTaskUsage" (
   billing_key TEXT NOT NULL PRIMARY KEY,
@@ -130,12 +141,33 @@ class LibTVPersistence:
         try:
             await self.db.execute_raw(CREATE_UPLOAD_CACHE_TABLE)
             await self.db.execute_raw(CREATE_PROJECTS_TABLE)
+            await self.db.execute_raw(CREATE_CANVAS_TASKS_TABLE)
             await self.db.execute_raw(CREATE_ASSET_REGISTRY_TABLE)
             await self.db.execute_raw(CREATE_VIDEO_TASK_USAGE_TABLE)
             await self.db.execute_raw(CREATE_BILLED_VIDEO_TASKS_TABLE)
             _tables_ready = True
         except Exception:  # noqa: BLE001  # table creation is best-effort; caller falls through to a fresh, ungated write path
             _warn("libtv persistence: failed to create tables", exc_info=True)
+
+    async def store_canvas_task(self, account: str, task_id: str, project_uuid: str, node_key: str) -> None:
+        await self.ensure_tables()
+        await self.db.execute_raw(
+            'INSERT INTO "LiteLLM_LibTVCanvasTasks" (account_key, task_id, project_uuid, node_key) '
+            "VALUES ($1, $2, $3, $4) ON CONFLICT (account_key, task_id) DO NOTHING",
+            account,
+            task_id,
+            project_uuid,
+            node_key,
+        )
+
+    async def canvas_task(self, account: str, task_id: str) -> dict | None:
+        await self.ensure_tables()
+        rows = await self.db.query_raw(
+            'SELECT project_uuid, node_key FROM "LiteLLM_LibTVCanvasTasks" WHERE account_key=$1 AND task_id=$2',
+            account,
+            task_id,
+        )
+        return dict(rows[0]) if rows else None
 
     async def cached_upload(self, account_key: str, source_key: str) -> str | None:
         try:
@@ -188,10 +220,7 @@ class LibTVPersistence:
         except Exception:  # noqa: BLE001  # eviction is best-effort; a failed delete just leaves a stale row
             _warn("libtv persistence: delete_upload failed", exc_info=True)
 
-
-    async def cached_asset(
-        self, account_key: str, cdn_url: str, asset_type: str, *, ttl_seconds: float
-    ) -> dict | None:
+    async def cached_asset(self, account_key: str, cdn_url: str, asset_type: str, *, ttl_seconds: float) -> dict | None:
         """A previously completed third_asset registration, or None.
 
         Returns libtv's own ``CompliantAssetRef`` shape. ``assetId`` of None is a
@@ -238,9 +267,7 @@ class LibTVPersistence:
             _warn("libtv persistence: cached_asset failed", exc_info=True)
             return None
 
-    async def store_asset(
-        self, account_key: str, cdn_url: str, asset_type: str, asset_id: str | None
-    ) -> None:
+    async def store_asset(self, account_key: str, cdn_url: str, asset_type: str, asset_id: str | None) -> None:
         """Remember a terminal registration. created_at is refreshed on conflict so
         a re-registered asset restarts its TTL rather than expiring on the original
         row's clock."""

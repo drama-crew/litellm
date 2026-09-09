@@ -140,12 +140,16 @@ class FakeSyncClient:
         self.post_by_path = post_by_path or {}
         self.get_payload = get_payload
         self.calls = []
+        self.canvas_calls = []
 
     def _path(self, url):
         return url.split("api.liblib.tv", 1)[-1]
 
     def post(self, url, json=None, headers=None, timeout=None):
         path = self._path(url)
+        if path == "/api/canvas/nodes/batch" and (json or {}).get("nodes", {}).get("update"):
+            self.canvas_calls.append((path, json))
+            return FakeResponse({"code": 0})
         self.calls.append((path, json))
         queue = self.post_by_path[path]
         item = queue.pop(0) if isinstance(queue, list) else queue
@@ -154,6 +158,9 @@ class FakeSyncClient:
         return FakeResponse(item)
 
     def get(self, url, headers=None, timeout=None, params=None):
+        if self._path(url) == "/api/canvas/project/detail":
+            self.canvas_calls.append((self._path(url), None))
+            return FakeResponse({"code": 0, "data": {"nodeList": []}})
         self.calls.append((self._path(url), None))
         return FakeResponse(self.get_payload)
 
@@ -163,12 +170,16 @@ class FakeAsyncClient:
         self.post_by_path = post_by_path or {}
         self.get_payload = get_payload
         self.calls = []
+        self.canvas_calls = []
 
     def _path(self, url):
         return url.split("api.liblib.tv", 1)[-1]
 
     async def post(self, url, json=None, headers=None, timeout=None):
         path = self._path(url)
+        if path == "/api/canvas/nodes/batch" and (json or {}).get("nodes", {}).get("update"):
+            self.canvas_calls.append((path, json))
+            return FakeResponse({"code": 0})
         self.calls.append((path, json))
         queue = self.post_by_path[path]
         item = queue.pop(0) if isinstance(queue, list) else queue
@@ -180,6 +191,9 @@ class FakeAsyncClient:
         return await self.post(url, json, headers, timeout)
 
     async def get(self, url, headers=None, params=None):
+        if self._path(url) == "/api/canvas/project/detail":
+            self.canvas_calls.append((self._path(url), None))
+            return FakeResponse({"code": 0, "data": {"nodeList": []}})
         self.calls.append((self._path(url), None))
         return FakeResponse(self.get_payload)
 
@@ -437,9 +451,9 @@ def test_build_params_nebula_ultra_count_bare_list_default_does_not_crash():
     assert params["count"] == 1
 
 
-def test_build_params_nebula_ultra_searchable_advanced_setting_not_sent_unless_explicit():
+def test_build_params_nebula_ultra_searchable_uses_cli_default():
     params = build_generation_params("x", {}, _NEBULA_ULTRA_SPEC, "text2image")
-    assert "searchable" not in params
+    assert params["searchable"] == 0
     params_explicit = build_generation_params(
         "x", {"advancedSettings": {"searchable": 1}}, _NEBULA_ULTRA_SPEC, "text2image"
     )
@@ -473,7 +487,7 @@ def test_build_node_batch_body_video_carries_model_and_params():
     # node must carry the model + generation params (not a hollow placeholder)
     assert data["params"]["model"] == "wanxiang-plus"
     assert data["params"]["prompt"] == "p"
-    assert data["params"]["ratio"] == "16:9"  # flattened, not nested
+    assert data["params"]["settings"]["ratio"] == "16:9"  # CLI canvas settings are nested
 
 
 def test_build_node_batch_body_image_has_no_poster():
@@ -489,7 +503,7 @@ def test_build_generation_body_shape_and_team_id():
     assert body["provider"] == "seedance2.0"
     assert body["taskType"] == "video"
     assert body["metadata"] == {"node_id": "nk", "project_id": "proj"}
-    assert body["params"] == {"prompt": "x"}
+    assert body["params"] == {"prompt": "x", "model": "seedance2.0"}
     assert body["requestId"]
     assert "teamId" not in body  # personal project: omitted
     team_body = build_generation_body("m", "v", "video", {}, "nk", "proj", team_id=42)
@@ -1471,10 +1485,10 @@ _KLING_V3_OMNI_SPEC = {
 def test_build_params_kling_omni_text2video_defaults():
     params = build_generation_params("a cat", {}, _KLING_V3_OMNI_SPEC, "text2video")
     assert params["ratio"] == "16:9"
-    assert params["quality_4k"] == "low"
+    assert params["quality"] == "low"
     assert params["duration"] == 5
     assert params["enableSound"] == "on"
-    assert params["smartStoryboard"] is False
+    assert params["multi_shot"] is False
 
 
 def test_build_params_kling_omni_text2video_explicit_values():
@@ -1488,11 +1502,11 @@ def test_build_params_kling_omni_text2video_explicit_values():
         "text2video",
     )
     assert params["ratio"] == "9:16"
-    assert params["quality_4k"] == "high"
+    assert params["quality"] == "high"
     assert params["duration"] == 8
     assert isinstance(params["duration"], int)
     assert params["enableSound"] == "off"
-    assert params["smartStoryboard"] is False
+    assert params["multi_shot"] is False
 
 
 def test_build_params_kling_omni_canonicalizes_generic_image2video_mode():
@@ -1500,10 +1514,10 @@ def test_build_params_kling_omni_canonicalizes_generic_image2video_mode():
     # "image2video" for a single reference image, but omni's schema buckets its
     # settings under "singleImage2video".
     params = build_generation_params("a cat", {"quality": "high"}, _KLING_V3_OMNI_SPEC, "image2video")
-    assert params["quality_4k"] == "high"
+    assert params["quality"] == "high"
     assert params["duration"] == 5
     assert params["enableSound"] == "on"
-    assert params["smartStoryboard"] is False
+    assert params["multi_shot"] is False
 
 
 def test_build_params_kling_omni_canonicalizes_generic_video2video_mode_to_mixed2video():
@@ -1512,7 +1526,7 @@ def test_build_params_kling_omni_canonicalizes_generic_video2video_mode_to_mixed
     )
     assert params["modeType"] == "mixed2video"
     assert params["ratio"] == "1:1"
-    assert params["quality_4k"] == "high"
+    assert params["quality"] == "high"
     assert params["duration"] == 6
 
 
@@ -1522,21 +1536,21 @@ def test_build_params_kling_omni_video_edit_uses_duration_10_and_quality():
     # existing key.startswith("duration") branch) and the low/high-only "quality"
     # key -- a requested "4k" isn't a valid option there and coerces to the default.
     params = build_generation_params("a cat", {"seconds": 8, "quality": "4k"}, _KLING_V3_OMNI_SPEC, "videoEdit2video")
-    assert params["duration_10"] == 8
-    assert isinstance(params["duration_10"], int)
+    assert params["duration"] == 8
+    assert isinstance(params["duration"], int)
     assert params["quality"] == "low"
     assert "quality_4k" not in params
-    assert "duration" not in params
+    assert "duration_10" not in params
 
 
 def test_build_params_kling_omni_frames2video_uses_ratio_auto_and_drops_storyboard():
     params = build_generation_params(
         "a cat", {"aspect_ratio": "9:16", "quality": "high"}, _KLING_V3_OMNI_SPEC, "frames2video"
     )
-    assert params["ratio_auto"] == "9:16"
-    assert "ratio" not in params
-    assert params["quality_4k"] == "high"
-    assert "smartStoryboard" not in params
+    assert params["ratio"] == "9:16"
+    assert "ratio_auto" not in params
+    assert params["quality"] == "high"
+    assert "multi_shot" not in params
 
 
 def test_build_params_flat_settings_seedance_unaffected_by_mode_canonicalization():
@@ -1568,10 +1582,10 @@ def test_build_params_kling_omni_explicit_enablesound_wins_over_generate_audio()
 
 def test_build_params_kling_omni_smart_storyboard_honors_user_value():
     params = build_generation_params("a cat", {"smartStoryboard": True}, _KLING_V3_OMNI_SPEC, "text2video")
-    assert params["smartStoryboard"] is True
+    assert params["multi_shot"] is True
 
     params = build_generation_params("a cat", {"smartStoryboard": False}, _KLING_V3_OMNI_SPEC, "text2video")
-    assert params["smartStoryboard"] is False
+    assert params["multi_shot"] is False
 
 
 def test_build_params_kling_omni_count_is_forced_to_one():
@@ -1684,9 +1698,9 @@ def test_build_params_kling_omni_mixed2video_exact_match_still_wins_over_alias_c
     params = build_generation_params("a cat", {"seconds": 6, "quality": "high"}, _KLING_V3_OMNI_SPEC, "mixed2video")
     assert params["modeType"] == "mixed2video"
     assert params["duration"] == 6
-    assert params["quality_4k"] == "high"
+    assert params["quality"] == "high"
     assert "duration_10" not in params
-    assert "quality" not in params
+    assert "quality_4k" not in params
 
 
 def test_build_params_happy_horse_frames2video_single_image():
@@ -1856,7 +1870,7 @@ async def test_h3_max_real_schema_preserves_modes_settings_and_frame_order(image
     assert body["imageList"] == refs
     assert body["duration"] == 8
     assert body["resolution"] == "768P"
-    assert body["ratio" if refs else "ratio_t2v"] == "16:9"
+    assert body["ratio"] == "16:9"
     assert "mixedList" not in body
 
 

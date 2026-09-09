@@ -429,14 +429,15 @@ async def test_ensure_tables_creates_every_table_once():
     await p.cached_upload("acct1", "cdn.example.com/g.png")
 
     create_calls = [c for c in db.execute_calls if "CREATE TABLE" in c[0]]
-    assert len(create_calls) == 5
+    assert len(create_calls) == 6
     assert any("LiteLLM_LibTVUploadCache" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVAssetRegistry" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVProjects" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVVideoTaskUsage" in c[0] for c in create_calls)
     assert any("LiteLLM_LibTVBilledVideoTasks" in c[0] for c in create_calls)
-    assert calls_after_first == 5
-    assert len(db.execute_calls) == 5
+    assert any("LiteLLM_LibTVCanvasTasks" in c[0] for c in create_calls)
+    assert calls_after_first == 6
+    assert len(db.execute_calls) == 6
 
 
 @pytest.mark.asyncio

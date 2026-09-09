@@ -101,6 +101,13 @@ def _allowed_setting_keys(spec: Dict[str, Any], mode: str) -> List[str]:
     return []
 
 
+def advanced_setting_keys(spec: Dict[str, Any], mode: str) -> List[str]:
+    fields = (spec.get("config") or {}).get("advancedSettings") or []
+    if isinstance(fields, dict):
+        return list(fields.get(mode) or fields.get("text2video") or [])
+    return list(fields) if isinstance(fields, list) else []
+
+
 def _candidate_value(
     key: str,
     ratio: Optional[str],
@@ -220,7 +227,11 @@ def build_generation_params(
     settings: Dict[str, Any] = {}
     for key in _allowed_setting_keys(spec, mode):
         prop = props.get(key) or {}
+        store_key = prop.get("originalField") or key
         val = _candidate_value(key, ratio, resolution, duration, quality, enable_sound, smart_storyboard)
+        nested = op.get("settings") or {}
+        if val is None:
+            val = op.get(store_key, op.get(key, nested.get(store_key, nested.get(key))))
         if key.startswith("duration") and val is not None:
             try:
                 val = int(val)
@@ -231,7 +242,7 @@ def build_generation_params(
         if val is None:
             val = prop.get("default")
         if val is not None:
-            settings[key] = val
+            settings[store_key] = val
 
     count_prop = props.get("count")
     count_default = count_prop.get("default") if isinstance(count_prop, dict) else 1
@@ -247,7 +258,19 @@ def build_generation_params(
         "audioList": [],
     }
     params.update(settings)
-    advanced = op.get("advancedSettings")
+    advanced = op.get("advancedSettings") or {}
+    for key in advanced_setting_keys(spec, mode):
+        prop = props.get(key) or {}
+        if not isinstance(prop, dict):
+            continue
+        store_key = prop.get("originalField") or key
+        value = advanced.get(store_key, advanced.get(key, op.get(store_key, op.get(key, prop.get("default")))))
+        if value is not None:
+            params[store_key] = value
+    # Preserve provider extensions used by existing callers, mapping schema aliases
+    # to the same wire key used by the CLI (notably searchEnabled -> search_enabled).
     if isinstance(advanced, dict):
-        params.update(advanced)
+        for key, value in advanced.items():
+            prop = props.get(key)
+            params[(prop.get("originalField") or key) if isinstance(prop, dict) else key] = value
     return params

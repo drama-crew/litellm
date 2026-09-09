@@ -679,27 +679,13 @@ _TERMINAL_REJECTION_MARKER = "合规"
 
 
 def _is_fresh_asset_aging_failure(state: dict) -> bool:
-    """Whether a frames2video, image2video, or mixed2video task failed with the
-    vendor's generic retryable failure. Live-verified (2026-07-11): seedance/star-video2
-    with a freshly registered real-person compliant asset ALWAYS fails upstream within
-    seconds with this generic reason, while the exact same asset ids succeed once the
-    registration is a few minutes old (server runs an internal deep audit with no
-    observable readiness signal in third_asset/check; assetId and status=1 are returned
-    immediately and never change).
+    """Retry only the legacy uncategorized asset-aging failure.
 
-    Production's full libtv failedReason corpus (SpendLogs, 2026-06-05..07-25) has
-    exactly four distinct reasons. The three genuinely terminal ones each end with
-    an actionable remediation instruction -- 请先进行合规校验后重试 / 请选择其他参考素材 /
-    请尝试修改信息后重试 -- while the one retryable reason ends with the bare
-    "请稍后重试" and nothing else, which is why matching that token alone is
-    sufficient. An earlier, ad-hoc-captured terminal reason outside this corpus
-    (生成视频可能涉及版权限制...请调整描述或素材后重试) follows the same pattern. "合规"
-    stays excluded defensively even though no terminal reason seen so far -- corpus
-    or ad hoc -- has ever combined it with the retry token: if a future terminal
-    wording regressed to something like "合规审核中，请稍后重试", matching the retry
-    token alone would fail open and silently retry a rejection that must never be
-    retried."""
-    if state.get("status") != 3:
+    The same generic retry wording also accompanies INVALID_PARAMS, verified
+    with native CLI Seedance 2.5 ratio A/B. A structured failure category is
+    terminal: resubmitting the same invalid input cannot resolve it.
+    """
+    if state.get("status") != 3 or state.get("failed_category"):
         return False
     reason = state.get("failed_reason") or ""
     return _FRESH_ASSET_RETRY_TOKEN in reason and _TERMINAL_REJECTION_MARKER not in reason
