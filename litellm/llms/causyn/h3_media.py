@@ -9,7 +9,7 @@ import httpx
 from pydantic import TypeAdapter
 
 from litellm.litellm_core_utils.url_utils import validate_url
-from litellm.llms.causyn.h3_prompt import ContextIRRequest, RewriteError
+from litellm.llms.causyn.h3_prompt import RETRYABLE_STATUS_CODES, ContextIRRequest, RewriteError
 from litellm.proxy.video_endpoints.minimax_h3_models import ImageItem, MediaURL, VideoItem
 
 
@@ -29,7 +29,12 @@ async def fetch_media(client: httpx.AsyncClient, url: str, limit: int, redirects
                 raise RewriteError("Invalid reference redirect", 400)
             return await fetch_media(client, str(httpx.URL(url).join(target)), limit, redirects + 1)
         if response.status_code != 200:
-            raise RewriteError("Reference file is not accessible", 400)
+            raise RewriteError(
+                "Reference file is not accessible",
+                502 if response.status_code in RETRYABLE_STATUS_CODES else 400,
+                retryable=response.status_code in RETRYABLE_STATUS_CODES,
+                retry_after=response.headers.get("retry-after"),
+            )
         with io.BytesIO() as output:
             async for chunk in response.aiter_bytes():
                 if output.tell() + len(chunk) > limit:
@@ -117,5 +122,7 @@ async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> Co
         )
     except RewriteError:
         raise
+    except (httpx.TransportError, TimeoutError) as exc:
+        raise RewriteError("Reference media transfer interrupted", retryable=True) from exc
     except Exception as exc:
         raise RewriteError("Reference media could not be validated", 400) from exc

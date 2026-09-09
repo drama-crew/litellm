@@ -13,6 +13,8 @@ from pydantic import JsonValue
 from litellm.llms.causyn.context_ir_budget import settle_reservation
 from litellm.llms.causyn.context_ir_callback import notify_callback
 from litellm.llms.causyn.context_ir_store import (
+    PENDING,
+    READY,
     BillingIdentity,
     ContextIRStore,
     ContextIRTask,
@@ -88,9 +90,16 @@ class ContextIRService:
             self.worker = None
 
     async def run(self) -> None:
+        async with asyncio.TaskGroup() as group:
+            for queue in (PENDING, READY):
+                for _ in range(4):
+                    group.create_task(self.run_lane(queue))
+
+    async def run_lane(self, queue: str) -> None:
         while True:
             try:
-                await asyncio.gather(*(self.process(task_id) for task_id in await self.store.due()))
+                for task_id in await self.store.due(queue, limit=1):
+                    await self.process(task_id, defer_completion=queue == PENDING)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -125,13 +134,13 @@ class ContextIRService:
         )
         return await self.store.create(self.with_notification(task))
 
-    async def process(self, task_id: str) -> None:
+    async def process(self, task_id: str, *, defer_completion: bool = False) -> None:
         token = uuid.uuid4().hex
         if not await self.store.claim(task_id, token):
             return
         try:
             async with asyncio.timeout(210):
-                await self.process_claimed(task_id, token)
+                await self.process_claimed(task_id, token, defer_completion=defer_completion)
         except asyncio.CancelledError:
             await asyncio.shield(asyncio.wait_for(self.store.retry(task_id, token, 0), timeout=5))
             raise
@@ -139,7 +148,7 @@ class ContextIRService:
             logger.exception("Context IR persistence or settlement failed for %s", task_id)
             await asyncio.wait_for(self.store.retry(task_id, token, 2), timeout=5)
 
-    async def process_claimed(self, task_id: str, token: str) -> None:
+    async def process_claimed(self, task_id: str, token: str, *, defer_completion: bool = False) -> None:
         original = await self.store.get(task_id)
         if original is None:
             return
@@ -161,18 +170,26 @@ class ContextIRService:
         if running.result is not None:
             await self.complete(running, token)
             return
-        await self.rewrite_and_complete(running, token)
+        await self.rewrite_and_complete(running, token, defer_completion=defer_completion)
 
-    async def rewrite_and_complete(self, running: ContextIRTask, token: str) -> None:
+    async def rewrite_and_complete(self, running: ContextIRTask, token: str, *, defer_completion: bool = False) -> None:
         task_id = running.id
+        if running.attempts >= 3:
+            await self.fail(running, token, "H3 prompt rewrite retry limit exceeded")
+            return
         attempted = running.model_copy(update={"attempts": running.attempts + 1})
         await self.store.save(attempted, token)
         try:
-            result = await self.rewrite(attempted.request)
+            async with asyncio.timeout(max(0.0, min(155.0, attempted.created_at + 600 - time.time()))):
+                result = await self.rewrite(attempted.request)
         except RewriteError as exc:
-            if exc.status_code == 429 and attempted.attempts < 3:
+            if exc.retryable and attempted.attempts < 3:
                 await self.store.save(self.with_notification(attempted.model_copy(update={"status": "queued"})), token)
-                await self.store.retry(task_id, token, (0.0, 2.0, 4.0)[attempted.attempts])
+                await self.store.retry(
+                    task_id,
+                    token,
+                    min(exc.retry_delay(attempted.attempts), max(0.0, attempted.created_at + 600 - time.time())),
+                )
                 return
             await self.fail(attempted, token, str(exc))
             return
@@ -182,6 +199,9 @@ class ContextIRService:
             return
         completed = attempted.model_copy(update={"result": result, "updated_at": int(time.time())})
         await self.store.save(completed, token)
+        if defer_completion:
+            await self.store.retry(task_id, token, 0)
+            return
         await self.complete(completed, token)
 
     async def complete(self, task: ContextIRTask, token: str) -> None:
