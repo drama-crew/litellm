@@ -171,9 +171,7 @@ async def test_billing_event_persists_narrow_upscale_attribution_in_spend_logs()
         ),
     ),
 )
-async def test_billing_event_uses_utc_timestamp_cast_for_image_and_causyn(
-    event, expected_call_type, expected_time
-):
+async def test_billing_event_uses_utc_timestamp_cast_for_image_and_causyn(event, expected_call_type, expected_time):
     transaction = FakeTransaction(inserted=True)
     reconciler = LibTVBillingReconciler(FakeStreamRedis([]), FakePrisma(transaction))
 
@@ -243,7 +241,8 @@ class FakePrisma:
     not os.getenv("LIBTV_BILLING_POSTGRES_URL"),
     reason="Set LIBTV_BILLING_POSTGRES_URL to an isolated PostgreSQL 17 database",
 )
-async def test_billing_event_executes_against_isolated_postgres():
+@pytest.mark.parametrize("task_type", ["video_generation", "h3_context_ir"])
+async def test_billing_event_executes_against_isolated_postgres(task_type):
     from prisma import Prisma
 
     database_url = os.environ["LIBTV_BILLING_POSTGRES_URL"]
@@ -268,9 +267,12 @@ async def test_billing_event_executes_against_isolated_postgres():
         team_id=f"billing-outbox-test-{schema_name}",
         occurred_at="2026-08-27T04:00:00+08:00",
     )
+    causyn_cost = 4.0 if task_type == "h3_context_ir" else 2.5
     causyn_event = CausynBillingEvent(
+        task_type=task_type,
+        model="causyn-h3-context-ir" if task_type == "h3_context_ir" else "causyn-1.0",
         provider_task_id=f"pg-{schema_name}",
-        response_cost=2.5,
+        response_cost=causyn_cost,
         team_id=f"billing-outbox-test-{schema_name}",
         occurred_at="2026-08-27T04:00:00-05:00",
     )
@@ -291,8 +293,7 @@ async def test_billing_event_executes_against_isolated_postgres():
             "metadata JSONB NOT NULL, team_id TEXT, organization_id TEXT)"
         )
         await schema_db.execute_raw(
-            'CREATE TABLE "LiteLLM_TeamTable" ('
-            "team_id TEXT PRIMARY KEY, spend DOUBLE PRECISION NOT NULL DEFAULT 0)"
+            'CREATE TABLE "LiteLLM_TeamTable" (team_id TEXT PRIMARY KEY, spend DOUBLE PRECISION NOT NULL DEFAULT 0)'
         )
         await schema_db.execute_raw('INSERT INTO "LiteLLM_TeamTable" (team_id, spend) VALUES ($1, 0)', team_id)
         reconciler = LibTVBillingReconciler(FakeStreamRedis([]), schema_db)
@@ -302,27 +303,30 @@ async def test_billing_event_executes_against_isolated_postgres():
         await reconciler._reconcile_event(causyn_event)
 
         rows = await schema_db.query_raw(
-            'SELECT call_type, spend, '
+            "SELECT call_type, spend, "
             'to_char("startTime", \'YYYY-MM-DD"T"HH24:MI:SS.US\') AS start_time, '
             'to_char("endTime", \'YYYY-MM-DD"T"HH24:MI:SS.US\') AS end_time '
             'FROM "LiteLLM_SpendLogs" ORDER BY call_type'
         )
-        assert rows == [
-            {
-                "call_type": "image_upscale",
-                "spend": 1.25,
-                "start_time": "2026-08-26T20:00:00.000000",
-                "end_time": "2026-08-26T20:00:00.000000",
-            },
-            {
-                "call_type": "video_generation",
-                "spend": 2.5,
-                "start_time": "2026-08-27T09:00:00.000000",
-                "end_time": "2026-08-27T09:00:00.000000",
-            },
-        ]
+        assert rows == sorted(
+            [
+                {
+                    "call_type": "image_upscale",
+                    "spend": 1.25,
+                    "start_time": "2026-08-26T20:00:00.000000",
+                    "end_time": "2026-08-26T20:00:00.000000",
+                },
+                {
+                    "call_type": task_type,
+                    "spend": causyn_cost,
+                    "start_time": "2026-08-27T09:00:00.000000",
+                    "end_time": "2026-08-27T09:00:00.000000",
+                },
+            ],
+            key=lambda row: row["call_type"],
+        )
         team_rows = await schema_db.query_raw('SELECT spend FROM "LiteLLM_TeamTable" WHERE team_id = $1', team_id)
-        assert team_rows == [{"spend": 3.75}]
+        assert team_rows == [{"spend": 1.25 + causyn_cost}]
     finally:
         if schema_db.is_connected():
             await schema_db.disconnect()

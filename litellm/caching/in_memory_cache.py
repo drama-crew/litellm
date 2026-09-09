@@ -264,7 +264,7 @@ class InMemoryCache(BaseCache):
     async def disconnect(self):
         pass
 
-    def delete_cache(self, key):
+    def delete_cache(self, key: str) -> None:
         self._remove_key(key)
 
     async def async_get_ttl(self, key: str) -> Optional[int]:

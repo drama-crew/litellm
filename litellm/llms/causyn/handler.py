@@ -50,6 +50,9 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
+from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask, task_key, PREFIX as CONTEXT_IR_PREFIX
+from litellm.llms.causyn.h3_prompt import RewriteError
+from litellm.llms.causyn.video_prompt import VideoPromptInput, VideoSubmission, submit_video_prompt
 from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
 from litellm.llms.libtv.persistence import get_persistence
 from litellm.llms.libtv.transfer import get_transfer_redis
@@ -734,6 +737,10 @@ class _DurableTaskMetadataV3(BaseModel):
     pricing: _Pricing
     attribution: _DurableAttribution
 
+    context_ir_task_id: str | None = None
+    prompt_rewrite_model: str | None = None
+    prompt_rewrite_system_sha256: str | None = None
+
     @model_validator(mode="after")
     def _requires_h3_contract(self) -> _DurableTaskMetadataV3:
         if self.pricing.model != self.model:
@@ -944,6 +951,7 @@ class CausynVideoHandler(CustomLLM):
         persistence_factory: PersistenceFactory = _default_persistence_factory,
         billing_enqueue: BillingEnqueue | None = None,
         topaz_adapter: TopazVideoAdapter | None = None,
+        prompt_submit: Callable[[VideoSubmission, BillingIdentity], Awaitable[None]] = submit_video_prompt,
     ) -> None:
         super().__init__()
         self._redis_factory = redis_factory or _redis_factory
@@ -955,6 +963,7 @@ class CausynVideoHandler(CustomLLM):
         self._persistence_factory = persistence_factory
         self._billing_enqueue = billing_enqueue if billing_enqueue is not None else enqueue_causyn_billing
         self._topaz_adapter = topaz_adapter
+        self._prompt_submit = prompt_submit
 
     async def _bill_completed_video(
         self,
@@ -1156,6 +1165,16 @@ class CausynVideoHandler(CustomLLM):
         except ValidationError as exc:
             logger.warning("causyn video billing: deployment pricing metadata is missing or invalid")
             raise _service_error() from exc
+        if spec.model == CAUSYN_H3_MODEL:
+            prompt_input = VideoPromptInput.model_validate(request)
+            try:
+                rewrite_settings = self._settings_factory()
+                for reference in prompt_input.references:
+                    validate_video_generate_url(
+                        reference.url, rewrite_settings.source_hosts, rewrite_settings, reference.role
+                    )
+            except VideoGenerateError as exc:
+                raise _bad_request("invalid causyn video reference") from exc
         durable_metadata = metadata_model
         serialized_metadata = durable_metadata.model_dump()
         serialized_metadata["pricing"] = durable_metadata.pricing.model_dump(exclude_none=True)
@@ -1168,7 +1187,15 @@ class CausynVideoHandler(CustomLLM):
         }
         try:
             settings = self._settings_factory()
-            await enqueue_video_generate(payload, redis_factory=self._redis_factory, settings=settings)
+            if spec.model == CAUSYN_H3_MODEL:
+                await self._prompt_submit(
+                    VideoSubmission.model_validate(payload),
+                    BillingIdentity.model_validate(metadata_model.attribution.model_dump()),
+                )
+            else:
+                await enqueue_video_generate(payload, redis_factory=self._redis_factory, settings=settings)
+        except RewriteError as exc:
+            raise CustomLLMError(status_code=exc.status_code, message=str(exc)) from None
         except VideoGenerateError as error:
             status_code = 400 if error.code in {"invalid_params", "invalid_url"} else 503
             message = "invalid causyn video request" if status_code == 400 else "causyn video service unavailable"
@@ -1216,7 +1243,7 @@ class CausynVideoHandler(CustomLLM):
         )
 
     async def _status(self, video_id: str) -> _StatusEnvelope:
-        task_id = _decode_task_id(video_id)
+        task_id, spec = _decode_video_identity(video_id)
         try:
             raw_body: object = await fetch_video_generate_status(  # pyright: ignore[reportUnknownVariableType]  # validated below
                 task_id, redis=self._redis_factory()
@@ -1241,8 +1268,26 @@ class CausynVideoHandler(CustomLLM):
             )
             raise _service_error() from None
         if body.status is None:
+            if spec.model == CAUSYN_H3_MODEL:
+                return await self._rewrite_status(task_id)
             raise CustomLLMError(status_code=404, message="causyn video was not found")
         return body
+
+    async def _rewrite_status(self, task_id: str) -> _StatusEnvelope:
+        try:
+            raw = await self._redis_factory().get(task_key(CONTEXT_IR_PREFIX + task_id))
+            if raw is not None:
+                task = ContextIRTask.model_validate_json(raw)
+                if task.video_payload is not None:
+                    return _StatusEnvelope.model_validate(
+                        {
+                            "status": "failed" if task.status in {"failed", "cancelled"} else "queued",
+                            "error": {"code": "prompt_rewrite_failed", "message": task.error} if task.error else None,
+                        }
+                    )
+        except Exception as exc:
+            raise _service_error() from exc
+        raise CustomLLMError(status_code=404, message="causyn video was not found")
 
     async def avideo_status(
         self,

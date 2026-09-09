@@ -9,9 +9,12 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 
 from litellm._logging import verbose_proxy_logger
+from litellm.llms.causyn.context_ir import ContextIRService, get_context_ir_service
+from litellm.llms.causyn.context_ir_store import PREFIX
+from litellm.llms.causyn.h3_prompt import AUTH_MODEL, ContextIRRequest, RewriteError
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.http_parsing_utils import _safe_set_request_parsed_body
@@ -70,39 +73,63 @@ def task_owner(auth: UserAPIKeyAuth) -> str:
     return hashlib.sha256(("minimax-h3-owner\0" + identity).encode()).hexdigest()
 
 
+async def read_json_body(request: Request) -> bytearray:
+    raw = bytearray()
+    async for chunk in request.stream():
+        if len(raw) + len(chunk) > BODY_LIMIT:
+            raise H3Error(400, "Request body exceeds 64 MB")
+        raw.extend(chunk)
+    return raw
+
+
+async def prepare_request(request: Request) -> None:
+    is_ir_create = request.url.path == "/v2/h3_context_ir"
+    is_ir_list = request.url.path == "/v2/query/video_generation"
+    public_id = TypeAdapter(str).validate_python(request.path_params.get("video_id", ""))
+    is_ir = is_ir_create or is_ir_list or public_id.startswith(PREFIX)
+    request.scope["causyn_context_ir"] = is_ir
+    if (request.query_params and not is_ir_list) or any(
+        request.headers.get(name)
+        for name in ("x-litellm-model", "custom-llm-provider", "x-litellm-custom-llm-provider")
+    ):
+        raise H3Error(400, "Provider routing overrides are not supported on this endpoint")
+    if request.method == "POST":
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise H3Error(400, "Content-Type must be application/json")
+        raw = await read_json_body(request)
+        if is_ir_create:
+            spec_ir = ContextIRRequest.model_validate_json(raw)
+            spec_ir.require_supported()
+            request.scope["causyn_context_ir_spec"] = spec_ir
+            _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
+        else:
+            spec = MiniMaxH3Create.model_validate_json(raw)
+            request.scope["minimax_h3_spec"] = spec
+            _safe_set_request_parsed_body(request, spec.internal_body())
+    elif is_ir:
+        _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
+    else:
+        public_id = TypeAdapter(str).validate_python(request.path_params["video_id"])
+        try:
+            task = decode_task(public_id)
+        except ValueError as exc:
+            raise H3Error(404, "Task not found or outside the 7-day query window") from exc
+        request.scope["minimax_h3_task"] = task
+        request.scope["minimax_h3_public_id"] = public_id
+        request.path_params["video_id"] = task.native_id
+        _safe_set_request_parsed_body(request, {})
+
+
 class MiniMaxH3Route(APIRoute):
     def get_route_handler(self):
         original = super().get_route_handler()
 
         async def handle(request: Request) -> Response:
             try:
-                if request.query_params or any(
-                    request.headers.get(name)
-                    for name in ("x-litellm-model", "custom-llm-provider", "x-litellm-custom-llm-provider")
-                ):
-                    raise H3Error(400, "Provider routing overrides are not supported on this endpoint")
-                if request.method == "POST":
-                    if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
-                        raise H3Error(400, "Content-Type must be application/json")
-                    raw = bytearray()
-                    async for chunk in request.stream():
-                        if len(raw) + len(chunk) > BODY_LIMIT:
-                            raise H3Error(400, "Request body exceeds 64 MB")
-                        raw.extend(chunk)
-                    spec = MiniMaxH3Create.model_validate_json(raw)
-                    request.scope["minimax_h3_spec"] = spec
-                    _safe_set_request_parsed_body(request, spec.internal_body())
-                else:
-                    public_id = str(request.path_params["video_id"])
-                    try:
-                        task = decode_task(public_id)
-                    except ValueError as exc:
-                        raise H3Error(404, "Task not found or outside the 7-day query window") from exc
-                    request.scope["minimax_h3_task"] = task
-                    request.scope["minimax_h3_public_id"] = public_id
-                    request.path_params["video_id"] = task.native_id
-                    _safe_set_request_parsed_body(request, {})
+                await prepare_request(request)
                 return await original(request)
+            except RewriteError as exc:
+                return error_response(exc.status_code, str(exc))
             except H3Error as exc:
                 return error_response(exc.code, str(exc))
             except ValidationError as exc:
@@ -124,6 +151,10 @@ class MiniMaxH3Route(APIRoute):
                 return error_response(500, "Video request failed")
 
         return handle
+
+
+async def context_ir_service_for_request(request: Request) -> ContextIRService | None:
+    return get_context_ir_service() if request.scope.get("causyn_context_ir") else None
 
 
 router = APIRouter(route_class=MiniMaxH3Route)
@@ -167,7 +198,10 @@ async def query_video(
     request: Request,
     response: Response,
     auth: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
+    ir_service: Annotated[ContextIRService | None, Depends(context_ir_service_for_request)],
 ) -> dict[str, object]:
+    if ir_service is not None:
+        return await query_context_ir_task(video_id, task_owner(auth), ir_service)
     task = request.scope.get("minimax_h3_task")
     public_id = request.scope.get("minimax_h3_public_id")
     if not isinstance(task, MiniMaxTask) or not isinstance(public_id, str):
@@ -204,3 +238,10 @@ async def query_video(
     if video.completed_at is not None:
         result["updated_at"] = video.completed_at
     return {"task": result}
+
+
+async def query_context_ir_task(video_id: str, owner: str, service: ContextIRService) -> dict[str, object]:
+    task = await service.store.get(video_id)
+    if task is None or not task.listed or not hmac.compare_digest(task.owner, owner):
+        raise H3Error(404, "Task not found")
+    return {"task": task.public()}

@@ -2,15 +2,44 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import fakeredis.aioredis
 import pytest
 
 import litellm.llms.causyn.handler as mod
 from litellm.llms.causyn.handler import CausynVideoHandler
+from litellm.llms.causyn.context_ir import ContextIRService
+from litellm.llms.causyn.context_ir_store import ContextIRStore
+from litellm.llms.causyn.video_prompt import VideoPromptInput, rewritten_video_payload
+from litellm.llms.causyn.h3_prompt import RewriteResult, RewriteUsage
 from litellm.llms.custom_llm import CustomLLMError
 from litellm.types.videos.utils import (
     decode_video_id_with_provider,
     encode_video_id_with_provider,
 )
+
+
+async def fake_submit(payload, billing):
+    async def rewrite(spec):
+        return RewriteResult(prompt="structured: " + spec.prompt, usage=RewriteUsage(), system_sha256="a" * 64)
+
+    async def deliver(task):
+        await mod.enqueue_video_generate(
+            rewritten_video_payload(task).model_dump(mode="json"), redis_factory=lambda: None,
+            settings=mod.VideoGenerateSettings.from_environment(),
+        )
+
+    async def settle(task):
+        pass
+
+    async with fakeredis.aioredis.FakeRedis() as redis:
+        service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, deliver=deliver, settle=settle)
+        task = await service.create(
+            VideoPromptInput.model_validate(payload.request).context_ir(),
+            owner="test", billing=billing, task_id="h3_ir_" + payload.task_id,
+            video_payload=payload.model_dump(mode="json"), listed=False,
+        )
+        await service.process(task.id)
+        assert (await service.store.get(task.id)).status == "succeeded"
 
 
 TASK_ID = "0123456789abcdef0123456789abcdef"
@@ -56,7 +85,9 @@ def _params(**overrides: object) -> dict[str, object]:
 
 @pytest.mark.asyncio
 async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -> None:
-    video = await CausynVideoHandler(task_id_factory=lambda: TASK_ID, clock=lambda: 2_000_000_000.0).avideo_generation(
+    video = await CausynVideoHandler(
+        prompt_submit=fake_submit, task_id_factory=lambda: TASK_ID, clock=lambda: 2_000_000_000.0
+    ).avideo_generation(
         model="causyn-1.1",
         prompt="a cat crosses the room",
         api_key=None,
@@ -68,7 +99,7 @@ async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -
     assert payload["model"] == "causyn-1.1"
     assert payload["deadline_ts"] == 2_000_001_800.0
     assert payload["request"] == {
-        "prompt": "a cat crosses the room",
+        "prompt": "structured: a cat crosses the room",
         "duration_seconds": 5,
         "resolution": "768p",
         "ratio": "16:9",
@@ -77,6 +108,9 @@ async def test_h3_enqueues_text_to_video_with_v3_metadata(enqueued: _Recorder) -
     }
     assert payload["task_metadata"] == {
         "version": "causyn-video-billing-v3",
+        "context_ir_task_id": "h3_ir_" + TASK_ID,
+        "prompt_rewrite_model": "qwen/qwen3.8-flash",
+        "prompt_rewrite_system_sha256": "a" * 64,
         "duration_seconds": 5.0,
         "source_resolution": "1344x768",
         "requested_resolution": "768p",
@@ -142,7 +176,9 @@ def test_h3_uses_an_independent_deadline_constant() -> None:
 async def test_h3_maps_keyframes_to_worker_references(
     enqueued: _Recorder, params: dict[str, object], expected: list[dict[str, str]]
 ) -> None:
-    await CausynVideoHandler().avideo_generation(
+    await CausynVideoHandler(
+        prompt_submit=fake_submit,
+    ).avideo_generation(
         model="causyn-1.1",
         prompt="continuous movement",
         api_key=None,
@@ -192,7 +228,9 @@ async def test_h3_flag_is_independent_from_causyn_1_0(monkeypatch: pytest.Monkey
     monkeypatch.delenv("DRAMA_CAUSYN_1_1_ENABLED")
     monkeypatch.delenv("OH_DRAMA_CAUSYN_1_1_ENABLED", raising=False)
     with pytest.raises(CustomLLMError) as exc:
-        await CausynVideoHandler().avideo_generation(
+        await CausynVideoHandler(
+            prompt_submit=fake_submit,
+        ).avideo_generation(
             model="causyn-1.1",
             prompt="prompt",
             api_key=None,
@@ -256,7 +294,9 @@ async def test_h3_completed_status_restores_model_and_billing(
     monkeypatch.setattr(mod, "fetch_video_generate_status", fetch_status)
     monkeypatch.setattr(mod, "fetch_video_generate_task_metadata", fetch_metadata)
     video_id = encode_video_id_with_provider(TASK_ID, "causyn", "causyn-1-1")
-    handler = CausynVideoHandler(redis_factory=lambda: SimpleNamespace(), billing_enqueue=enqueue_billing)
+    handler = CausynVideoHandler(
+        prompt_submit=fake_submit, redis_factory=lambda: SimpleNamespace(), billing_enqueue=enqueue_billing
+    )
     video = await handler.avideo_status(video_id, None, None, {}, None)
     assert video.status == "completed"
     assert video.model == "causyn-1.1"

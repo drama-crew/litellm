@@ -9,7 +9,7 @@ import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from redis.exceptions import ResponseError
 
@@ -104,6 +104,7 @@ class CausynBillingEvent:
     organization_id: str | None = None
     api_key: str | None = None
     model: str = "causyn-1.0"
+    task_type: Literal["video_generation", "h3_context_ir"] = "video_generation"
     event_id: str = field(default="")
     occurred_at: str = field(default="")
 
@@ -115,11 +116,15 @@ class CausynBillingEvent:
 
     @property
     def billing_key(self) -> str:
-        return f"causyn-video:{self.provider_task_id}"
+        return (
+            f"causyn-context-ir:{self.provider_task_id}"
+            if self.task_type == "h3_context_ir"
+            else f"causyn-video:{self.provider_task_id}"
+        )
 
     @property
     def request_id(self) -> str:
-        return f"causyn:{self.provider_task_id}"
+        return self.billing_key if self.task_type == "h3_context_ir" else f"causyn:{self.provider_task_id}"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self) | {
@@ -130,7 +135,11 @@ class CausynBillingEvent:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "CausynBillingEvent":
+        task_type = value.get("task_type", "video_generation")
+        if task_type not in {"video_generation", "h3_context_ir"}:
+            raise ValueError("Invalid Causyn billing task type")
         return cls(
+            task_type="h3_context_ir" if task_type == "h3_context_ir" else "video_generation",
             provider_task_id=str(value["provider_task_id"]),
             response_cost=float(value.get("response_cost", value.get("spend", 0.0))),
             team_id=_optional_str(value.get("team_id")),
@@ -267,7 +276,7 @@ class LibTVBillingReconciler:
         db = getattr(self.prisma_client, "db", self.prisma_client)
         async with db.tx() as transaction:
             if isinstance(event, CausynBillingEvent):
-                call_type = "video_generation"
+                call_type = event.task_type
                 metadata = json.dumps({"causyn_billing_key": event.billing_key})
             else:
                 call_type = "image_upscale"

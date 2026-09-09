@@ -521,6 +521,7 @@ from litellm.proxy.utils import (
 )
 from litellm.proxy.video_endpoints.endpoints import router as video_router
 from litellm.proxy.video_endpoints.minimax_h3_endpoints import router as minimax_h3_router
+from litellm.proxy.video_endpoints.context_ir_endpoints import router as context_ir_router
 from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.router import (
     AssistantsTypedDict,
@@ -775,6 +776,9 @@ async def proxy_shutdown_event():
             verbose_proxy_logger.exception("Failed to stop libtv billing outbox reconciler")
         finally:
             _libtv_billing_reconciler = None
+    from litellm.llms.causyn.context_ir import stop_context_ir_service
+
+    await stop_context_ir_service()
     if _causyn_billing_reconciler is not None:
         try:
             await _causyn_billing_reconciler.stop()
@@ -1107,6 +1111,11 @@ async def proxy_startup_event(app: FastAPI):
     except Exception:
         # Causyn uses a separate Redis stream and must not block libtv startup.
         verbose_proxy_logger.exception("Failed to start Causyn billing outbox reconciler")
+
+    if _causyn_billing_reconciler is not None:
+        from litellm.llms.causyn.context_ir import get_context_ir_service
+
+        get_context_ir_service()
 
     from litellm.llms.libtv.account_health import start_libtv_account_health_prober
 
@@ -15901,6 +15910,7 @@ app.include_router(ocr_router)
 app.include_router(rag_router)
 app.include_router(video_router)
 app.include_router(minimax_h3_router)
+app.include_router(context_ir_router)
 app.include_router(container_router)
 app.include_router(search_router)
 app.include_router(image_router)
