@@ -34,6 +34,8 @@ async def main() -> None:
     await db.connect()
     try:
         # Newest 90 days are bounded; keyset batches avoid growing OFFSET scans.
+        # Stop at the first live capture so failed submissions (no task ID)
+        # cannot be imported again under a different legacy ID.
         cursor = ""
         count = 0
         while True:
@@ -42,7 +44,9 @@ async def main() -> None:
                     """SELECT request_id, api_key, "user", model,
                 status, "startTime", "endTime", spend, metadata->'error_information'->>'error_message' AS error
                 FROM "LiteLLM_SpendLogs" WHERE call_type='avideo_generation'
-                AND coalesce("user",'')<>'' AND "startTime">now()-interval '90 days' AND request_id>$1
+                AND coalesce("user",'')<>'' AND "startTime">now()-interval '90 days'
+                AND "startTime" < coalesce((SELECT min(started_at) FROM "LiteLLM_OpenApiLog" WHERE NOT historical),now())
+                AND request_id>$1
                 ORDER BY request_id LIMIT 250""",
                     cursor,
                 )
