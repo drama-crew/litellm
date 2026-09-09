@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import random
 import re
+import time
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from importlib.resources import files
 from typing import Literal
@@ -26,6 +29,7 @@ MODEL = "qwen/qwen3.8-flash"
 PUBLIC_MODEL = "causyn-h3-context-ir"
 AUTH_MODEL = "causyn-1.1"
 PRICE_CREDITS = 4.0
+RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
 REFERENCE_FIELDS = (
     "subject_definitions",
@@ -38,9 +42,26 @@ REFERENCE_FIELDS = (
 
 
 class RewriteError(Exception):
-    def __init__(self, message: str, status_code: int = 502) -> None:
+    def __init__(
+        self, message: str, status_code: int = 502, *, retryable: bool | None = None, retry_after: str | None = None
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.retryable = status_code == 429 if retryable is None else retryable
+        self.retry_after = retry_after
+
+    def retry_delay(self, attempt: int) -> float:
+        backoff = min(30.0, 2.0**attempt) + random.uniform(0.0, 1.0)
+        if self.retry_after is None:
+            return backoff
+        try:
+            seconds = float(self.retry_after)
+        except ValueError:
+            try:
+                seconds = parsedate_to_datetime(self.retry_after).timestamp() - time.time()
+            except (ValueError, TypeError, OverflowError):
+                return backoff
+        return max(backoff, min(60.0, seconds))
 
 
 class ContextIRRequest(BaseModel):
@@ -220,16 +241,24 @@ class H3PromptRewriter:
             "reasoning": {"enabled": False},
             "provider": {"allow_fallbacks": False, "require_parameters": True},
         }
-        async with asyncio.timeout(90):
-            response = await self.client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json=payload,
-                timeout=85,
-                follow_redirects=False,
-            )
+        try:
+            async with asyncio.timeout(90):
+                response = await self.client.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                    timeout=85,
+                    follow_redirects=False,
+                )
+        except (httpx.TransportError, TimeoutError) as exc:
+            raise RewriteError("H3 prompt rewrite provider interrupted", retryable=True) from exc
         if response.status_code != 200:
-            raise RewriteError("H3 prompt rewrite provider unavailable", 429 if response.status_code == 429 else 502)
+            raise RewriteError(
+                "H3 prompt rewrite provider unavailable",
+                429 if response.status_code == 429 else 502,
+                retryable=response.status_code in RETRYABLE_STATUS_CODES,
+                retry_after=response.headers.get("retry-after"),
+            )
         completed = _Completion.model_validate(response.json())
         prompt = completed.choices[0].message.content.strip()
         validate_prompt(prompt, spec)

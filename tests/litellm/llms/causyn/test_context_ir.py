@@ -216,11 +216,16 @@ async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, 
     monkeypatch.setattr(context_ir, "get_context_ir_service", lambda: service)
     monkeypatch.setattr(context_ir, "get_transfer_redis", lambda url: redis)
     video_id = "0123456789abcdef0123456789abcdef"
-    await submit_video_prompt(VideoSubmission(
-        task_id=video_id, model="causyn-1.1", deadline_ts=time.time() + 300,
-        request={"prompt": "A cat walks.", "duration_seconds": 5, "ratio": "16:9"},
-        task_metadata={},
-    ), BillingIdentity())
+    await submit_video_prompt(
+        VideoSubmission(
+            task_id=video_id,
+            model="causyn-1.1",
+            deadline_ts=time.time() + 300,
+            request={"prompt": "A cat walks.", "duration_seconds": 5, "ratio": "16:9"},
+            task_metadata={},
+        ),
+        BillingIdentity(),
+    )
     await service.process("h3_ir_" + video_id)
     automatic = await service.store.get("h3_ir_" + video_id)
     assert automatic.status == "succeeded"
@@ -393,9 +398,15 @@ async def test_video_bridge_survives_process_loss_without_rewrite_or_duplicate_e
 
     async def settle(task):
         calls["settle"] += 1
-        await enqueue_causyn_billing(redis, CausynBillingEvent(
-            provider_task_id=task.id, response_cost=4, model="causyn-h3-context-ir", task_type="h3_context_ir",
-        ))
+        await enqueue_causyn_billing(
+            redis,
+            CausynBillingEvent(
+                provider_task_id=task.id,
+                response_cost=4,
+                model="causyn-h3-context-ir",
+                task_type="h3_context_ir",
+            ),
+        )
         if calls["settle"] == 1:
             raise ConnectionError("lost billing acknowledgement after GPU enqueue")
 
@@ -403,17 +414,30 @@ async def test_video_bridge_survives_process_loss_without_rewrite_or_duplicate_e
     submitted = []
 
     async def submit(payload, billing):
-        submitted.append(await service.create(
-            bridge.VideoPromptInput.model_validate(payload.request).context_ir(),
-            owner="video:" + payload.task_id, billing=billing, task_id="h3_ir_" + payload.task_id,
-            listed=False, video_payload=payload.model_dump(mode="json"),
-        ))
+        submitted.append(
+            await service.create(
+                bridge.VideoPromptInput.model_validate(payload.request).context_ir(),
+                owner="video:" + payload.task_id,
+                billing=billing,
+                task_id="h3_ir_" + payload.task_id,
+                listed=False,
+                video_payload=payload.model_dump(mode="json"),
+            )
+        )
 
     handler = CausynVideoHandler(redis_factory=lambda: redis, prompt_submit=submit)
     video = await handler.avideo_generation(
-        model="causyn-1.1", prompt="cat", api_key=None, api_base=None, logging_obj=None,
-        optional_params={"seconds": "5", "size": "768p", "aspect_ratio": "16:9",
-                         "model_info": {"id": "causyn-1-1", "output_cost_per_second_768p": 5.0}},
+        model="causyn-1.1",
+        prompt="cat",
+        api_key=None,
+        api_base=None,
+        logging_obj=None,
+        optional_params={
+            "seconds": "5",
+            "size": "768p",
+            "aspect_ratio": "16:9",
+            "model_info": {"id": "causyn-1-1", "output_cost_per_second_768p": 5.0},
+        },
     )
     assert calls["rewrite"] == 0
     assert (await handler.avideo_status(video.id, None, None, {}, None)).status == "queued"
@@ -452,12 +476,22 @@ async def test_failed_video_rewrite_never_reaches_gpu_and_is_visible_in_video_st
 
     service = ContextIRService(ContextIRStore(redis), rewrite=bad_rewrite, settle=no_settle)
     video_id = "0123456789abcdef0123456789abcdef"
-    task = await service.create(spec(), owner="video:" + video_id, billing=BillingIdentity(),
-                                task_id="h3_ir_" + video_id, listed=False, video_payload={"task_id": video_id})
+    task = await service.create(
+        spec(),
+        owner="video:" + video_id,
+        billing=BillingIdentity(),
+        task_id="h3_ir_" + video_id,
+        listed=False,
+        video_payload={"task_id": video_id},
+    )
     await service.process(task.id)
     handler = CausynVideoHandler(redis_factory=lambda: redis)
     response = await handler.avideo_status(
-        encode_video_id_with_provider(video_id, "causyn", "causyn-1-1"), None, None, {}, None,
+        encode_video_id_with_provider(video_id, "causyn", "causyn-1-1"),
+        None,
+        None,
+        {},
+        None,
     )
     assert response.status == "failed"
     assert await redis.xlen(stream_key(TASK_TYPE_VIDEO_GENERATE)) == 0
@@ -492,3 +526,217 @@ async def test_ir_admission_refunds_only_if_task_was_not_persisted(redis, monkey
     with pytest.raises(ConnectionError):
         await ir.accept_context_ir(service, spec(), "owner", reservation, BillingIdentity())
     assert refunded == [reservation]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [429, 500, 502, 503, 504, 408, "read", "timeout", "protocol"])
+async def test_provider_interruptions_retry_then_settle_once(redis, failure):
+    from litellm.llms.causyn.h3_prompt import H3PromptRewriter, MODEL
+
+    calls = Counter()
+
+    def transport(request):
+        calls["upstream"] += 1
+        if calls["upstream"] < 3:
+            if failure == "read":
+                raise httpx.ReadError("interrupted")
+            if failure == "timeout":
+                raise httpx.ReadTimeout("interrupted")
+            if failure == "protocol":
+                raise httpx.RemoteProtocolError("incomplete body")
+            return httpx.Response(failure, headers={"Retry-After": "3"})
+        return httpx.Response(
+            200,
+            json={
+                "model": MODEL,
+                "choices": [{"message": {"content": PROMPT}, "finish_reason": "stop"}],
+                "usage": RESULT.usage.model_dump(),
+            },
+        )
+
+    async def settle(task):
+        calls["settle"] += 1
+        assert task.result is not None
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        service = ContextIRService(
+            ContextIRStore(redis), rewrite=H3PromptRewriter(client, "test").rewrite, settle=settle
+        )
+        task = await service.create(spec(), owner="owner", billing=BillingIdentity())
+        for _ in range(3):
+            await service.process(task.id)
+        done = await service.store.get(task.id)
+        assert done.status == "succeeded"
+        assert done.attempts == 3
+        assert calls == {"upstream": 3, "settle": 1}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [400, 401, 403, 422, "length", "invalid"])
+async def test_permanent_provider_errors_never_retry_or_deliver(redis, failure):
+    from litellm.llms.causyn.h3_prompt import H3PromptRewriter, MODEL
+
+    calls = Counter()
+
+    def transport(request):
+        calls["upstream"] += 1
+        if isinstance(failure, int):
+            return httpx.Response(failure)
+        return httpx.Response(
+            200,
+            json={
+                "model": MODEL,
+                "choices": [
+                    {
+                        "message": {"content": PROMPT if failure == "length" else "invalid"},
+                        "finish_reason": "length" if failure == "length" else "stop",
+                    }
+                ],
+                "usage": RESULT.usage.model_dump(),
+            },
+        )
+
+    async def deliver(task):
+        calls["deliver"] += 1
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        service = ContextIRService(
+            ContextIRStore(redis), rewrite=H3PromptRewriter(client, "test").rewrite, settle=no_settle, deliver=deliver
+        )
+        task = await service.create(spec(), owner="owner", billing=BillingIdentity())
+        await service.process(task.id)
+        await service.process(task.id)
+        assert (await service.store.get(task.id)).status == "failed"
+        assert calls == {"upstream": 1}
+
+
+def test_retry_after_is_bounded_and_jittered():
+    import time
+    from email.utils import formatdate
+
+    assert 2 <= RewriteError("x", 429).retry_delay(1) <= 3
+    assert RewriteError("x", 429, retry_after="99999").retry_delay(1) == 60
+    assert 4 <= RewriteError("x", 429, retry_after="broken").retry_delay(2) <= 5
+    assert 8 <= RewriteError("x", 429, retry_after=formatdate(time.time() + 10, usegmt=True)).retry_delay(1) <= 10
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ir_admission_is_bounded_and_duplicate_does_not_consume_capacity(redis):
+    service = ContextIRService(ContextIRStore(redis, max_pending=3), rewrite=rewrite, settle=no_settle)
+    first = await service.create(spec(), owner="owner", billing=BillingIdentity(), task_id="same")
+    admitted = await asyncio.gather(
+        *(service.create(spec(), owner="owner", billing=BillingIdentity()) for _ in range(20)), return_exceptions=True
+    )
+    assert sum(not isinstance(task, BaseException) for task in admitted) == 2
+    assert all(
+        not isinstance(task, BaseException) or isinstance(task, RewriteError) and task.status_code == 429
+        for task in admitted
+    )
+    same = await service.create(spec(), owner="owner", billing=BillingIdentity(), task_id="same")
+    assert same == first
+    await service.process(first.id)
+    assert await service.create(spec(), owner="owner", billing=BillingIdentity())
+
+
+@pytest.mark.asyncio
+async def test_ready_delivery_runs_while_all_rewrite_slots_are_blocked_and_stop_recovers(redis):
+    from litellm.llms.causyn.context_ir_store import PENDING, READY
+
+    entered = asyncio.Event()
+    delivered = asyncio.Event()
+    calls = Counter()
+
+    async def blocked(request):
+        calls["rewrite"] += 1
+        if calls["rewrite"] == 4:
+            entered.set()
+        await asyncio.Event().wait()
+
+    async def deliver(task):
+        delivered.set()
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=blocked, deliver=deliver, settle=no_settle)
+    tasks = [await service.create(spec(), owner="owner", billing=BillingIdentity()) for _ in range(4)]
+    service.start()
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        ready = await service.create(spec(), owner="owner", billing=BillingIdentity())
+        assert await service.store.claim(ready.id, "prepare")
+        await service.store.save(ready.model_copy(update={"result": RESULT}), "prepare")
+        await service.store.retry(ready.id, "prepare", 0)
+        assert await redis.zscore(PENDING, ready.id) is None
+        await asyncio.wait_for(delivered.wait(), 2)
+    finally:
+        await service.stop()
+    assert await redis.zcard(READY) == 0
+    for task in tasks:
+        assert await redis.get(task_key(task.id) + ":lease") is None
+    restarted = ContextIRService(ContextIRStore(redis), rewrite=rewrite, settle=no_settle)
+    for task in tasks:
+        await restarted.process(task.id)
+        assert (await restarted.store.get(task.id)).status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_recovered_task_never_exceeds_persisted_attempt_limit(redis):
+    calls = Counter()
+
+    async def counted(request):
+        calls["rewrite"] += 1
+        return RESULT
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=counted, settle=no_settle)
+    task = await service.create(spec(), owner="owner", billing=BillingIdentity())
+    assert await service.store.claim(task.id, "crashed")
+    await service.store.save(task.model_copy(update={"attempts": 3}), "crashed")
+    await redis.delete(task_key(task.id) + ":lease")
+    await service.process(task.id)
+    assert (await service.store.get(task.id)).status == "failed"
+    assert calls["rewrite"] == 0
+
+
+@pytest.mark.asyncio
+async def test_gpu_admission_is_atomic_bounded_and_releases_terminal_tasks(redis):
+    import time
+    from litellm.llms.causyn.video_admission import ACTIVE, MAX_ADMITTED
+    from litellm.llms.libtv.transfer import status_key
+    from litellm.llms.libtv.video_generate import (
+        enqueue_video_generate,
+        VideoGenerateSettings,
+        VideoGenerateError,
+        alive_zset_key,
+        stream_key,
+    )
+
+    await redis.zadd(alive_zset_key("video_generate"), {"worker": time.time()})
+    await redis.hset("worker:capacity:video_generate", "worker", 0)
+    settings = VideoGenerateSettings(
+        source_hosts=frozenset({"source.example"}), target_hosts=frozenset({"target.example"})
+    )
+
+    async def submit(task_id):
+        return await enqueue_video_generate(
+            {
+                "task_id": task_id,
+                "model": "causyn-1.1",
+                "deadline_ts": time.time() + 1800,
+                "request": {"prompt": PROMPT, "duration_seconds": 5, "resolution": "768p", "ratio": "16:9"},
+                "task_metadata": {"provider_task_id": task_id},
+            },
+            redis_factory=lambda: redis,
+            settings=settings,
+        )
+
+    results = await asyncio.gather(*(submit(str(i)) for i in range(32)), return_exceptions=True)
+    ids = [item for item in results if isinstance(item, str)]
+    assert len(ids) == MAX_ADMITTED
+    assert all(
+        isinstance(item, str) or isinstance(item, VideoGenerateError) and item.code == "no_capacity_available"
+        for item in results
+    )
+    assert await redis.zcard(ACTIVE) == MAX_ADMITTED
+    await asyncio.gather(*(submit(ids[0]) for _ in range(20)))
+    assert await redis.xlen(stream_key("video_generate")) == MAX_ADMITTED
+    await redis.set(status_key(ids[0]), "done")
+    assert await submit("replacement") == "replacement"
+    assert await redis.zcard(ACTIVE) == MAX_ADMITTED

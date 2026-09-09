@@ -93,3 +93,25 @@ def test_broken_dialogue_close_and_shot_order_are_rejected():
                 f"integrated_multimodal_description: {description}\noverall_soundscape: N/A\nnon_diegetic_music: N/A",
                 request([]),
             )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [503, 429, "read", "timeout", 404])
+async def test_reference_download_classifies_retryable_failure(monkeypatch, failure):
+    import litellm.llms.causyn.h3_media as media
+
+    monkeypatch.setattr(media, "validate_url", lambda url: (url, "source.example"))
+
+    def transport(request):
+        if failure == "read":
+            raise httpx.ReadError("interrupted")
+        if failure == "timeout":
+            raise httpx.ReadTimeout("interrupted")
+        return httpx.Response(failure)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(RewriteError) as error:
+            await prepare_media(
+                client, request([{"type": "image_url", "image_url": {"url": "https://source.example/ref.png"}}])
+            )
+    assert error.value.retryable is (failure != 404)
