@@ -130,3 +130,50 @@ def test_causyn_poll_timestamp_is_not_an_authoritative_finish_time():
     video = VideoSnapshot(id=encode_video_id_with_provider("native-task", "causyn"), completed_at=1700000000)
     assert completion_time(video) is None
     assert completion_time(VideoSnapshot(id="other-task", completed_at=1700000000)) == 1700000000
+
+
+def test_minimax_boundary_records_original_input_and_exact_public_task_id(monkeypatch):
+    import json
+    from unittest.mock import AsyncMock
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.video_endpoints import minimax_h3_endpoints as h3
+    from litellm.proxy.video_endpoints import openapi_log_capture
+    from litellm.types.videos.main import VideoObject
+
+    db = FakeDB()
+    monkeypatch.setenv("LITELLM_VIDEO_ID_SECRET", "synthetic-history-test-secret")
+    monkeypatch.setattr(openapi_log_capture, "database", lambda: db)
+    completed = VideoObject(id="video-native", object="video", status="completed")
+    completed._hidden_params = {"url": "https://media.example/result.mp4"}
+    processor = AsyncMock(
+        side_effect=[
+            VideoObject(id="video-native", object="video", status="queued"),
+            completed,
+        ]
+    )
+    monkeypatch.setattr(h3.endpoints.ProxyBaseLLMRequestProcessing, "base_process_llm_request", processor)
+    app = FastAPI()
+    app.dependency_overrides[h3.user_api_key_auth] = lambda: UserAPIKeyAuth(api_key="sk-owner", user_id="owner-user")
+    app.include_router(h3.router)
+    client = TestClient(app)
+    result = client.post(
+        "/v2/video_generation",
+        json={
+            "model": "MiniMax-H3",
+            "content": [{"type": "text", "text": "original prompt"}],
+            "resolution": "768P",
+            "duration": 8,
+            "ratio": "16:9",
+        },
+    )
+    assert result.status_code == 200, result.text
+    public_id = result.json()["task_id"]
+    assert db.calls[0][1][2:4] == ("owner-user", "minimax_h3")
+    assert json.loads(db.calls[0][1][-1])["model"] == "MiniMax-H3"
+    assert db.calls[1][1][1] == "video-native"
+    assert db.calls[2][1][1] == public_id
+    polled = client.get("/v2/query/video_generation/" + public_id)
+    assert polled.status_code == 200, polled.text
+    assert db.calls[-1][1][:3] == (key_owner("sk-owner"), "video-native", "succeeded")
