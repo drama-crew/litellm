@@ -34,6 +34,8 @@ from litellm.llms.causyn.video_prompt import deliver_video_prompt
 from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
 from litellm.llms.libtv.transfer import get_transfer_redis
 
+from .task_telemetry import interval, stage, task_scope
+
 logger = logging.getLogger(__name__)
 Rewrite = Callable[[ContextIRRequest], Awaitable[RewriteResult]]
 Settle = Callable[[ContextIRTask], Awaitable[None]]
@@ -125,6 +127,7 @@ class ContextIRService:
             owner=owner,
             request=spec,
             created_at=now,
+            trace_created_ns=time.time_ns(),
             updated_at=now,
             billing=billing,
             price=price,
@@ -135,18 +138,19 @@ class ContextIRService:
         return await self.store.create(self.with_notification(task))
 
     async def process(self, task_id: str, *, defer_completion: bool = False) -> None:
-        token = uuid.uuid4().hex
-        if not await self.store.claim(task_id, token):
-            return
-        try:
-            async with asyncio.timeout(210):
-                await self.process_claimed(task_id, token, defer_completion=defer_completion)
-        except asyncio.CancelledError:
-            await asyncio.shield(asyncio.wait_for(self.store.retry(task_id, token, 0), timeout=5))
-            raise
-        except Exception:
-            logger.exception("Context IR persistence or settlement failed for %s", task_id)
-            await asyncio.wait_for(self.store.retry(task_id, token, 2), timeout=5)
+        with task_scope(task_id), stage("causyn.ir.attempt"):
+            token = uuid.uuid4().hex
+            if not await self.store.claim(task_id, token):
+                return
+            try:
+                async with asyncio.timeout(210):
+                    await self.process_claimed(task_id, token, defer_completion=defer_completion)
+            except asyncio.CancelledError:
+                await asyncio.shield(asyncio.wait_for(self.store.retry(task_id, token, 0), timeout=5))
+                raise
+            except Exception:
+                logger.exception("Context IR persistence or settlement failed for %s", task_id)
+                await asyncio.wait_for(self.store.retry(task_id, token, 2), timeout=5)
 
     async def process_claimed(self, task_id: str, token: str, *, defer_completion: bool = False) -> None:
         original = await self.store.get(task_id)
@@ -177,11 +181,14 @@ class ContextIRService:
         if running.attempts >= 3:
             await self.fail(running, token, "H3 prompt rewrite retry limit exceeded")
             return
+        if running.attempts == 0:
+            interval("causyn.ir.queue", running.trace_created_ns or running.created_at * 1_000_000_000, time.time_ns())
         attempted = running.model_copy(update={"attempts": running.attempts + 1})
         await self.store.save(attempted, token)
         try:
             async with asyncio.timeout(max(0.0, min(155.0, attempted.created_at + 600 - time.time()))):
-                result = await self.rewrite(attempted.request)
+                with stage("causyn.prompt.rewrite", attempt=attempted.attempts):
+                    result = await self.rewrite(attempted.request)
         except RewriteError as exc:
             if exc.retryable and attempted.attempts < 3:
                 await self.store.save(self.with_notification(attempted.model_copy(update={"status": "queued"})), token)
@@ -197,7 +204,9 @@ class ContextIRService:
             logger.exception("Context IR rewrite failed for %s", task_id)
             await self.fail(attempted, token, "H3 prompt rewrite failed")
             return
-        completed = attempted.model_copy(update={"result": result, "updated_at": int(time.time())})
+        completed = attempted.model_copy(
+            update={"result": result, "updated_at": int(time.time()), "rewrite_completed_ns": time.time_ns()}
+        )
         await self.store.save(completed, token)
         if defer_completion:
             await self.store.retry(task_id, token, 0)
@@ -206,10 +215,13 @@ class ContextIRService:
 
     async def complete(self, task: ContextIRTask, token: str) -> None:
         try:
-            await self.deliver(task)
+            with stage("causyn.gpu.admission"):
+                await self.deliver(task)
         except RewriteError as exc:
             await self.fail(task, token, str(exc))
             return
+        if task.video_payload is not None and task.rewrite_completed_ns is not None:
+            interval("causyn.gpu.admission_wait", task.rewrite_completed_ns, time.time_ns())
         await self.settle(task)
         await self.finish(
             self.with_notification(
@@ -225,6 +237,13 @@ class ContextIRService:
         await self.store.save(failed, token)
         await self.settle(failed)
         await self.finish(failed.model_copy(update={"settled": True}), token)
+        interval(
+            "causyn.task.processing",
+            task.trace_created_ns or task.created_at * 1_000_000_000,
+            time.time_ns(),
+            root=True,
+            outcome="failed",
+        )
 
     async def wait(self, task_id: str) -> RewriteResult:
         async with asyncio.timeout(300):

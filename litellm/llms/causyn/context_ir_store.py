@@ -46,6 +46,8 @@ class ContextIRTask(BaseModel):
     request: ContextIRRequest
     created_at: int
     updated_at: int
+    trace_created_ns: int | None = None
+    rewrite_completed_ns: int | None = None
     status: Literal["queued", "running", "succeeded", "failed", "cancelled"] = "queued"
     result: RewriteResult | None = None
     error: str | None = None

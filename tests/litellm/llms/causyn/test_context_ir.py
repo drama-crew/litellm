@@ -744,3 +744,44 @@ async def test_gpu_admission_is_atomic_bounded_and_releases_terminal_tasks(redis
     await redis.set(status_key(ids[0]), "done")
     assert await submit("replacement") == "replacement"
     assert await redis.zcard(ACTIVE) == MAX_ADMITTED
+
+
+@pytest.mark.asyncio
+async def test_trace_survives_durable_retry_and_reports_rewrite_attempts(redis, monkeypatch):
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    from litellm.llms.causyn import task_telemetry as telemetry
+
+    exporter = InMemorySpanExporter()
+    monkeypatch.setattr(telemetry._state, "provider", None)
+    monkeypatch.setenv("CAUSYN_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://unused/v1/traces")
+    monkeypatch.setattr("opentelemetry.exporter.otlp.proto.http.trace_exporter.OTLPSpanExporter", lambda **kw: exporter)
+    calls = Counter()
+
+    async def interrupted(request):
+        calls["rewrite"] += 1
+        if calls["rewrite"] == 1:
+            raise RewriteError("private upstream error", retryable=True)
+        return RESULT
+
+    try:
+        service = ContextIRService(ContextIRStore(redis), rewrite=interrupted, settle=no_settle)
+        task = await service.create(spec(), owner="owner", billing=BillingIdentity())
+        await service.process(task.id)
+        restarted = ContextIRService(ContextIRStore(redis), rewrite=interrupted, settle=no_settle)
+        await restarted.process(task.id)
+        ready = await restarted.store.get(task.id)
+        assert ready.status == "succeeded"
+        assert ready.trace_created_ns == task.trace_created_ns
+        assert ready.rewrite_completed_ns >= task.trace_created_ns
+        telemetry._state.provider.force_flush()
+        spans = exporter.get_finished_spans()
+        assert {s.context.trace_id for s in spans} == {telemetry.identity(task.id)[0]}
+        rewrites = [s for s in spans if s.name == "causyn.prompt.rewrite"]
+        assert [s.attributes["causyn.attempt"] for s in rewrites] == [1, 2]
+        assert rewrites[0].status.is_ok is False
+        assert len([s for s in spans if s.name == "causyn.ir.queue"]) == 1
+        assert all(not s.events for s in spans)
+        assert telemetry.current_task() == ""
+    finally:
+        if telemetry._state.provider is not None:
+            telemetry._state.provider.shutdown()

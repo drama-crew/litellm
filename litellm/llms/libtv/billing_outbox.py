@@ -273,6 +273,15 @@ class LibTVBillingReconciler:
         return processed
 
     async def _reconcile_event(self, event: ImageBillingEvent | CausynBillingEvent) -> None:
+        if isinstance(event, CausynBillingEvent):
+            from litellm.llms.causyn.task_telemetry import stage, task_scope
+
+            with task_scope(event.provider_task_id), stage("causyn.billing.commit", phase=event.task_type):
+                await self._commit_event(event)
+            return
+        await self._commit_event(event)
+
+    async def _commit_event(self, event: ImageBillingEvent | CausynBillingEvent) -> None:
         db = getattr(self.prisma_client, "db", self.prisma_client)
         async with db.tx() as transaction:
             if isinstance(event, CausynBillingEvent):

@@ -48,12 +48,15 @@ from urllib.parse import SplitResult, urlsplit
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator, model_validator
 
-from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
-from litellm.llms.custom_llm import CustomLLM, CustomLLMError
-from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask, task_key, PREFIX as CONTEXT_IR_PREFIX
+from litellm.litellm_core_utils.asyncify import run_async_function  # pyright: ignore[reportUnknownVariableType]
+from litellm.llms.causyn.context_ir_store import PREFIX as CONTEXT_IR_PREFIX
+from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask, task_key
 from litellm.llms.causyn.h3_prompt import RewriteError
+from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
 from litellm.llms.causyn.vdn_geometry import pixel_budget, resolve_geometry
 from litellm.llms.causyn.video_prompt import VideoPromptInput, VideoSubmission, submit_video_prompt
+from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
+from litellm.llms.custom_llm import CustomLLM, CustomLLMError
 from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
 from litellm.llms.libtv.persistence import get_persistence
 from litellm.llms.libtv.transfer import get_transfer_redis
@@ -61,15 +64,15 @@ from litellm.llms.libtv.video_generate import (
     VideoGenerateError,
     VideoGenerateSettings,
     enqueue_video_generate,  # pyright: ignore[reportUnknownVariableType]  # legacy engine has untyped Redis ports
-    fetch_video_generate_task_metadata,
     fetch_video_generate_status,  # pyright: ignore[reportUnknownVariableType]  # legacy engine returns an untyped dict
+    fetch_video_generate_task_metadata,
     validate_video_generate_url,
 )
-from litellm.litellm_core_utils.asyncify import run_async_function  # pyright: ignore[reportUnknownVariableType]
 from litellm.types.utils import all_litellm_params
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
-from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
+
+from .task_telemetry import stage, task_scope
 
 CAUSYN_MODEL = "causyn-1.0"
 CAUSYN_H3_MODEL = "causyn-1.1"
@@ -1037,62 +1040,63 @@ class CausynVideoHandler(CustomLLM):
         # The worker result is the authoritative usage fact. The Redis metadata
         # key only carries immutable pricing/attribution captured at enqueue;
         # neither depends on the best-effort usage DB side channel.
-        try:
-            task_metadata = await fetch_video_generate_task_metadata(task_id, redis=self._redis_factory())
-        except Exception as exc:  # noqa: BLE001
-            raise _service_error() from exc
-        try:
-            durable = _TASK_METADATA_ADAPTER.validate_python(task_metadata)
-        except ValidationError as exc:
-            logger.warning("causyn video billing: task metadata is missing or invalid")
-            raise _service_error() from exc
-        if _metadata_model(durable) != spec.model:
-            raise _service_error()
-        requested_resolution, _ = _metadata_resolution(durable)
-        # Ordered durations are whole seconds (3..8), so a worker that rendered
-        # something other than what was ordered is off by at least a second.
-        # Anything smaller is frame quantisation, not a mismatch: the pipeline
-        # renders duration*24 + 1 frames at 24 fps, so every result comes back
-        # ~0.0417s long by construction. The previous abs_tol=1e-6 demanded
-        # equality and so rejected EVERY completed video -- and because a
-        # rejection here surfaces as a 503 on the status poll, which the
-        # platform treats as terminal, each one became a "生成失败" for a video
-        # that was already sitting in the object store. 45 of them before this
-        # was found.
-        if abs(durable.duration_seconds - result.duration_seconds) > _DURATION_RECONCILE_TOLERANCE_SECONDS:
-            logger.warning("causyn video billing: task metadata duration does not match worker result")
-            raise _service_error()
-        if not _result_geometry_matches(durable, result):
-            logger.warning("causyn video billing: task metadata resolution does not match worker result")
-            raise _service_error()
-        response.usage = _usage(result.duration_seconds, requested_resolution)
-        _set_response_cost(response, 0.0)
-        # Never bill above the quote. The two differ by that extra frame on every
-        # single render, so billing the worker's figure charged 5.0417s against a
-        # 5s quote every time.
-        try:
-            cost = _completion_cost(
-                durable.pricing, min(durable.duration_seconds, result.duration_seconds), requested_resolution
-            )
-        except ValueError as exc:
-            raise _service_error() from exc
-        attribution = durable.attribution.model_dump()
-        try:
-            event = CausynBillingEvent(
-                provider_task_id=task_id,
-                response_cost=cost,
-                team_id=attribution.get("team_id"),
-                user_id=attribution.get("user_id"),
-                organization_id=attribution.get("organization_id"),
-                api_key=attribution.get("api_key"),
-                model=spec.model,
-            )
-            enqueued = await self._billing_enqueue(self._redis_factory(), event)
-            if not enqueued:
-                raise RuntimeError("durable outbox did not accept the billing event")
-        except Exception as exc:  # noqa: BLE001  # status must remain retryable until durable delivery succeeds
-            raise _service_error() from exc
-        _set_response_cost(response, cost)
+        with task_scope(task_id), stage("causyn.billing.enqueue"):
+            try:
+                task_metadata = await fetch_video_generate_task_metadata(task_id, redis=self._redis_factory())
+            except Exception as exc:  # noqa: BLE001
+                raise _service_error() from exc
+            try:
+                durable = _TASK_METADATA_ADAPTER.validate_python(task_metadata)
+            except ValidationError as exc:
+                logger.warning("causyn video billing: task metadata is missing or invalid")
+                raise _service_error() from exc
+            if _metadata_model(durable) != spec.model:
+                raise _service_error()
+            requested_resolution, _ = _metadata_resolution(durable)
+            # Ordered durations are whole seconds (3..8), so a worker that rendered
+            # something other than what was ordered is off by at least a second.
+            # Anything smaller is frame quantisation, not a mismatch: the pipeline
+            # renders duration*24 + 1 frames at 24 fps, so every result comes back
+            # ~0.0417s long by construction. The previous abs_tol=1e-6 demanded
+            # equality and so rejected EVERY completed video -- and because a
+            # rejection here surfaces as a 503 on the status poll, which the
+            # platform treats as terminal, each one became a "生成失败" for a video
+            # that was already sitting in the object store. 45 of them before this
+            # was found.
+            if abs(durable.duration_seconds - result.duration_seconds) > _DURATION_RECONCILE_TOLERANCE_SECONDS:
+                logger.warning("causyn video billing: task metadata duration does not match worker result")
+                raise _service_error()
+            if not _result_geometry_matches(durable, result):
+                logger.warning("causyn video billing: task metadata resolution does not match worker result")
+                raise _service_error()
+            response.usage = _usage(result.duration_seconds, requested_resolution)
+            _set_response_cost(response, 0.0)
+            # Never bill above the quote. The two differ by that extra frame on every
+            # single render, so billing the worker's figure charged 5.0417s against a
+            # 5s quote every time.
+            try:
+                cost = _completion_cost(
+                    durable.pricing, min(durable.duration_seconds, result.duration_seconds), requested_resolution
+                )
+            except ValueError as exc:
+                raise _service_error() from exc
+            attribution = durable.attribution.model_dump()
+            try:
+                event = CausynBillingEvent(
+                    provider_task_id=task_id,
+                    response_cost=cost,
+                    team_id=attribution.get("team_id"),
+                    user_id=attribution.get("user_id"),
+                    organization_id=attribution.get("organization_id"),
+                    api_key=attribution.get("api_key"),
+                    model=spec.model,
+                )
+                enqueued = await self._billing_enqueue(self._redis_factory(), event)
+                if not enqueued:
+                    raise RuntimeError("durable outbox did not accept the billing event")
+            except Exception as exc:  # noqa: BLE001  # status must remain retryable until durable delivery succeeds
+                raise _service_error() from exc
+            _set_response_cost(response, cost)
 
     def _completed_response(
         self,
