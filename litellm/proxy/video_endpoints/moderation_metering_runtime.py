@@ -20,7 +20,7 @@ from litellm.proxy.video_endpoints.moderation_metering import (
     PhaseEvent,
     request_id,
 )
-from litellm.proxy.video_endpoints.moderation_metering_projection import BillingRoute, FinancialProjection
+from litellm.proxy.video_endpoints.moderation_metering_projection import BillingRoute, FinancialProjection, actual_debit
 from litellm.proxy.video_endpoints.openapi_log_capture import raw_method
 from litellm.types.videos.main import CharacterObject, VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider
@@ -247,6 +247,7 @@ async def _handoff(logging_obj: Logging, result: object, start_time: datetime, e
             completion_tokens=TypeAdapter[int | None](int | None).validate_python(usage.get("completion_tokens")),
         )
     )
+    raw_cost = TypeAdapter[Decimal | None](Decimal | None).validate_python(raw)
     event = PhaseEvent(
         binding=scope.binding,
         request_id=request_id(scope.binding, scope.phase),
@@ -255,9 +256,17 @@ async def _handoff(logging_obj: Logging, result: object, start_time: datetime, e
         deployment_id=deployment,
         native_id=result.id,
         provider_task_id=TypeAdapter(str).validate_python(decoded.get("video_id") or result.id),
-        amount=TypeAdapter[Decimal | None](Decimal | None).validate_python(raw),
-        finalized=raw is not None,
-        facts=facts,
+        amount=scope.previous.amount
+        if scope.previous is not None and scope.previous.finalized
+        else actual_debit(raw_cost)
+        if raw_cost is not None
+        else None,
+        finalized=scope.previous.finalized
+        if scope.previous is not None and scope.previous.finalized
+        else raw is not None,
+        facts=facts.with_actual(raw_cost)
+        if raw_cost is not None and not (scope.previous is not None and scope.previous.finalized)
+        else facts,
     )
     if scope.previous is not None and scope.previous.finalized:
         if (scope.previous.native_id, scope.previous.provider, scope.previous.deployment_id) != (
@@ -630,12 +639,15 @@ def actual_outbox_event(result: VideoObject, amount: float, occurred_at: str) ->
         deployment_id=TypeAdapter(str).validate_python(decoded.get("model_id")),
         native_id=result.id,
         provider_task_id=TypeAdapter(str).validate_python(decoded.get("video_id")),
-        amount=Decimal(str(amount)),
+        amount=actual_debit(Decimal(str(amount))),
         finalized=True,
-        facts=BillingFacts(
+        facts=scope.previous.facts.with_actual(Decimal(str(amount)))
+        if scope.previous is not None and not scope.previous.finalized and scope.previous.facts is not None
+        else BillingFacts(
             started_at=timestamp,
             ended_at=timestamp,
             route="avideo_status",
+            raw_cost_credit=Decimal(str(amount)),
             pricing=submission.pricing if submission else (),
             duration_seconds=TypeAdapter[Decimal | None](Decimal | None).validate_python(
                 (result.usage or {}).get("duration_seconds")
@@ -647,9 +659,15 @@ def actual_outbox_event(result: VideoObject, amount: float, occurred_at: str) ->
     )
     previous = scope.previous
     event = previous if previous is not None and previous.finalized else candidate
-    if (event.provider_task_id, event.amount, event.native_id) != (
+    if (
+        event.provider_task_id,
+        event.facts.raw_cost_credit
+        if event.facts is not None and event.facts.raw_cost_credit is not None
+        else event.amount,
+        event.native_id,
+    ) != (
         candidate.provider_task_id,
-        candidate.amount,
+        Decimal(str(amount)),
         candidate.native_id,
     ):
         raise ValueError("terminal actual outbox receipt conflict")

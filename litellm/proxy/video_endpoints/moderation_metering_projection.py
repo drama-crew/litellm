@@ -4,11 +4,19 @@ import hashlib
 import json
 import re
 from datetime import datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    TypeAdapter,
+    model_serializer,
+    model_validator,
+)
 
 from litellm.proxy.video_endpoints.openapi_logs import Database
 
@@ -25,6 +33,15 @@ BillingRoute = Literal[
 ]
 
 
+def actual_debit(raw: Decimal) -> Decimal:
+    if not raw.is_finite() or raw < 0 or raw >= Decimal("1000000000000"):
+        raise ValueError("actual Credit cost is outside ledger range")
+    debit = raw.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+    if debit >= Decimal("1000000000000"):
+        raise ValueError("actual Credit debit is outside ledger range")
+    return debit
+
+
 class BillingFacts(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     started_at: datetime
@@ -35,6 +52,21 @@ class BillingFacts(BaseModel):
     resolution: str | None = Field(default=None, max_length=24, pattern=r"^[A-Za-z0-9x]+$")
     prompt_tokens: int | None = Field(default=None, ge=0)
     completion_tokens: int | None = Field(default=None, ge=0)
+
+    raw_cost_credit: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_serializer(mode="wrap")
+    def serialize_facts(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        return {
+            key: value
+            for key, value in TypeAdapter(dict[str, object]).validate_python(handler(self)).items()
+            if key != "raw_cost_credit" or self.raw_cost_credit is not None
+        }
+
+    def with_actual(self, raw: Decimal) -> Self:
+        if self.raw_cost_credit is not None and self.raw_cost_credit != raw:
+            raise ValueError("immutable upstream cost changed")
+        return self.model_copy(update={"raw_cost_credit": raw})
 
     @model_validator(mode="after")
     def immutable_facts(self) -> Self:

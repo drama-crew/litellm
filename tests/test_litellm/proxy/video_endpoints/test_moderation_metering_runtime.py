@@ -347,7 +347,8 @@ async def test_post_provider_processing_failure_retains_native_without_paid_fall
     finally:
         runtime.CONTEXT.reset(token)
     assert len(calls) == 1
-    assert runtime.private_event(result)["amount"] == "2"
+    assert runtime.private_event(result)["amount"] == "2.000000"
+    assert runtime.private_event(result)["facts"]["raw_cost_credit"] == "2"
 
 
 @pytest.mark.asyncio

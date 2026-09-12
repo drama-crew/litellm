@@ -129,10 +129,21 @@ def actual_cost(task: ContextIRTask) -> float:
 
 
 def freeze_financial(task: ContextIRTask) -> ContextIRTask:
+    from decimal import Decimal
+
+    from litellm.proxy.video_endpoints.moderation_metering_projection import actual_debit
+
+    if (
+        task.financial_actual is not None
+        or task.financial_facts_json is not None
+        or task.financial_event_json is not None
+    ):
+        return task
+    raw = Decimal(str(actual_cost(task)))
     frozen = task.model_copy(
         update={
-            "financial_actual": actual_cost(task),
-            "financial_facts_json": financial_facts(task).model_dump_json(),
+            "financial_actual": float(actual_debit(raw)),
+            "financial_facts_json": financial_facts(task).with_actual(raw).model_dump_json(),
         }
     )
     phase = financial_event(frozen)

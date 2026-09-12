@@ -1935,6 +1935,13 @@ async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_o
     await service.process(task_id)
     task = await service.store.get(task_id)
     assert task.status == "succeeded" and task.settled and task.price == 4
+    assert context_ir.financial_facts(task).raw_cost_credit == Decimal(4)
+    assert context_ir.actual_cost(task) == 4
+    assert (
+        context_ir.freeze_financial(task.model_copy(update={"price": 999})).financial_facts_json
+        == task.financial_facts_json
+    )
+    assert context_ir.freeze_financial(task.model_copy(update={"price": 999})).financial_actual == task.financial_actual
     assert rewrite.await_count == 1
     assert await redis.xlen(prefix + "outbox") == 1
     worker = billing_outbox.LibTVBillingReconciler(
@@ -2330,3 +2337,104 @@ async def test_entry_fix1_historical_operation_precedes_new_global_configuration
     assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 3.0}]
     assert await redis.get(prefix + "spend:user:global-budget") is None
     assert float(await redis.get(prefix + "spend:team:team")) == 103
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw,charged",
+    [(25 * (119 / 24), "123.958333"), (1.0000005, "1.000001"), (0.000001, "0.000001"), (0.0000004, "0.000000")],
+)
+async def test_new_actual_quantum_is_same_in_receipt_sql_redis_and_logs(production_store, raw, charged):
+    from datetime import datetime, timezone
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+    from litellm.types.videos.main import VideoObject
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    meter, db, redis, prefix = production_store
+    await prepare_meter(meter, binding(), {})
+    result = VideoObject(
+        id=encode_video_id_with_provider("provider-task", "libtv", "deployment"), object="video", status="completed"
+    )
+    token = runtime.CONTEXT.set(runtime.Scope(binding(), "completion", meter))
+    try:
+        phase = runtime.actual_outbox_event(result, raw, datetime.now(timezone.utc).isoformat())
+    finally:
+        runtime.CONTEXT.reset(token)
+    assert phase.amount == Decimal(charged)
+    assert phase.facts.raw_cost_credit == Decimal(str(raw))
+    await meter.persist(phase)
+    await asyncio.gather(*(meter.run_once() for _ in range(3)))
+    restarted = MeteringStore.from_client(db, redis, namespace=prefix)
+    await restarted.persist(phase)
+    await restarted.run_once()
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": float(charged)}]
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_SpendLogs"') == [{"spend": float(charged)}]
+    assert Decimal(await redis.get(prefix + "spend:team:team")) == Decimal(charged)
+
+
+@pytest.mark.asyncio
+async def test_legacy_frozen_actual_hash_and_new_pending_raw_completion(production_store):
+    import hashlib
+    import json
+    from datetime import datetime, timezone
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+    from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
+    from litellm.types.videos.main import VideoObject
+    from litellm.types.videos.utils import encode_video_id_with_provider
+
+    meter, db, redis, prefix = production_store
+    await prepare_meter(meter, binding(), {})
+    result = VideoObject(
+        id=encode_video_id_with_provider("provider-task", "libtv", "deployment"), object="video", status="completed"
+    )
+    facts_json = '{"started_at":"2026-09-13T00:00:00Z","ended_at":"2026-09-13T00:00:00Z","route":"avideo_status","pricing":[],"duration_seconds":null,"resolution":null,"prompt_tokens":null,"completion_tokens":null}'
+    facts = BillingFacts.model_validate_json(facts_json)
+    assert facts.model_dump_json() == facts_json
+    legacy = event(amount="123.95833333333333").model_copy(update={"facts": facts, "native_id": result.id})
+    payload = legacy.model_dump_json()
+    assert "raw_cost_credit" not in payload
+    assert legacy.digest() == hashlib.sha256(payload.encode()).hexdigest()
+    await meter.persist(legacy)
+    token = runtime.CONTEXT.set(runtime.Scope(binding(), "completion", meter, previous=legacy))
+    try:
+        replay = runtime.actual_outbox_event(result, 25 * (119 / 24), datetime.now(timezone.utc).isoformat())
+    finally:
+        runtime.CONTEXT.reset(token)
+    assert replay.model_dump_json() == payload
+    await meter.run_once()
+    restarted = MeteringStore.from_client(db, redis, namespace=prefix)
+    await restarted.persist(PhaseEvent.model_validate_json(payload))
+    await restarted.run_once()
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 123.95833333333333}]
+    assert json.loads(payload)["facts"]["duration_seconds"] is None
+
+    other = binding().model_copy(update={"intent_id": "pending-quantum"})
+    await prepare_meter(meter, other, {})
+    unknown = event(amount=None).model_copy(
+        update={
+            "binding": other,
+            "request_id": "public-video:pending-quantum:completion",
+            "native_id": result.id,
+            "facts": facts,
+        }
+    )
+    await meter.persist(unknown)
+    await meter.run_once()
+    assert (await meter.settlement(other)).complete is False
+    token = runtime.CONTEXT.set(runtime.Scope(other, "completion", meter, previous=unknown))
+    try:
+        completed = runtime.actual_outbox_event(result, 0.0000004, datetime.now(timezone.utc).isoformat())
+    finally:
+        runtime.CONTEXT.reset(token)
+    await meter.persist(completed)
+    await meter.persist(unknown)
+    await meter.run_once()
+    assert completed.amount == 0
+    assert completed.facts.raw_cost_credit == Decimal("0.0000004")
+    assert completed.facts.model_copy(update={"raw_cost_credit": None}) == facts
+    with pytest.raises(ValueError, match="replay conflict"):
+        await meter.persist(
+            completed.model_copy(
+                update={"facts": completed.facts.model_copy(update={"raw_cost_credit": Decimal("0.0000003")})}
+            )
+        )

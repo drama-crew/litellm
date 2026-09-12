@@ -1088,13 +1088,15 @@ class CausynVideoHandler(CustomLLM):
 
                 happened_at = datetime.now(timezone.utc).isoformat()
                 phase_event = actual_outbox_event(response, cost, happened_at)
+                if phase_event is not None and phase_event.amount is None:
+                    raise ValueError("Trusted actual cost missing")
                 event = CausynBillingEvent(
                     occurred_at=happened_at,
                     deployment_id=spec.deployment_id,
                     metering_event_json=phase_event.model_dump_json() if phase_event else None,
                     moderation_intent_id=phase_event.binding.intent_id if phase_event else None,
                     provider_task_id=task_id,
-                    response_cost=cost,
+                    response_cost=float(phase_event.amount) if phase_event is not None else cost,
                     team_id=attribution.get("team_id"),
                     user_id=attribution.get("user_id"),
                     organization_id=attribution.get("organization_id"),

@@ -982,11 +982,11 @@ class LibTVLLM(CustomLLM):
         vo.usage = usage
         happened_at = datetime.now(timezone.utc).isoformat()
         phase = actual_outbox_event(vo, cost, happened_at)
-        if phase is None:
+        if phase is None or phase.amount is None:
             raise ValueError("Trusted financial scope missing")
         event = CausynBillingEvent(
             provider_task_id=task_id,
-            response_cost=cost,
+            response_cost=float(phase.amount),
             provider="libtv",
             model=scope.binding.model,
             api_key=scope.binding.fingerprint,

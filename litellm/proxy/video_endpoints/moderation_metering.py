@@ -7,16 +7,17 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Self
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
 
 from litellm.proxy.video_endpoints import moderation_metering_cache as cache
 from litellm.proxy.video_endpoints.moderation_metering_projection import (
     BillingFacts,
     FinancialProjection,
     LegacyMetadata,
+    actual_debit,
 )
 from litellm.proxy.video_endpoints.openapi_log_capture import RawDatabase, raw_method
 from litellm.proxy.video_endpoints.openapi_logs import Database
@@ -66,6 +67,16 @@ class PhaseEvent(BaseModel):
     unit: Literal["USD"] = "USD"
     finalized: bool = False
     facts: BillingFacts | None = None
+
+    @model_validator(mode="after")
+    def actual_matches_raw(self) -> Self:
+        if (
+            self.facts is not None
+            and self.facts.raw_cost_credit is not None
+            and (not self.finalized or self.amount != actual_debit(self.facts.raw_cost_credit))
+        ):
+            raise ValueError("actual debit does not match immutable upstream cost")
+        return self
 
     def digest(self) -> str:
         return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
@@ -416,7 +427,10 @@ class MeteringStore:
                         update={
                             "amount": previous.payload.amount,
                             "finalized": previous.payload.finalized,
-                            "facts": event.facts or previous.payload.facts,
+                            "facts": previous.payload.facts
+                            if previous.payload.facts is not None
+                            and event.facts == previous.payload.facts.model_copy(update={"raw_cost_credit": None})
+                            else event.facts or previous.payload.facts,
                         }
                     )
                     if predecessor == previous.payload:
@@ -424,6 +438,10 @@ class MeteringStore:
                 updates = {"amount": event.amount, "finalized": event.finalized}
                 if previous.payload.facts is None:
                     updates["facts"] = event.facts
+                elif event.finalized and event.facts is not None and previous.payload.facts.raw_cost_credit is None:
+                    updates["facts"] = previous.payload.facts.model_copy(
+                        update={"raw_cost_credit": event.facts.raw_cost_credit}
+                    )
                 if not previous.payload.native_id:
                     updates = {
                         **updates,
