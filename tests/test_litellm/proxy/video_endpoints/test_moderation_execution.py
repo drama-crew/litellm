@@ -166,3 +166,99 @@ async def test_character_download_timeout_is_not_provider_submission(monkeypatch
         )
     assert provider.await_count == 0
     assert execution.failure_outcome(error.value) == "not_sent"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_resume_replaces_body_cache_before_real_processor(monkeypatch):
+    import importlib
+
+    from starlette.requests import Request
+
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
+
+    auth_module = importlib.import_module("litellm.proxy.auth.user_api_key_auth")
+    monkeypatch.setattr(
+        auth_module,
+        "_user_api_key_auth_builder",
+        AsyncMock(return_value=UserAPIKeyAuth(api_key="key", end_user_id="owner")),
+    )
+    monkeypatch.setattr(auth_module, "_run_centralized_common_checks", AsyncMock())
+    parent = Request(
+        {"type": "http", "method": "POST", "path": "/internal/moderation/submit", "headers": [], "query_string": b""}
+    )
+    original = execution.execution_request(parent, {"model": "synthetic-model", "prompt": "approved"}, "/v1/videos")
+    auth = await execution.authenticate(original, "sk-synthetic")
+    cached = await _read_request_body(original)
+    assert cached == {"model": "synthetic-model", "prompt": "approved"}
+    seen = []
+
+    async def process(self, **kwargs):
+        seen.append(dict(self.data))
+        return VideoObject(id="native", object="video", status="queued")
+
+    monkeypatch.setattr(ProxyBaseLLMRequestProcessing, "base_process_llm_request", process)
+    await execution.invoke(original, auth, {"model": "synthetic-model", "prompt": "sealed-new"}, "avideo_generation")
+    assert seen[0]["num_retries"] == 0
+    assert seen[0]["prompt"] == "sealed-new"
+    assert await _read_request_body(original) == cached
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind,expected",
+    [
+        ("http-status", "rejected"),
+        ("http-exception", "rejected"),
+        ("proxy-exception", "rejected"),
+        ("connect", "not_sent"),
+        ("read", "ambiguous"),
+        ("write", "ambiguous"),
+        ("server", "ambiguous"),
+        ("rewritten-read", "ambiguous"),
+    ],
+)
+async def test_actual_endpoint_error_wrapping_preserves_submission_evidence(monkeypatch, kind, expected):
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import ProxyException
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+
+    request = httpx.Request("POST", "https://synthetic.invalid/videos")
+    errors = {
+        "http-status": httpx.HTTPStatusError(
+            "rejected", request=request, response=httpx.Response(422, request=request)
+        ),
+        "http-exception": HTTPException(422, "rejected"),
+        "proxy-exception": ProxyException(message="rejected", type="invalid_request_error", param=None, code=422),
+        "connect": httpx.ConnectError("not sent", request=request),
+        "rewritten-read": httpx.ReadTimeout("accepted then callback rewrites error", request=request),
+        "read": httpx.ReadTimeout("accepted response lost", request=request),
+        "write": httpx.WriteTimeout("partial transmission", request=request),
+        "server": httpx.HTTPStatusError(
+            "server unknown", request=request, response=httpx.Response(503, request=request)
+        ),
+    }
+
+    async def process(self, **kwargs):
+        raise errors[kind]
+
+    monkeypatch.setattr(ProxyBaseLLMRequestProcessing, "base_process_llm_request", process)
+    monkeypatch.setattr(
+        proxy_server.proxy_logging_obj,
+        "post_call_failure_hook",
+        AsyncMock(return_value=HTTPException(422, "redacted") if kind == "rewritten-read" else None),
+    )
+    monkeypatch.setattr(proxy_server.proxy_logging_obj, "post_call_response_headers_hook", AsyncMock(return_value=None))
+    parent = Request({"type": "http", "method": "POST", "path": "/v1/videos", "headers": [], "query_string": b""})
+    with pytest.raises(Exception) as wrapped:
+        await execution.invoke(
+            parent,
+            UserAPIKeyAuth(api_key="synthetic"),
+            {"model": "synthetic", "prompt": "synthetic"},
+            "avideo_generation",
+        )
+    assert isinstance(wrapped.value, (HTTPException, ProxyException))
+    assert execution.failure_outcome(wrapped.value) == expected

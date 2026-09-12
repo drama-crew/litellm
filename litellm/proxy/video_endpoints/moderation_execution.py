@@ -11,7 +11,7 @@ import jwt
 from fastapi import APIRouter, Header, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
-from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.video_endpoints import moderation_bridge as bridge
 from litellm.types.videos.main import CharacterObject, VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider
@@ -66,7 +66,12 @@ def authorize(ticket: str, authorization: str | None, purpose: str) -> Claims:
 
 def execution_request(request: Request, payload: dict[str, JsonValue], path: str, method: str = "POST") -> Request:
     scope = {
-        **request.scope,
+        **{
+            key: value
+            for key, value in request.scope.items()
+            if key not in {"parsed_body", "state", "route", "endpoint"}
+        },
+        "state": dict(request.scope.get("state", {})),
         "method": method,
         "path": path,
         "raw_path": path.encode(),
@@ -150,10 +155,28 @@ async def authenticate(request: Request, credential: str) -> UserAPIKeyAuth:
     )
 
 
-def failure_outcome(error: BaseException) -> str:
+def transport_outcome(error: BaseException, depth: int = 0) -> str | None:
     if isinstance(error, (PreflightFailure, httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)):
         return "not_sent"
-    if isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {400, 401, 402, 403, 404, 422, 429}:
+    rejected = {400, 401, 402, 403, 404, 422, 429}
+    if isinstance(error, httpx.HTTPStatusError):
+        return "rejected" if error.response.status_code in rejected else "ambiguous"
+    if isinstance(error, (httpx.ReadTimeout, httpx.WriteTimeout, httpx.ReadError, httpx.WriteError)):
+        return "ambiguous"
+    original = error.__cause__ or error.__context__
+    if original is not None and original is not error and depth < 16:
+        return transport_outcome(original, depth + 1)
+    return None
+
+
+def failure_outcome(error: BaseException) -> str:
+    evidence = transport_outcome(error)
+    if evidence is not None:
+        return evidence
+    rejected = {400, 401, 402, 403, 404, 422, 429}
+    if isinstance(error, HTTPException) and error.status_code in rejected:
+        return "rejected"
+    if isinstance(error, ProxyException) and error.code in {str(code) for code in rejected}:
         return "rejected"
     return "ambiguous"
 
@@ -193,9 +216,12 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
             execution.scope["causyn_context_ir_spec"] = ContextIRRequest.model_validate(payload)
             _safe_set_request_parsed_body(execution, {"model": AUTH_MODEL})
         auth = await authenticate(execution, TypeAdapter(str).validate_python(begin["credential"]))
-    except Exception:
+    except Exception as exc:
         await bridge.platform(
-            request, "POST", f"/intents/{claims.intent_id}/not-sent", {"token": token, "outcome": "not_sent"}
+            request,
+            "POST",
+            f"/intents/{claims.intent_id}/not-sent",
+            {"token": token, "outcome": "rejected" if failure_outcome(exc) == "rejected" else "not_sent"},
         )
         raise
     try:
@@ -336,6 +362,19 @@ async def collect(body: Ticket, request: Request, authorization: Annotated[str |
             "staging_key": stored.get("staging_key"),
             "media_type": "video",
         }
+        if result.status == "completed" and not facts["url"] and not facts["staging_key"]:
+            from litellm.proxy.video_endpoints.moderation_content import materialize_content
+
+            facts = {
+                **facts,
+                **await materialize_content(
+                    request,
+                    auth,
+                    native_id,
+                    intent_id=claims.intent_id,
+                    ticket=TypeAdapter(str).validate_python(task["upload_ticket"]),
+                ),
+            }
     await bridge.platform(
         request,
         "POST",

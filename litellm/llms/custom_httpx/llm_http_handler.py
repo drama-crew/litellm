@@ -6940,6 +6940,15 @@ class BaseLLMHTTPHandler:
             variant=variant,
         )
 
+        from litellm.videos.content_sink import VIDEO_CONTENT_SINK, stream_content_to_sink
+
+        sink = VIDEO_CONTENT_SINK.get()
+        if sink is not None:
+            if not video_content_provider_config.video_content_is_binary or data:
+                raise ValueError("Provider content adapter does not support bounded binary import")
+            await stream_content_to_sink(async_httpx_client.client, url, headers, sink)
+            return b""
+
         try:
             # Use POST if params contains data (e.g., Vertex AI fetchPredictOperation)
             # Otherwise use GET (e.g., OpenAI video content download)

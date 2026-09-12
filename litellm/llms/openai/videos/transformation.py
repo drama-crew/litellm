@@ -37,6 +37,8 @@ else:
 
 
 class OpenAIVideoConfig(BaseVideoConfig):
+    video_content_is_binary: bool = True
+
     """
     Configuration class for OpenAI video generation.
     """

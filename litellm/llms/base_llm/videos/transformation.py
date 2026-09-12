@@ -31,6 +31,8 @@ else:
 
 
 class BaseVideoConfig(ABC):
+    video_content_is_binary: bool = False
+
     def __init__(self):
         pass
 

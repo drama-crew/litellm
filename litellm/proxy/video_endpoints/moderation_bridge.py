@@ -487,7 +487,10 @@ async def source_descriptor(
         raise HTTPException(409, "Source video is not complete")
     url = result._hidden_params.get("url")
     if not isinstance(url, str):
-        raise HTTPException(409, "Source video has no retrievable media")
+        from litellm.proxy.video_endpoints.moderation_content import materialize_content
+
+        materialized = await materialize_content(request, auth, source_id)
+        url = materialized["private_reference"]
     return {"requested_id": requested, "native_id": source_id, "model": model or result.model, "url": url}
 
 
