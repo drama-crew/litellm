@@ -76,7 +76,7 @@ class ImageBillingEvent:
         return cls(
             deployment_id=str(value["deployment_id"]),
             provider_task_id=str(value.get("provider_task_id") or value["task_id"]),
-            response_cost=float(value.get("response_cost", value.get("spend", 0.0))),
+            response_cost=float(value["response_cost"] if "response_cost" in value else value["spend"]),
             team_id=_optional_str(value.get("team_id")),
             user_id=_optional_str(value.get("user_id")),
             organization_id=_optional_str(value.get("organization_id", value.get("org_id"))),
@@ -110,6 +110,10 @@ class CausynBillingEvent:
     provider: Literal["causyn", "libtv"] = "causyn"
     request_id_override: str | None = None
     moderation_intent_id: str | None = None
+    metering_event_json: str | None = None
+    billing_facts_json: str | None = None
+    deployment_id: str = ""
+    reservation_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.event_id:
@@ -149,7 +153,7 @@ class CausynBillingEvent:
         return cls(
             task_type="h3_context_ir" if task_type == "h3_context_ir" else "video_generation",
             provider_task_id=str(value["provider_task_id"]),
-            response_cost=float(value.get("response_cost", value.get("spend", 0.0))),
+            response_cost=float(value["response_cost"] if "response_cost" in value else value["spend"]),
             team_id=_optional_str(value.get("team_id")),
             user_id=_optional_str(value.get("user_id")),
             organization_id=_optional_str(value.get("organization_id", value.get("org_id"))),
@@ -160,6 +164,10 @@ class CausynBillingEvent:
             provider=provider,
             request_id_override=_optional_str(value.get("request_id_override")),
             moderation_intent_id=_optional_str(value.get("moderation_intent_id")),
+            metering_event_json=_optional_str(value.get("metering_event_json")),
+            billing_facts_json=_optional_str(value.get("billing_facts_json")),
+            deployment_id=str(value.get("deployment_id") or ""),
+            reservation_id=_optional_str(value.get("reservation_id")),
         )
 
 
@@ -283,11 +291,14 @@ class LibTVBillingReconciler:
         events = await self._read_events()
         processed = 0
         for event_id, fields in events:
-            event = _event_from_stream(fields)
             try:
-                await self._reconcile_event(event)
-            except BudgetAuthorityDependencyPending:
-                logger.warning("billing authority dependency pending: %s", event.request_id)
+                event = _event_from_stream(fields)
+            except (ValueError, TypeError, KeyError):
+                logger.warning("billing outbox event awaits durable reconciliation")
+                continue
+            outcome = await asyncio.gather(self._reconcile_event(event), return_exceptions=True)
+            if isinstance(outcome[0], BaseException):
+                logger.warning("billing outbox event awaits durable reconciliation")
                 continue
             await self.redis.xack(self.stream_key, self.consumer_group, event_id)
             processed += 1
@@ -303,17 +314,10 @@ class LibTVBillingReconciler:
         await self._commit_event(event)
 
     async def _commit_event(self, event: ImageBillingEvent | CausynBillingEvent) -> None:
-        from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_authority
+        from litellm.proxy.video_endpoints.moderation_metering_outbox import settle_outbox
 
-        targets = (
-            ("key", event.api_key),
-            ("team", event.team_id),
-            ("user", event.user_id),
-            ("org", event.organization_id),
-        )
-        for kind, identity in targets:
-            if identity and await protected_authority("spend:" + kind + ":" + identity) is not None:
-                raise BudgetAuthorityDependencyPending("protected outbox requires B1-entry actual receipt authority")
+        if await settle_outbox(event):
+            return
         db = getattr(self.prisma_client, "db", self.prisma_client)
         async with db.tx() as transaction:
             if isinstance(event, CausynBillingEvent):

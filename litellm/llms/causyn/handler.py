@@ -1082,7 +1082,17 @@ class CausynVideoHandler(CustomLLM):
                 raise _service_error() from exc
             attribution = durable.attribution.model_dump()
             try:
+                from datetime import datetime, timezone
+
+                from litellm.proxy.video_endpoints.moderation_metering_runtime import actual_outbox_event
+
+                happened_at = datetime.now(timezone.utc).isoformat()
+                phase_event = actual_outbox_event(response, cost, happened_at)
                 event = CausynBillingEvent(
+                    occurred_at=happened_at,
+                    deployment_id=spec.deployment_id,
+                    metering_event_json=phase_event.model_dump_json() if phase_event else None,
+                    moderation_intent_id=phase_event.binding.intent_id if phase_event else None,
                     provider_task_id=task_id,
                     response_cost=cost,
                     team_id=attribution.get("team_id"),
@@ -1095,7 +1105,10 @@ class CausynVideoHandler(CustomLLM):
                 if not enqueued:
                     raise RuntimeError("durable outbox did not accept the billing event")
             except Exception as exc:  # noqa: BLE001  # status must remain retryable until durable delivery succeeds
-                raise _service_error() from exc
+                from litellm.proxy.video_endpoints.moderation_metering_runtime import private_event
+
+                if private_event(response) is None:
+                    raise _service_error() from exc
             _set_response_cost(response, cost)
 
     def _completed_response(

@@ -1581,6 +1581,14 @@ def client(original_function):
         print_args_passed_to_litellm(original_function, args, kwargs)
         start_time = datetime.datetime.now()
         result = None
+        accepted_result = None
+        moderation_metering_runtime = sys.modules.get("litellm.proxy.video_endpoints.moderation_metering_runtime")
+        if moderation_metering_runtime is not None and moderation_metering_runtime.cache_scope() is not None:
+            kwargs.pop("cache_key", None)
+            if isinstance(kwargs.get("litellm_params"), dict):
+                kwargs["litellm_params"] = {
+                    key: value for key, value in kwargs["litellm_params"].items() if key != "preset_cache_key"
+                }
         _update_response_metadata = getattr(sys.modules[__name__], "update_response_metadata")
         logging_obj: Optional[LiteLLMLoggingObject] = kwargs.get("litellm_logging_obj", None)
         LLMCachingHandler = _get_cached_llm_caching_handler()
@@ -1609,6 +1617,8 @@ def client(original_function):
             moderation_metering_runtime = sys.modules.get("litellm.proxy.video_endpoints.moderation_metering_runtime")
             if moderation_metering_runtime is not None:
                 moderation_metering_runtime.attach(logging_obj, call_type)
+                if moderation_metering_runtime.cache_scope() is not None:
+                    kwargs.pop("cache_key", None)
 
             modified_kwargs = await async_pre_call_deployment_hook(kwargs, call_type)
             if modified_kwargs is not None:
@@ -1651,6 +1661,10 @@ def client(original_function):
                     _caching_handler_response.cached_result is not None
                     and _caching_handler_response.final_embedding_cached_response is None
                 ):
+                    if moderation_metering_runtime is not None:
+                        _caching_handler_response.cached_result = await moderation_metering_runtime.cached_handoff(
+                            logging_obj, _caching_handler_response.cached_result
+                        )
                     return _caching_handler_response.cached_result
 
                 elif _caching_handler_response.embedding_all_elements_cache_hit is True:
@@ -1691,6 +1705,7 @@ def client(original_function):
 
             # MODEL CALL
             result = await original_function(*args, **kwargs)
+            accepted_result = result
             end_time = datetime.datetime.now()
 
             if moderation_metering_runtime is not None:
@@ -1802,6 +1817,12 @@ def client(original_function):
 
             return result
         except Exception as e:
+            if (
+                accepted_result is not None
+                and moderation_metering_runtime is not None
+                and moderation_metering_runtime.private_event(accepted_result) is not None
+            ):
+                return accepted_result
             traceback_exception = traceback.format_exc()
             end_time = datetime.datetime.now()
             if logging_obj and not _is_litellm_internal_call:

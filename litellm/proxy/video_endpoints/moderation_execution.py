@@ -14,7 +14,6 @@ from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.video_endpoints import moderation_bridge as bridge
 from litellm.types.videos.main import CharacterObject, VideoObject
-from litellm.types.videos.utils import decode_video_id_with_provider
 
 
 class Ticket(BaseModel):
@@ -29,7 +28,7 @@ class Claims(BaseModel):
     model: str
     policy_version: str
     policy_digest: str
-    purpose: Literal["submit", "collect", "cancel"]
+    purpose: Literal["submit", "collect", "cancel", "settlement"]
 
 
 class BillingContext(BaseModel):
@@ -216,6 +215,10 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
             execution.scope["causyn_context_ir_spec"] = ContextIRRequest.model_validate(payload)
             _safe_set_request_parsed_body(execution, {"model": AUTH_MODEL})
         auth = await authenticate(execution, TypeAdapter(str).validate_python(begin["credential"]))
+        from litellm.proxy.video_endpoints.moderation_metering_entry import attest
+
+        attest(execution, begin["metering"])
+        execution.scope["moderation_public_receipt"] = (claims.intent_id, token)
     except Exception as exc:
         await bridge.platform(
             request,
@@ -245,45 +248,25 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
                 request, "POST", f"/intents/{claims.intent_id}/not-sent", {"token": token, "outcome": outcome}
             )
         raise
-    decoded = decode_video_id_with_provider(native_id)
-    provider = decoded.get("custom_llm_provider") or ("context_ir" if route == "context_ir" else "unknown")
-    provider_id = decoded.get("video_id") or native_id
-    request_id = (
-        "causyn-context-ir:" + native_id
-        if route == "context_ir"
-        else "causyn:" + provider_id
-        if provider == "causyn"
-        else "public-video:" + claims.intent_id
-    )
-    await bridge.platform(
-        request,
-        "POST",
-        f"/intents/{claims.intent_id}/receipt",
-        {
-            "token": token,
-            "native_id": native_id,
-            "billing": {
-                "request_id": request_id,
-                "provider": provider,
-                "provider_task_id": provider_id,
-                "deployment_id": decoded.get("model_id"),
-                "status": "pending",
-                "request_ids": [
-                    request_id,
-                    "public-video:" + claims.intent_id + ":submit",
-                    "public-video:" + claims.intent_id + ":completion",
-                ],
-                "pricing_snapshot": bridge.JSON_OBJECT.validate_python(
-                    result._hidden_params.get("billing_pricing_snapshot") or {}
-                )
-                if isinstance(result, VideoObject)
-                else {},
-                "usage_snapshot": bridge.JSON_OBJECT.validate_python(result.usage or {})
-                if isinstance(result, VideoObject)
-                else {},
+    if route != "context_ir":
+        await bridge.capture(execution, result)
+    else:
+        await bridge.platform(
+            request,
+            "POST",
+            f"/intents/{claims.intent_id}/receipt",
+            {
+                "token": token,
+                "native_id": native_id,
+                "billing": {
+                    "request_id": "causyn-context-ir:" + native_id,
+                    "metering_event": execution.scope["moderation_context_ir_event"].model_dump(mode="json"),
+                    "provider": "causyn",
+                    "provider_task_id": native_id,
+                    "status": "pending",
+                },
             },
-        },
-    )
+        )
     if isinstance(result, CharacterObject):
         await bridge.platform(
             request,
@@ -320,6 +303,16 @@ async def collect(body: Ticket, request: Request, authorization: Annotated[str |
         ir = await get_context_ir_service().store.get(native_id)
         if ir is None or ir.status not in {"succeeded", "failed", "cancelled"}:
             return {"accepted": False}
+        from litellm.llms.causyn.context_ir import financial_event
+
+        phase = financial_event(ir)
+        if phase is not None:
+            await bridge.platform(
+                request,
+                "POST",
+                f"/intents/{claims.intent_id}/financial-event",
+                {"ticket": body.ticket, "native_id": native_id, "metering_event": phase.model_dump(mode="json")},
+            )
         facts = {"status": ir.status, "content": ir.public().get("content"), "media_type": "text"}
     elif task["route"] == "avideo_create_character":
         from litellm.proxy.video_endpoints.endpoints import video_get_character
@@ -337,6 +330,10 @@ async def collect(body: Ticket, request: Request, authorization: Annotated[str |
         from litellm.proxy.video_endpoints.endpoints import video_status
 
         execution = execution_request(request, {}, "/v1/videos/" + native_id, "GET")
+        from litellm.proxy.video_endpoints.moderation_metering_entry import attest
+
+        attest(execution, task["metering"], phase="completion")
+        execution.scope["moderation_financial_read_ticket"] = body.ticket
         execution.scope["headers"] = [
             *execution.scope["headers"],
             (b"x-litellm-call-id", ("public-video:" + claims.intent_id + ":completion").encode()),
@@ -412,3 +409,36 @@ async def cancel(body: Ticket, request: Request, authorization: Annotated[str | 
         },
     )
     return {"action": action}
+
+
+@router.post("/settlement", include_in_schema=False)
+async def settlement(body: Ticket, request: Request, authorization: Annotated[str | None, Header()] = None):
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
+    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, PhaseEvent
+
+    claims = authorize(body.ticket, authorization, "settlement")
+    authority = await bridge.platform(
+        request, "POST", f"/intents/{claims.intent_id}/settlement-authority", {"ticket": body.ticket}
+    )
+    store = metering.store()
+    binding = await store.binding(claims.intent_id)
+    if binding.intent_id != claims.intent_id or binding.request_digest != claims.request_digest:
+        raise HTTPException(403, "Settlement intent identity mismatch")
+    if authority.get("binding") is not None and BillingBinding.model_validate(authority["binding"]) != binding:
+        raise HTTPException(403, "Settlement actor identity mismatch")
+    proof = bridge.JSON_OBJECT.validate_python(authority.get("recovery_binding") or {})
+    if proof and any(binding.model_dump(mode="json").get(key) != value for key, value in proof.items()):
+        raise HTTPException(403, "Settlement recovery admission mismatch")
+    if not proof and authority.get("binding") is None:
+        raise HTTPException(403, "Settlement admission required")
+    for value in bridge.JSON_OBJECT.validate_python(authority.get("events") or {}).values():
+        event = PhaseEvent.model_validate(value)
+        if event.binding != binding or event.native_id != authority["native_id"]:
+            raise HTTPException(403, "Settlement provider binding mismatch")
+        await store.persist(event)
+    events: list[PhaseEvent] = []
+    for phase in binding.expected_phases:
+        event = await store.phase(binding.intent_id, phase)
+        if event is not None and event.native_id:
+            events.append(event)
+    return (await store.settlement(binding)).model_copy(update={"events": tuple(events)}).model_dump(mode="json")

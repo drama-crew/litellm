@@ -987,7 +987,13 @@ class LLMCachingHandler:
                         )
                     )
             else:
-                asyncio.create_task(litellm.cache.async_add_cache(result, **new_kwargs))
+                import sys
+
+                metering = sys.modules.get("litellm.proxy.video_endpoints.moderation_metering_runtime")
+                if metering is not None and metering.cache_scope() is not None:
+                    await litellm.cache.async_add_cache(result, **new_kwargs)
+                else:
+                    asyncio.create_task(litellm.cache.async_add_cache(result, **new_kwargs))
 
     def sync_set_cache(
         self,

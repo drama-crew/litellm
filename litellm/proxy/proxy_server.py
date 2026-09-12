@@ -764,6 +764,11 @@ def cleanup_router_config_variables():
 async def proxy_shutdown_event():
     global prisma_client, master_key, user_custom_auth, user_custom_key_generate, user_custom_key_update
     global _libtv_billing_reconciler, _causyn_billing_reconciler, _libtv_account_health_prober
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import RECOVERY
+
+    if RECOVERY.consumer is not None:
+        await RECOVERY.consumer.stop()
+        RECOVERY.consumer = None
     verbose_proxy_logger.info("Shutting down LiteLLM Proxy Server")
     if _libtv_account_health_prober is not None:
         try:
@@ -1098,6 +1103,10 @@ async def proxy_startup_event(app: FastAPI):
 
     ## Initialize shared aiohttp session for connection reuse
     shared_aiohttp_session = await _initialize_shared_aiohttp_session()
+
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import RECOVERY, start_recovery
+
+    RECOVERY.consumer = await start_recovery()
 
     from litellm.llms.libtv.billing_outbox import (
         start_causyn_billing_reconciler,

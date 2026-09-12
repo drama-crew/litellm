@@ -6,8 +6,9 @@ import os
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
+from enum import Enum
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, JsonValue, TypeAdapter
@@ -19,6 +20,7 @@ from litellm.proxy.video_endpoints.moderation_metering import (
     PhaseEvent,
     request_id,
 )
+from litellm.proxy.video_endpoints.moderation_metering_projection import BillingRoute, FinancialProjection
 from litellm.proxy.video_endpoints.openapi_log_capture import raw_method
 from litellm.types.videos.main import CharacterObject, VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider
@@ -33,11 +35,22 @@ class Scope:
     binding: BillingBinding
     phase: str
     store: MeteringStore
+    previous: PhaseEvent | None = None
+    submission: PhaseEvent | None = None
+
+
+class Ownership(str, Enum):
+    PROTECTED = "protected-v1"
+    DEFERRED_IMAGE = "deferred-image-v1"
 
 
 CONTEXT: ContextVar[Scope | None] = ContextVar("moderation_metering_scope", default=None)
 SCOPE_KEY = "_moderation_metering_scope"
 EVENT_KEY = "_moderation_metering_event"
+CALL_TYPE_KEY = "_moderation_call_type"
+DEFERRED_KEY = "_deferred_outbox_billing"
+HANDOFF_TIMEOUT = 5.0
+HANDOFFS: set[asyncio.Task[None]] = set()
 CALL_TYPES = frozenset(
     ("avideo_generation", "avideo_remix", "avideo_edit", "avideo_extension", "avideo_status", "avideo_create_character")
 )
@@ -65,7 +78,7 @@ async def counter_mode(counter_key: str) -> bool:
             raise ValueError("protected budget writer requires Redis")
         return False
     try:
-        mode = await redis_cache.async_get_cache(key="protected:mode")
+        mode = await raw_method(redis_cache, "async_get_cache")(key="protected:mode")
     except Exception:
         if configured() or getattr(redis_cache, "protected_budget_mode", False) is True:
             raise
@@ -83,7 +96,9 @@ def store() -> MeteringStore:
     redis_cache = proxy_server.spend_counter_cache.redis_cache
     if proxy_server.prisma_client is None or redis_cache is None:
         raise ValueError("moderation metering requires durable SQL and Redis")
-    redis = redis_cache.init_async_client()
+    redis = TypeAdapter[Callable[[], object]](Callable[[], object]).validate_python(
+        getattr(redis_cache, "init_async_client")
+    )()
     namespace = redis_cache.check_and_fix_namespace("")
     return MeteringStore.from_client(
         proxy_server.prisma_client, RedisAdapter(raw_method(redis, "eval")), namespace=namespace
@@ -116,30 +131,51 @@ async def continuation(intent_id: str, phase: str) -> Scope:
     binding = await authority.binding(intent_id)
     if phase not in binding.expected_phases:
         raise ValueError("moderation billing phase mismatch")
-    return Scope(binding, phase, authority)
+    return Scope(
+        binding, phase, authority, await authority.phase(intent_id, phase), await authority.phase(intent_id, "submit")
+    )
 
 
 def attach(logging_obj: Logging, call_type: str) -> None:
     scope = CONTEXT.get()
     if scope is not None and call_type in CALL_TYPES:
-        logging_obj.model_call_details[SCOPE_KEY] = scope
+        setattr(logging_obj, SCOPE_KEY, scope)
+        setattr(logging_obj, CALL_TYPE_KEY, call_type)
+        logging_obj.model_call_details[SCOPE_KEY] = Ownership.PROTECTED
 
 
 def owns(value: object) -> bool:
-    return isinstance(value, Scope)
+    return isinstance(value, Scope) or value is Ownership.PROTECTED
 
 
 async def handoff(logging_obj: Logging, result: object, start_time: datetime, end_time: datetime) -> None:
+    async def bounded() -> None:
+        async with asyncio.timeout(HANDOFF_TIMEOUT):
+            await _handoff(logging_obj, result, start_time, end_time)
+
+    task = asyncio.create_task(bounded(), name="moderation-private-handoff")
+    HANDOFFS.add(task)
+    task.add_done_callback(HANDOFFS.discard)
+    delivery = asyncio.gather(task, return_exceptions=True)
+    cancelled: asyncio.CancelledError | None = None
     try:
-        await _handoff(logging_obj, result, start_time, end_time)
-    except Exception:
+        outcome = await asyncio.shield(delivery)
+    except asyncio.CancelledError as exc:
+        cancelled = exc
+        outcome = await asyncio.shield(delivery)
+    if isinstance(outcome[0], BaseException):
         if isinstance(result, (VideoObject, CharacterObject)):
-            result._hidden_params["_moderation_metering_pending"] = True
+            result._hidden_params = {
+                **result._hidden_params,
+                "_moderation_metering_pending": True,
+            }
         logging.getLogger(__name__).warning("moderation metering result retains unknown financial phase")
+    if cancelled is not None:
+        raise cancelled
 
 
 async def _handoff(logging_obj: Logging, result: object, start_time: datetime, end_time: datetime) -> None:
-    scope = logging_obj.model_call_details.get(SCOPE_KEY)
+    scope = getattr(logging_obj, SCOPE_KEY, None)
     if not isinstance(scope, Scope) or not isinstance(result, (VideoObject, CharacterObject)):
         return
     if (
@@ -148,15 +184,69 @@ async def _handoff(logging_obj: Logging, result: object, start_time: datetime, e
         and result.status not in ("completed", "failed", "cancelled")
     ):
         return
-    logging_obj._process_hidden_params_and_response_cost(result, start_time, end_time, emit=False)
+    existing = getattr(result, EVENT_KEY, None)
+    if isinstance(existing, PhaseEvent):
+        await scope.store.persist(existing)
+        return
+    TypeAdapter(Callable[[object, datetime, datetime, bool], None]).validate_python(
+        getattr(logging_obj, "_process_hidden_params_and_response_cost")
+    )(result, start_time, end_time, False)
+    hidden = TypeAdapter(dict[str, object]).validate_python(getattr(result, "_hidden_params", {}))
     raw = logging_obj.model_call_details.get("response_cost")
     decoded = decode_video_id_with_provider(result.id)
     provider = TypeAdapter(str).validate_python(
-        decoded.get("custom_llm_provider") or logging_obj.custom_llm_provider or ""
+        decoded.get("custom_llm_provider") or getattr(logging_obj, "custom_llm_provider", None) or ""
     )
     params = TypeAdapter(dict[str, object]).validate_python(logging_obj.model_call_details.get("litellm_params") or {})
-    model_info = TypeAdapter(dict[str, JsonValue]).validate_python(params.get("model_info") or {})
-    deployment = TypeAdapter(str).validate_python(decoded.get("model_id") or model_info.get("id") or "")
+    metadata = TypeAdapter(dict[str, object]).validate_python(
+        params.get("litellm_metadata") or params.get("metadata") or {}
+    )
+    model_info = TypeAdapter(dict[str, JsonValue]).validate_python(
+        hidden.get("billing_pricing_snapshot") or metadata.get("model_info") or params.get("model_info") or {}
+    )
+    submission = scope.submission
+    deployment = TypeAdapter(str).validate_python(
+        submission.deployment_id
+        if submission is not None and submission.native_id == result.id
+        else model_info.get("id") or decoded.get("model_id") or ""
+    )
+    from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
+
+    usage = (
+        TypeAdapter(dict[str, JsonValue]).validate_python(result.usage or {}) if isinstance(result, VideoObject) else {}
+    )
+    if scope.phase == "submit" and provider in {"libtv", "causyn"}:
+        raw = Decimal(0)
+    elif scope.phase == "completion" and (
+        provider not in {"libtv", "causyn"}
+        or isinstance(result, VideoObject)
+        and result.status in {"failed", "cancelled"}
+    ):
+        raw = Decimal(0)
+    elif raw == 0 and "response_cost" not in hidden and not usage.get("duration_seconds"):
+        raw = None
+    facts = (
+        scope.previous.facts
+        if scope.previous is not None and scope.previous.facts is not None
+        else BillingFacts(
+            started_at=start_time.replace(tzinfo=timezone.utc) if start_time.tzinfo is None else start_time,
+            ended_at=end_time.replace(tzinfo=timezone.utc) if end_time.tzinfo is None else end_time,
+            route=TypeAdapter[BillingRoute](BillingRoute).validate_python(getattr(logging_obj, CALL_TYPE_KEY, None)),
+            pricing=tuple(
+                sorted(
+                    (key, Decimal(str(value)))
+                    for key, value in model_info.items()
+                    if key.startswith(("output_cost_per_", "input_cost_per_"))
+                    and isinstance(value, (int, float))
+                    and not isinstance(value, bool)
+                )
+            ),
+            duration_seconds=TypeAdapter[Decimal | None](Decimal | None).validate_python(usage.get("duration_seconds")),
+            resolution=TypeAdapter[str | None](str | None).validate_python(usage.get("video_resolution")),
+            prompt_tokens=TypeAdapter[int | None](int | None).validate_python(usage.get("prompt_tokens")),
+            completion_tokens=TypeAdapter[int | None](int | None).validate_python(usage.get("completion_tokens")),
+        )
+    )
     event = PhaseEvent(
         binding=scope.binding,
         request_id=request_id(scope.binding, scope.phase),
@@ -165,15 +255,24 @@ async def _handoff(logging_obj: Logging, result: object, start_time: datetime, e
         deployment_id=deployment,
         native_id=result.id,
         provider_task_id=TypeAdapter(str).validate_python(decoded.get("video_id") or result.id),
-        amount=TypeAdapter(Decimal | None).validate_python(raw),
+        amount=TypeAdapter[Decimal | None](Decimal | None).validate_python(raw),
         finalized=raw is not None,
+        facts=facts,
     )
-    result._hidden_params[EVENT_KEY] = event.model_dump(mode="json")
+    if scope.previous is not None and scope.previous.finalized:
+        if (scope.previous.native_id, scope.previous.provider, scope.previous.deployment_id) != (
+            event.native_id,
+            event.provider,
+            event.deployment_id,
+        ):
+            raise ValueError("metering native receipt changed")
+        event = scope.previous
+    setattr(result, EVENT_KEY, event)
     try:
         async with asyncio.timeout(5):
             await scope.store.persist(event)
     except Exception:
-        result._hidden_params["_moderation_metering_pending"] = True
+        result._hidden_params = {**hidden, "_moderation_metering_pending": True}
         logging.getLogger(__name__).warning(
             "moderation metering native result awaits durable financial recovery", exc_info=True
         )
@@ -182,10 +281,10 @@ async def _handoff(logging_obj: Logging, result: object, start_time: datetime, e
 def private_event(result: object) -> dict[str, JsonValue] | None:
     if not isinstance(result, (VideoObject, CharacterObject)):
         return None
-    value = result._hidden_params.get(EVENT_KEY)
-    if value is None:
+    value = getattr(result, EVENT_KEY, None)
+    if not isinstance(value, PhaseEvent):
         return None
-    return TypeAdapter(dict[str, JsonValue]).validate_python(PhaseEvent.model_validate(value).model_dump(mode="json"))
+    return TypeAdapter(dict[str, JsonValue]).validate_python(value.model_dump(mode="json"))
 
 
 async def check_budget(counter_key: str) -> None:
@@ -326,18 +425,18 @@ async def settle_legacy(
     tags: tuple[str, ...],
     amount: float | None,
     reservation_id: str | None,
+    financial: FinancialProjection | None = None,
 ) -> Projection:
     from litellm.proxy.proxy_server import litellm_proxy_budget_name
     from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, ProtectedBudgetStore
 
+    global_user_id = (
+        financial.global_user_id if financial else litellm_proxy_budget_name if litellm.max_budget > 0 else None
+    )
     targets = (
         *((BudgetIdentity(kind="key", identity=token),) if token else ()),
         *((BudgetIdentity(kind="user", identity=user_id),) if user_id else ()),
-        *(
-            (BudgetIdentity(kind="user", identity=litellm_proxy_budget_name),)
-            if litellm.max_budget > 0 and litellm_proxy_budget_name
-            else ()
-        ),
+        *((BudgetIdentity(kind="user", identity=global_user_id),) if global_user_id else ()),
         *((BudgetIdentity(kind="team", identity=team_id),) if team_id else ()),
         *((BudgetIdentity(kind="team_member", identity=user_id, team_id=team_id),) if user_id and team_id else ()),
         *((BudgetIdentity(kind="org", identity=org_id),) if org_id else ()),
@@ -376,7 +475,12 @@ async def settle_legacy(
     if amount is None:
         raise ValueError("protected actual fee remains unknown")
     await protected.mutate(
-        "legacy:" + operation_id, counter_keys, kind="debit", amount=Decimal(str(amount)), reservation_id=reservation_id
+        "legacy:" + operation_id,
+        counter_keys,
+        kind="debit",
+        amount=Decimal(str(amount)),
+        reservation_id=reservation_id,
+        projection=financial,
     )
     return Projection(frozenset(counter_keys))
 
@@ -418,3 +522,136 @@ def projection_tags(value: object) -> tuple[str, ...]:
     adapter = TypeAdapter(tuple[str, ...])
     tags = adapter.validate_json(value) if isinstance(value, str) else adapter.validate_python(value or ())
     return tuple(sorted(set(tags)))
+
+
+class RecoveryConsumer:
+    def __init__(self, authority: MeteringStore, *, interval: float = 0.5):
+        self.authority = authority
+        self.interval = interval
+        self.stopped = asyncio.Event()
+        self.task: asyncio.Task[None] | None = None
+        self.last_operation = ""
+
+    async def tick(self) -> None:
+        async with asyncio.timeout(15):
+            self.last_operation = await self.authority.recover_pending(self.last_operation)
+            await self.authority.run_once()
+
+    async def run(self) -> None:
+        while not self.stopped.is_set():
+            outcome = await asyncio.gather(self.tick(), return_exceptions=True)
+            if isinstance(outcome[0], BaseException):
+                logging.getLogger(__name__).warning("moderation metering durable recovery pending")
+            try:
+                await asyncio.wait_for(self.stopped.wait(), timeout=self.interval)
+            except TimeoutError:
+                pass
+
+    async def start(self) -> None:
+        if self.task is None or self.task.done():
+            self.stopped.clear()
+            self.task = asyncio.create_task(self.run(), name="moderation-metering-recovery")
+
+    async def stop(self) -> None:
+        self.stopped.set()
+        if self.task is not None:
+            try:
+                async with asyncio.timeout(16):
+                    await self.task
+            except TimeoutError:
+                self.task.cancel()
+                await asyncio.gather(self.task, return_exceptions=True)
+            self.task = None
+
+
+@dataclass
+class RecoveryState:
+    consumer: RecoveryConsumer | None = None
+
+
+RECOVERY = RecoveryState()
+
+
+async def start_recovery() -> RecoveryConsumer | None:
+    if not configured():
+        return None
+    consumer = RecoveryConsumer(store())
+    await consumer.start()
+    return consumer
+
+
+def actual_outbox_event(result: VideoObject, amount: float, occurred_at: str) -> PhaseEvent | None:
+    from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
+
+    scope = CONTEXT.get()
+    if scope is None:
+        return None
+    decoded = decode_video_id_with_provider(result.id)
+    timestamp = datetime.fromisoformat(occurred_at)
+    submission = scope.submission.facts if scope.submission is not None else None
+    candidate = PhaseEvent(
+        binding=scope.binding,
+        request_id=request_id(scope.binding, scope.phase),
+        phase=scope.phase,
+        provider=TypeAdapter(str).validate_python(decoded.get("custom_llm_provider")),
+        deployment_id=TypeAdapter(str).validate_python(decoded.get("model_id")),
+        native_id=result.id,
+        provider_task_id=TypeAdapter(str).validate_python(decoded.get("video_id")),
+        amount=Decimal(str(amount)),
+        finalized=True,
+        facts=BillingFacts(
+            started_at=timestamp,
+            ended_at=timestamp,
+            route="avideo_status",
+            pricing=submission.pricing if submission else (),
+            duration_seconds=TypeAdapter[Decimal | None](Decimal | None).validate_python(
+                (result.usage or {}).get("duration_seconds")
+            ),
+            resolution=TypeAdapter[str | None](str | None).validate_python(
+                (result.usage or {}).get("video_resolution")
+            ),
+        ),
+    )
+    previous = scope.previous
+    event = previous if previous is not None and previous.finalized else candidate
+    if (event.provider_task_id, event.amount, event.native_id) != (
+        candidate.provider_task_id,
+        candidate.amount,
+        candidate.native_id,
+    ):
+        raise ValueError("terminal actual outbox receipt conflict")
+    setattr(result, EVENT_KEY, event)
+    return event
+
+
+def cache_scope() -> str | None:
+    import hashlib
+
+    scope = CONTEXT.get()
+    if scope is None:
+        return None
+    return (
+        "moderation:"
+        + hashlib.sha256(
+            (scope.binding.intent_id + ":" + scope.binding.request_digest + ":" + scope.phase).encode()
+        ).hexdigest()
+    )
+
+
+async def cached_handoff(logging_obj: Logging, result: object) -> object:
+    scope = getattr(logging_obj, SCOPE_KEY, None)
+    if not isinstance(scope, Scope):
+        return result
+    if isinstance(result, dict):
+        result = (
+            CharacterObject.model_validate(result)
+            if scope.binding.expected_phases == ("submit",)
+            else VideoObject.model_validate(result)
+        )
+    if not isinstance(result, (VideoObject, CharacterObject)):
+        raise ValueError("moderated cache result has invalid native type")
+    phase = await scope.store.phase(scope.binding.intent_id, scope.phase)
+    if phase is None or phase.binding != scope.binding or phase.native_id != result.id:
+        raise ValueError("moderated cache native has no durable financial binding")
+    setattr(result, EVENT_KEY, phase)
+    return result

@@ -43,26 +43,81 @@ Notify = Callable[[str, dict[str, JsonValue]], Awaitable[bool]]
 
 
 async def settle_task(task: ContextIRTask) -> None:
-    if task.result is not None and task.status not in {"failed", "cancelled"} and task.price > 0:
+    from datetime import datetime, timezone
+
+    from litellm.llms.causyn.h3_prompt import AUTH_MODEL
+
+    actual = task.price if task.result is not None and task.status not in {"failed", "cancelled"} else 0.0
+    if task.reservation is not None:
+        await settle_reservation(task.id, task.reservation, actual)
+    phase = financial_event(task)
+    binding = phase.binding if phase else None
+    if actual > 0 or phase is not None:
         await enqueue_causyn_billing(
             get_transfer_redis(os.getenv("LIBTV_VIDEO_GENERATE_REDIS_URL")),
             CausynBillingEvent(
                 provider_task_id=task.id,
-                response_cost=task.price,
+                response_cost=actual,
                 model=PUBLIC_MODEL,
                 task_type="h3_context_ir",
                 api_key=task.billing.api_key,
                 team_id=task.billing.team_id,
                 user_id=task.billing.user_id,
                 organization_id=task.billing.organization_id,
+                deployment_id=AUTH_MODEL,
+                reservation_id=str(task.reservation["reservation_id"])
+                if task.reservation and task.reservation.get("reservation_id")
+                else None,
+                moderation_intent_id=binding.intent_id if binding else None,
+                metering_event_json=phase.model_dump_json() if phase else None,
+                billing_facts_json=financial_facts(task).model_dump_json(),
+                occurred_at=datetime.fromtimestamp(task.updated_at, timezone.utc).isoformat(),
             ),
         )
-    if task.reservation is not None:
-        await settle_reservation(
-            task.id,
-            task.reservation,
-            task.price if task.result is not None and task.status not in {"failed", "cancelled"} else 0.0,
+
+
+def financial_facts(task: ContextIRTask):
+    from datetime import datetime, timezone
+    from decimal import Decimal
+
+    from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
+
+    usage = task.result.usage if task.result else None
+    return BillingFacts(
+        started_at=datetime.fromtimestamp(task.created_at, timezone.utc),
+        ended_at=datetime.fromtimestamp(task.updated_at, timezone.utc),
+        route="h3_context_ir",
+        pricing=(("output_cost_per_task", Decimal(str(task.price))),),
+        prompt_tokens=usage.prompt_tokens if usage else None,
+        completion_tokens=usage.completion_tokens if usage else None,
+    )
+
+
+def financial_event(task: ContextIRTask):
+    from decimal import Decimal
+
+    from litellm.llms.causyn.h3_prompt import AUTH_MODEL
+    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, PhaseEvent, request_id
+
+    actual = task.price if task.result is not None and task.status not in {"failed", "cancelled"} else 0.0
+    binding = BillingBinding.model_validate_json(task.metering_binding_json) if task.metering_binding_json else None
+    phase = (
+        PhaseEvent(
+            binding=binding,
+            request_id=request_id(binding, "completion"),
+            phase="completion",
+            provider="causyn",
+            deployment_id=AUTH_MODEL,
+            native_id=task.id,
+            provider_task_id=task.id,
+            amount=Decimal(str(actual)),
+            finalized=True,
+            facts=financial_facts(task),
         )
+        if binding
+        else None
+    )
+    return phase
 
 
 class ContextIRService:
@@ -122,6 +177,9 @@ class ContextIRService:
     ) -> ContextIRTask:
         spec.require_supported()
         now = int(time.time())
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import CONTEXT
+
+        scope = CONTEXT.get()
         task = ContextIRTask(
             id=task_id or new_task_id(owner),
             owner=owner,
@@ -133,6 +191,9 @@ class ContextIRService:
             price=price,
             listed=listed,
             reservation=reservation,
+            metering_binding_json=scope.binding.model_dump_json()
+            if scope is not None and video_payload is None
+            else None,
             video_payload=video_payload,
         )
         return await self.store.create(self.with_notification(task))

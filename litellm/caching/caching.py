@@ -337,6 +337,19 @@ class Cache:
             str: The cache key generated from the arguments, or None if no cache key could be generated.
         """
         cache_key = ""
+        import sys
+
+        metering_module = sys.modules.get("litellm.proxy.video_endpoints.moderation_metering_runtime")
+        metering_scope = metering_module.cache_scope() if metering_module is not None else None
+        if metering_scope is not None:
+            kwargs = {
+                **kwargs,
+                "litellm_params": {
+                    key: value
+                    for key, value in (kwargs.get("litellm_params") or {}).items()
+                    if key != "preset_cache_key"
+                },
+            }
         # verbose_logger.debug("\nGetting Cache key. Kwargs: %s", kwargs)
 
         preset_cache_key = self._get_preset_cache_key_from_kwargs(**kwargs)
@@ -365,7 +378,7 @@ class Cache:
         if is_semantic_cache:
             cache_key += self._get_semantic_cache_tenant_scope(kwargs)
 
-        hashed_cache_key = Cache._get_hashed_cache_key(cache_key)
+        hashed_cache_key = Cache._get_hashed_cache_key((metering_scope + ":" if metering_scope else "") + cache_key)
         hashed_cache_key = self._add_namespace_to_cache_key(hashed_cache_key, **kwargs)
         verbose_logger.debug(
             "\nCreated cache key: %s (source material length: %d)",

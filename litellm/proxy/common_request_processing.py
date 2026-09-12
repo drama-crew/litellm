@@ -1557,7 +1557,11 @@ class ProxyBaseLLMRequestProcessing:
             user_model=user_model,
             user_api_key_dict=user_api_key_dict,
         )
-        llm_call_task = asyncio.create_task(llm_call)
+        from litellm.proxy.video_endpoints.moderation_metering_entry import execute as metered_execute
+
+        llm_call_task = asyncio.create_task(
+            metered_execute(request, user_api_key_dict, route_type, llm_call, self.data)
+        )
         tasks.append(llm_call_task)
 
         llm_responses = asyncio.gather(*tasks)  # run the moderation check in parallel to the actual llm api call
@@ -2491,10 +2495,13 @@ class ProxyBaseLLMRequestProcessing:
         finalize_public_response_headers(headers, user_api_key_dict)
 
         if isinstance(e, ProxyException):
-            e.headers = finalize_public_response_headers({
-                **e.headers,
-                **{k: v if isinstance(v, str) else str(v) for k, v in headers.items()},
-            }, user_api_key_dict)
+            e.headers = finalize_public_response_headers(
+                {
+                    **e.headers,
+                    **{k: v if isinstance(v, str) else str(v) for k, v in headers.items()},
+                },
+                user_api_key_dict,
+            )
             raise e
 
         if isinstance(e, HTTPException):

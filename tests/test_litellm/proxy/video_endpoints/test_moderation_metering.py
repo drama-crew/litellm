@@ -225,7 +225,6 @@ async def test_sql_rollback_after_redis_adjustment_recovers_same_event(store):
 
 @pytest.mark.asyncio
 async def test_redis_lost_reply_does_not_repeat_reservation_adjustment(store):
-    from litellm.proxy.video_endpoints import moderation_metering_cache as cache
 
     meter, db, redis, prefix = store
     await redis.set(prefix + "spend:team:team", 100)
@@ -869,7 +868,7 @@ async def test_prepare_rejects_wrong_durable_reservation_binding(store):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_kind", ["causyn", "image"])
-async def test_context_ir_adjustment_and_outbox_wait_for_entry_authority(store, monkeypatch, event_kind):
+async def test_reservation_adjustment_and_partial_identity_outbox_use_actual_authority(store, monkeypatch, event_kind):
     from datetime import datetime, timezone, timedelta
     from types import SimpleNamespace
     from litellm.caching import DualCache, RedisCache
@@ -911,6 +910,7 @@ async def test_context_ir_adjustment_and_outbox_wait_for_entry_authority(store, 
         assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 0.0}]
         from litellm.llms.libtv import billing_outbox
 
+        await create_financial_projection_tables(db)
         stream = prefix + "outbox"
         monkeypatch.setattr(billing_outbox, "CAUSYN_BILLING_STREAM_KEY", stream)
         monkeypatch.setattr(billing_outbox, "CAUSYN_BILLING_MARKER_PREFIX", prefix + "enqueued:")
@@ -923,6 +923,7 @@ async def test_context_ir_adjustment_and_outbox_wait_for_entry_authority(store, 
                     team_id="team",
                     user_id="user",
                     task_type="h3_context_ir",
+                    reservation_id="ir",
                 ),
             )
         else:
@@ -947,17 +948,18 @@ async def test_context_ir_adjustment_and_outbox_wait_for_entry_authority(store, 
             worker = LibTVBillingReconciler(
                 redis, SimpleNamespace(db=db), stream_key=stream, consumer_group=prefix + "group", consumer=consumer
             )
-            assert await worker.reconcile_once() == 0
-            assert (await redis.xpending(stream, prefix + "group"))["pending"] == 1
-        assert await db.query_raw('SELECT spend FROM "LiteLLM_UserTable"') == [{"spend": 0.0}]
-        assert float(await redis.get(prefix + "spend:team:team")) == 3
-        from unittest.mock import AsyncMock
-
-        recovered_authority = AsyncMock()
-        monkeypatch.setattr(worker, "_reconcile_event", recovered_authority)
-        assert await worker.reconcile_once() == 1
-        assert recovered_authority.await_args.args[0].provider_task_id == "ir-task"
-        assert (await redis.xpending(stream, prefix + "group"))["pending"] == 0
+            assert await worker.reconcile_once() == (1 if consumer == "one" else 0)
+            assert (await redis.xpending(stream, prefix + "group"))["pending"] == 0
+        for table in (
+            "LiteLLM_UserTable",
+            "LiteLLM_TeamTable",
+            "LiteLLM_DailyUserSpend",
+            "LiteLLM_DailyTeamSpend",
+            "LiteLLM_SpendLogs",
+        ):
+            assert await db.query_raw(f'SELECT spend FROM "{table}"') == [{"spend": 3.0}]
+        assert await db.query_raw('SELECT spend FROM "LiteLLM_VerificationToken"') == [{"spend": 0.0}]
+        assert float(await redis.get(prefix + "spend:team:team")) == (3 if event_kind == "causyn" else 6)
 
     finally:
         await cache.disconnect()
@@ -1440,3 +1442,503 @@ async def test_fix1_parallel_phase_receipts_freeze_final_disposition_independent
 
         await protected_store(meter).recover(request_id(bound, phase))
     assert float(await redis.get(prefix + "spend:team:team")) == 5
+
+
+async def create_financial_projection_tables(db):
+    await db.execute_raw(
+        'CREATE TABLE "LiteLLM_SpendLogs" (request_id text primary key,call_type text,api_key text,spend double precision,"startTime" timestamptz,"endTime" timestamptz,model text,model_id text,model_group text,custom_llm_provider text,"user" text,team_id text,organization_id text,end_user text,metadata jsonb,request_tags jsonb,prompt_tokens integer default 0,completion_tokens integer default 0,total_tokens integer default 0)'
+    )
+    for table, dimension in [
+        ("LiteLLM_DailyUserSpend", "user_id"),
+        ("LiteLLM_DailyTeamSpend", "team_id"),
+        ("LiteLLM_DailyOrganizationSpend", "organization_id"),
+        ("LiteLLM_DailyEndUserSpend", "end_user_id"),
+        ("LiteLLM_DailyTagSpend", "tag"),
+    ]:
+        await db.execute_raw(
+            f'CREATE TABLE "{table}" (id text primary key,{dimension} text,date text,api_key text,model text,model_group text,custom_llm_provider text,mcp_namespaced_tool_name text,endpoint text,spend double precision default 0,api_requests bigint default 0,successful_requests bigint default 0,prompt_tokens bigint default 0,completion_tokens bigint default 0,updated_at timestamptz,UNIQUE({dimension},date,api_key,model,custom_llm_provider,mcp_namespaced_tool_name,endpoint))'
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_kind", ["image", "causyn"])
+async def test_entry_actual_outbox_commits_mixed_dimensions_and_projections_once(store, monkeypatch, event_kind):
+    from datetime import datetime, timezone
+    import json
+    from types import SimpleNamespace
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+    from litellm.llms.libtv.billing_outbox import ImageBillingEvent, CausynBillingEvent, LibTVBillingReconciler
+
+    meter, db, redis, prefix = store
+    await create_financial_projection_tables(db)
+    authority = protected_store(meter)
+    await redis.set(prefix + "spend:team:team", 100)
+    await authority.register_cutover(cutover_receipt())
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    monkeypatch.setattr(
+        runtime, "counter_mode", __import__("unittest.mock", fromlist=["AsyncMock"]).AsyncMock(return_value=True)
+    )
+    fields = dict(
+        deployment_id="deployment",
+        provider_task_id="actual-task",
+        response_cost=3,
+        api_key="key",
+        team_id="team",
+        user_id="user",
+        occurred_at=datetime(2026, 9, 13, tzinfo=timezone.utc).isoformat(),
+    )
+    event = (
+        ImageBillingEvent(**fields, scale=4, project_id="project", artifact_id="artifact", attribution_user_id="owner")
+        if event_kind == "image"
+        else CausynBillingEvent(**fields)
+    )
+    stream = prefix + "entry-outbox"
+    await redis.xadd(stream, {"payload": json.dumps(event.to_dict())})
+    worker = LibTVBillingReconciler(redis, SimpleNamespace(db=db), stream_key=stream, consumer_group=prefix + "group")
+    assert await worker.reconcile_once() == 1
+    assert (await redis.xpending(stream, prefix + "group"))["pending"] == 0
+    await asyncio.gather(*(worker._commit_event(event) for _ in range(3)))
+    for table in [
+        "LiteLLM_TeamTable",
+        "LiteLLM_UserTable",
+        "LiteLLM_VerificationToken",
+        "LiteLLM_TeamMembership",
+        "LiteLLM_DailyUserSpend",
+        "LiteLLM_DailyTeamSpend",
+        "LiteLLM_SpendLogs",
+    ]:
+        assert await db.query_raw(f'SELECT spend FROM "{table}"') == [{"spend": 3.0}]
+    assert float(await redis.get(prefix + "spend:team:team")) == 103
+    assert await db.query_raw('SELECT status FROM "LiteLLM_BudgetOperation"') == [{"status": "committed"}]
+    metadata = (await db.query_raw('SELECT metadata FROM "LiteLLM_SpendLogs"'))[0]["metadata"]
+    if event_kind == "image":
+        assert {
+            key: metadata[key] for key in ("libtv_billing_key", "scale", "project_id", "artifact_id", "user_id")
+        } == {
+            "libtv_billing_key": event.billing_key,
+            "scale": 4,
+            "project_id": "project",
+            "artifact_id": "artifact",
+            "user_id": "owner",
+        }
+    else:
+        assert metadata["causyn_billing_key"] == event.billing_key
+        assert metadata["provider"] == event.provider
+
+
+@pytest.mark.asyncio
+async def test_entry_phase_projection_rolls_back_with_actual_then_recovers(store):
+    from datetime import datetime, timezone
+    from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
+
+    meter, db, redis, prefix = store
+    await create_financial_projection_tables(db)
+    await prepare_meter(meter, binding(), {})
+    facts = BillingFacts(
+        started_at=datetime(2026, 9, 13, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 9, 13, tzinfo=timezone.utc),
+        route="avideo_status",
+        pricing=(("output_cost_per_second", Decimal("4")),),
+        duration_seconds=5,
+    )
+    terminal = event().model_copy(update={"facts": facts})
+    await meter.persist(terminal)
+    await db.execute_raw(
+        'ALTER TABLE "LiteLLM_DailyTeamSpend" ADD CONSTRAINT synthetic_projection_failure CHECK(spend<0)'
+    )
+    with pytest.raises(Exception):
+        await meter.run_once()
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 0.0}]
+    assert await db.query_raw('SELECT request_id FROM "LiteLLM_SpendLogs"') == []
+    await db.execute_raw('ALTER TABLE "LiteLLM_DailyTeamSpend" DROP CONSTRAINT synthetic_projection_failure')
+    await db.execute_raw('UPDATE "LiteLLM_ModerationMeteringPhase" SET available_at=NOW()')
+    await meter.run_once()
+    await meter.persist(terminal)
+    await meter.run_once()
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_DailyTeamSpend"') == [{"spend": 20.0}]
+    assert float(await redis.get(prefix + "spend:team:team")) == 20
+
+
+@pytest.mark.asyncio
+async def test_settlement_endpoint_recovers_private_event_and_never_regresses_unknown(store, monkeypatch):
+    import time
+    import jwt
+    import httpx
+    from fastapi import FastAPI
+    from litellm.proxy.video_endpoints import moderation_execution as execution, moderation_metering_runtime as runtime
+
+    meter, db, redis, prefix = store
+    bound = binding()
+    await prepare_meter(meter, bound, {})
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", "synthetic-settlement-secret-long-enough-32-bytes")
+    private = [event("submit", "0"), event("completion", "20")]
+    proof = dict(
+        binding=bound.model_dump(mode="json"),
+        native_id="native",
+        events={e.phase: e.model_dump(mode="json") for e in private},
+    )
+
+    async def platform(request, method, path, payload):
+        assert path == "/intents/intent/settlement-authority"
+        return proof
+
+    monkeypatch.setattr(execution.bridge, "platform", platform)
+    app = FastAPI()
+    app.include_router(execution.router)
+
+    def ticket(purpose):
+        return jwt.encode(
+            dict(
+                intent_id="intent",
+                request_digest="digest",
+                input_digest="input",
+                model="video",
+                policy_version="v1",
+                policy_digest="policy",
+                purpose=purpose,
+                iat=int(time.time()),
+                exp=int(time.time()) + 60,
+                aud="moderation-fork",
+            ),
+            "synthetic-settlement-secret-long-enough-32-bytes",
+            algorithm="HS256",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://synthetic") as client:
+        assert (
+            await client.post("/internal/moderation/settlement", json={"ticket": ticket("settlement")})
+        ).status_code == 401
+        headers = {"Authorization": "Bearer synthetic-settlement-secret-long-enough-32-bytes"}
+        assert (
+            await client.post("/internal/moderation/settlement", headers=headers, json={"ticket": ticket("collect")})
+        ).status_code == 403
+        response = await client.post(
+            "/internal/moderation/settlement", headers=headers, json={"ticket": ticket("settlement")}
+        )
+        assert response.status_code == 200 and response.json()["complete"] is False
+        consumer = runtime.RecoveryConsumer(meter, interval=0.01)
+        await consumer.start()
+        try:
+            for _ in range(100):
+                if (await meter.settlement(bound)).complete:
+                    break
+                await asyncio.sleep(0.02)
+        finally:
+            await consumer.stop()
+        proof["events"]["completion"] = (
+            private[1].model_copy(update={"amount": None, "finalized": False}).model_dump(mode="json")
+        )
+        response = await client.post(
+            "/internal/moderation/settlement", headers=headers, json={"ticket": ticket("settlement")}
+        )
+        assert response.status_code == 200
+        assert response.json()["complete"] is True and Decimal(response.json()["total_actual"]) == Decimal("20")
+        assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 20.0}]
+        assert float(await redis.get(prefix + "spend:team:team")) == 20
+
+
+@pytest.mark.asyncio
+async def test_missing_moderated_outbox_proof_does_not_starve_valid_event(store, monkeypatch):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+    from litellm.llms.libtv.billing_outbox import CausynBillingEvent, LibTVBillingReconciler
+
+    meter, db, redis, prefix = store
+    await create_financial_projection_tables(db)
+    await redis.set(prefix + "spend:team:team", 100)
+    await protected_store(meter).register_cutover(cutover_receipt())
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    monkeypatch.setattr(runtime, "counter_mode", AsyncMock(return_value=True))
+    fields = dict(team_id="team", user_id="user", response_cost=3)
+    missing = CausynBillingEvent(provider_task_id="missing-proof", moderation_intent_id="moderated", **fields)
+    valid = CausynBillingEvent(provider_task_id="valid", **fields)
+    stream = prefix + "actual-outbox"
+    for event in (missing, valid):
+        await redis.xadd(stream, {"payload": json.dumps(event.to_dict())})
+    worker = LibTVBillingReconciler(redis, SimpleNamespace(db=db), stream_key=stream, consumer_group=prefix + "group")
+    assert await worker.reconcile_once() == 1
+    assert await worker.reconcile_once() == 0
+    assert (await redis.xpending(stream, prefix + "group"))["pending"] == 1
+    assert await db.query_raw('SELECT request_id,spend FROM "LiteLLM_SpendLogs"') == [
+        {"request_id": valid.request_id, "spend": 3.0}
+    ]
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def production_store():
+    schema = "entry_schema_" + uuid4().hex
+    url = os.environ["MODERATION_METERING_POSTGRES_URL"]
+    control = Prisma(datasource={"url": url})
+    db = Prisma(datasource={"url": url + "?schema=" + schema + "&connection_limit=8"})
+    redis = Redis.from_url(os.environ["MODERATION_METERING_REDIS_URL"], decode_responses=True)
+    prefix = schema + ":"
+    try:
+        await control.connect()
+        await control.execute_raw(f'CREATE SCHEMA "{schema}"')
+        process = await asyncio.create_subprocess_exec(
+            "uv",
+            "run",
+            "--no-sync",
+            "prisma",
+            "db",
+            "push",
+            "--schema",
+            "litellm/proxy/schema.prisma",
+            "--skip-generate",
+            env={**os.environ, "DATABASE_URL": url + "?schema=" + schema},
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 60)
+        finally:
+            if process.returncode is None:
+                process.terminate()
+                await process.wait()
+        assert process.returncode == 0, (stdout.decode(), stderr.decode())
+        await db.connect()
+        await db.execute_raw("INSERT INTO \"LiteLLM_UserTable\"(user_id) VALUES('user')")
+        await db.execute_raw("INSERT INTO \"LiteLLM_TeamTable\"(team_id) VALUES('team')")
+        await db.execute_raw(
+            "INSERT INTO \"LiteLLM_VerificationToken\"(token,user_id,team_id) VALUES('key','user','team')"
+        )
+        await db.execute_raw("INSERT INTO \"LiteLLM_TeamMembership\"(user_id,team_id) VALUES('user','team')")
+        yield MeteringStore.from_client(db, redis, namespace=prefix), db, redis, prefix
+    finally:
+        try:
+            async for key in redis.scan_iter(match=prefix + "*"):
+                await redis.delete(key)
+        finally:
+            await redis.aclose()
+            if db.is_connected():
+                await db.disconnect()
+            if control.is_connected():
+                await control.execute_raw(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+                await control.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_phase_projection_matches_complete_production_prisma_schema(production_store):
+    from datetime import datetime, timezone
+    from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
+
+    meter, db, redis, prefix = production_store
+    await prepare_meter(meter, binding(), {})
+    facts = BillingFacts(
+        started_at=datetime(2026, 9, 13, tzinfo=timezone.utc),
+        ended_at=datetime(2026, 9, 13, tzinfo=timezone.utc),
+        route="avideo_generation",
+        prompt_tokens=30,
+        completion_tokens=20,
+    )
+    phase = event().model_copy(update={"facts": facts})
+    await meter.persist(phase)
+    await asyncio.gather(*(meter.run_once() for _ in range(3)))
+    await meter.persist(phase)
+    await meter.run_once()
+    assert await db.query_raw('SELECT spend,prompt_tokens,completion_tokens,total_tokens FROM "LiteLLM_SpendLogs"') == [
+        {"spend": 20.0, "prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}
+    ]
+    for table in ("LiteLLM_DailyUserSpend", "LiteLLM_DailyTeamSpend"):
+        assert await db.query_raw(f'SELECT spend,prompt_tokens,completion_tokens,api_requests FROM "{table}"') == [
+            {"spend": 20.0, "prompt_tokens": 30, "completion_tokens": 20, "api_requests": 1}
+        ]
+    assert float(await redis.get(prefix + "spend:team:team")) == 20
+
+    from datetime import timedelta
+
+    for updates in (
+        {"prompt_tokens": 31},
+        {"pricing": (("output_cost_per_task", Decimal(25)),)},
+        {"ended_at": facts.ended_at + timedelta(seconds=1)},
+    ):
+        altered = phase.model_copy(update={"facts": facts.model_copy(update=updates)})
+        assert altered.digest() != phase.digest()
+        with pytest.raises(ValueError, match="replay conflict"):
+            await meter.persist(altered)
+    assert await db.query_raw('SELECT spend,api_requests FROM "LiteLLM_DailyTeamSpend"') == [
+        {"spend": 20.0, "api_requests": 1}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_first", [False, True])
+async def test_image_own_reservation_and_actual_outbox_commute_once(store, monkeypatch, terminal_first):
+    from datetime import datetime, timezone, timedelta
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+    from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+    from litellm.llms.libtv.billing_outbox import ImageBillingEvent, LibTVBillingReconciler
+    from litellm.types.utils import ImageResponse
+
+    meter, db, redis, prefix = store
+    await create_financial_projection_tables(db)
+    await redis.set(prefix + "spend:team:team", 100)
+    authority = protected_store(meter)
+    await authority.register_cutover(cutover_receipt())
+    await authority.mutate(
+        "image-own-reserve",
+        ("spend:team:team",),
+        kind="reserve",
+        amount=Decimal(5),
+        reservation_id="image-own",
+        valid_until=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    monkeypatch.setattr(runtime, "counter_mode", AsyncMock(return_value=True))
+    reservation = {
+        "reservation_id": "image-own",
+        "reserved_cost": 5,
+        "entries": [{"counter_key": "spend:team:team", "reservation_id": "image-own", "reserved_cost": 5}],
+    }
+    from litellm.llms.libtv.handler import LibTVLLM
+
+    handler = LibTVLLM()
+    provider = SimpleNamespace(aresolve_model_spec=AsyncMock(return_value={}))
+    submit = AsyncMock(return_value=SimpleNamespace(to_dict=lambda: {"task_id": "image-own-task"}))
+    monkeypatch.setattr(handler, "_make_client", lambda *args, **kwargs: provider)
+    monkeypatch.setattr(handler, "asubmit_image_upscale", submit)
+    response = await handler.aimage_generation(
+        model="topaz-image-upscaler",
+        prompt="",
+        model_response=ImageResponse(data=[]),
+        api_key="synthetic",
+        api_base=None,
+        optional_params={"libtv_image_upscale_submit": True},
+        logging_obj=None,
+        client=object(),
+    )
+    submit.assert_awaited_once()
+    assert response._hidden_params["response_cost"] == 0
+    assert getattr(response, runtime.DEFERRED_KEY) is runtime.Ownership.DEFERRED_IMAGE
+
+    event = ImageBillingEvent(
+        deployment_id="deployment",
+        provider_task_id="image-own-task",
+        response_cost=3,
+        api_key="key",
+        team_id="team",
+        user_id="user",
+    )
+    worker = LibTVBillingReconciler(redis, SimpleNamespace(db=db))
+
+    async def release():
+        await _ProxyDBLogger()._PROXY_track_cost_callback(
+            {"litellm_params": {"metadata": {"user_api_key_budget_reservation": reservation}}}, response
+        )
+
+    if terminal_first:
+        await worker._commit_event(event)
+        await release()
+    else:
+        await release()
+        await worker._commit_event(event)
+    await worker._commit_event(event)
+    await release()
+    assert float(await redis.get(prefix + "spend:team:team")) == 103
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 3.0}]
+    assert await db.query_raw('SELECT request_id,spend FROM "LiteLLM_SpendLogs"') == [
+        {"request_id": event.request_id, "spend": 3.0}
+    ]
+    assert reservation["finalized"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [False, True])
+async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_once(
+    production_store, monkeypatch, admitted
+):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from fastapi import Request
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.video_endpoints import (
+        context_ir_endpoints as endpoint,
+        moderation_bridge,
+        moderation_metering_entry as entry,
+        moderation_metering_runtime as runtime,
+    )
+    from litellm.llms.causyn import context_ir, context_ir_store
+    from litellm.llms.causyn.h3_prompt import AUTH_MODEL, ContextIRRequest, RewriteResult, RewriteUsage
+    from litellm.llms.libtv import billing_outbox
+
+    meter, db, redis, prefix = production_store
+    fingerprint = "b" * 64
+    await db.execute_raw('UPDATE "LiteLLM_VerificationToken" SET token=$1', fingerprint)
+    baseline = binding().model_copy(
+        update={
+            "intent_id": "seed",
+            "fingerprint": fingerprint,
+            "model": AUTH_MODEL,
+            "actor_user_id": "actor",
+            "expected_phases": ("completion",),
+        }
+    )
+    await prepare_meter(meter, baseline, {})
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    monkeypatch.setattr(runtime, "counter_mode", AsyncMock(return_value=True))
+    monkeypatch.setattr(moderation_bridge, "submit", AsyncMock(return_value=None))
+    monkeypatch.setattr(context_ir, "get_transfer_redis", lambda url: redis)
+    monkeypatch.setattr(context_ir_store, "PENDING", prefix + "pending")
+    monkeypatch.setattr(context_ir_store, "READY", prefix + "ready")
+    monkeypatch.setattr(context_ir_store, "task_key", lambda task_id: prefix + "task:" + task_id)
+    monkeypatch.setattr(context_ir_store, "owner_key", lambda owner: prefix + "owner:" + owner)
+    monkeypatch.setattr(billing_outbox, "CAUSYN_BILLING_STREAM_KEY", prefix + "outbox")
+    monkeypatch.setattr(billing_outbox, "CAUSYN_BILLING_MARKER_PREFIX", prefix + "enqueued:")
+    rewrite = AsyncMock(
+        return_value=RewriteResult(
+            prompt="integrated_multimodal_description: [Shot 1] A cat walks.\noverall_soundscape: Quiet.\nnon_diegetic_music: None.",
+            usage=RewriteUsage(prompt_tokens=30, completion_tokens=20, total_tokens=50, cost=0.001),
+            system_sha256="a" * 64,
+        )
+    )
+    service = context_ir.ContextIRService(context_ir_store.ContextIRStore(redis), rewrite=rewrite)
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v2/h3_context_ir", "headers": [], "query_string": b""}
+    )
+    request.scope["causyn_context_ir_spec"] = ContextIRRequest.model_validate(
+        {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat walks."}], "duration": 5, "ratio": "16:9"}
+    )
+    if admitted:
+        await db.execute_raw(
+            'UPDATE "LiteLLM_TeamTable" SET budget_limits=$1::jsonb',
+            json.dumps([{"budget_duration": "1d", "max_budget": 100, "reset_at": "2026-09-20T00:00:00Z"}]),
+        )
+        entry.attest(
+            request, {"intent_id": "entry", "request_digest": "digest", "actor_user_id": "actor", "model": AUTH_MODEL}
+        )
+    response = await endpoint.create_context_ir(
+        request, UserAPIKeyAuth(api_key=fingerprint, user_id="user", team_id="team"), service
+    )
+    task_id = response["task_id"]
+    await service.process(task_id)
+    await service.process(task_id)
+    task = await service.store.get(task_id)
+    assert task.status == "succeeded" and task.settled and task.price == 4
+    assert rewrite.await_count == 1
+    assert await redis.xlen(prefix + "outbox") == 1
+    worker = billing_outbox.LibTVBillingReconciler(
+        redis, SimpleNamespace(db=db), stream_key=prefix + "outbox", consumer_group=prefix + "group"
+    )
+    assert await worker.reconcile_once() == 1
+    await context_ir.settle_task(task)
+    assert await worker.reconcile_once() == 0
+    assert await db.query_raw('SELECT spend,prompt_tokens,completion_tokens,total_tokens FROM "LiteLLM_SpendLogs"') == [
+        {"spend": 4.0, "prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}
+    ]
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 4.0}]
+    assert float(await redis.get(prefix + "spend:team:team")) == 4
+    if admitted:
+        bound = await meter.binding("entry")
+        assert bound.expected_phases == ("completion",)
+        assert len(bound.windows) == 1
+        assert (await meter.settlement(bound)).total_actual == Decimal(4)
+        assert float(await redis.get(prefix + "spend:team:team:window:1d")) == 4
+    else:
+        assert task.metering_binding_json is None
+        assert await db.query_raw('SELECT intent_id FROM "LiteLLM_ModerationMeteringTask"') == [{"intent_id": "seed"}]

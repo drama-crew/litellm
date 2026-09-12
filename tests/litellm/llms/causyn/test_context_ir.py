@@ -230,6 +230,7 @@ async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, 
     automatic = await service.store.get("h3_ir_" + video_id)
     assert automatic.status == "succeeded"
     assert automatic.price == 0
+    assert automatic.metering_binding_json is None
     assert automatic.settled
     assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 0
 
@@ -237,6 +238,12 @@ async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, 
     await service.process(standalone.id)
     assert (await service.store.get(standalone.id)).price == 4
     assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 1
+    await service.process(standalone.id)
+    await context_ir.settle_task(await service.store.get(standalone.id))
+    assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 1
+    payload = json.loads((await redis.xrange(CAUSYN_BILLING_STREAM_KEY))[0][1][b"payload"])
+    assert payload["response_cost"] == 4
+    assert payload["moderation_intent_id"] is None
 
 
 def test_mixed_media_indexes_and_audio_rejection():
@@ -529,7 +536,9 @@ async def test_ir_admission_refunds_only_if_task_was_not_persisted(redis, monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [429, 500, 502, 503, 504, 408, "read", "timeout", "protocol", "json", "provider_error"])
+@pytest.mark.parametrize(
+    "failure", [429, 500, 502, 503, 504, 408, "read", "timeout", "protocol", "json", "provider_error"]
+)
 async def test_provider_interruptions_retry_then_settle_once(redis, failure):
     from litellm.llms.causyn.h3_prompt import H3PromptRewriter, MODEL
 

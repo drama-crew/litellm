@@ -12,6 +12,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, model_validator
 
 from litellm.proxy.video_endpoints.moderation_metering_cache import RedisCommands, keys
+from litellm.proxy.video_endpoints.moderation_metering_projection import FinancialProjection
 from litellm.proxy.video_endpoints.openapi_logs import Database
 
 
@@ -160,6 +161,7 @@ class OperationPayload(FrozenModel):
     phase_request_id: str | None = None
     phase_hash: str | None = None
     reservation_final: bool = True
+    projection: FinancialProjection | None = None
 
     def digest(self) -> str:
         return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
@@ -559,6 +561,7 @@ END $$
         valid_until: datetime | None = None,
         phase_request_id: str | None = None,
         phase_hash: str | None = None,
+        projection: FinancialProjection | None = None,
     ) -> None:
         async with asyncio.timeout(10):
             while True:
@@ -572,6 +575,7 @@ END $$
                         valid_until=valid_until,
                         phase_request_id=phase_request_id,
                         phase_hash=phase_hash,
+                        projection=projection,
                     )
                     return
                 except BudgetBusy:
@@ -588,7 +592,10 @@ END $$
         valid_until: datetime | None = None,
         phase_request_id: str | None = None,
         phase_hash: str | None = None,
+        projection: FinancialProjection | None = None,
     ) -> None:
+        if projection is not None and (kind != "debit" or projection.amount != amount):
+            raise ValueError("financial projection requires matching actual debit")
         if not operation_id.strip() or not amount.is_finite() or amount < 0:
             raise ValueError("stable operation identity and finite nonnegative amount required")
         if phase_request_id is not None and kind != "debit":
@@ -607,6 +614,8 @@ END $$
                 previous.payload.phase_hash,
             ) != (phase_request_id, phase_hash):
                 raise BudgetPending("operation replay conflict")
+            if previous.payload.projection != projection:
+                raise BudgetPending("financial projection replay conflict")
             if kind == "reserve" and any(
                 c.reservation is None or c.reservation.valid_until != valid_until for c in previous.payload.changes
             ):
@@ -636,6 +645,7 @@ END $$
                     phase_request_id=phase_request_id,
                     phase_hash=phase_hash,
                     reservation_final=reservation_final,
+                    projection=projection,
                 ),
             )
         await self.recover(operation_id)
@@ -877,6 +887,15 @@ END $$
                     change.generation,
                     change.period_start.isoformat() if change.period_start else "",
                 )
+            if row.payload.projection is not None:
+                from litellm.proxy.video_endpoints.moderation_metering_projection import project
+
+                await project(
+                    tx,
+                    row.payload.projection,
+                    protected=frozenset(change.before.counter_key for change in row.payload.changes),
+                    debit_unprotected=row.payload.phase_request_id is None,
+                )
             if row.payload.phase_request_id is not None:
                 await tx.execute_raw(
                     "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET status='settled',receipt=payload WHERE request_id=$1",
@@ -904,6 +923,10 @@ END $$
         if len(rows) != 1 or rows[0].payload_hash != payload.phase_hash:
             raise BudgetPending("phase identity/hash missing or changed")
         phase = rows[0].payload
+        from litellm.proxy.video_endpoints.moderation_metering import projection_for
+
+        if projection_for(phase) != payload.projection:
+            raise BudgetPending("phase financial projection binding changed")
         if not phase.finalized or phase.amount != payload.amount:
             raise BudgetPending("authoritative phase amount missing")
         authority = MeteringStore(self.db, self.transactions, self.redis, namespace=self.namespace)

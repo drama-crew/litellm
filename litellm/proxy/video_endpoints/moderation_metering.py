@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from collections.abc import AsyncIterator, Callable
@@ -12,6 +13,11 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from litellm.proxy.video_endpoints import moderation_metering_cache as cache
+from litellm.proxy.video_endpoints.moderation_metering_projection import (
+    BillingFacts,
+    FinancialProjection,
+    LegacyMetadata,
+)
 from litellm.proxy.video_endpoints.openapi_log_capture import RawDatabase, raw_method
 from litellm.proxy.video_endpoints.openapi_logs import Database
 
@@ -39,6 +45,7 @@ class BillingBinding(BaseModel):
     actor_user_id: str | None = None
     team_id: str
     organization_id: str | None = None
+    global_user_id: str | None = None
     model: str
     end_user_id: str | None = None
     tag_ids: tuple[str, ...] = ()
@@ -58,6 +65,7 @@ class PhaseEvent(BaseModel):
     amount: Decimal | None = Field(default=None, ge=0, allow_inf_nan=False)
     unit: Literal["USD"] = "USD"
     finalized: bool = False
+    facts: BillingFacts | None = None
 
     def digest(self) -> str:
         return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
@@ -67,6 +75,7 @@ class SettlementEnvelope(BaseModel):
     model_config = ConfigDict(frozen=True)
     binding: BillingBinding
     receipts: tuple[PhaseEvent, ...]
+    events: tuple[PhaseEvent, ...] = ()
     complete: bool
     total_actual: Decimal | None
     unit: Literal["USD"] = "USD"
@@ -122,6 +131,7 @@ def base_counter_keys(binding: BillingBinding) -> tuple[str, ...]:
                 "spend:user:" + binding.user_id,
                 "spend:team:" + binding.team_id,
                 "spend:team_member:" + binding.user_id + ":" + binding.team_id,
+                *(("spend:user:" + binding.global_user_id,) if binding.global_user_id else ()),
                 *(("spend:org:" + binding.organization_id,) if binding.organization_id else ()),
                 *(("spend:end_user:" + binding.end_user_id,) if binding.end_user_id else ()),
                 *("spend:tag:" + tag for tag in binding.tag_ids),
@@ -133,6 +143,38 @@ def base_counter_keys(binding: BillingBinding) -> tuple[str, ...]:
 
 def request_id(binding: BillingBinding, phase: str) -> str:
     return "public-video:" + binding.intent_id + ":" + phase
+
+
+def projection_for(event: PhaseEvent) -> FinancialProjection | None:
+    if event.facts is None or event.amount is None:
+        return None
+    binding = event.binding
+    return FinancialProjection(
+        request_id=event.request_id,
+        fingerprint=binding.fingerprint,
+        user_id=binding.user_id,
+        team_id=binding.team_id,
+        organization_id=binding.organization_id,
+        global_user_id=binding.global_user_id,
+        end_user_id=binding.end_user_id,
+        tag_ids=binding.tag_ids,
+        provider=event.provider,
+        deployment_id=event.deployment_id,
+        provider_task_id=event.provider_task_id,
+        model=binding.model,
+        amount=event.amount,
+        facts=event.facts,
+        intent_id=binding.intent_id,
+        legacy_metadata=LegacyMetadata(
+            causyn_billing_key=(
+                "causyn-context-ir:" if event.facts.route == "h3_context_ir" else event.provider + "-video:"
+            )
+            + event.provider_task_id,
+            provider=event.provider,
+        )
+        if event.provider in {"causyn", "libtv"}
+        else None,
+    )
 
 
 class MeteringStore:
@@ -193,6 +235,11 @@ class MeteringStore:
                 else ()
             ),
             *(("spend:tag:" + tag, '"LiteLLM_TagTable"', "tag_name", tag) for tag in binding.tag_ids),
+            *(
+                ((("spend:user:" + binding.global_user_id), '"LiteLLM_UserTable"', "user_id", binding.global_user_id),)
+                if binding.global_user_id
+                else ()
+            ),
             ("spend:user:" + binding.user_id, '"LiteLLM_UserTable"', "user_id", binding.user_id),
             ("spend:team:" + binding.team_id, '"LiteLLM_TeamTable"', "team_id", binding.team_id),
             *(
@@ -364,7 +411,19 @@ class MeteringStore:
                 previous = old[0]
                 if previous.payload == event:
                     return
+                if not event.finalized and event.amount is None and event.native_id:
+                    predecessor = event.model_copy(
+                        update={
+                            "amount": previous.payload.amount,
+                            "finalized": previous.payload.finalized,
+                            "facts": event.facts or previous.payload.facts,
+                        }
+                    )
+                    if predecessor == previous.payload:
+                        return
                 updates = {"amount": event.amount, "finalized": event.finalized}
+                if previous.payload.facts is None:
+                    updates["facts"] = event.facts
                 if not previous.payload.native_id:
                     updates = {
                         **updates,
@@ -372,6 +431,7 @@ class MeteringStore:
                         "deployment_id": event.deployment_id,
                         "native_id": event.native_id,
                         "provider_task_id": event.provider_task_id,
+                        "facts": event.facts,
                     }
                 if previous.status != "unknown" or previous.payload.model_copy(update=updates) != event:
                     raise ValueError("moderation billing payload replay conflict")
@@ -474,6 +534,7 @@ class MeteringStore:
             reservation_id=tasks[0].reservation_id,
             phase_request_id=event.request_id,
             phase_hash=row.payload_hash,
+            projection=projection_for(event),
         )
 
     async def settlement(self, binding: BillingBinding) -> SettlementEnvelope:
@@ -509,3 +570,25 @@ class MeteringStore:
         if not tasks:
             raise ValueError("moderation metering admission missing")
         return tasks[0].binding
+
+    async def phase(self, intent_id: str, phase: str) -> PhaseEvent | None:
+        rows = TypeAdapter(tuple[PhaseRow, ...]).validate_python(
+            await self.db.query_raw(
+                'SELECT * FROM "LiteLLM_ModerationMeteringPhase" WHERE intent_id=$1 AND phase=$2', intent_id, phase
+            )
+        )
+        return rows[0].payload if rows else None
+
+    async def recover_pending(self, after: str = "") -> str:
+        from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore
+
+        rows = TypeAdapter(tuple[dict[str, str], ...]).validate_python(
+            await self.db.query_raw(
+                """SELECT operation_id FROM "LiteLLM_BudgetOperation" WHERE operation_id>$1 AND (status='pending' OR (status='running' AND lease_until<NOW())) ORDER BY operation_id LIMIT 8""",
+                after,
+            )
+        )
+        authority = ProtectedBudgetStore(self.db, self.transactions, self.redis, namespace=self.namespace)
+        for row in rows:
+            await asyncio.gather(authority.recover(row["operation_id"]), return_exceptions=True)
+        return rows[-1]["operation_id"] if rows else ""

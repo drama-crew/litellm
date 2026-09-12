@@ -205,6 +205,11 @@ class _ProxyDBLogger(CustomLogger):
                 metadata = await _ProxyDBLogger._enrich_failure_metadata_with_key_info(metadata=metadata)
                 _write_spend_metadata_to_kwargs(kwargs=kwargs, metadata=metadata)
             budget_reservation = _get_budget_reservation_from_metadata(metadata=metadata)
+            from litellm.proxy.video_endpoints.moderation_metering_runtime import Ownership
+
+            if getattr(completion_response, "_deferred_outbox_billing", None) is Ownership.DEFERRED_IMAGE:
+                await _release_budget_reservation(budget_reservation=budget_reservation)
+                return
             if is_causyn_video_billing_call(kwargs):
                 # Causyn terminal polls persist a task-keyed event before the
                 # response is returned. The outbox reconciler owns the spend

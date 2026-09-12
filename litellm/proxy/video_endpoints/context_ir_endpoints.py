@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 from typing import Annotated, Literal
@@ -65,13 +66,40 @@ async def create_context_ir(request: Request, auth: Auth, service: Service) -> d
         raise
     identity = auth.api_key or auth.token or ""
     key_hash = identity if re.fullmatch(r"[0-9a-f]{64}", identity) else hashlib.sha256(identity.encode()).hexdigest()
-    task = await accept_context_ir(
-        service,
-        spec,
-        task_owner(auth),
-        reservation,
-        BillingIdentity(api_key=key_hash, team_id=auth.team_id, user_id=auth.user_id, organization_id=auth.org_id),
+    from litellm.proxy.video_endpoints.moderation_metering_entry import execute as metered_execute
+
+    task = await metered_execute(
+        request,
+        auth,
+        "context_ir",
+        accept_context_ir(
+            service,
+            spec,
+            task_owner(auth),
+            reservation,
+            BillingIdentity(api_key=key_hash, team_id=auth.team_id, user_id=auth.user_id, organization_id=auth.org_id),
+        ),
     )
+    if task.metering_binding_json:
+        from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, PhaseEvent, request_id
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import store
+
+        binding = BillingBinding.model_validate_json(task.metering_binding_json)
+        event = PhaseEvent(
+            binding=binding,
+            request_id=request_id(binding, "completion"),
+            phase="completion",
+            provider="causyn",
+            deployment_id=AUTH_MODEL,
+            native_id=task.id,
+            provider_task_id=task.id,
+        )
+        request.scope["moderation_context_ir_event"] = event
+
+        async def persist() -> None:
+            await store().persist(event)
+
+        await asyncio.gather(persist(), return_exceptions=True)
     return {"task_id": task.id}
 
 

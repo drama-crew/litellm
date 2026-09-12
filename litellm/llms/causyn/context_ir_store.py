@@ -55,6 +55,7 @@ class ContextIRTask(BaseModel):
     billing: BillingIdentity
     price: float
     reservation: dict[str, JsonValue] | None = None
+    metering_binding_json: str | None = None
     video_payload: dict[str, JsonValue] | None = None
     settled: bool = False
     listed: bool = True

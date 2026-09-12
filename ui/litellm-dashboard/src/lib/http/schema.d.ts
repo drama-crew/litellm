@@ -6153,6 +6153,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/internal/moderation/settlement": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Settlement */
+        post: operations["settlement_internal_moderation_settlement_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/internal/moderation/submit": {
         parameters: {
             query?: never;
@@ -42069,6 +42086,41 @@ export interface operations {
         };
     };
     collect_internal_moderation_collect_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Ticket"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    settlement_internal_moderation_settlement_post: {
         parameters: {
             query?: never;
             header?: {

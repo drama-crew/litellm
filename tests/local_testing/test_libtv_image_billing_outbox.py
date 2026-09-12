@@ -397,11 +397,11 @@ async def test_causyn_event_replays_after_db_failure_without_double_spend():
         batch_size=1,
     )
 
-    with pytest.raises(RuntimeError, match="database unavailable"):
-        await reconciler.reconcile_once()
+    assert await reconciler.reconcile_once() == 0
     assert redis.acked == []
+    assert transaction.sql == []
 
-    await reconciler.reconcile_once()
+    assert await reconciler.reconcile_once() == 1
 
     assert redis.acked == [(CAUSYN_BILLING_STREAM_KEY, "test-group", "1-0")]
     assert transaction.attempts >= 2

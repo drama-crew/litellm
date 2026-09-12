@@ -8,7 +8,7 @@ import re
 import time
 from functools import wraps
 from inspect import iscoroutinefunction
-from typing import Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 import httpx
 
@@ -32,6 +32,10 @@ from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import (
     decode_video_id_with_provider,
 )
+
+if TYPE_CHECKING:
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import Scope
+
 
 LIBTV_PROVIDER = "libtv"
 logger = logging.getLogger(__name__)
@@ -961,6 +965,49 @@ class LibTVLLM(CustomLLM):
         except Exception:
             logger.warning("libtv video billing: failed to record task usage at create", exc_info=True)
 
+    async def _bill_protected_video(self, vo: VideoObject, task_id: str, scope: "Scope") -> None:
+        from datetime import datetime, timezone
+
+        from litellm.llms.causyn.handler import _default_redis_factory
+        from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import actual_outbox_event
+
+        facts = scope.submission.facts if scope.submission else None
+        if facts is None or facts.duration_seconds is None:
+            raise ValueError("Trusted create-time billing facts missing")
+        usage = {"duration_seconds": float(facts.duration_seconds), "video_resolution": facts.resolution}
+        cost = _video_completion_cost({"model_info": {key: float(value) for key, value in facts.pricing}}, usage)
+        if cost is None:
+            raise ValueError("Trusted create-time price remains unknown")
+        vo.usage = usage
+        happened_at = datetime.now(timezone.utc).isoformat()
+        phase = actual_outbox_event(vo, cost, happened_at)
+        if phase is None:
+            raise ValueError("Trusted financial scope missing")
+        event = CausynBillingEvent(
+            provider_task_id=task_id,
+            response_cost=cost,
+            provider="libtv",
+            model=scope.binding.model,
+            api_key=scope.binding.fingerprint,
+            user_id=scope.binding.user_id,
+            team_id=scope.binding.team_id,
+            organization_id=scope.binding.organization_id,
+            deployment_id=phase.deployment_id,
+            request_id_override=phase.request_id,
+            moderation_intent_id=scope.binding.intent_id,
+            metering_event_json=phase.model_dump_json(),
+            occurred_at=happened_at,
+        )
+
+        async def enqueue() -> None:
+            await enqueue_causyn_billing(_default_redis_factory(), event)
+
+        outcome = await asyncio.gather(enqueue(), return_exceptions=True)
+        if isinstance(outcome[0], BaseException):
+            logger.warning("accepted video retains private financial event for recovery")
+        vo._hidden_params = {**vo._hidden_params, "response_cost": cost}
+
     async def _bill_completed_video(self, vo: VideoObject, task_id: str, optional_params: dict) -> None:
         """Charge for a completed libtv video task exactly once.
 
@@ -990,6 +1037,12 @@ class LibTVLLM(CustomLLM):
         from litellm.proxy.video_endpoints.moderation_execution import BILLING_CONTEXT
 
         context = BILLING_CONTEXT.get()
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import CONTEXT
+
+        scope = CONTEXT.get()
+        if scope is not None:
+            await self._bill_protected_video(vo, task_id, scope)
+            return
         if context is not None:
             from litellm.llms.causyn.handler import _default_redis_factory
             from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
@@ -1334,8 +1387,11 @@ class LibTVLLM(CustomLLM):
         spec = await lt.aresolve_model_spec(model)
         if optional_params.get("libtv_image_upscale_submit") is True:
             receipt = await self.asubmit_image_upscale(model, api_key, api_base, optional_params, logging_obj, client)
+            from litellm.proxy.video_endpoints.moderation_metering_runtime import DEFERRED_KEY, Ownership
+
             model_response.data = []
-            model_response._hidden_params = {"submission_receipt": receipt.to_dict()}
+            model_response._hidden_params = {"submission_receipt": receipt.to_dict(), "response_cost": 0.0}
+            setattr(model_response, DEFERRED_KEY, Ownership.DEFERRED_IMAGE)
             return model_response
         images, _, _ = _collect_reference_groups(optional_params)
         params = await self._aresolved_image_params(lt, prompt, spec, images, optional_params)

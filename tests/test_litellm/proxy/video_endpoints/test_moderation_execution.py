@@ -56,6 +56,12 @@ async def test_continuation_never_resubmits_after_unknown_or_receipt_ack_loss(mo
                 json={
                     "acquired": True,
                     "token": "attempt",
+                    "metering": {
+                        "intent_id": "intent",
+                        "request_digest": "a" * 64,
+                        "actor_user_id": "actor",
+                        "model": "hailuo-h3",
+                    },
                     "credential": "sk-original",
                     "route": "avideo_generation",
                     "request": {"model": "hailuo-h3", "prompt": "synthetic"},

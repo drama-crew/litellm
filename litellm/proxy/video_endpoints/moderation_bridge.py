@@ -241,6 +241,9 @@ async def submit(
             )
         request.scope["moderation_admission"] = ADMITTED
         request.scope["moderation_producer_ticket"] = ticket
+        from litellm.proxy.video_endpoints.moderation_metering_entry import attest
+
+        attest(request, admission["metering"])
         from litellm.proxy.auth.user_api_key_auth import _run_centralized_common_checks
 
         await _run_centralized_common_checks(auth, request, payload, "/v1/videos")
@@ -297,9 +300,64 @@ async def submit(
 
 
 async def capture(request: Request, result: object) -> None:
-    ticket = request.scope.get("moderation_producer_ticket")
-    if isinstance(ticket, str) and isinstance(result, VideoObject):
-        await platform(request, "POST", "/generation-receipt", {"ticket": ticket, "native_id": result.id})
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import private_event
+    from litellm.types.videos.utils import decode_video_id_with_provider
+
+    if not isinstance(result, (VideoObject, CharacterObject)):
+        return
+    event = private_event(result)
+    producer = request.scope.get("moderation_producer_ticket")
+    public = request.scope.get("moderation_public_receipt")
+    read_ticket = request.scope.get("moderation_financial_read_ticket")
+    if isinstance(producer, str):
+        await platform(
+            request,
+            "POST",
+            "/generation-receipt",
+            {"ticket": producer, "native_id": result.id, "metering_event": event},
+        )
+    elif isinstance(public, tuple):
+        intent_id, token = public
+        decoded = decode_video_id_with_provider(result.id)
+        provider_id = decoded.get("video_id") or result.id
+        provider = decoded.get("custom_llm_provider") or "unknown"
+        billing_id = "causyn:" + provider_id if provider == "causyn" else "public-video:" + intent_id
+        await platform(
+            request,
+            "POST",
+            f"/intents/{intent_id}/receipt",
+            {
+                "token": token,
+                "native_id": result.id,
+                "billing": {
+                    "request_id": billing_id,
+                    "provider": provider,
+                    "provider_task_id": provider_id,
+                    "deployment_id": decoded.get("model_id"),
+                    "status": "pending",
+                    "request_ids": [
+                        billing_id,
+                        "public-video:" + intent_id + ":submit",
+                        "public-video:" + intent_id + ":completion",
+                    ],
+                    "pricing_snapshot": JSON_OBJECT.validate_python(
+                        result._hidden_params.get("billing_pricing_snapshot") or {}
+                    ),
+                    "usage_snapshot": JSON_OBJECT.validate_python(result.usage or {})
+                    if isinstance(result, VideoObject)
+                    else {},
+                    "metering_event": event,
+                },
+            },
+        )
+    elif isinstance(read_ticket, str) and event is not None:
+        binding = JSON_OBJECT.validate_python(event["binding"])
+        await platform(
+            request,
+            "POST",
+            f"/intents/{binding['intent_id']}/financial-event",
+            {"ticket": read_ticket, "native_id": result.id, "metering_event": event},
+        )
 
 
 async def upload_media(request: Request, owner: dict[str, JsonValue], upload: StarletteUploadFile) -> str:
@@ -356,7 +414,7 @@ async def query(request: Request, auth: UserAPIKeyAuth, task_id: str, *, purpose
         return None
     read_ticket = request.headers.get("x-drama-moderation-read")
     if read_ticket:
-        await platform(
+        admission = await platform(
             request,
             "POST",
             "/generation-read",
@@ -368,6 +426,11 @@ async def query(request: Request, auth: UserAPIKeyAuth, task_id: str, *, purpose
             },
         )
         request.scope["moderation_admission"] = ADMITTED
+        if purpose == "query":
+            from litellm.proxy.video_endpoints.moderation_metering_entry import attest
+
+            attest(request, admission["metering"], phase="completion")
+            request.scope["moderation_financial_read_ticket"] = read_ticket
         return None
     if not task_id.startswith(PREFIX):
         lookup = await platform(request, "POST", "/lookup", {"principal": principal(auth), "native_id": task_id})
