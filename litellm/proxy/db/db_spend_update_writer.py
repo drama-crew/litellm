@@ -176,16 +176,6 @@ class DBSpendUpdateWriter:
             if team_id is not None and team_id != "":
                 payload["team_id"] = team_id
 
-            if disable_spend_logs is False:
-                await self._insert_spend_log_to_db(
-                    payload=payload,
-                    prisma_client=prisma_client,
-                )
-            else:
-                verbose_proxy_logger.debug(
-                    "disable_spend_logs=True. Skipping writing spend logs to db. Other spend updates - Key/User/Team table will still occur."
-                )
-
             from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
 
             projection = metering.PROJECTION.get()
@@ -203,6 +193,16 @@ class DBSpendUpdateWriter:
                     reservation_id=None,
                 )
             settlement_pending = False
+            if disable_spend_logs is False:
+                await self._insert_spend_log_to_db(
+                    payload=payload,
+                    prisma_client=prisma_client,
+                )
+            else:
+                verbose_proxy_logger.debug(
+                    "disable_spend_logs=True. Skipping writing spend logs to db. Other spend updates - Key/User/Team table will still occur."
+                )
+
             projection_token = metering.PROJECTION.set(projection)
             try:
                 asyncio.create_task(

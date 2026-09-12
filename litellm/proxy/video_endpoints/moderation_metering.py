@@ -471,7 +471,7 @@ class MeteringStore:
             base_counter_keys(event.binding),
             kind="debit",
             amount=event.amount,
-            reservation_id=tasks[0].reservation_id if event.phase == event.binding.expected_phases[0] else None,
+            reservation_id=tasks[0].reservation_id,
             phase_request_id=event.request_id,
             phase_hash=row.payload_hash,
         )

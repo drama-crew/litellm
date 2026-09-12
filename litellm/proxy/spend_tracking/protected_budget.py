@@ -145,13 +145,21 @@ class CounterChange(FrozenModel):
     reservation: ReservationState | None = None
 
 
+class PhaseCompletion(FrozenModel):
+    request_id: str
+    phase: str
+    status: str
+    expected_phases: tuple[str, ...]
+
+
 class OperationPayload(FrozenModel):
-    kind: Literal["reserve", "resize", "release", "debit", "reset"]
+    kind: Literal["reserve", "resize", "reconcile", "release", "debit", "reset"]
     changes: tuple[CounterChange, ...]
     amount: Decimal
     reservation_id: str | None = None
     phase_request_id: str | None = None
     phase_hash: str | None = None
+    reservation_final: bool = True
 
     def digest(self) -> str:
         return hashlib.sha256(self.model_dump_json().encode()).hexdigest()
@@ -545,7 +553,7 @@ END $$
         operation_id: str,
         counter_keys: tuple[str, ...],
         *,
-        kind: Literal["reserve", "resize", "release", "debit"],
+        kind: Literal["reserve", "resize", "reconcile", "release", "debit"],
         amount: Decimal,
         reservation_id: str | None = None,
         valid_until: datetime | None = None,
@@ -574,15 +582,19 @@ END $$
         operation_id: str,
         counter_keys: tuple[str, ...],
         *,
-        kind: Literal["reserve", "resize", "release", "debit"],
+        kind: Literal["reserve", "resize", "reconcile", "release", "debit"],
         amount: Decimal,
         reservation_id: str | None = None,
         valid_until: datetime | None = None,
         phase_request_id: str | None = None,
         phase_hash: str | None = None,
     ) -> None:
-        if not operation_id or not amount.is_finite() or amount < 0:
+        if not operation_id.strip() or not amount.is_finite() or amount < 0:
             raise ValueError("stable operation identity and finite nonnegative amount required")
+        if phase_request_id is not None and kind != "debit":
+            raise ValueError("phase receipt requires actual debit")
+        if (phase_request_id is None) != (phase_hash is None):
+            raise ValueError("phase receipt requires paired identity and hash")
         previous = await self.operation(operation_id)
         if previous is not None:
             if (
@@ -606,8 +618,12 @@ END $$
             states = await self.states(tx, counter_keys, lock=True)
             if len(states) != len(set(counter_keys)) or any(s.pending_operation or s.status != "ready" for s in states):
                 raise BudgetBusy("all operation counters must be ready")
+            reservation_final = await self._phase_reservation_final(tx, phase_request_id) if phase_request_id else True
             changes = tuple(
-                [await self._change(tx, state, kind, amount, reservation_id, valid_until) for state in states]
+                [
+                    await self._change(tx, state, kind, amount, reservation_id, valid_until, reservation_final)
+                    for state in states
+                ]
             )
             await self._persist_operation(
                 tx,
@@ -619,9 +635,23 @@ END $$
                     reservation_id=reservation_id,
                     phase_request_id=phase_request_id,
                     phase_hash=phase_hash,
+                    reservation_final=reservation_final,
                 ),
             )
         await self.recover(operation_id)
+
+    async def _phase_reservation_final(self, tx: Database, phase_request_id: str) -> bool:
+        rows = TypeAdapter(tuple[PhaseCompletion, ...]).validate_python(
+            await tx.query_raw(
+                "SELECT p.request_id,p.phase,p.status,t.binding->'expected_phases' AS expected_phases "
+                'FROM "LiteLLM_ModerationMeteringPhase" p JOIN "LiteLLM_ModerationMeteringTask" t ON p.intent_id=t.intent_id '
+                'WHERE t.intent_id=(SELECT intent_id FROM "LiteLLM_ModerationMeteringPhase" WHERE request_id=$1)',
+                phase_request_id,
+            )
+        )
+        if not rows or {row.phase for row in rows} != set(rows[0].expected_phases):
+            raise BudgetPending("phase reservation manifest incomplete")
+        return all(row.request_id == phase_request_id or row.status == "settled" for row in rows)
 
     async def _change(
         self,
@@ -631,6 +661,7 @@ END $$
         amount: Decimal,
         reservation_id: str | None,
         valid_until: datetime | None,
+        reservation_final: bool,
     ) -> CounterChange:
         await self._balance(tx, state.target)
         previous = TypeAdapter(tuple[ReservationState, ...]).validate_python(
@@ -653,7 +684,7 @@ END $$
                 status="active",
             )
             return CounterChange(before=state, generation=state.generation, delta=amount, reservation=reservation)
-        if kind in ("resize", "release") and not previous:
+        if kind in ("resize", "reconcile", "release") and not previous:
             raise BudgetPending("reservation identity missing")
         if (
             kind == "resize"
@@ -666,13 +697,27 @@ END $$
                 return CounterChange(before=state, generation=state.generation, delta=Decimal(0))
             raise BudgetPending("reservation already settled")
         remaining = previous[0].remaining if previous and previous[0].generation == state.generation else Decimal(0)
-        new_remaining = amount if kind == "resize" else Decimal(0)
+        partial_phase = kind == "debit" and not reservation_final
+        new_remaining = (
+            amount
+            if kind in ("resize", "reconcile")
+            else max(remaining - amount, Decimal(0))
+            if partial_phase
+            else Decimal(0)
+        )
+        status = (
+            "active"
+            if kind == "resize" or partial_phase or (kind == "reconcile" and amount > 0)
+            else "released"
+            if kind in ("release", "reconcile")
+            else "settled"
+        )
         reservation = (
             previous[0].model_copy(
                 update={
                     "remaining": new_remaining,
                     "generation": state.generation,
-                    "status": "active" if kind == "resize" else "released" if kind == "release" else "settled",
+                    "status": status,
                 }
             )
             if previous
@@ -681,7 +726,9 @@ END $$
         return CounterChange(
             before=state,
             generation=state.generation,
-            delta=amount - remaining if kind != "release" else -remaining,
+            delta=(amount + new_remaining - remaining if partial_phase else amount - remaining)
+            if kind != "release"
+            else -remaining,
             debit=amount if kind == "debit" else Decimal(0),
             reservation=reservation,
         )

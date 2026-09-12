@@ -1190,3 +1190,253 @@ async def test_adjustment_lost_reply_recovery_and_old_replay_after_reset(store, 
     )
     assert float(await redis.get(prefix + "spend:team:team")) == 9
     assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 9.0}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("submit_amount", [Decimal(0), Decimal(2)])
+async def test_fix1_partial_phases_retain_reservation_until_complete_manifest(store, submit_amount):
+    from datetime import datetime, timezone
+
+    meter, db, redis, prefix = store
+    await prepare_meter(meter, binding(), {"spend:team:team": Decimal(5)})
+    await meter.persist(event("submit", str(submit_amount)))
+    await meter.run_once()
+    expected_remaining = 5 - submit_amount
+    rows = await db.query_raw('SELECT remaining,status FROM "LiteLLM_BudgetReservation"')
+    assert Decimal(str(rows[0]["remaining"])) == expected_remaining
+    assert rows[0]["status"] == "active"
+    assert float(await redis.get(prefix + "spend:team:team")) == 5
+    assert not (await meter.settlement(binding())).complete
+    authority = protected_store(meter)
+    await authority.reset("phase-reset", "spend:team:team", boundary=datetime.now(timezone.utc), reset_at=None)
+    assert float(await redis.get(prefix + "spend:team:team")) == float(expected_remaining)
+    await meter.persist(event("completion", "3"))
+    await meter.run_once()
+    assert float(await redis.get(prefix + "spend:team:team")) == 3
+    assert await db.query_raw('SELECT remaining,status FROM "LiteLLM_BudgetReservation"') == [
+        {"remaining": 0, "status": "settled"}
+    ]
+    assert (await meter.settlement(binding())).complete
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 3.0}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("released", [False, True])
+async def test_fix1_late_context_ir_reconciles_expired_or_released_without_actual_sql(store, monkeypatch, released):
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+    from litellm.caching import DualCache, RedisCache
+    from litellm.proxy import proxy_server
+    from litellm.llms.causyn.context_ir_budget import settle_reservation
+
+    meter, db, redis, prefix = store
+    cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
+    monkeypatch.setattr(proxy_server, "spend_counter_cache", DualCache(redis_cache=cache))
+    monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=db))
+    monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
+    try:
+        await redis.set(prefix + "spend:team:team", 100)
+        authority = protected_store(meter)
+        await authority.register_cutover(cutover_receipt())
+        await authority.mutate(
+            "late-reserve",
+            ("spend:team:team",),
+            kind="reserve",
+            amount=Decimal(5),
+            reservation_id="late-r",
+            valid_until=datetime.now(timezone.utc) + timedelta(seconds=0.3),
+        )
+        if released:
+            await authority.mutate(
+                "late-release", ("spend:team:team",), kind="release", amount=Decimal(0), reservation_id="late-r"
+            )
+        await asyncio.sleep(0.35)
+        await authority.reset("late-reset", "spend:team:team", boundary=datetime.now(timezone.utc), reset_at=None)
+        reservation = {
+            "reservation_id": "late-r",
+            "reserved_cost": 5,
+            "entries": [{"counter_key": "spend:team:team", "reservation_id": "late-r", "reserved_cost": 5}],
+        }
+        await settle_reservation("late-task", reservation, 3)
+        await settle_reservation("late-task", reservation, 3)
+        assert float(await redis.get(prefix + "spend:team:team")) == 3
+        assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 0.0}]
+        await authority.reset("late-next-reset", "spend:team:team", boundary=datetime.now(timezone.utc), reset_at=None)
+        await settle_reservation("late-task", reservation, 3)
+        assert float(await redis.get(prefix + "spend:team:team")) == 0
+    finally:
+        await cache.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "entrypoint,scenario",
+    [
+        ("callback", "global-ready"),
+        ("direct", "global-born"),
+        ("direct", "global-unregistered"),
+        ("callback", "new-window"),
+        ("direct", "new-window"),
+        ("callback", "missing-id"),
+        ("direct", "missing-id"),
+    ],
+)
+async def test_fix1_real_writer_dimensions_and_original_operation_identity(store, monkeypatch, entrypoint, scenario):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import litellm
+    from litellm.caching import DualCache, RedisCache
+    from litellm.proxy import proxy_server
+    from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
+    from litellm.proxy.hooks.proxy_track_cost_callback import _update_database_and_spend_counters
+    from litellm.proxy.spend_tracking import spend_tracking_utils
+    from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, CounterBaseline
+
+    meter, db, redis, prefix = store
+    await db.execute_raw("INSERT INTO \"LiteLLM_EndUserTable\" (user_id) VALUES ('end')")
+    if scenario in ("global-ready", "global-unregistered"):
+        await db.execute_raw("INSERT INTO \"LiteLLM_UserTable\" (user_id) VALUES ('global-budget')")
+    await db.execute_raw('ALTER TABLE "LiteLLM_TeamTable" ADD COLUMN budget_limits jsonb')
+    cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
+    monkeypatch.setattr(proxy_server, "spend_counter_cache", DualCache(redis_cache=cache))
+    monkeypatch.setattr(proxy_server, "user_api_key_cache", DualCache())
+    monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=db))
+    monkeypatch.setattr(proxy_server, "disable_spend_logs", False)
+    monkeypatch.setattr(proxy_server, "litellm_proxy_budget_name", "global-budget")
+    monkeypatch.setattr(litellm, "max_budget", 100 if scenario.startswith("global") else 0)
+    monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
+    writer = DBSpendUpdateWriter()
+    spend_log = AsyncMock()
+    monkeypatch.setattr(writer, "_insert_spend_log_to_db", spend_log)
+    for dimension in ("user", "end_user", "agent", "team", "org", "tag"):
+        monkeypatch.setattr(writer, "add_spend_log_transaction_to_daily_" + dimension + "_transaction", AsyncMock())
+    completed = asyncio.Event()
+    original_batch = writer._batch_database_updates
+
+    async def batch(**kwargs):
+        try:
+            await original_batch(**kwargs)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(writer, "_batch_database_updates", batch)
+    identifier = "" if scenario == "missing-id" else "fix1-actual"
+    monkeypatch.setattr(
+        spend_tracking_utils,
+        "get_logging_payload",
+        lambda **kwargs: {
+            "startTime": "2026-09-01T00:00:00",
+            "endTime": "2026-09-01T00:00:01",
+            "request_id": identifier,
+            "request_tags": "[]",
+            "model": "synthetic",
+        },
+    )
+    try:
+        authority = protected_store(meter)
+        await redis.set(prefix + "spend:team:team", 100)
+        await authority.register_cutover(cutover_receipt())
+        if scenario == "global-ready":
+            await authority.register_cutover(
+                cutover_receipt().model_copy(
+                    update={
+                        "receipt_id": "global-cutover",
+                        "baselines": (
+                            CounterBaseline(
+                                target=BudgetIdentity(kind="user", identity="global-budget"),
+                                sql_value=0,
+                                period_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                            ),
+                        ),
+                    }
+                )
+            )
+        elif scenario == "global-born":
+            await db.execute_raw("INSERT INTO \"LiteLLM_UserTable\" (user_id) VALUES ('global-budget')")
+        elif scenario == "new-window":
+            await db.execute_raw(
+                'UPDATE "LiteLLM_TeamTable" SET budget_limits=\'[{"budget_duration":"1d","max_budget":10,"reset_at":"2026-09-20T00:00:00Z"}]\''
+            )
+
+        async def invoke():
+            completed.clear()
+            args = {
+                "user_id": "user",
+                "end_user_id": "end",
+                "team_id": "team",
+                "org_id": None,
+                "kwargs": {"litellm_call_id": identifier, "response_cost": 3},
+                "completion_response": None,
+                "start_time": None,
+                "end_time": None,
+                "response_cost": 3,
+            }
+            if entrypoint == "direct":
+                await writer.update_database(token=None, **args)
+            else:
+                await _update_database_and_spend_counters(
+                    proxy_logging_obj=SimpleNamespace(db_spend_update_writer=writer),
+                    increment_spend_counters=proxy_server.increment_spend_counters,
+                    user_api_key=None,
+                    budget_reservation=None,
+                    **args,
+                )
+            await asyncio.wait_for(completed.wait(), 2)
+
+        for _ in range(2):
+            if scenario == "missing-id":
+                with pytest.raises(ValueError, match="operation identity"):
+                    await invoke()
+            else:
+                await invoke()
+        if scenario == "missing-id":
+            assert await db.query_raw('SELECT operation_id FROM "LiteLLM_BudgetOperation"') == []
+            assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 0.0}]
+        elif scenario == "global-unregistered":
+            assert await db.query_raw("SELECT spend FROM \"LiteLLM_UserTable\" WHERE user_id='global-budget'") == [
+                {"spend": 0.0}
+            ]
+        elif scenario.startswith("global"):
+            assert await db.query_raw("SELECT spend FROM \"LiteLLM_UserTable\" WHERE user_id='global-budget'") == [
+                {"spend": 3.0}
+            ]
+            assert float(await redis.get(prefix + "spend:user:global-budget")) == 3
+        else:
+            assert float(await redis.get(prefix + "spend:team:team:window:1d")) == 3
+        buffered = await writer.spend_update_queue.flush_and_get_aggregated_db_spend_update_transactions()
+        if scenario == "missing-id":
+            spend_log.assert_not_awaited()
+            assert not buffered["user_list_transactions"]
+        else:
+            assert buffered["end_user_list_transactions"] == {"end": 6.0}
+            assert not buffered["team_list_transactions"]
+            if scenario == "global-unregistered":
+                assert buffered["user_list_transactions"] == {"user": 6.0, "global-budget": 6.0}
+    finally:
+        await cache.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phases", [("submit", "completion"), ("completion", "submit")])
+async def test_fix1_parallel_phase_receipts_freeze_final_disposition_independent_of_order(store, phases):
+    meter, db, redis, prefix = store
+    bound = binding().model_copy(update={"expected_phases": phases})
+    await prepare_meter(meter, bound, {"spend:team:team": Decimal(5)})
+    for phase, amount in (("submit", "2"), ("completion", "3")):
+        await meter.persist(event(phase, amount).model_copy(update={"binding": bound}))
+    await asyncio.gather(*(meter.run_once() for _ in range(4)))
+    assert (await meter.settlement(bound)).complete
+    assert float(await redis.get(prefix + "spend:team:team")) == 5
+    assert await db.query_raw('SELECT remaining,status FROM "LiteLLM_BudgetReservation"') == [
+        {"remaining": 0, "status": "settled"}
+    ]
+    operations = await db.query_raw(
+        "SELECT payload->'reservation_final' AS final FROM \"LiteLLM_BudgetOperation\" WHERE payload->>'kind'='debit'"
+    )
+    assert sorted(row["final"] for row in operations) == [False, True]
+    for phase in phases:
+        from litellm.proxy.video_endpoints.moderation_metering import request_id
+
+        await protected_store(meter).recover(request_id(bound, phase))
+    assert float(await redis.get(prefix + "spend:team:team")) == 5

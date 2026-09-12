@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
+import litellm
 from litellm.proxy.video_endpoints.moderation_metering import (
     BillingBinding,
     MeteringStore,
@@ -310,6 +311,10 @@ async def adjust_registered(
     return True
 
 
+class CounterKey(BaseModel):
+    counter_key: str
+
+
 async def settle_legacy(
     operation_id: str,
     *,
@@ -322,11 +327,17 @@ async def settle_legacy(
     amount: float | None,
     reservation_id: str | None,
 ) -> Projection:
-    from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, CounterState, ProtectedBudgetStore
+    from litellm.proxy.proxy_server import litellm_proxy_budget_name
+    from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, ProtectedBudgetStore
 
     targets = (
         *((BudgetIdentity(kind="key", identity=token),) if token else ()),
         *((BudgetIdentity(kind="user", identity=user_id),) if user_id else ()),
+        *(
+            (BudgetIdentity(kind="user", identity=litellm_proxy_budget_name),)
+            if litellm.max_budget > 0 and litellm_proxy_budget_name
+            else ()
+        ),
         *((BudgetIdentity(kind="team", identity=team_id),) if team_id else ()),
         *((BudgetIdentity(kind="team_member", identity=user_id, team_id=team_id),) if user_id and team_id else ()),
         *((BudgetIdentity(kind="org", identity=org_id),) if org_id else ()),
@@ -339,14 +350,13 @@ async def settle_legacy(
     protected = ProtectedBudgetStore(
         authority.db, authority.transactions, authority.redis, namespace=authority.namespace
     )
-    for target in targets:
-        await protected.register_birth(target.counter_key)
     groups = await asyncio.gather(
         *(
             authority.db.query_raw(
-                "SELECT counter_key,generation,committed_seq,status,target,period_start,pending_operation "
-                "FROM \"LiteLLM_ModerationMeteringCounter\" WHERE target->>'kind'=$1 AND target->>'identity'=$2 "
-                "AND COALESCE(target->>'team_id','')=$3",
+                'SELECT counter_key FROM "LiteLLM_ModerationMeteringCounter" '
+                "WHERE target->>'kind'=$1 AND target->>'identity'=$2 AND COALESCE(target->>'team_id','')=$3 "
+                'UNION SELECT counter_key FROM "LiteLLM_BudgetBirth" '
+                "WHERE target->>'kind'=$1 AND target->>'identity'=$2 AND COALESCE(target->>'team_id','')=$3",
                 target.kind,
                 target.identity,
                 target.team_id or "",
@@ -354,10 +364,15 @@ async def settle_legacy(
             for target in targets
         )
     )
-    states = tuple(state for group in groups for state in TypeAdapter(tuple[CounterState, ...]).validate_python(group))
-    counter_keys = tuple(sorted({state.counter_key for state in states}))
+    counter_keys = tuple(
+        sorted(
+            {row.counter_key for group in groups for row in TypeAdapter(tuple[CounterKey, ...]).validate_python(group)}
+        )
+    )
     if not counter_keys:
         return Projection(frozenset())
+    if not operation_id.strip():
+        raise ValueError("stable server operation identity required")
     if amount is None:
         raise ValueError("protected actual fee remains unknown")
     await protected.mutate(

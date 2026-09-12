@@ -42,3 +42,25 @@ async def test_direct_writer_propagates_durable_settlement_failure(monkeypatch):
             end_time=None,
             response_cost=3,
         )
+
+
+async def test_reservation_only_reconcile_cannot_issue_actual_phase_receipt():
+    from decimal import Decimal
+    from unittest.mock import AsyncMock
+    import pytest
+    from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore
+
+    db = AsyncMock()
+    authority = ProtectedBudgetStore(db, AsyncMock(), AsyncMock())
+    with pytest.raises(ValueError, match="phase receipt requires actual debit"):
+        await authority.mutate(
+            "reconcile-only",
+            ("spend:team:team",),
+            kind="reconcile",
+            amount=Decimal(3),
+            reservation_id="reservation",
+            phase_request_id="phase",
+            phase_hash="hash",
+        )
+    db.query_raw.assert_not_awaited()
+    db.execute_raw.assert_not_awaited()

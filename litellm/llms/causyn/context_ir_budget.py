@@ -66,7 +66,7 @@ async def settle_reservation(task_id: str, reservation: dict[str, JsonValue] | N
             await authority.mutate(
                 "context-ir:" + task_id + ":" + entry.counter_key,
                 (entry.counter_key,),
-                kind="resize" if actual > 0 else "release",
+                kind="reconcile",
                 amount=Decimal(str(actual)),
                 reservation_id=reservation_id,
             )
