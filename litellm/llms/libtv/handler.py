@@ -62,13 +62,12 @@ _REF_DEFAULT_NAME = {"image": "reference.png", "video": "reference.mp4", "audio"
 # request that never mentioned references at all. Owned by .observability, which
 # reports them per submission -- one tuple, so the audit can never disagree with
 # what the handler actually inspected.
-from .observability import REFERENCE_KEYS as _REFERENCE_KEYS
-
 from litellm.llms.openai.cost_calculation import _video_output_cost_per_second
 
 from .client import LibTVClient
 from .common import LibTVContentPolicyError, LibTVError, resolve_libtv_credentials
 from .image_upscale import ImageUpscaleReceipt
+from .observability import REFERENCE_KEYS as _REFERENCE_KEYS
 from .observability import audit_logger, record_video_submission
 from .persistence import get_persistence
 from .transform import _allowed_setting_keys, _resolution_from_size, build_generation_params, build_topaz_upscale_params
@@ -801,7 +800,7 @@ class LibTVLLM(CustomLLM):
         if type(forwarded_prompt_chars) is int:
             vo.forwarded_prompt_chars = forwarded_prompt_chars
         vo.usage = _video_usage(op)
-        vo._hidden_params = {"project_uuid": created.get("project_uuid")}
+        vo._hidden_params = {"project_uuid": created.get("project_uuid"), "billing_pricing_snapshot": model_info}
         return vo
 
     def _create_with_fresh_asset_retry(
@@ -988,6 +987,37 @@ class LibTVLLM(CustomLLM):
         or without a matching price both mean real spend went unbilled, and staying
         silent is exactly what let the kling-v3-omni gap run 15 days unnoticed.
         """
+        from litellm.proxy.video_endpoints.moderation_execution import BILLING_CONTEXT
+
+        context = BILLING_CONTEXT.get()
+        if context is not None:
+            from litellm.llms.causyn.handler import _default_redis_factory
+            from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
+
+            usage = context.billing.get("usage_snapshot")
+            pricing = context.billing.get("pricing_snapshot")
+            if not isinstance(usage, dict) or not isinstance(pricing, dict):
+                raise ValueError("Public video billing snapshot is missing")
+            cost = _video_completion_cost({"model_info": pricing}, usage)
+            if cost is None:
+                raise ValueError("Public video billing price is missing")
+            await enqueue_causyn_billing(
+                _default_redis_factory(),
+                CausynBillingEvent(
+                    provider_task_id=task_id,
+                    response_cost=cost,
+                    provider="libtv",
+                    model=context.model,
+                    api_key=str(context.principal["fingerprint"]),
+                    user_id=str(context.principal["user_id"]),
+                    team_id=str(context.principal["team_id"]),
+                    request_id_override=str(context.billing["request_id"]),
+                    moderation_intent_id=context.intent_id,
+                ),
+            )
+            vo.usage = usage
+            vo._hidden_params = {**vo._hidden_params, "response_cost": 0.0}
+            return
         persistence = get_persistence()
         model_info = optional_params.get("model_info") or {}
         deployment_id = model_info.get("id")

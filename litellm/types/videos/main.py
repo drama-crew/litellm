@@ -21,6 +21,8 @@ class VideoObject(BaseModel):
     size: Optional[str] = None
     model: Optional[str] = None
     forwarded_prompt_chars: Optional[int] = None
+    moderation_status: Optional[str] = None
+    generation_status: Optional[str] = None
     usage: Optional[Dict[str, Any]] = None
     # Set only by providers whose finished object already lives in OUR object
     # store (causyn). Carrying the staging key back lets the platform finalise
@@ -123,6 +125,8 @@ class CharacterObject(BaseModel):
     object: Literal["character"] = "character"
     created_at: int
     name: str
+    status: Optional[str] = None
+    moderation_status: Optional[str] = None
     _hidden_params: Dict[str, Any] = {}
 
     def __contains__(self, key):

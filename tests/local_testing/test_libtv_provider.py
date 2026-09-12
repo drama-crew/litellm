@@ -6474,3 +6474,30 @@ async def test_unready_asset_never_submits_generation(use_async, item):
     paths = [path for path, _ in fake.calls]
     assert "/api/task/generation/create" not in paths
     assert paths.count("/api/third_asset/check") == (1 if item.get("status") == 2 else 30)
+
+
+@pytest.mark.asyncio
+async def test_public_collector_enqueues_original_price_and_billing_identity(monkeypatch):
+    from unittest.mock import AsyncMock
+    from litellm.llms.libtv import billing_outbox
+    from litellm.llms.causyn import handler as causyn_handler
+    from litellm.proxy.video_endpoints.moderation_execution import BILLING_CONTEXT, BillingContext
+    from litellm.types.videos.main import VideoObject
+    enqueue = AsyncMock(return_value=True)
+    monkeypatch.setattr(billing_outbox, 'enqueue_causyn_billing', enqueue)
+    monkeypatch.setattr(causyn_handler, '_default_redis_factory', lambda: 'synthetic-redis')
+    ctx = BillingContext(intent_id='intent', model='hailuo-h3', principal={
+        'fingerprint': 'a' * 64, 'user_id': 'original-user', 'team_id': 'original-team'}, billing={
+        'request_id': 'public-video:intent', 'usage_snapshot': {'duration_seconds': 8, 'video_resolution': '720p'},
+        'pricing_snapshot': {'output_cost_per_second_720p': 0.25}})
+    token = BILLING_CONTEXT.set(ctx)
+    video = VideoObject(id='native', object='video', status='completed')
+    try:
+        await LibTVLLM()._bill_completed_video(video, 'native', {'model_info': {'output_cost_per_second_720p': 99}})
+    finally:
+        BILLING_CONTEXT.reset(token)
+    event = enqueue.call_args.args[1]
+    assert event.response_cost == 2
+    assert event.api_key == 'a' * 64 and event.user_id == 'original-user'
+    assert event.request_id == 'public-video:intent' and event.provider == 'libtv'
+    assert video._hidden_params['response_cost'] == 0

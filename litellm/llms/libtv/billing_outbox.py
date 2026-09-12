@@ -107,6 +107,9 @@ class CausynBillingEvent:
     task_type: Literal["video_generation", "h3_context_ir"] = "video_generation"
     event_id: str = field(default="")
     occurred_at: str = field(default="")
+    provider: Literal["causyn", "libtv"] = "causyn"
+    request_id_override: str | None = None
+    moderation_intent_id: str | None = None
 
     def __post_init__(self) -> None:
         if not self.event_id:
@@ -119,12 +122,14 @@ class CausynBillingEvent:
         return (
             f"causyn-context-ir:{self.provider_task_id}"
             if self.task_type == "h3_context_ir"
-            else f"causyn-video:{self.provider_task_id}"
+            else f"{self.provider}-video:{self.provider_task_id}"
         )
 
     @property
     def request_id(self) -> str:
-        return self.billing_key if self.task_type == "h3_context_ir" else f"causyn:{self.provider_task_id}"
+        return self.request_id_override or (
+            self.billing_key if self.task_type == "h3_context_ir" else f"causyn:{self.provider_task_id}"
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self) | {
@@ -138,6 +143,9 @@ class CausynBillingEvent:
         task_type = value.get("task_type", "video_generation")
         if task_type not in {"video_generation", "h3_context_ir"}:
             raise ValueError("Invalid Causyn billing task type")
+        provider = value.get("provider", "causyn")
+        if provider not in {"causyn", "libtv"}:
+            raise ValueError("Invalid video billing provider")
         return cls(
             task_type="h3_context_ir" if task_type == "h3_context_ir" else "video_generation",
             provider_task_id=str(value["provider_task_id"]),
@@ -149,6 +157,9 @@ class CausynBillingEvent:
             model=str(value.get("model") or "causyn-1.0"),
             event_id=str(value.get("event_id") or ""),
             occurred_at=str(value.get("occurred_at") or ""),
+            provider=provider,
+            request_id_override=_optional_str(value.get("request_id_override")),
+            moderation_intent_id=_optional_str(value.get("moderation_intent_id")),
         )
 
 
@@ -180,7 +191,9 @@ async def enqueue_causyn_billing(redis_client: Any, event: CausynBillingEvent) -
         _ENQUEUE_SCRIPT,
         2,
         CAUSYN_BILLING_STREAM_KEY,
-        f"{CAUSYN_BILLING_MARKER_PREFIX}{event.provider_task_id}",
+        f"{CAUSYN_BILLING_MARKER_PREFIX}{event.provider_task_id}"
+        if event.provider == "causyn"
+        else f"{CAUSYN_BILLING_MARKER_PREFIX}{event.billing_key}",
         payload,
         event.event_id,
     )
@@ -286,7 +299,13 @@ class LibTVBillingReconciler:
         async with db.tx() as transaction:
             if isinstance(event, CausynBillingEvent):
                 call_type = event.task_type
-                metadata = json.dumps({"causyn_billing_key": event.billing_key})
+                metadata = json.dumps(
+                    {
+                        "causyn_billing_key": event.billing_key,
+                        "provider": event.provider,
+                        **({"moderation_intent_id": event.moderation_intent_id} if event.moderation_intent_id else {}),
+                    }
+                )
             else:
                 call_type = "image_upscale"
                 metadata = json.dumps(

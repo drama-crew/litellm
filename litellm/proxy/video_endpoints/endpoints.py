@@ -26,7 +26,7 @@ from litellm.types.videos.utils import (
     decode_video_id_with_provider,
 )
 
-from litellm.proxy.video_endpoints import openapi_log_capture
+from litellm.proxy.video_endpoints import openapi_log_capture, moderation_bridge
 
 router = APIRouter()
 
@@ -82,6 +82,9 @@ async def video_generation(
 
     # Read request body
     data = await _read_request_body(request=request)
+    moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_generation", input_reference)
+    if moderated is not None:
+        return moderated
     if input_reference is not None:
         input_reference_file = await batch_to_bytesio([input_reference])
         if input_reference_file:
@@ -113,6 +116,7 @@ async def video_generation(
             user_api_base=user_api_base,
             version=version,
         )
+        await moderation_bridge.capture(request, result)
         await openapi_log_capture.submitted(history_id, result)
         return result
     except Exception as e:
@@ -154,6 +158,10 @@ async def video_list(
         -H "Authorization: Bearer sk-1234"
     ```
     """
+    moderated = await moderation_bridge.list_tasks(request, user_api_key_dict)
+    if moderated is not None:
+        return moderated
+
     from litellm.proxy.proxy_server import (
         general_settings,
         llm_router,
@@ -240,6 +248,10 @@ async def video_status(
         -H "Authorization: Bearer sk-1234"
     ```
     """
+    moderated = await moderation_bridge.query(request, user_api_key_dict, video_id)
+    if moderated is not None:
+        return moderated
+
     from litellm.proxy.proxy_server import (
         general_settings,
         llm_router,
@@ -300,7 +312,7 @@ async def video_status(
             user_api_base=user_api_base,
             version=version,
         )
-        await openapi_log_capture.observe(user_api_key_dict, result)
+        await openapi_log_capture.observe(user_api_key_dict, result, request)
         return result
     except Exception as e:
         raise await processor._handle_llm_api_exception(
@@ -342,6 +354,10 @@ async def video_content(
         --output video.mp4
     ```
     """
+    moderated = await moderation_bridge.download(request, user_api_key_dict, video_id)
+    if moderated is not None:
+        return moderated
+
     from litellm.proxy.proxy_server import (
         general_settings,
         llm_router,
@@ -469,6 +485,11 @@ async def video_remix(
     # Read request body
     body = await request.body()
     data = orjson.loads(body)
+    moderated = await moderation_bridge.submit(
+        request, user_api_key_dict, {**data, "source_video_id": video_id}, "avideo_remix"
+    )
+    if moderated is not None:
+        return moderated
     data["video_id"] = video_id
 
     decoded = decode_video_id_with_provider(video_id)
@@ -569,6 +590,12 @@ async def video_create_character(
     )
 
     data = await _read_request_body(request=request)
+    target_model_name = extract_model_from_target_model_names(data.get("target_model_names"))
+    if target_model_name and not data.get("model"):
+        data["model"] = target_model_name
+    moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_create_character", video)
+    if moderated is not None:
+        return moderation_bridge.character(moderated)
     video_file = await batch_to_bytesio([video])
     if video_file:
         data["video"] = video_file[0]
@@ -668,6 +695,9 @@ async def video_get_character(
         version,
     )
 
+    moderated = await moderation_bridge.query(request, user_api_key_dict, character_id)
+    if moderated is not None:
+        return moderation_bridge.character(moderated)
     original_requested_character_id = character_id
     data: Dict[str, Any] = {"character_id": character_id}
 
@@ -777,6 +807,9 @@ async def video_edit(
 
     body = await request.body()
     data = orjson.loads(body)
+    moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_edit")
+    if moderated is not None:
+        return moderated
 
     # Extract video_id from nested video object
     video_ref = data.pop("video", {})
@@ -877,6 +910,9 @@ async def video_extension(
 
     body = await request.body()
     data = orjson.loads(body)
+    moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_extension")
+    if moderated is not None:
+        return moderated
 
     # Extract video_id from nested video object
     video_ref = data.pop("video", {})

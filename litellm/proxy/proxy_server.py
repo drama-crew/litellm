@@ -524,6 +524,7 @@ from litellm.proxy.video_endpoints.minimax_h3_endpoints import router as minimax
 from litellm.proxy.video_endpoints.openapi_log_query import router as openapi_log_router
 from litellm.proxy.video_endpoints.monitor import router as video_monitor_router
 from litellm.proxy.video_endpoints.context_ir_endpoints import router as context_ir_router
+from litellm.proxy.video_endpoints.moderation_execution import router as moderation_execution_router
 from litellm.repositories.credentials_repository import CredentialsRepository
 from litellm.router import (
     AssistantsTypedDict,
@@ -15915,6 +15916,7 @@ app.include_router(minimax_h3_router)
 app.include_router(openapi_log_router)
 app.include_router(video_monitor_router)
 app.include_router(context_ir_router)
+app.include_router(moderation_execution_router)
 app.include_router(container_router)
 app.include_router(search_router)
 app.include_router(image_router)

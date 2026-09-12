@@ -46,6 +46,14 @@ async def create_context_ir(request: Request, auth: Auth, service: Service) -> d
     spec = request.scope.get("causyn_context_ir_spec")
     if not isinstance(spec, ContextIRRequest):
         raise RewriteError("Invalid Context IR request", 400)
+    from litellm.llms.causyn.h3_prompt import AUTH_MODEL
+    from litellm.proxy.video_endpoints import moderation_bridge
+
+    moderated = await moderation_bridge.submit(
+        request, auth, spec.model_dump(mode="json"), "context_ir", policy_model=AUTH_MODEL
+    )
+    if moderated is not None:
+        return {"task_id": moderated.id}
     reservation = TypeAdapter[dict[str, JsonValue] | None](dict[str, JsonValue] | None).validate_python(
         auth.budget_reservation
     )
@@ -87,6 +95,11 @@ async def accept_context_ir(
 
 @router.get("/v2/query/video_generation", tags=["MiniMax H3"])
 async def list_context_ir(request: Request, auth: Auth, service: Service) -> dict[str, JsonValue]:
+    from litellm.proxy.video_endpoints import moderation_bridge
+
+    moderated = await moderation_bridge.list_tasks(request, auth, v2=True)
+    if moderated is not None:
+        return moderated
     params = ListParams.model_validate(
         {
             key: request.query_params.getlist(key) if key == "filter.task_ids" else value
@@ -106,6 +119,22 @@ async def list_context_ir(request: Request, auth: Auth, service: Service) -> dic
 
 
 @router.delete("/v2/video_generation/{video_id}", tags=["MiniMax H3"])
-async def delete_context_ir(video_id: str, auth: Auth, service: Service) -> dict[str, str]:
-    action = await service.cancel_or_delete(video_id, task_owner(auth))
+async def delete_context_ir(video_id: str, request: Request, auth: Auth, service: Service) -> dict[str, str]:
+    from litellm.proxy.video_endpoints import moderation_bridge as bridge
+
+    if video_id.startswith(bridge.PREFIX):
+        import os
+
+        from litellm.proxy.video_endpoints.moderation_execution import Ticket, cancel
+
+        outcome = await bridge.platform(
+            request, "POST", f"/intents/{video_id}/cancel", {"principal": bridge.principal(auth)}
+        )
+        if isinstance(outcome.get("ticket"), str):
+            outcome = await cancel(
+                Ticket(ticket=outcome["ticket"]), request, "Bearer " + os.environ["DRAMA_MODERATION_SERVICE_TOKEN"]
+            )
+        action = TypeAdapter(str).validate_python(outcome["action"])
+    else:
+        action = await service.cancel_or_delete(video_id, task_owner(auth))
     return {"task_id": video_id, "action": action, "status": action}

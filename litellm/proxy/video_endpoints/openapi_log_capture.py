@@ -116,7 +116,11 @@ async def failed(log_id: str | None, exc: Exception) -> None:
     await persist(operation())
 
 
-async def observe(auth: UserAPIKeyAuth, video: object) -> None:
+async def observe(auth: UserAPIKeyAuth, video: object, request: Request | None = None) -> None:
+    from litellm.proxy.video_endpoints.moderation_bridge import ADMITTED
+
+    if request is not None and request.scope.get("moderation_admission") is ADMITTED:
+        return
     if not isinstance(video, VideoObject):
         return
 

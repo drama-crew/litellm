@@ -18,7 +18,7 @@ from litellm.llms.causyn.h3_prompt import AUTH_MODEL, ContextIRRequest, RewriteE
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.http_parsing_utils import _safe_set_request_parsed_body
-from litellm.proxy.video_endpoints import endpoints
+from litellm.proxy.video_endpoints import endpoints, moderation_bridge
 from litellm.proxy.video_endpoints.minimax_h3_models import (
     ImageItem,
     MiniMaxH3Create,
@@ -108,6 +108,8 @@ async def prepare_request(request: Request) -> None:
             _safe_set_request_parsed_body(request, spec.internal_body())
     elif is_ir:
         _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
+    elif public_id.startswith(moderation_bridge.PREFIX):
+        _safe_set_request_parsed_body(request, {})
     else:
         public_id = TypeAdapter(str).validate_python(request.path_params["video_id"])
         try:
@@ -179,6 +181,8 @@ async def create_video(
     video = await endpoints.video_generation(request, response, input_reference=None, user_api_key_dict=auth)
     if not isinstance(video, VideoObject) or not video.id:
         raise H3Error(500, "Video provider returned an invalid task")
+    if video.id.startswith(moderation_bridge.PREFIX):
+        return {"task_id": video.id}
     task = MiniMaxTask(
         native_id=video.id,
         model=spec.model,
@@ -202,6 +206,11 @@ async def query_video(
     auth: Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)],
     ir_service: Annotated[ContextIRService | None, Depends(context_ir_service_for_request)],
 ) -> dict[str, object]:
+    if video_id.startswith(moderation_bridge.PREFIX):
+        moderated = await moderation_bridge.query(request, auth, video_id)
+        if moderated is None:
+            raise H3Error(404, "Task not found")
+        return {"task": moderation_bridge.v2_task(moderated)}
     if ir_service is not None:
         return await query_context_ir_task(video_id, task_owner(auth), ir_service)
     task = request.scope.get("minimax_h3_task")

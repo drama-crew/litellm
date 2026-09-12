@@ -82,6 +82,7 @@ class FakeRequest:
         query: Optional[Dict[str, str]] = None,
         raw_body: bytes = b"{}",
     ):
+        self.scope = {"type": "http", "method": "POST", "path": "/v1/videos", "headers": []}
         self.headers = headers or {}
         self.query_params = query or {}
         self._raw_body = raw_body

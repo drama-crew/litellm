@@ -2374,6 +2374,11 @@ async def _run_centralized_common_checks(
         project_object=project_object,
     )
 
+    from litellm.proxy.video_endpoints.moderation_bridge import defer_budget
+
+    if defer_budget(request, user_api_key_auth_obj, route):
+        return
+
     await _reserve_budget_after_common_checks(
         user_api_key_auth_obj=user_api_key_auth_obj,
         request_data=request_data,

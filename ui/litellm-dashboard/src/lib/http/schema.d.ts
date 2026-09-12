@@ -6119,6 +6119,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/internal/moderation/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Cancel */
+        post: operations["cancel_internal_moderation_cancel_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/moderation/collect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Collect */
+        post: operations["collect_internal_moderation_collect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/moderation/submit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Submit */
+        post: operations["submit_internal_moderation_submit_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/openapi-logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** History */
+        get: operations["history_internal_openapi_logs_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/internal/v1/image-upscale/finalize": {
         parameters: {
             query?: never;
@@ -6232,6 +6300,40 @@ export interface paths {
         get: operations["libtv_validated_media_transfer_readiness_internal_v1_validated_media_transfer_readiness_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/video-monitor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Monitor List */
+        get: operations["monitor_list_internal_video_monitor_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/internal/video-monitor/probe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Monitor Probe */
+        post: operations["monitor_probe_internal_video_monitor_probe_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -27238,6 +27340,55 @@ export interface components {
          * @enum {string}
          */
         LitellmUserRoles: "proxy_admin" | "proxy_admin_viewer" | "org_admin" | "internal_user" | "internal_user_viewer" | "team" | "customer";
+        /** LogPage */
+        LogPage: {
+            /** Items */
+            items: components["schemas"]["LogRow"][];
+            /** Page */
+            page: number;
+            /** Page Size */
+            page_size: number;
+            /** Total */
+            total: number;
+        };
+        /** LogRow */
+        LogRow: {
+            /** Cost Usd */
+            cost_usd?: number | null;
+            /** Elapsed Estimated */
+            elapsed_estimated: boolean;
+            /** Endpoint */
+            endpoint: string;
+            /** Error */
+            error?: string | null;
+            /** Finished At */
+            finished_at: string | null;
+            /** Historical */
+            historical: boolean;
+            /** Id */
+            id: string;
+            input?: components["schemas"]["JsonValue"];
+            /** Model */
+            model: string;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            result?: components["schemas"]["JsonValue"];
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "queued" | "running" | "succeeded" | "failed" | "cancelled" | "unknown";
+            /** Task Id */
+            task_id: string | null;
+        };
         /** LoggingCallbackStatus */
         LoggingCallbackStatus: {
             /** Callbacks */
@@ -27684,6 +27835,46 @@ export interface components {
             system_fingerprint?: string | null;
         } & {
             [key: string]: unknown;
+        };
+        /** MonitorPage */
+        MonitorPage: {
+            /** Items */
+            items: components["schemas"]["MonitorRow"][];
+            /** Next After */
+            next_after: string;
+        };
+        /** MonitorRow */
+        MonitorRow: {
+            /** Error */
+            error?: string | null;
+            /** Finished At */
+            finished_at?: string | null;
+            /** Id */
+            id: string;
+            /** Model */
+            model: string;
+            /** Observation Error */
+            observation_error?: string | null;
+            /**
+             * Observed At
+             * Format: date-time
+             */
+            observed_at: string;
+            /** Provider Task Id */
+            provider_task_id?: string | null;
+            /** Public Task Id */
+            public_task_id?: string | null;
+            /**
+             * Started At
+             * Format: date-time
+             */
+            started_at: string;
+            /** Status */
+            status: string;
+            /** Task Id */
+            task_id?: string | null;
+            /** Trace Id */
+            trace_id?: string | null;
         };
         /**
          * MutualTLSSecurityScheme
@@ -29612,6 +29803,11 @@ export interface components {
              * @description New status: 'published' or 'production'.
              */
             version_status: string;
+        };
+        /** ProbeRequest */
+        ProbeRequest: {
+            /** Log Id */
+            log_id: string;
         };
         /** Prompt */
         Prompt: {
@@ -31625,6 +31821,11 @@ export interface components {
             litellm_params: {
                 [key: string]: unknown;
             };
+        };
+        /** Ticket */
+        Ticket: {
+            /** Ticket */
+            ticket: string;
         };
         /**
          * TokenCountDetailsResponse
@@ -41832,6 +42033,150 @@ export interface operations {
             };
         };
     };
+    cancel_internal_moderation_cancel_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Ticket"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    collect_internal_moderation_collect_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Ticket"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_internal_moderation_submit_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Ticket"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    history_internal_openapi_logs_get: {
+        parameters: {
+            query: {
+                user_id: string;
+                page?: number;
+                page_size?: number;
+                endpoint?: ("videos" | "minimax_h3") | null;
+                status?: ("queued" | "running" | "succeeded" | "failed" | "cancelled" | "unknown") | null;
+                model?: string | null;
+                task_id?: string | null;
+                start?: string | null;
+                end?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LogPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     libtv_image_upscale_finalize_internal_v1_image_upscale_finalize_post: {
         parameters: {
             query?: never;
@@ -42049,6 +42394,71 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
+                };
+            };
+        };
+    };
+    monitor_list_internal_video_monitor_get: {
+        parameters: {
+            query: {
+                since: string;
+                after?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MonitorPage"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    monitor_probe_internal_video_monitor_probe_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProbeRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MonitorRow"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
