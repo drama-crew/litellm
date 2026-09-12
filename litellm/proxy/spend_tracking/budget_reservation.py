@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, cast
+from uuid import uuid4
 
 import litellm
 from litellm._logging import verbose_proxy_logger
@@ -156,6 +157,7 @@ async def reserve_budget_for_request(
     if reservation_cost is None or reservation_cost <= 0:
         return None
 
+    reservation_id = uuid4().hex
     applied_entries: List[Dict[str, Any]] = []
     try:
         for counter in counters:
@@ -163,11 +165,17 @@ async def reserve_budget_for_request(
                 counter=counter,
                 reserved_cost=reservation_cost,
             )
+            from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_authority
+
+            if await protected_authority(counter.counter_key) is not None:
+                entry["reservation_id"] = reservation_id
+                entry["window_start"] = counter.window_start.isoformat() if counter.window_start else None
             applied_entries.append(entry)
             try:
                 reserved_value = await _reserve_counter(
                     counter=counter,
                     reservation_cost=reservation_cost,
+                    reservation_id=reservation_id,
                 )
             except _CounterReservationUnavailable as exc:
                 if exc.touched_counter and not exc.counter_invalidated:
@@ -208,6 +216,7 @@ async def reserve_budget_for_request(
     input_cost = estimate_request_input_cost(request_body=request_body, route=route, llm_router=llm_router)
     return {
         "reserved_cost": reservation_cost,
+        **({"reservation_id": reservation_id} if any("reservation_id" in entry for entry in applied_entries) else {}),
         "entries": applied_entries,
         "finalized": False,
         "input_cost": min(float(input_cost or 0.0), reservation_cost),
@@ -222,6 +231,13 @@ async def reconcile_budget_reservation(
     if not budget_reservation or budget_reservation.get("finalized") is True:
         return
 
+    if actual_cost is None:
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_authority
+
+        for key in get_reserved_counter_keys(budget_reservation):
+            if await protected_authority(key) is not None:
+                return
+
     reserved_cost = float(budget_reservation.get("reserved_cost") or 0.0)
     actual = float(actual_cost or 0.0)
     await _set_reserved_entries_actual_cost(
@@ -234,10 +250,16 @@ async def reconcile_budget_reservation(
 
 
 async def release_budget_reservation(budget_reservation: Optional[dict]) -> None:
-    await reconcile_budget_reservation(
-        budget_reservation=budget_reservation,
-        actual_cost=0.0,
-    )
+    if not budget_reservation or budget_reservation.get("finalized") is True:
+        return
+    for entry in budget_reservation.get("entries") or []:
+        await _set_reserved_entry_actual_cost(
+            entry,
+            0.0,
+            float(budget_reservation.get("reserved_cost") or 0),
+            release=True,
+        )
+    budget_reservation["finalized"] = True
 
 
 async def release_budget_reservation_on_cancel(
@@ -264,6 +286,19 @@ async def release_budget_reservation_on_cancel(
     """
     if not budget_reservation or budget_reservation.get("finalized") is True:
         return
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_authority
+
+    protected_keys = set()
+    for key in get_reserved_counter_keys(budget_reservation):
+        if await protected_authority(key) is not None:
+            protected_keys.add(key)
+    if protected_keys:
+        legacy_entries = [
+            entry for entry in budget_reservation.get("entries", []) if entry.get("counter_key") not in protected_keys
+        ]
+        if not legacy_entries:
+            return
+        budget_reservation = {**budget_reservation, "entries": legacy_entries}
     incurred_cost = float(budget_reservation.get("input_cost") or 0.0)
     try:
         await asyncio.shield(
@@ -619,6 +654,7 @@ def _coerce_window(window: Any) -> dict:
 async def _reserve_counter(
     counter: _BudgetCounter,
     reservation_cost: float,
+    reservation_id: str | None = None,
 ) -> Optional[float]:
     from litellm.proxy.proxy_server import (
         _ensure_spend_counter_initialized,
@@ -626,6 +662,17 @@ async def _reserve_counter(
         _invalidate_spend_counter,
         _increment_spend_counter_cache,
     )
+
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import reserve_registered
+
+    reserved = await reserve_registered(
+        counter.counter_key,
+        reservation_id or "",
+        reservation_cost,
+        datetime.now(timezone.utc) + timedelta(seconds=600),
+    )
+    if reserved is not None:
+        return reserved
 
     attempted_increment = False
     try:
@@ -707,6 +754,7 @@ async def _set_reserved_entry_actual_cost(
     actual_cost: float,
     default_reserved_cost: float,
     reseed_on_inconsistent: bool = True,
+    release: bool = False,
 ) -> None:
     from litellm.proxy.proxy_server import (
         _increment_spend_counter_cache,
@@ -716,6 +764,17 @@ async def _set_reserved_entry_actual_cost(
     counter_key = entry.get("counter_key")
     if counter_key is None:
         return
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import adjust_registered
+
+    if await adjust_registered(
+        counter_key,
+        entry.get("reservation_id") or "",
+        actual_cost,
+        resize=not reseed_on_inconsistent,
+        release=release,
+    ):
+        return
+
     reserved_cost = _get_entry_reserved_cost(
         entry=entry,
         default_reserved_cost=default_reserved_cost,
@@ -778,6 +837,7 @@ async def _release_applied_entries_best_effort(
                 entry=entry,
                 actual_cost=0.0,
                 default_reserved_cost=default_reserved_cost,
+                release=True,
             )
         except Exception:
             counter_key = entry.get("counter_key")

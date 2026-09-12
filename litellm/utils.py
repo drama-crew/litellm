@@ -1325,7 +1325,6 @@ def client(original_function):
             # Type assertion: logging_obj is guaranteed to be non-None after function_setup
             assert logging_obj is not None, "logging_obj should not be None after function_setup"
 
-
             ## LOAD CREDENTIALS
             load_credentials_from_list(kwargs)
             kwargs["litellm_logging_obj"] = logging_obj

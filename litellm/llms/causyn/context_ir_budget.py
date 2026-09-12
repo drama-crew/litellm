@@ -8,12 +8,14 @@ from litellm.llms.causyn.h3_prompt import RewriteError
 
 
 class ReservationEntry(BaseModel):
+    reservation_id: str | None = None
     counter_key: str
     reserved_cost: float | None = None
     applied_adjustment: float = 0.0
 
 
 class Reservation(BaseModel):
+    reservation_id: str | None = None
     reserved_cost: float = Field(ge=0)
     entries: tuple[ReservationEntry, ...]
     finalized: bool = False
@@ -52,6 +54,23 @@ async def settle_reservation(task_id: str, reservation: dict[str, JsonValue] | N
         raise RewriteError("Context IR budget cache unavailable", 503)
     script = cache.async_register_script(REFUND_SCRIPT)
     for entry in parsed.entries:
+        from decimal import Decimal
+
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_authority
+
+        authority = await protected_authority(entry.counter_key)
+        if authority is not None:
+            reservation_id = entry.reservation_id or parsed.reservation_id
+            if not reservation_id:
+                raise RewriteError("Protected Context IR reservation identity missing", 503)
+            await authority.mutate(
+                "context-ir:" + task_id + ":" + entry.counter_key,
+                (entry.counter_key,),
+                kind="resize" if actual > 0 else "release",
+                amount=Decimal(str(actual)),
+                reservation_id=reservation_id,
+            )
+            continue
         reserved = entry.reserved_cost if entry.reserved_cost is not None else parsed.reserved_cost
         delta = actual - reserved - entry.applied_adjustment
         if delta == 0:
@@ -63,7 +82,7 @@ async def settle_reservation(task_id: str, reservation: dict[str, JsonValue] | N
 
 async def release_unaccepted_reservation(reservation: dict[str, JsonValue] | None) -> None:
     from litellm.proxy.spend_tracking.budget_reservation import (
-        reconcile_budget_reservation,  # pyright: ignore[reportUnknownVariableType]  # legacy reservation API uses an unparameterized dict
+        release_budget_reservation,  # pyright: ignore[reportUnknownVariableType]  # legacy reservation API uses an unparameterized dict
     )
 
-    await reconcile_budget_reservation(reservation, 0.0)
+    await release_budget_reservation(reservation)

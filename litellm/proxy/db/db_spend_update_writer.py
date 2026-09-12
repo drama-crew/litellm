@@ -141,6 +141,7 @@ class DBSpendUpdateWriter:
         )
         from litellm.proxy.utils import ProxyUpdateSpend, hash_token
 
+        settlement_pending = False
         try:
             verbose_proxy_logger.debug(
                 f"Enters prisma db call, response_cost: {response_cost}, token: {token}; user_id: {user_id}; team_id: {team_id}"
@@ -185,21 +186,41 @@ class DBSpendUpdateWriter:
                     "disable_spend_logs=True. Skipping writing spend logs to db. Other spend updates - Key/User/Team table will still occur."
                 )
 
-            # Single task replaces 11 create_task() calls
-            asyncio.create_task(
-                self._batch_database_updates(
-                    response_cost=response_cost,
+            from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
+
+            projection = metering.PROJECTION.get()
+            if projection is None:
+                settlement_pending = True
+                projection = await metering.settle_legacy(
+                    str((kwargs or {}).get("litellm_call_id") or payload.get("request_id") or ""),
+                    token=hashed_token,
                     user_id=user_id,
-                    hashed_token=hashed_token,
                     team_id=team_id,
                     org_id=org_id,
                     end_user_id=end_user_id,
-                    prisma_client=prisma_client,
-                    user_api_key_cache=user_api_key_cache,
-                    litellm_proxy_budget_name=litellm_proxy_budget_name,
-                    payload=payload,
+                    tags=metering.projection_tags(payload.get("request_tags")),
+                    amount=response_cost,
+                    reservation_id=None,
                 )
-            )
+            settlement_pending = False
+            projection_token = metering.PROJECTION.set(projection)
+            try:
+                asyncio.create_task(
+                    self._batch_database_updates(
+                        response_cost=response_cost,
+                        user_id=user_id,
+                        hashed_token=hashed_token,
+                        team_id=team_id,
+                        org_id=org_id,
+                        end_user_id=end_user_id,
+                        prisma_client=prisma_client,
+                        user_api_key_cache=user_api_key_cache,
+                        litellm_proxy_budget_name=litellm_proxy_budget_name,
+                        payload=payload,
+                    )
+                )
+            finally:
+                metering.PROJECTION.reset(projection_token)
 
             self._enqueue_tool_registry_upsert(
                 kwargs=kwargs,
@@ -210,6 +231,8 @@ class DBSpendUpdateWriter:
 
             verbose_proxy_logger.debug("Runs spend update on all tables")
         except Exception:
+            if settlement_pending:
+                raise
             spend_log_error(
                 "Spend tracking - update_database failed. Spend log insertion or daily transaction enqueue "
                 "may not have completed for this request. "
@@ -484,6 +507,37 @@ class DBSpendUpdateWriter:
                 traceback.format_exc(),
             )
 
+    async def _enqueue_cumulative_spend(self, update: SpendUpdateQueueItem) -> None:
+        from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
+
+        names = {
+            Litellm_EntityType.KEY: "key",
+            Litellm_EntityType.USER: "user",
+            Litellm_EntityType.TEAM: "team",
+            Litellm_EntityType.ORGANIZATION: "org",
+            Litellm_EntityType.END_USER: "end_user",
+            Litellm_EntityType.TAG: "tag",
+        }
+        entity_type = update.get("entity_type")
+        entity_id = update.get("entity_id")
+        if entity_type is None or not entity_id:
+            raise ValueError("cumulative spend identity required")
+        if entity_type == Litellm_EntityType.TEAM_MEMBER:
+            team, separator, user = entity_id.removeprefix("team_id::").partition("::user_id::")
+            if not separator:
+                raise ValueError("invalid membership spend identity")
+            counter_key = f"spend:team_member:{user}:{team}"
+        elif entity_type in names:
+            counter_key = f"spend:{names[entity_type]}:{entity_id}"
+        else:
+            await self.spend_update_queue.add_update(update=update)
+            return
+        if metering.projected(counter_key):
+            return
+        if await metering.protected_authority(counter_key) is not None:
+            raise ValueError("unversioned buffered write to protected counter rejected")
+        await self.spend_update_queue.add_update(update=update)
+
     async def _update_key_db(
         self,
         response_cost: Optional[float],
@@ -494,7 +548,7 @@ class DBSpendUpdateWriter:
             if hashed_token is None or prisma_client is None:
                 return
 
-            await self.spend_update_queue.add_update(
+            await self._enqueue_cumulative_spend(
                 update=SpendUpdateQueueItem(
                     entity_type=Litellm_EntityType.KEY,
                     entity_id=hashed_token,
@@ -530,7 +584,7 @@ class DBSpendUpdateWriter:
 
                 for _id in user_ids:
                     if _id is not None:
-                        await self.spend_update_queue.add_update(
+                        await self._enqueue_cumulative_spend(
                             update=SpendUpdateQueueItem(
                                 entity_type=Litellm_EntityType.USER,
                                 entity_id=_id,
@@ -539,7 +593,7 @@ class DBSpendUpdateWriter:
                         )
 
                 if end_user_id is not None:
-                    await self.spend_update_queue.add_update(
+                    await self._enqueue_cumulative_spend(
                         update=SpendUpdateQueueItem(
                             entity_type=Litellm_EntityType.END_USER,
                             entity_id=end_user_id,
@@ -571,7 +625,7 @@ class DBSpendUpdateWriter:
                 )
                 return
 
-            await self.spend_update_queue.add_update(
+            await self._enqueue_cumulative_spend(
                 update=SpendUpdateQueueItem(
                     entity_type=Litellm_EntityType.TEAM,
                     entity_id=team_id,
@@ -584,7 +638,7 @@ class DBSpendUpdateWriter:
                 if user_id is not None:
                     # key is "team_id::<value>::user_id::<value>"
                     team_member_key = f"team_id::{team_id}::user_id::{user_id}"
-                    await self.spend_update_queue.add_update(
+                    await self._enqueue_cumulative_spend(
                         update=SpendUpdateQueueItem(
                             entity_type=Litellm_EntityType.TEAM_MEMBER,
                             entity_id=team_member_key,
@@ -624,7 +678,7 @@ class DBSpendUpdateWriter:
                 )
                 return
 
-            await self.spend_update_queue.add_update(
+            await self._enqueue_cumulative_spend(
                 update=SpendUpdateQueueItem(
                     entity_type=Litellm_EntityType.ORGANIZATION,
                     entity_id=org_id,
@@ -651,7 +705,7 @@ class DBSpendUpdateWriter:
             if agent_id is None or prisma_client is None:
                 return
 
-            await self.spend_update_queue.add_update(
+            await self._enqueue_cumulative_spend(
                 update=SpendUpdateQueueItem(
                     entity_type=Litellm_EntityType.AGENT,
                     entity_id=agent_id,
@@ -701,7 +755,7 @@ class DBSpendUpdateWriter:
             # Update spend for each tag
             for tag_name in tags:
                 if tag_name and isinstance(tag_name, str):
-                    await self.spend_update_queue.add_update(
+                    await self._enqueue_cumulative_spend(
                         update=SpendUpdateQueueItem(
                             entity_type=Litellm_EntityType.TAG,
                             entity_id=tag_name,

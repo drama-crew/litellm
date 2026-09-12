@@ -70,6 +70,10 @@ class ResetBudgetJob:
         commit opens a window where get_current_spend reads 0 from Redis
         while the DB still holds the pre-reset value, allowing bypass.
         """
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+        if await protected_value(counter_key) is not None:
+            return
         try:
             from litellm.proxy.proxy_server import spend_counter_cache
 
@@ -134,11 +138,39 @@ class ResetBudgetJob:
         if extra_where:
             where.update(extra_where)
 
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import counter_mode
+
+        if await counter_mode("spend:"):
+            where.pop("spend", None)
+
         try:
             rows = await table.find_many(where=where)
         except Exception as e:
+            from litellm.proxy.video_endpoints.moderation_metering_runtime import counter_mode
+
+            if await counter_mode("spend:"):
+                raise
             rows = []
             verbose_proxy_logger.warning("Failed to fetch %s for counter invalidation: %s", log_subject, e)
+
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import (
+            protected_authority,
+            reset_linked_registered,
+        )
+
+        protected_filters = []
+        for row in rows:
+            counter_key = counter_key_fn(row)
+            authority = await protected_authority(counter_key)
+            if authority is None:
+                continue
+            await reset_linked_registered(counter_key, getattr(row, "budget_id", None))
+            target = (await authority.states(authority.db, (counter_key,)))[0].target
+            protected_filters.append(
+                {target.column: target.identity, **({"team_id": target.team_id} if target.team_id else {})}
+            )
+        if protected_filters:
+            where = {**where, "NOT": {"OR": protected_filters}}
 
         update_result = await table.update_many(where=where, data={"spend": 0})
 
@@ -239,12 +271,6 @@ class ResetBudgetJob:
                 for budget in budgets_to_reset:
                     budget = await ResetBudgetJob._reset_budget_reset_at_date(budget, now)
 
-                await self.prisma_client.update_data(
-                    query_type="update_many",
-                    data_list=budgets_to_reset,
-                    table_name="budget",
-                )
-
                 budget_ids_to_reset = [budget.budget_id for budget in budgets_to_reset if budget.budget_id is not None]
 
                 endusers_to_reset = await self.prisma_client.get_data(
@@ -276,6 +302,16 @@ class ResetBudgetJob:
             if endusers_to_reset is not None and len(endusers_to_reset) > 0:
                 for enduser in endusers_to_reset:
                     try:
+                        from litellm.proxy.video_endpoints.moderation_metering_runtime import reset_linked_registered
+
+                        if await reset_linked_registered(
+                            f"spend:end_user:{enduser.user_id}",
+                            getattr(enduser, "budget_id", None)
+                            or getattr(getattr(enduser, "litellm_budget_table", None), "budget_id", None)
+                            or litellm.max_end_user_budget_id,
+                        ):
+                            await self._invalidate_user_api_key_cache_entry(enduser.user_id)
+                            continue
                         updated_enduser = await ResetBudgetJob._reset_budget_for_enduser(enduser=enduser)
                         if updated_enduser is not None:
                             updated_endusers.append(updated_enduser)
@@ -305,6 +341,13 @@ class ResetBudgetJob:
             if len(failed_endusers) > 0:  # If any endusers failed to reset
                 raise Exception(
                     f"Failed to reset {len(failed_endusers)} endusers: {json.dumps(failed_endusers, default=str)}"
+                )
+
+            if budgets_to_reset:
+                await self.prisma_client.update_data(
+                    query_type="update_many",
+                    data_list=budgets_to_reset,
+                    table_name="budget",
                 )
 
             asyncio.create_task(
@@ -379,6 +422,10 @@ class ResetBudgetJob:
             token = getattr(k, "token", None)
             if token is None:
                 continue
+            from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+            if await protected_value(f"spend:key:{token}") is not None:
+                continue
             batcher.litellm_verificationtoken.update(
                 where={"token": token},
                 data={"spend": 0, "budget_reset_at": k.budget_reset_at},
@@ -398,6 +445,10 @@ class ResetBudgetJob:
             user_id = getattr(u, "user_id", None)
             if user_id is None:
                 continue
+            from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+            if await protected_value(f"spend:user:{user_id}") is not None:
+                continue
             batcher.litellm_usertable.update(
                 where={"user_id": user_id},
                 data={"spend": 0, "budget_reset_at": u.budget_reset_at},
@@ -416,6 +467,10 @@ class ResetBudgetJob:
         for t in updated_teams:
             team_id = getattr(t, "team_id", None)
             if team_id is None:
+                continue
+            from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+            if await protected_value(f"spend:team:{team_id}") is not None:
                 continue
             batcher.litellm_teamtable.update(
                 where={"team_id": team_id},
@@ -665,6 +720,12 @@ class ResetBudgetJob:
         reset_at = datetime.fromisoformat(reset_at_str.replace("Z", "+00:00")).replace(tzinfo=None)
         if reset_at > now:
             return False
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import reset_registered
+
+        next_reset = get_budget_reset_time(budget_duration=window["budget_duration"])
+        if await reset_registered(counter_key, reset_at, next_reset):
+            window["reset_at"] = next_reset.isoformat()
+            return False
         spend_counter_cache.in_memory_cache.set_cache(key=counter_key, value=0.0)
         if spend_counter_cache.redis_cache is not None:
             try:
@@ -706,10 +767,25 @@ class ResetBudgetJob:
                     if await ResetBudgetJob._reset_expired_window(window, counter_key, spend_counter_cache, now):
                         changed = True
                 if changed:
-                    await VerificationTokenRepository(self.prisma_client).table.update(
-                        where={"token": row["token"]},
-                        data={"budget_limits": json.dumps(windows)},  # type: ignore[arg-type]
-                    )
+                    from litellm.proxy.video_endpoints.moderation_metering_runtime import counter_mode
+
+                    if await counter_mode(f"spend:key:{row['token']}"):
+                        await self.prisma_client.db.execute_raw(
+                            'UPDATE "LiteLLM_VerificationToken" SET budget_limits=(SELECT jsonb_agg('
+                            'CASE WHEN EXISTS (SELECT 1 FROM "LiteLLM_ModerationMeteringCounter" c '
+                            "WHERE c.counter_key=$2 || (w->>'budget_duration')) THEN w "
+                            "ELSE COALESCE((SELECT n FROM jsonb_array_elements($3::jsonb) n "
+                            "WHERE n->>'budget_duration'=w->>'budget_duration'),w) END) "
+                            "FROM jsonb_array_elements(budget_limits::jsonb) w) WHERE token=$1",
+                            row["token"],
+                            f"spend:key:{row['token']}:window:",
+                            json.dumps(windows),
+                        )
+                    else:
+                        await VerificationTokenRepository(self.prisma_client).table.update(
+                            where={"token": row["token"]},
+                            data={"budget_limits": json.dumps(windows)},
+                        )
         except Exception as e:
             verbose_proxy_logger.exception("Failed to reset budget windows for keys: %s", e)
 
@@ -729,10 +805,25 @@ class ResetBudgetJob:
                     if await ResetBudgetJob._reset_expired_window(window, counter_key, spend_counter_cache, now):
                         changed = True
                 if changed:
-                    await TeamRepository(self.prisma_client).table.update(
-                        where={"team_id": row["team_id"]},
-                        data={"budget_limits": json.dumps(windows)},  # type: ignore[arg-type]
-                    )
+                    from litellm.proxy.video_endpoints.moderation_metering_runtime import counter_mode
+
+                    if await counter_mode(f"spend:team:{row['team_id']}"):
+                        await self.prisma_client.db.execute_raw(
+                            'UPDATE "LiteLLM_TeamTable" SET budget_limits=(SELECT jsonb_agg('
+                            'CASE WHEN EXISTS (SELECT 1 FROM "LiteLLM_ModerationMeteringCounter" c '
+                            "WHERE c.counter_key=$2 || (w->>'budget_duration')) THEN w "
+                            "ELSE COALESCE((SELECT n FROM jsonb_array_elements($3::jsonb) n "
+                            "WHERE n->>'budget_duration'=w->>'budget_duration'),w) END) "
+                            "FROM jsonb_array_elements(budget_limits::jsonb) w) WHERE team_id=$1",
+                            row["team_id"],
+                            f"spend:team:{row['team_id']}:window:",
+                            json.dumps(windows),
+                        )
+                    else:
+                        await TeamRepository(self.prisma_client).table.update(
+                            where={"team_id": row["team_id"]},
+                            data={"budget_limits": json.dumps(windows)},
+                        )
         except Exception as e:
             verbose_proxy_logger.exception("Failed to reset budget windows for teams: %s", e)
 
@@ -752,6 +843,19 @@ class ResetBudgetJob:
         DB write fails: get_current_spend reads 0 from Redis while the DB
         still holds the pre-reset value, admitting requests past the cap.
         """
+        from litellm.proxy.common_utils.timezone_utils import get_budget_reset_time
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_authority, reset_registered
+
+        identity = getattr(item, {"key": "token", "user": "user_id", "team": "team_id"}[item_type])
+        counter_key = f"spend:{item_type}:{identity}"
+        if await protected_authority(counter_key) is not None:
+            if item.budget_reset_at is None or item.budget_duration is None:
+                raise ValueError("protected reset requires frozen period")
+            next_reset = get_budget_reset_time(budget_duration=item.budget_duration)
+            await reset_registered(counter_key, item.budget_reset_at, next_reset)
+            item.budget_reset_at = next_reset
+            item.spend = 0.0
+            return item
         try:
             item.spend = 0.0
             if hasattr(item, "budget_duration") and item.budget_duration is not None:

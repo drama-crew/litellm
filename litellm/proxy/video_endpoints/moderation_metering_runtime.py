@@ -6,18 +6,16 @@ import os
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, JsonValue, TypeAdapter
 
-from litellm.proxy.video_endpoints import moderation_metering_cache as cache
 from litellm.proxy.video_endpoints.moderation_metering import (
     BillingBinding,
-    CounterFailure,
     MeteringStore,
     PhaseEvent,
-    base_counter_keys,
     request_id,
 )
 from litellm.proxy.video_endpoints.openapi_log_capture import raw_method
@@ -25,9 +23,8 @@ from litellm.types.videos.main import CharacterObject, VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider
 
 if TYPE_CHECKING:
-    from datetime import datetime
-
     from litellm.litellm_core_utils.litellm_logging import Logging
+    from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore
 
 
 @dataclass(frozen=True)
@@ -37,10 +34,12 @@ class Scope:
     store: MeteringStore
 
 
-CONTEXT: ContextVar[Scope | None] = ContextVar('moderation_metering_scope', default=None)
-SCOPE_KEY = '_moderation_metering_scope'
-EVENT_KEY = '_moderation_metering_event'
-CALL_TYPES = frozenset(('avideo_generation', 'avideo_remix', 'avideo_edit', 'avideo_extension', 'avideo_status', 'avideo_create_character'))
+CONTEXT: ContextVar[Scope | None] = ContextVar("moderation_metering_scope", default=None)
+SCOPE_KEY = "_moderation_metering_scope"
+EVENT_KEY = "_moderation_metering_event"
+CALL_TYPES = frozenset(
+    ("avideo_generation", "avideo_remix", "avideo_edit", "avideo_extension", "avideo_status", "avideo_create_character")
+)
 
 
 @dataclass(frozen=True)
@@ -48,11 +47,33 @@ class RedisAdapter:
     evaluate: Callable[..., Awaitable[object]]
 
     async def eval(self, script: str, numkeys: int, *args: str) -> object:
-        return await self.evaluate(script, numkeys, *args)
+        value = await self.evaluate(script, numkeys, *args)
+        return value.decode() if isinstance(value, bytes) else value
 
 
 def configured() -> bool:
-    return bool(os.getenv('DRAMA_MODERATION_PLATFORM_URL'))
+    return os.getenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "false").lower() == "true"
+
+
+async def counter_mode(counter_key: str) -> bool:
+    from litellm.proxy import proxy_server
+
+    redis_cache = proxy_server.spend_counter_cache.redis_cache
+    if redis_cache is None:
+        if configured():
+            raise ValueError("protected budget writer requires Redis")
+        return False
+    try:
+        mode = await redis_cache.async_get_cache(key="protected:mode")
+    except Exception:
+        if configured() or getattr(redis_cache, "protected_budget_mode", False) is True:
+            raise
+        return False
+    if mode == "protected-v1":
+        redis_cache.protected_budget_mode = True
+    if getattr(redis_cache, "protected_budget_mode", False) is True and not configured():
+        raise ValueError("protected budget writer configuration mismatch; maintenance fencing required")
+    return configured()
 
 
 def store() -> MeteringStore:
@@ -60,11 +81,11 @@ def store() -> MeteringStore:
 
     redis_cache = proxy_server.spend_counter_cache.redis_cache
     if proxy_server.prisma_client is None or redis_cache is None:
-        raise ValueError('moderation metering requires durable SQL and Redis')
+        raise ValueError("moderation metering requires durable SQL and Redis")
     redis = redis_cache.init_async_client()
-    namespace = redis_cache.check_and_fix_namespace('')
+    namespace = redis_cache.check_and_fix_namespace("")
     return MeteringStore.from_client(
-        proxy_server.prisma_client, RedisAdapter(raw_method(redis, 'eval')), namespace=namespace
+        proxy_server.prisma_client, RedisAdapter(raw_method(redis, "eval")), namespace=namespace
     )
 
 
@@ -74,13 +95,18 @@ class ReservationEntry(BaseModel):
 
 
 class Reservation(BaseModel):
+    reservation_id: str | None = None
     entries: tuple[ReservationEntry, ...] = ()
 
 
 async def prepare(binding: BillingBinding, reservation: object) -> Scope:
     authority = store()
-    entries = Reservation.model_validate(reservation or {}).entries
-    await authority.prepare(binding, {entry.counter_key: entry.reserved_cost for entry in entries})
+    frozen = Reservation.model_validate(reservation or {})
+    await authority.prepare(
+        binding,
+        {entry.counter_key: entry.reserved_cost for entry in frozen.entries},
+        reservation_id=frozen.reservation_id,
+    )
     return Scope(binding, binding.expected_phases[0], authority)
 
 
@@ -88,7 +114,7 @@ async def continuation(intent_id: str, phase: str) -> Scope:
     authority = store()
     binding = await authority.binding(intent_id)
     if phase not in binding.expected_phases:
-        raise ValueError('moderation billing phase mismatch')
+        raise ValueError("moderation billing phase mismatch")
     return Scope(binding, phase, authority)
 
 
@@ -107,36 +133,49 @@ async def handoff(logging_obj: Logging, result: object, start_time: datetime, en
         await _handoff(logging_obj, result, start_time, end_time)
     except Exception:
         if isinstance(result, (VideoObject, CharacterObject)):
-            result._hidden_params['_moderation_metering_pending'] = True
-        logging.getLogger(__name__).warning('moderation metering result retains unknown financial phase')
+            result._hidden_params["_moderation_metering_pending"] = True
+        logging.getLogger(__name__).warning("moderation metering result retains unknown financial phase")
 
 
 async def _handoff(logging_obj: Logging, result: object, start_time: datetime, end_time: datetime) -> None:
     scope = logging_obj.model_call_details.get(SCOPE_KEY)
     if not isinstance(scope, Scope) or not isinstance(result, (VideoObject, CharacterObject)):
         return
-    if scope.phase == 'completion' and isinstance(result, VideoObject) and result.status not in ('completed', 'failed', 'cancelled'):
+    if (
+        scope.phase == "completion"
+        and isinstance(result, VideoObject)
+        and result.status not in ("completed", "failed", "cancelled")
+    ):
         return
     logging_obj._process_hidden_params_and_response_cost(result, start_time, end_time, emit=False)
-    raw = logging_obj.model_call_details.get('response_cost')
+    raw = logging_obj.model_call_details.get("response_cost")
     decoded = decode_video_id_with_provider(result.id)
-    provider = TypeAdapter(str).validate_python(decoded.get('custom_llm_provider') or logging_obj.custom_llm_provider or '')
-    params = TypeAdapter(dict[str, object]).validate_python(logging_obj.model_call_details.get('litellm_params') or {})
-    model_info = TypeAdapter(dict[str, JsonValue]).validate_python(params.get('model_info') or {})
-    deployment = TypeAdapter(str).validate_python(decoded.get('model_id') or model_info.get('id') or '')
-    event = PhaseEvent(
-        binding=scope.binding, request_id=request_id(scope.binding, scope.phase), phase=scope.phase,
-        provider=provider, deployment_id=deployment, native_id=result.id,
-        provider_task_id=TypeAdapter(str).validate_python(decoded.get('video_id') or result.id),
-        amount=TypeAdapter(Decimal | None).validate_python(raw), finalized=raw is not None,
+    provider = TypeAdapter(str).validate_python(
+        decoded.get("custom_llm_provider") or logging_obj.custom_llm_provider or ""
     )
-    result._hidden_params[EVENT_KEY] = event.model_dump(mode='json')
+    params = TypeAdapter(dict[str, object]).validate_python(logging_obj.model_call_details.get("litellm_params") or {})
+    model_info = TypeAdapter(dict[str, JsonValue]).validate_python(params.get("model_info") or {})
+    deployment = TypeAdapter(str).validate_python(decoded.get("model_id") or model_info.get("id") or "")
+    event = PhaseEvent(
+        binding=scope.binding,
+        request_id=request_id(scope.binding, scope.phase),
+        phase=scope.phase,
+        provider=provider,
+        deployment_id=deployment,
+        native_id=result.id,
+        provider_task_id=TypeAdapter(str).validate_python(decoded.get("video_id") or result.id),
+        amount=TypeAdapter(Decimal | None).validate_python(raw),
+        finalized=raw is not None,
+    )
+    result._hidden_params[EVENT_KEY] = event.model_dump(mode="json")
     try:
         async with asyncio.timeout(5):
             await scope.store.persist(event)
     except Exception:
-        result._hidden_params['_moderation_metering_pending'] = True
-        logging.getLogger(__name__).warning('moderation metering native result awaits durable financial recovery')
+        result._hidden_params["_moderation_metering_pending"] = True
+        logging.getLogger(__name__).warning(
+            "moderation metering native result awaits durable financial recovery", exc_info=True
+        )
 
 
 def private_event(result: object) -> dict[str, JsonValue] | None:
@@ -145,41 +184,44 @@ def private_event(result: object) -> dict[str, JsonValue] | None:
     value = result._hidden_params.get(EVENT_KEY)
     if value is None:
         return None
-    return TypeAdapter(dict[str, JsonValue]).validate_python(PhaseEvent.model_validate(value).model_dump(mode='json'))
+    return TypeAdapter(dict[str, JsonValue]).validate_python(PhaseEvent.model_validate(value).model_dump(mode="json"))
 
 
 async def check_budget(counter_key: str) -> None:
-    if configured():
+    if await counter_mode(counter_key):
         await store().assert_admission((counter_key,))
 
 
 async def guarded_increment(counter_key: str, amount: float) -> float | None:
-    if not configured():
+    if not await counter_mode(counter_key):
         return None
     authority = store()
-    await authority.assert_admission((counter_key,))
-    result = TypeAdapter(tuple[str, ...]).validate_python(await authority.redis.eval(
-        cache.INCREMENT, 2, *cache.keys(counter_key, authority.namespace), str(amount)
-    ))
-    if result[0] == 'legacy':
+    from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore
+
+    protected = ProtectedBudgetStore(
+        authority.db, authority.transactions, authority.redis, namespace=authority.namespace
+    )
+    states = await protected.assert_admission((counter_key,))
+    if not states:
         return None
-    if result[0] != 'ok':
-        await authority.quarantine((counter_key,))
-        raise CounterFailure((counter_key,), result[0])
-    return float(result[1])
+    if projected(counter_key):
+        return await protected_value(counter_key)
+    raise ValueError("protected counter mutation requires durable operation or reservation identity")
 
 
 async def protect_invalidation(counter_key: str) -> bool:
-    if not configured():
+    if not await counter_mode(counter_key):
         return False
     authority = store()
-    rows = TypeAdapter(list[dict[str, JsonValue]]).validate_python(await authority.db.query_raw(
-        'SELECT counter_key FROM "LiteLLM_ModerationMeteringCounter" WHERE counter_key=$1', counter_key
-    ))
+    rows = TypeAdapter(list[dict[str, JsonValue]]).validate_python(
+        await authority.db.query_raw(
+            'SELECT counter_key FROM "LiteLLM_ModerationMeteringCounter" WHERE counter_key=$1', counter_key
+        )
+    )
     if not rows:
         return False
     await authority.quarantine((counter_key,))
-    logging.getLogger(__name__).error('moderation protected spend counter requires reconciliation')
+    logging.getLogger(__name__).error("moderation protected spend counter requires reconciliation")
     return True
 
 
@@ -189,8 +231,175 @@ async def consume(stop: asyncio.Event) -> None:
             async with asyncio.timeout(15):
                 await store().run_once()
         except Exception:
-            logging.getLogger(__name__).warning('moderation metering durable retry pending')
+            logging.getLogger(__name__).warning("moderation metering durable retry pending", exc_info=True)
         try:
             await asyncio.wait_for(stop.wait(), timeout=0.5)
         except TimeoutError:
             pass
+
+
+@dataclass(frozen=True)
+class Projection:
+    counter_keys: frozenset[str]
+
+
+PROJECTION: ContextVar[Projection | None] = ContextVar("protected_budget_projection", default=None)
+
+
+def projected(counter_key: str) -> bool:
+    current = PROJECTION.get()
+    return current is not None and counter_key in current.counter_keys
+
+
+async def protected_authority(counter_key: str) -> ProtectedBudgetStore | None:
+    from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore
+
+    if not await counter_mode(counter_key):
+        return None
+    authority = store()
+    protected = ProtectedBudgetStore(
+        authority.db, authority.transactions, authority.redis, namespace=authority.namespace
+    )
+    if not await protected.assert_admission((counter_key,)):
+        return None
+    return protected
+
+
+async def protected_value(counter_key: str) -> float | None:
+    authority = await protected_authority(counter_key)
+    if authority is None:
+        return None
+    value = await authority.redis.eval('return redis.call("GET",KEYS[1])', 1, authority.namespace + counter_key)
+    return TypeAdapter(float).validate_python(value)
+
+
+async def reserve_registered(
+    counter_key: str, reservation_id: str, amount: float, valid_until: datetime
+) -> float | None:
+    authority = await protected_authority(counter_key)
+    if authority is None:
+        return None
+    operation_id = "reserve:" + reservation_id + ":" + counter_key
+    previous = await authority.operation(operation_id)
+    if previous and previous.payload.changes[0].reservation is not None:
+        valid_until = previous.payload.changes[0].reservation.valid_until
+    await authority.mutate(
+        operation_id,
+        (counter_key,),
+        kind="reserve",
+        amount=Decimal(str(amount)),
+        reservation_id=reservation_id,
+        valid_until=valid_until,
+    )
+    return await protected_value(counter_key)
+
+
+async def adjust_registered(
+    counter_key: str, reservation_id: str, amount: float, *, resize: bool, release: bool
+) -> bool:
+    authority = await protected_authority(counter_key)
+    if authority is None:
+        return False
+    if projected(counter_key):
+        return True
+    kind = "resize" if resize else "release" if release else "debit"
+    identity = kind + ":" + reservation_id + ":" + counter_key + (":" + str(amount) if resize else "")
+    await authority.mutate(
+        identity, (counter_key,), kind=kind, amount=Decimal(str(amount)), reservation_id=reservation_id
+    )
+    return True
+
+
+async def settle_legacy(
+    operation_id: str,
+    *,
+    token: str | None,
+    user_id: str | None,
+    team_id: str | None,
+    org_id: str | None,
+    end_user_id: str | None,
+    tags: tuple[str, ...],
+    amount: float | None,
+    reservation_id: str | None,
+) -> Projection:
+    from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, CounterState, ProtectedBudgetStore
+
+    targets = (
+        *((BudgetIdentity(kind="key", identity=token),) if token else ()),
+        *((BudgetIdentity(kind="user", identity=user_id),) if user_id else ()),
+        *((BudgetIdentity(kind="team", identity=team_id),) if team_id else ()),
+        *((BudgetIdentity(kind="team_member", identity=user_id, team_id=team_id),) if user_id and team_id else ()),
+        *((BudgetIdentity(kind="org", identity=org_id),) if org_id else ()),
+        *((BudgetIdentity(kind="end_user", identity=end_user_id),) if end_user_id else ()),
+        *(BudgetIdentity(kind="tag", identity=tag) for tag in tags),
+    )
+    if not targets or not await counter_mode(targets[0].counter_key):
+        return Projection(frozenset())
+    authority = store()
+    protected = ProtectedBudgetStore(
+        authority.db, authority.transactions, authority.redis, namespace=authority.namespace
+    )
+    for target in targets:
+        await protected.register_birth(target.counter_key)
+    groups = await asyncio.gather(
+        *(
+            authority.db.query_raw(
+                "SELECT counter_key,generation,committed_seq,status,target,period_start,pending_operation "
+                "FROM \"LiteLLM_ModerationMeteringCounter\" WHERE target->>'kind'=$1 AND target->>'identity'=$2 "
+                "AND COALESCE(target->>'team_id','')=$3",
+                target.kind,
+                target.identity,
+                target.team_id or "",
+            )
+            for target in targets
+        )
+    )
+    states = tuple(state for group in groups for state in TypeAdapter(tuple[CounterState, ...]).validate_python(group))
+    counter_keys = tuple(sorted({state.counter_key for state in states}))
+    if not counter_keys:
+        return Projection(frozenset())
+    if amount is None:
+        raise ValueError("protected actual fee remains unknown")
+    await protected.mutate(
+        "legacy:" + operation_id, counter_keys, kind="debit", amount=Decimal(str(amount)), reservation_id=reservation_id
+    )
+    return Projection(frozenset(counter_keys))
+
+
+async def reset_registered(counter_key: str, boundary: datetime, reset_at: datetime | None) -> bool:
+    from datetime import timezone
+
+    authority = await protected_authority(counter_key)
+    if authority is None:
+        return False
+    normalized = boundary.replace(tzinfo=timezone.utc) if boundary.tzinfo is None else boundary
+    next_reset = reset_at.replace(tzinfo=timezone.utc) if reset_at is not None and reset_at.tzinfo is None else reset_at
+    operation_id = "reset:" + counter_key + ":" + normalized.isoformat()
+    previous = await authority.operation(operation_id)
+    if previous:
+        next_reset = previous.payload.changes[0].reset_at
+    await authority.reset(operation_id, counter_key, boundary=normalized, reset_at=next_reset)
+    return True
+
+
+async def reset_linked_registered(counter_key: str, budget_id: str | None) -> bool:
+    authority = await protected_authority(counter_key)
+    if authority is None:
+        return False
+    if not budget_id:
+        raise ValueError("protected budget link has no period identity")
+    rows = TypeAdapter(tuple[dict[str, datetime | None], ...]).validate_python(
+        await authority.db.query_raw(
+            'SELECT budget_reset_at FROM "LiteLLM_BudgetTable" WHERE budget_id=$1',
+            budget_id,
+        )
+    )
+    if len(rows) != 1 or rows[0]["budget_reset_at"] is None:
+        raise ValueError("protected linked budget period missing")
+    return await reset_registered(counter_key, rows[0]["budget_reset_at"], None)
+
+
+def projection_tags(value: object) -> tuple[str, ...]:
+    adapter = TypeAdapter(tuple[str, ...])
+    tags = adapter.validate_json(value) if isinstance(value, str) else adapter.validate_python(value or ())
+    return tuple(sorted(set(tags)))

@@ -5,6 +5,7 @@ datasource client {
 
 generator client {
   provider = "prisma-client-py"
+  enable_experimental_decimal = true
   binaryTargets = ["native", "debian-openssl-1.1.x", "debian-openssl-3.0.x", "linux-musl", "linux-musl-openssl-3.0.x"]
 }
 
@@ -1438,19 +1439,26 @@ model LiteLLM_OpenApiLog {
 }
 
 model LiteLLM_ModerationMeteringTask {
+  reservation_id String?
   intent_id String @id
   binding Json
   reservations Json
-  created_at DateTime @default(now()) @db.Timestamptz
+  created_at DateTime @default(now()) @client.Timestamptz
   phases LiteLLM_ModerationMeteringPhase[]
 }
 
 model LiteLLM_ModerationMeteringCounter {
+  target Json?
+  period_start DateTime @default(now()) @client.Timestamptz(6)
+  pending_operation String?
+  cutover_id String?
+  failure_reason String?
+  reservations LiteLLM_BudgetReservation[]
   counter_key String @id
   generation String
-  committed_seq Int @default(0)
+  committed_seq BigInt @default(0)
   status String @default("ready")
-  updated_at DateTime @default(now()) @db.Timestamptz
+  updated_at DateTime @default(now()) @client.Timestamptz
 }
 
 model LiteLLM_ModerationMeteringPhase {
@@ -1461,11 +1469,11 @@ model LiteLLM_ModerationMeteringPhase {
   payload_hash String
   status String
   lease_token String?
-  lease_until DateTime? @db.Timestamptz
+  lease_until DateTime? @client.Timestamptz
   attempts Int @default(0)
-  available_at DateTime @default(now()) @db.Timestamptz
+  available_at DateTime @default(now()) @client.Timestamptz
   receipt Json?
-  created_at DateTime @default(now()) @db.Timestamptz
+  created_at DateTime @default(now()) @client.Timestamptz
   task LiteLLM_ModerationMeteringTask @relation(fields: [intent_id], references: [intent_id])
   @@unique([intent_id, phase])
   @@index([status, available_at, lease_until], map: "moderation_metering_phase_ready")
@@ -1478,4 +1486,43 @@ model LiteLLM_OpenApiLogSpend {
   task_id String
   amount Float
   @@index([owner, task_id])
+}
+
+model LiteLLM_BudgetCutover {
+  receipt_id String @id
+  payload Json
+  payload_hash String
+  status String @default("pending")
+  created_at DateTime @default(now()) @client.Timestamptz(6)
+}
+
+model LiteLLM_BudgetOperation {
+  operation_id String @id
+  payload Json
+  payload_hash String
+  status String @default("pending")
+  fence Int @default(0)
+  lease_until DateTime? @client.Timestamptz(6)
+  created_at DateTime @default(now()) @client.Timestamptz(6)
+  @@index([status, lease_until], map: "budget_operation_pending")
+}
+
+model LiteLLM_BudgetReservation {
+  reservation_id String
+  counter_key String
+  generation String
+  remaining Decimal @client.Decimal(65, 30)
+  valid_until DateTime @client.Timestamptz(6)
+  status String
+  counter LiteLLM_ModerationMeteringCounter @relation(fields: [counter_key], references: [counter_key])
+  @@id([reservation_id, counter_key])
+  @@index([counter_key, status, valid_until], map: "budget_reservation_active")
+}
+
+model LiteLLM_BudgetBirth {
+  counter_key String @id
+  birth_id String @unique
+  target Json
+  initial_spend Decimal @client.Decimal(65, 30)
+  created_at DateTime @default(now()) @client.Timestamptz(6)
 }

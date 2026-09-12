@@ -14,7 +14,7 @@ from litellm.utils import client
 from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
 
-@pytest_asyncio.fixture(autouse=True, loop_scope='function')
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
 async def drain_logging():
     yield
     await asyncio.sleep(0)
@@ -23,29 +23,52 @@ async def drain_logging():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('amount', [None, 0, 20])
+@pytest.mark.parametrize("amount", [None, 0, 20])
 async def test_wrapper_router_retains_native_event_without_retry_on_store_failure(amount):
     authority = AsyncMock()
-    authority.persist.side_effect = ConnectionError('synthetic SQL unavailable')
-    binding = BillingBinding(intent_id='intent', request_digest='digest', fingerprint='key',
-                             user_id='user', team_id='team', model='synthetic', expected_phases=('submit', 'completion'))
-    accepted = VideoObject(id=encode_video_id_with_provider('native', 'openai', 'deployment'),
-                           object='video', status='queued')
-    accepted._hidden_params['response_cost'] = amount
+    authority.persist.side_effect = ConnectionError("synthetic SQL unavailable")
+    binding = BillingBinding(
+        intent_id="intent",
+        request_digest="digest",
+        fingerprint="key",
+        user_id="user",
+        team_id="team",
+        model="synthetic",
+        expected_phases=("submit", "completion"),
+    )
+    accepted = VideoObject(
+        id=encode_video_id_with_provider("native", "openai", "deployment"), object="video", status="queued"
+    )
+    accepted._hidden_params["response_cost"] = amount
     provider = AsyncMock(return_value=accepted)
 
     @client
     async def avideo_generation(**kwargs):
         return await provider(**kwargs)
 
-    router = Router(model_list=[
-        {'model_name': 'synthetic', 'litellm_params': {'model': 'openai/synthetic'}, 'model_info': {'id': 'deployment'}},
-        {'model_name': 'fallback', 'litellm_params': {'model': 'openai/synthetic'}, 'model_info': {'id': 'fallback'}},
-    ], num_retries=2, fallbacks=[{'synthetic': ['fallback']}])
-    token = runtime.CONTEXT.set(runtime.Scope(binding, 'submit', authority))
+    router = Router(
+        model_list=[
+            {
+                "model_name": "synthetic",
+                "litellm_params": {"model": "openai/synthetic"},
+                "model_info": {"id": "deployment"},
+            },
+            {
+                "model_name": "fallback",
+                "litellm_params": {"model": "openai/synthetic"},
+                "model_info": {"id": "fallback"},
+            },
+        ],
+        num_retries=2,
+        fallbacks=[{"synthetic": ["fallback"]}],
+    )
+    token = runtime.CONTEXT.set(runtime.Scope(binding, "submit", authority))
     try:
         result = await router._ageneric_api_call_with_fallbacks(
-            model='synthetic', original_function=avideo_generation, prompt='synthetic', caching=False,
+            model="synthetic",
+            original_function=avideo_generation,
+            prompt="synthetic",
+            caching=False,
         )
     finally:
         runtime.CONTEXT.reset(token)
@@ -56,18 +79,27 @@ async def test_wrapper_router_retains_native_event_without_retry_on_store_failur
     assert event.native_id == accepted.id
     assert event.amount == (None if amount is None else Decimal(amount))
     assert event.finalized is (amount is not None)
-    assert accepted._hidden_params['_moderation_metering_pending'] is True
+    assert accepted._hidden_params["_moderation_metering_pending"] is True
 
 
 @pytest.mark.asyncio
 async def test_request_metadata_cannot_select_metering_authority():
-    provider = AsyncMock(return_value=VideoObject(id='native', object='video', status='queued'))
+    provider = AsyncMock(return_value=VideoObject(id="native", object="video", status="queued"))
 
     @client
     async def avideo_generation(**kwargs):
         return await provider(**kwargs)
 
-    result = await avideo_generation(model='openai/synthetic', metadata={runtime.SCOPE_KEY: {'intent_id': 'forged'}})
+    result = await avideo_generation(model="openai/synthetic", metadata={runtime.SCOPE_KEY: {"intent_id": "forged"}})
     assert runtime.private_event(result) is None
-    assert '_moderation_metering_pending' not in result._hidden_params
+    assert "_moderation_metering_pending" not in result._hidden_params
     assert provider.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_platform_url_does_not_enable_protected_counter_sql_dependency(monkeypatch):
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "https://synthetic.invalid")
+    monkeypatch.delenv("DRAMA_PROTECTED_BUDGETS_ENABLED", raising=False)
+    assert runtime.configured() is False
+    await runtime.check_budget("spend:team:unregistered")
+    assert await runtime.guarded_increment("spend:team:unregistered", 1) is None

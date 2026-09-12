@@ -2163,6 +2163,11 @@ async def get_current_spend(
     from litellm.proxy.video_endpoints.moderation_metering_runtime import check_budget
 
     await check_budget(counter_key)
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+    protected = await protected_value(counter_key)
+    if protected is not None:
+        return protected
     current, verified = await _read_spend_counter_estimate(counter_key=counter_key, fallback_spend=fallback_spend)
     if fallback_authoritative:
         verified = True
@@ -2217,6 +2222,11 @@ async def _repair_stale_spend_counter(counter_key: str, db_spend: float) -> None
     in-memory copy is guarded by a read-compare-write with no await in between,
     so it is atomic within the worker.
     """
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+    if await protected_value(counter_key) is not None:
+        return
+
     cached = spend_counter_cache.in_memory_cache.get_cache(key=counter_key)
     needs_update = True
     if cached is not None:
@@ -2253,6 +2263,11 @@ async def reseed_spend_counter_from_db(counter_key: str) -> None:
     Counters with no DB row (window/end-user/tag) are left untouched rather than
     deleted, so enforcement keeps reading whatever value they hold.
     """
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+    if await protected_value(counter_key) is not None:
+        return
+
     db_spend = await SpendCounterReseed.from_db(prisma_client=prisma_client, counter_key=counter_key)
     if db_spend is None:
         return
@@ -2513,7 +2528,7 @@ async def _reconcile_budget_reservation_for_counter_update(
     try:
         await reconcile_budget_reservation(
             budget_reservation=budget_reservation,
-            actual_cost=response_cost or 0.0,
+            actual_cost=response_cost,
             finalize=False,
         )
     except Exception:
@@ -2650,6 +2665,11 @@ async def _ensure_spend_counter_initialized(
     counter_key: str,
     source_cache_key: Union[str, List[str]],
 ):
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+    if await protected_value(counter_key) is not None:
+        return
+
     is_warm = await _is_spend_counter_cache_warm(counter_key=counter_key)
     if is_warm is False:
         # Shares the per-counter lock with get_current_spend.
@@ -2686,6 +2706,11 @@ async def _ensure_window_spend_counter_initialized(
     entity_id: str,
     window_start: datetime,
 ) -> bool:
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+    if await protected_value(counter_key) is not None:
+        return True
+
     is_warm = await _is_spend_counter_cache_warm(counter_key=counter_key)
     if is_warm is True:
         return True

@@ -152,6 +152,12 @@ class SpendCounterReseed:
         Returns the spend value (including 0.0 from a fresh budget reset)
         when the DB read succeeds, or None when the DB is unavailable.
         """
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+        protected = await protected_value(counter_key)
+        if protected is not None:
+            return protected
+
         lock = await SpendCounterReseed._get_lock(counter_key)
         async with lock:
             # Re-check after acquiring the lock. Skip in-memory on a clean
@@ -262,6 +268,12 @@ class SpendCounterReseed:
         entity_id: str,
         window_start: datetime,
     ) -> Optional[float]:
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_value
+
+        protected = await protected_value(counter_key)
+        if protected is not None:
+            return protected
+
         lock = await SpendCounterReseed._get_lock(counter_key)
         async with lock:
             redis_clean_miss = False

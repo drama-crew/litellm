@@ -203,6 +203,10 @@ async def enqueue_causyn_billing(redis_client: Any, event: CausynBillingEvent) -
     return True
 
 
+class BudgetAuthorityDependencyPending(ValueError):
+    pass
+
+
 class LibTVBillingReconciler:
     def __init__(
         self,
@@ -280,7 +284,11 @@ class LibTVBillingReconciler:
         processed = 0
         for event_id, fields in events:
             event = _event_from_stream(fields)
-            await self._reconcile_event(event)
+            try:
+                await self._reconcile_event(event)
+            except BudgetAuthorityDependencyPending:
+                logger.warning("billing authority dependency pending: %s", event.request_id)
+                continue
             await self.redis.xack(self.stream_key, self.consumer_group, event_id)
             processed += 1
         return processed
@@ -295,6 +303,17 @@ class LibTVBillingReconciler:
         await self._commit_event(event)
 
     async def _commit_event(self, event: ImageBillingEvent | CausynBillingEvent) -> None:
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import protected_authority
+
+        targets = (
+            ("key", event.api_key),
+            ("team", event.team_id),
+            ("user", event.user_id),
+            ("org", event.organization_id),
+        )
+        for kind, identity in targets:
+            if identity and await protected_authority("spend:" + kind + ":" + identity) is not None:
+                raise BudgetAuthorityDependencyPending("protected outbox requires B1-entry actual receipt authority")
         db = getattr(self.prisma_client, "db", self.prisma_client)
         async with db.tx() as transaction:
             if isinstance(event, CausynBillingEvent):
