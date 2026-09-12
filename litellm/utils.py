@@ -1325,6 +1325,7 @@ def client(original_function):
             # Type assertion: logging_obj is guaranteed to be non-None after function_setup
             assert logging_obj is not None, "logging_obj should not be None after function_setup"
 
+
             ## LOAD CREDENTIALS
             load_credentials_from_list(kwargs)
             kwargs["litellm_logging_obj"] = logging_obj
@@ -1606,6 +1607,10 @@ def client(original_function):
             # Type assertion: logging_obj is guaranteed to be non-None after function_setup
             assert logging_obj is not None, "logging_obj should not be None after function_setup"
 
+            moderation_metering_runtime = sys.modules.get("litellm.proxy.video_endpoints.moderation_metering_runtime")
+            if moderation_metering_runtime is not None:
+                moderation_metering_runtime.attach(logging_obj, call_type)
+
             modified_kwargs = await async_pre_call_deployment_hook(kwargs, call_type)
             if modified_kwargs is not None:
                 kwargs = modified_kwargs
@@ -1688,6 +1693,9 @@ def client(original_function):
             # MODEL CALL
             result = await original_function(*args, **kwargs)
             end_time = datetime.datetime.now()
+
+            if moderation_metering_runtime is not None:
+                await moderation_metering_runtime.handoff(logging_obj, result, start_time, end_time)
 
             if _is_streaming_request(
                 kwargs=kwargs,

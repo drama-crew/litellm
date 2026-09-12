@@ -46,6 +46,10 @@ class _ProxyDBLogger(CustomLogger):
         user_api_key_dict: UserAPIKeyAuth,
         traceback_str: Optional[str] = None,
     ):
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import SCOPE_KEY, owns
+
+        if owns(request_data.get(SCOPE_KEY)):
+            return
         try:
             await _release_budget_reservation(budget_reservation=user_api_key_dict.budget_reservation)
         except Exception:
@@ -183,6 +187,10 @@ class _ProxyDBLogger(CustomLogger):
         )
 
         verbose_proxy_logger.debug("INSIDE _PROXY_track_cost_callback")
+        from litellm.proxy.video_endpoints.moderation_metering_runtime import SCOPE_KEY, owns
+
+        if owns(kwargs.get(SCOPE_KEY)):
+            return
         try:
             verbose_proxy_logger.debug(
                 f"kwargs stream: {kwargs.get('stream', None)} + complete streaming response: {kwargs.get('complete_streaming_response', None)}"

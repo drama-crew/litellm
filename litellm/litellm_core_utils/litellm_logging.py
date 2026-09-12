@@ -1725,6 +1725,7 @@ class Logging(LiteLLMLoggingBaseClass):
         logging_result,
         start_time,
         end_time,
+        emit: bool = True,
     ):
         """Resolve hidden params, compute response cost, and emit the standard logging payload."""
         hidden_params = getattr(logging_result, "_hidden_params", {})
@@ -1749,6 +1750,8 @@ class Logging(LiteLLMLoggingBaseClass):
         else:
             self.model_call_details["response_cost"] = self._response_cost_calculator(result=logging_result)
 
+        if not emit:
+            return
         self.model_call_details["standard_logging_object"] = self._build_standard_logging_payload(
             logging_result, start_time, end_time
         )

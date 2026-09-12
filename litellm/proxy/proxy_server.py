@@ -2160,6 +2160,9 @@ async def get_current_spend(
     and cached in-process for a few seconds, so a persistently stale counter
     drives at most one read per counter per window rather than one per request.
     """
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import check_budget
+
+    await check_budget(counter_key)
     current, verified = await _read_spend_counter_estimate(counter_key=counter_key, fallback_spend=fallback_spend)
     if fallback_authoritative:
         verified = True
@@ -2728,6 +2731,12 @@ async def _is_spend_counter_cache_warm(counter_key: str) -> bool:
 
 
 async def _increment_spend_counter_cache(counter_key: str, increment: float):
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import guarded_increment
+
+    guarded = await guarded_increment(counter_key, increment)
+    if guarded is not None:
+        spend_counter_cache.in_memory_cache.set_cache(key=counter_key, value=guarded)
+        return guarded
     if spend_counter_cache.redis_cache is not None:
         try:
             current_value = await spend_counter_cache.redis_cache.async_increment(
@@ -2752,6 +2761,10 @@ async def _increment_spend_counter_cache(counter_key: str, increment: float):
 
 
 async def _invalidate_spend_counter(counter_key: str):
+    from litellm.proxy.video_endpoints.moderation_metering_runtime import protect_invalidation
+
+    if await protect_invalidation(counter_key):
+        return
     spend_counter_cache.in_memory_cache.delete_cache(key=counter_key)
     if spend_counter_cache.redis_cache is not None:
         try:

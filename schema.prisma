@@ -1437,6 +1437,41 @@ model LiteLLM_OpenApiLog {
   @@index([owner, task_id])
 }
 
+model LiteLLM_ModerationMeteringTask {
+  intent_id String @id
+  binding Json
+  reservations Json
+  created_at DateTime @default(now()) @db.Timestamptz
+  phases LiteLLM_ModerationMeteringPhase[]
+}
+
+model LiteLLM_ModerationMeteringCounter {
+  counter_key String @id
+  generation String
+  committed_seq Int @default(0)
+  status String @default("ready")
+  updated_at DateTime @default(now()) @db.Timestamptz
+}
+
+model LiteLLM_ModerationMeteringPhase {
+  request_id String @id
+  intent_id String
+  phase String
+  payload Json
+  payload_hash String
+  status String
+  lease_token String?
+  lease_until DateTime? @db.Timestamptz
+  attempts Int @default(0)
+  available_at DateTime @default(now()) @db.Timestamptz
+  receipt Json?
+  created_at DateTime @default(now()) @db.Timestamptz
+  task LiteLLM_ModerationMeteringTask @relation(fields: [intent_id], references: [intent_id])
+  @@unique([intent_id, phase])
+  @@index([status, available_at, lease_until], map: "moderation_metering_phase_ready")
+}
+
+
 model LiteLLM_OpenApiLogSpend {
   id String @id
   owner String
