@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import io
+import logging
 import os
 import re
 import uuid
@@ -300,6 +302,19 @@ async def submit(
 
 
 async def capture(request: Request, result: object) -> None:
+    if not isinstance(result, (VideoObject, CharacterObject)):
+        return
+    outcomes = await asyncio.gather(_capture(request, result), return_exceptions=True)
+    outcome = outcomes[0]
+    if isinstance(outcome, asyncio.CancelledError):
+        raise outcome
+    if isinstance(outcome, Exception):
+        hidden = TypeAdapter(dict[str, object]).validate_python(getattr(result, "_hidden_params", {}))
+        setattr(result, "_hidden_params", {**hidden, "_moderation_metering_pending": True})
+        logging.getLogger(__name__).warning("accepted native financial receipt awaits durable recovery")
+
+
+async def _capture(request: Request, result: object) -> None:
     from litellm.proxy.video_endpoints.moderation_metering_runtime import private_event
     from litellm.types.videos.utils import decode_video_id_with_provider
 

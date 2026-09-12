@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from datetime import datetime
@@ -76,6 +77,35 @@ class FinancialProjection(BaseModel):
     facts: BillingFacts
     intent_id: str | None = None
     legacy_metadata: LegacyMetadata | None = None
+
+
+class FinancialAdmission(BaseModel):
+    payload: FinancialProjection
+    payload_hash: str
+
+
+async def freeze_legacy(tx: Database, value: FinancialProjection) -> FinancialProjection:
+    payload = value.model_dump_json()
+    await tx.execute_raw(
+        'INSERT INTO "LiteLLM_LegacyFinancialAdmission" (request_id,payload,payload_hash) VALUES ($1,$2::jsonb,$3) '
+        "ON CONFLICT (request_id) DO NOTHING",
+        value.request_id,
+        payload,
+        hashlib.sha256(payload.encode()).hexdigest(),
+    )
+    rows = TypeAdapter(tuple[FinancialAdmission, ...]).validate_python(
+        await tx.query_raw(
+            'SELECT payload,payload_hash FROM "LiteLLM_LegacyFinancialAdmission" WHERE request_id=$1', value.request_id
+        )
+    )
+    if len(rows) != 1:
+        raise ValueError("legacy financial admission missing")
+    stored = rows[0]
+    if hashlib.sha256(stored.payload.model_dump_json().encode()).hexdigest() != stored.payload_hash:
+        raise ValueError("legacy financial admission corrupt")
+    if value.model_copy(update={"global_user_id": stored.payload.global_user_id}) != stored.payload:
+        raise ValueError("legacy financial admission replay conflict")
+    return stored.payload
 
 
 async def project(

@@ -430,9 +430,42 @@ async def settle_legacy(
     from litellm.proxy.proxy_server import litellm_proxy_budget_name
     from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, ProtectedBudgetStore
 
-    global_user_id = (
-        financial.global_user_id if financial else litellm_proxy_budget_name if litellm.max_budget > 0 else None
+    initial_global = litellm_proxy_budget_name if litellm.max_budget > 0 else None
+    first = next(
+        (
+            "spend:" + kind + ":" + identity
+            for kind, identity in (
+                ("key", token),
+                ("user", user_id),
+                ("user", initial_global),
+                ("team", team_id),
+                ("org", org_id),
+                ("end_user", end_user_id),
+                *(("tag", tag) for tag in tags),
+            )
+            if identity
+        ),
+        None,
     )
+    if first is None or not await counter_mode(first):
+        return Projection(frozenset())
+    authority = store()
+    protected = ProtectedBudgetStore(
+        authority.db, authority.transactions, authority.redis, namespace=authority.namespace
+    )
+    previous = await protected.operation("legacy:" + operation_id)
+    global_user_id = (
+        previous.payload.projection.global_user_id
+        if previous is not None and previous.payload.projection is not None
+        else litellm_proxy_budget_name
+        if litellm.max_budget > 0
+        else None
+    )
+    if financial is not None:
+        from litellm.proxy.video_endpoints.moderation_metering_projection import freeze_legacy
+
+        financial = await freeze_legacy(authority.db, financial.model_copy(update={"global_user_id": global_user_id}))
+        global_user_id = financial.global_user_id
     targets = (
         *((BudgetIdentity(kind="key", identity=token),) if token else ()),
         *((BudgetIdentity(kind="user", identity=user_id),) if user_id else ()),
@@ -445,10 +478,6 @@ async def settle_legacy(
     )
     if not targets or not await counter_mode(targets[0].counter_key):
         return Projection(frozenset())
-    authority = store()
-    protected = ProtectedBudgetStore(
-        authority.db, authority.transactions, authority.redis, namespace=authority.namespace
-    )
     groups = await asyncio.gather(
         *(
             authority.db.query_raw(
@@ -468,6 +497,10 @@ async def settle_legacy(
             {row.counter_key for group in groups for row in TypeAdapter(tuple[CounterKey, ...]).validate_python(group)}
         )
     )
+    if financial is not None and global_user_id:
+        counter_keys = tuple(sorted({*counter_keys, "spend:user:" + global_user_id}))
+    if financial is not None and previous is not None and previous.payload.projection is not None:
+        counter_keys = tuple(change.before.counter_key for change in previous.payload.changes)
     if not counter_keys:
         return Projection(frozenset())
     if not operation_id.strip():

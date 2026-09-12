@@ -1526,3 +1526,10 @@ model LiteLLM_BudgetBirth {
   initial_spend Decimal @client.Decimal(65, 30)
   created_at DateTime @default(now()) @client.Timestamptz(6)
 }
+
+model LiteLLM_LegacyFinancialAdmission {
+  request_id String @id
+  payload Json
+  payload_hash String
+  created_at DateTime @default(now()) @client.Timestamptz(6)
+}

@@ -43,11 +43,9 @@ Notify = Callable[[str, dict[str, JsonValue]], Awaitable[bool]]
 
 
 async def settle_task(task: ContextIRTask) -> None:
-    from datetime import datetime, timezone
-
     from litellm.llms.causyn.h3_prompt import AUTH_MODEL
 
-    actual = task.price if task.result is not None and task.status not in {"failed", "cancelled"} else 0.0
+    actual = actual_cost(task)
     if task.reservation is not None:
         await settle_reservation(task.id, task.reservation, actual)
     phase = financial_event(task)
@@ -71,7 +69,7 @@ async def settle_task(task: ContextIRTask) -> None:
                 moderation_intent_id=binding.intent_id if binding else None,
                 metering_event_json=phase.model_dump_json() if phase else None,
                 billing_facts_json=financial_facts(task).model_dump_json(),
-                occurred_at=datetime.fromtimestamp(task.updated_at, timezone.utc).isoformat(),
+                occurred_at=financial_facts(task).ended_at.isoformat(),
             ),
         )
 
@@ -82,6 +80,8 @@ def financial_facts(task: ContextIRTask):
 
     from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
 
+    if task.financial_facts_json is not None:
+        return BillingFacts.model_validate_json(task.financial_facts_json)
     usage = task.result.usage if task.result else None
     return BillingFacts(
         started_at=datetime.fromtimestamp(task.created_at, timezone.utc),
@@ -99,7 +99,9 @@ def financial_event(task: ContextIRTask):
     from litellm.llms.causyn.h3_prompt import AUTH_MODEL
     from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, PhaseEvent, request_id
 
-    actual = task.price if task.result is not None and task.status not in {"failed", "cancelled"} else 0.0
+    if task.financial_event_json is not None:
+        return PhaseEvent.model_validate_json(task.financial_event_json)
+    actual = actual_cost(task)
     binding = BillingBinding.model_validate_json(task.metering_binding_json) if task.metering_binding_json else None
     phase = (
         PhaseEvent(
@@ -118,6 +120,23 @@ def financial_event(task: ContextIRTask):
         else None
     )
     return phase
+
+
+def actual_cost(task: ContextIRTask) -> float:
+    if task.financial_actual is not None:
+        return task.financial_actual
+    return task.price if task.result is not None and task.status not in {"failed", "cancelled"} else 0.0
+
+
+def freeze_financial(task: ContextIRTask) -> ContextIRTask:
+    frozen = task.model_copy(
+        update={
+            "financial_actual": actual_cost(task),
+            "financial_facts_json": financial_facts(task).model_dump_json(),
+        }
+    )
+    phase = financial_event(frozen)
+    return frozen.model_copy(update={"financial_event_json": phase.model_dump_json() if phase else None})
 
 
 class ContextIRService:
@@ -283,6 +302,8 @@ class ContextIRService:
             return
         if task.video_payload is not None and task.rewrite_completed_ns is not None:
             interval("causyn.gpu.admission_wait", task.rewrite_completed_ns, time.time_ns())
+        task = freeze_financial(task)
+        await self.store.save(task, token)
         await self.settle(task)
         await self.finish(
             self.with_notification(
@@ -295,6 +316,7 @@ class ContextIRService:
         failed = self.with_notification(
             task.model_copy(update={"status": "failed", "error": message, "updated_at": int(time.time())})
         )
+        failed = freeze_financial(failed)
         await self.store.save(failed, token)
         await self.settle(failed)
         await self.finish(failed.model_copy(update={"settled": True}), token)
@@ -337,6 +359,7 @@ class ContextIRService:
         cancelled = self.with_notification(
             current.model_copy(update={"status": "cancelled", "updated_at": int(time.time())})
         )
+        cancelled = freeze_financial(cancelled)
         await self.store.save(cancelled, token)
         await self.settle(cancelled)
         await self.finish(cancelled.model_copy(update={"settled": True}), token)

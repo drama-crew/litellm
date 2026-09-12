@@ -82,10 +82,13 @@ async def test_result_reused_after_settlement_failure_and_duplicate_delivery(red
     persisted = await service.store.get(task.id)
     assert persisted.result == RESULT
     assert persisted.status == "running"
+    assert persisted.financial_actual == 4
+    assert persisted.financial_facts_json is not None
     restarted = ContextIRService(ContextIRStore(redis), rewrite=counted_rewrite, settle=settle)
     await asyncio.gather(restarted.process(task.id), restarted.process(task.id))
     ready = await restarted.store.get(task.id)
     assert ready.status == "succeeded"
+    assert ready.financial_facts_json == persisted.financial_facts_json
     assert calls["rewrite"] == 1
     assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 1
     payload = json.loads((await redis.xrange(CAUSYN_BILLING_STREAM_KEY))[0][1][b"payload"])
@@ -111,6 +114,7 @@ async def test_invalid_output_failed_and_not_billable(redis):
     failed = await service.store.get(task.id)
     assert failed.status == "failed"
     assert failed.settled
+    assert failed.financial_actual == 0
     assert charged == [False]
     assert "content" not in failed.public()
 
@@ -128,6 +132,7 @@ async def test_cancel_owner_running_and_terminal_rules(redis):
     with pytest.raises(RewriteError, match="not found"):
         await service.cancel_or_delete(task.id, "other")
     assert await service.cancel_or_delete(task.id, "owner") == "cancelled"
+    assert (await service.store.get(task.id)).financial_actual == 0
     await service.process(task.id)
     assert calls["rewrite"] == 0
     with pytest.raises(RewriteError, match="cannot be cancelled"):
@@ -230,6 +235,8 @@ async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, 
     automatic = await service.store.get("h3_ir_" + video_id)
     assert automatic.status == "succeeded"
     assert automatic.price == 0
+    assert automatic.financial_actual == 0
+    assert automatic.financial_event_json is None
     assert automatic.metering_binding_json is None
     assert automatic.settled
     assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 0

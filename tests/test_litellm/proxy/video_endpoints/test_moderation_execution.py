@@ -84,7 +84,9 @@ async def test_continuation_never_resubmits_after_unknown_or_receipt_ack_loss(mo
         first = await client.post(
             "/internal/moderation/submit", json={"ticket": ticket()}, headers={"Authorization": "Bearer " + SECRET}
         )
-        assert first.status_code == 500
+        assert first.status_code == (200 if failure == "receipt_ack" else 500)
+        if failure == "receipt_ack":
+            assert first.json() == {"accepted": True, "state": "submitted"}
         second = await client.post(
             "/internal/moderation/submit", json={"ticket": ticket()}, headers={"Authorization": "Bearer " + SECRET}
         )

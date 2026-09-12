@@ -37,7 +37,8 @@ async def store():
         migration = Path(
             "litellm-proxy-extras/litellm_proxy_extras/migrations/20260913000000_moderation_metering/migration.sql"
         )
-        for statement in migration.read_text().split(";"):
+        admission = migration.parent.parent / "20260913010000_legacy_financial_admission" / "migration.sql"
+        for statement in (migration.read_text() + admission.read_text()).split(";"):
             if statement.strip():
                 await db.execute_raw(statement)
         for statement in (
@@ -1848,9 +1849,9 @@ async def test_image_own_reservation_and_actual_outbox_commute_once(store, monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("admitted", [False, True])
+@pytest.mark.parametrize("admitted,collect_first", [(False, False), (True, False), (True, True)])
 async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_once(
-    production_store, monkeypatch, admitted
+    production_store, monkeypatch, admitted, collect_first
 ):
     import json
     from types import SimpleNamespace
@@ -1897,7 +1898,21 @@ async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_o
             system_sha256="a" * 64,
         )
     )
-    service = context_ir.ContextIRService(context_ir_store.ContextIRStore(redis), rewrite=rewrite)
+    import time
+
+    clock = [time.time()]
+    monkeypatch.setattr(context_ir, "time", SimpleNamespace(time=lambda: clock[0], time_ns=lambda: int(clock[0] * 1e9)))
+    delivered_events = []
+
+    async def settle(task):
+        persisted = await service.store.get(task.id)
+        phase = context_ir.financial_event(persisted)
+        if phase:
+            delivered_events.append(phase)
+        await context_ir.settle_task(task)
+        clock[0] += 5
+
+    service = context_ir.ContextIRService(context_ir_store.ContextIRStore(redis), rewrite=rewrite, settle=settle)
     request = Request(
         {"type": "http", "method": "POST", "path": "/v2/h3_context_ir", "headers": [], "query_string": b""}
     )
@@ -1925,9 +1940,47 @@ async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_o
     worker = billing_outbox.LibTVBillingReconciler(
         redis, SimpleNamespace(db=db), stream_key=prefix + "outbox", consumer_group=prefix + "group"
     )
+    collected_events = []
+
+    async def collect():
+        if not admitted:
+            return
+        from litellm.proxy.video_endpoints import moderation_execution as execution
+        from litellm.proxy.video_endpoints.moderation_metering import PhaseEvent
+
+        monkeypatch.setattr(context_ir, "get_context_ir_service", lambda: service)
+        monkeypatch.setattr(execution, "authorize", lambda *args: SimpleNamespace(intent_id="entry"))
+
+        async def platform(request, method, path, body):
+            if path.endswith("/execution"):
+                return {
+                    "state": "submitted",
+                    "route": "context_ir",
+                    "native_id": task_id,
+                    "principal": {"fingerprint": fingerprint, "user_id": "user", "team_id": "team"},
+                }
+            if path.endswith("/financial-event"):
+                phase = PhaseEvent.model_validate(body["metering_event"])
+                collected_events.append(phase)
+                assert phase.digest() == delivered_events[0].digest()
+                await meter.persist(phase)
+                await meter.run_once()
+            return {}
+
+        monkeypatch.setattr(execution.bridge, "platform", platform)
+        await execution.collect(execution.Ticket(ticket="synthetic"), request)
+
+    if collect_first:
+        await collect()
     assert await worker.reconcile_once() == 1
+    clock[0] += 5
+    await collect()
     await context_ir.settle_task(task)
+    await collect()
     assert await worker.reconcile_once() == 0
+    if admitted:
+        assert all(phase == delivered_events[0] for phase in collected_events)
+        assert task.updated_at > delivered_events[0].facts.ended_at.timestamp()
     assert await db.query_raw('SELECT spend,prompt_tokens,completion_tokens,total_tokens FROM "LiteLLM_SpendLogs"') == [
         {"spend": 4.0, "prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}
     ]
@@ -1942,3 +1995,338 @@ async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_o
     else:
         assert task.metering_binding_json is None
         assert await db.query_raw('SELECT intent_id FROM "LiteLLM_ModerationMeteringTask"') == [{"intent_id": "seed"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_kind", ["image", "causyn", "context_ir"])
+@pytest.mark.parametrize("global_state", ["ready", "born", "unregistered"])
+async def test_entry_fix1_actual_outbox_freezes_global_identity(store, monkeypatch, event_kind, global_state):
+    import json
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+    from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, CounterBaseline
+    from litellm.llms.libtv.billing_outbox import ImageBillingEvent, CausynBillingEvent, LibTVBillingReconciler
+
+    meter, db, redis, prefix = store
+    await create_financial_projection_tables(db)
+    authority = protected_store(meter)
+    if global_state != "born":
+        await db.execute_raw("INSERT INTO \"LiteLLM_UserTable\" (user_id) VALUES ('global-budget')")
+    await redis.set(prefix + "spend:team:team", 100)
+    await authority.register_cutover(cutover_receipt())
+    if global_state == "born":
+        await db.execute_raw("INSERT INTO \"LiteLLM_UserTable\" (user_id) VALUES ('global-budget')")
+    global_receipt = cutover_receipt().model_copy(
+        update={
+            "receipt_id": "global-cutover",
+            "baselines": (
+                CounterBaseline(
+                    target=BudgetIdentity(kind="user", identity="global-budget"),
+                    sql_value=0,
+                    period_start=datetime(2026, 8, 1, tzinfo=timezone.utc),
+                ),
+            ),
+        }
+    )
+    if global_state == "ready":
+        await authority.register_cutover(global_receipt)
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    monkeypatch.setattr(runtime, "counter_mode", AsyncMock(return_value=True))
+    monkeypatch.setattr(proxy_server, "litellm_proxy_budget_name", "global-budget")
+    monkeypatch.setattr(litellm, "max_budget", 100)
+    fields = dict(
+        deployment_id="deployment",
+        provider_task_id="actual-task",
+        response_cost=3,
+        api_key="key",
+        team_id="team",
+        user_id="user",
+        occurred_at="2026-09-13T00:00:00+00:00",
+    )
+    event = (
+        ImageBillingEvent(**fields)
+        if event_kind == "image"
+        else CausynBillingEvent(
+            **fields, task_type="h3_context_ir" if event_kind == "context_ir" else "video_generation"
+        )
+    )
+    stream = prefix + "global-outbox"
+    await redis.xadd(stream, {"payload": json.dumps(event.to_dict())})
+    worker = LibTVBillingReconciler(redis, SimpleNamespace(db=db), stream_key=stream, consumer_group=prefix + "group")
+    if global_state == "ready":
+        await asyncio.gather(*(worker._commit_event(event) for _ in range(3)))
+    if global_state == "unregistered":
+        assert await worker.reconcile_once() == 0
+        assert (await redis.xpending(stream, prefix + "group"))["pending"] == 1
+        assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 0.0}]
+        assert await db.query_raw('SELECT request_id FROM "LiteLLM_SpendLogs"') == []
+        monkeypatch.setattr(proxy_server, "litellm_proxy_budget_name", "different-global")
+        monkeypatch.setattr(litellm, "max_budget", 0)
+        await authority.register_cutover(global_receipt)
+        assert await worker.reconcile_once() == 1
+        assert (await redis.xpending(stream, prefix + "group"))["pending"] == 0
+    else:
+        assert await worker.reconcile_once() == 1
+    await worker._commit_event(event)
+    operation = await authority.operation("legacy:" + event.request_id)
+    assert operation.payload.projection.global_user_id == "global-budget"
+    from litellm.proxy.video_endpoints.moderation_metering_projection import freeze_legacy
+
+    projection = operation.payload.projection
+    for changes in (
+        {"fingerprint": "other-key"},
+        {"user_id": "other-user"},
+        {"team_id": "other-team"},
+        {"provider": "other-provider"},
+        {"deployment_id": "other-deployment"},
+        {"provider_task_id": "other-task"},
+        {"amount": Decimal(4)},
+        {"facts": projection.facts.model_copy(update={"prompt_tokens": 42})},
+    ):
+        with pytest.raises(ValueError, match="admission replay conflict"):
+            await freeze_legacy(meter.db, projection.model_copy(update=changes))
+    assert len(await db.query_raw('SELECT request_id FROM "LiteLLM_LegacyFinancialAdmission"')) == 1
+    monkeypatch.setattr(proxy_server, "litellm_proxy_budget_name", "different-global")
+    monkeypatch.setattr(litellm, "max_budget", 0)
+    await asyncio.gather(*(worker._commit_event(event) for _ in range(3)))
+    assert (await authority.operation("legacy:" + event.request_id)).payload_hash == operation.payload_hash
+    assert await db.query_raw("SELECT spend FROM \"LiteLLM_UserTable\" WHERE user_id='global-budget'") == [
+        {"spend": 3.0}
+    ]
+    assert float(await redis.get(prefix + "spend:user:global-budget")) == 3
+    assert float(await redis.get(prefix + "spend:team:team")) == 103
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_SpendLogs"') == [{"spend": 3.0}]
+
+
+async def accepted_capture_entry(store, monkeypatch, failure, source="public", proof=None):
+    import json
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import httpx
+    import litellm
+    from fastapi import FastAPI, Request, Response
+    from litellm.proxy import proxy_server
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
+    from litellm.proxy.video_endpoints import moderation_execution as execution, moderation_metering_entry as entry
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime, endpoints, openapi_log_capture
+    from litellm.types.videos.main import VideoObject
+    from litellm.types.videos.utils import encode_video_id_with_provider
+    from litellm.utils import client
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+
+    meter, db, redis, prefix = store
+    for table in ("LiteLLM_VerificationToken", "LiteLLM_TeamTable"):
+        await db.execute_raw(f'ALTER TABLE "{table}" ADD COLUMN IF NOT EXISTS budget_limits jsonb')
+    bound = binding().model_copy(update={"fingerprint": "b" * 64, "actor_user_id": "actor"})
+    if proof is not None:
+        bound = BillingBinding(**proof, expected_phases=("submit", "completion"))
+    await db.execute_raw('UPDATE "LiteLLM_VerificationToken" SET token=$1 WHERE token=$2', bound.fingerprint, "key")
+    await prepare_meter(meter, bound, {})
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    monkeypatch.setattr(litellm, "max_budget", 0)
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", "synthetic-entry-fix1-secret-32-bytes")
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "http://platform.synthetic.invalid")
+    auth = UserAPIKeyAuth(api_key=bound.fingerprint, user_id=bound.user_id, team_id=bound.team_id)
+    monkeypatch.setattr(execution, "authenticate", AsyncMock(return_value=auth))
+    monkeypatch.setattr(execution, "authorize", lambda *args: SimpleNamespace(intent_id=bound.intent_id))
+    state = {"state": "input_moderation", "not_sent": [], "receipts": [], "entry_capture": 0}
+    admission = {
+        "intent_id": bound.intent_id,
+        "request_digest": bound.request_digest,
+        "actor_user_id": bound.actor_user_id,
+        "model": bound.model,
+        "generation_id": bound.generation_id,
+    }
+
+    async def platform(request):
+        payload = json.loads(request.content)
+        if request.url.path.endswith("/begin"):
+            if state["state"] != "input_moderation":
+                return httpx.Response(200, json={"acquired": False, "state": state["state"]})
+            state["state"] = "submission_unknown"
+            return httpx.Response(
+                200,
+                json={
+                    "acquired": True,
+                    "token": "attempt",
+                    "metering": admission,
+                    "credential": "synthetic",
+                    "route": "avideo_generation",
+                    "request": {"model": bound.model, "prompt": "synthetic"},
+                },
+            )
+        if request.url.path.endswith("/not-sent"):
+            state["not_sent"].append(payload)
+            state["state"] = "input_moderation"
+            return httpx.Response(200, json={})
+        assert request.url.path.endswith(("/receipt", "/generation-receipt"))
+        state["receipts"].append(payload)
+        if runtime.CONTEXT.get() is not None:
+            state["entry_capture"] += 1
+        if failure == "platform4xx":
+            return httpx.Response(403, json={"error": "synthetic lost admission"})
+        error = {
+            "connect": httpx.ConnectError,
+            "connect_timeout": httpx.ConnectTimeout,
+            "pool_timeout": httpx.PoolTimeout,
+        }.get(failure, httpx.ConnectError)("synthetic receipt loss", request=request)
+        if failure in ("nested_cause", "nested_context"):
+            try:
+                raise error
+            except httpx.ConnectError:
+                if failure == "nested_cause":
+                    raise RuntimeError("nested financial transport") from error
+                raise RuntimeError("nested financial transport") from None
+        raise error
+
+    app = FastAPI()
+    app.state.moderation_transport = httpx.MockTransport(platform)
+    app.include_router(execution.router)
+    responses = []
+    attempts = []
+
+    @client
+    async def avideo_generation(**kwargs):
+        attempts.append("provider")
+        if failure == "provider_connect":
+            raise httpx.ConnectError("synthetic provider not reached")
+        if failure == "provider_rejected":
+            rejected = httpx.Response(429, request=httpx.Request("POST", "http://provider.synthetic.invalid"))
+            rejected.raise_for_status()
+        response = VideoObject(
+            id=encode_video_id_with_provider("native", "openai", "deployment"), object="video", status="queued"
+        )
+        response._hidden_params["response_cost"] = 3.75
+        responses.append(response)
+        return response
+
+    monkeypatch.setattr(litellm, "avideo_generation", avideo_generation)
+    monkeypatch.setattr(proxy_server, "llm_router", None)
+    monkeypatch.setattr(proxy_server, "user_model", "openai/synthetic")
+    logging = SimpleNamespace(litellm_call_id="entry-call")
+
+    async def pre_call(self, **kwargs):
+        self.data.update(model="openai/synthetic", caching=False)
+        return self.data, logging
+
+    monkeypatch.setattr(ProxyBaseLLMRequestProcessing, "_pre_call_with_fallbacks", pre_call)
+    monkeypatch.setattr(ProxyBaseLLMRequestProcessing, "get_custom_headers", lambda **kwargs: {})
+    proxy_logging = SimpleNamespace(
+        during_call_hook=AsyncMock(),
+        update_request_status=AsyncMock(),
+        post_call_success_hook=AsyncMock(side_effect=lambda **kwargs: kwargs["response"]),
+        post_call_response_headers_hook=AsyncMock(return_value={}),
+        post_call_failure_hook=AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(proxy_server, "proxy_logging_obj", proxy_logging)
+    monkeypatch.setattr(openapi_log_capture, "start", AsyncMock(return_value=None))
+    try:
+        if source == "public":
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://fork"
+            ) as http:
+                first = await http.post("/internal/moderation/submit", json={"ticket": "synthetic"})
+                if failure.startswith("provider_"):
+                    assert first.status_code == (429 if failure == "provider_rejected" else 500)
+                    assert len(attempts) == 1 and responses == []
+                    assert state["not_sent"] == [
+                        {"token": "attempt", "outcome": "not_sent" if failure == "provider_connect" else "rejected"}
+                    ]
+                    assert state["receipts"] == []
+                    return None, bound, state
+                assert first.status_code == 200, (first.text, state, len(responses))
+                second = await http.post("/internal/moderation/submit", json={"ticket": "synthetic"})
+                assert second.status_code == 200
+                assert state["state"] == "submission_unknown"
+        else:
+            request = execution.execution_request(
+                Request(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/v1/videos",
+                        "headers": [],
+                        "query_string": b"",
+                        "app": app,
+                    }
+                ),
+                {"model": bound.model},
+                "/v1/videos",
+            )
+            entry.attest(request, admission)
+            request.scope["moderation_producer_ticket"] = "synthetic-producer"
+            returned = await endpoints.video_generation(request, Response(), None, auth)
+            assert returned is responses[0]
+        assert len(responses) == 1
+        assert state["entry_capture"] == 1
+        assert state["not_sent"] == []
+        assert runtime.private_event(responses[0]) is not None
+        phase = await meter.phase(bound.intent_id, "submit")
+        assert phase.native_id == responses[0].id
+        assert phase.amount == Decimal("3.75")
+        state["provider_calls"] = len(responses)
+        return responses[0], bound, state
+    finally:
+        await GLOBAL_LOGGING_WORKER.flush()
+        await GLOBAL_LOGGING_WORKER.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["connect", "connect_timeout", "pool_timeout", "nested_cause", "nested_context", "platform4xx"]
+)
+@pytest.mark.parametrize("source", ["public", "studio"])
+async def test_entry_fix1_capture_failure_after_actual_invoke_never_reopens_dispatch(
+    store, monkeypatch, failure, source
+):
+    await create_financial_projection_tables(store[1])
+    await accepted_capture_entry(store, monkeypatch, failure, source)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["provider_connect", "provider_rejected"])
+async def test_entry_fix1_actual_pre_provider_failure_keeps_trusted_outcome(store, monkeypatch, failure):
+    await accepted_capture_entry(store, monkeypatch, failure)
+
+
+@pytest.mark.asyncio
+async def test_entry_fix1_historical_operation_precedes_new_global_configuration(store, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    import litellm
+    from litellm.proxy import proxy_server
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+    from litellm.llms.libtv.billing_outbox import ImageBillingEvent, LibTVBillingReconciler
+
+    meter, db, redis, prefix = store
+    await create_financial_projection_tables(db)
+    await db.execute_raw("INSERT INTO \"LiteLLM_UserTable\" (user_id) VALUES ('global-budget')")
+    authority = protected_store(meter)
+    await redis.set(prefix + "spend:team:team", 100)
+    await authority.register_cutover(cutover_receipt())
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    monkeypatch.setattr(runtime, "counter_mode", AsyncMock(return_value=True))
+    monkeypatch.setattr(litellm, "max_budget", 0)
+    monkeypatch.setattr(proxy_server, "litellm_proxy_budget_name", "global-budget")
+    event = ImageBillingEvent(
+        deployment_id="deployment", provider_task_id="historical", response_cost=3, team_id="team", user_id="user"
+    )
+    worker = LibTVBillingReconciler(redis, SimpleNamespace(db=db))
+    await worker._commit_event(event)
+    original = await authority.operation("legacy:" + event.request_id)
+    assert original.payload.projection.global_user_id is None
+    await db.execute_raw('DELETE FROM "LiteLLM_LegacyFinancialAdmission" WHERE request_id=$1', event.request_id)
+    monkeypatch.setattr(litellm, "max_budget", 100)
+    await worker._commit_event(event)
+    assert (await authority.operation("legacy:" + event.request_id)).payload_hash == original.payload_hash
+    assert await db.query_raw("SELECT spend FROM \"LiteLLM_UserTable\" WHERE user_id='global-budget'") == [
+        {"spend": 0.0}
+    ]
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 3.0}]
+    assert await redis.get(prefix + "spend:user:global-budget") is None
+    assert float(await redis.get(prefix + "spend:team:team")) == 103
