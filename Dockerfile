@@ -205,6 +205,8 @@ ENV PATH="/app/.venv/bin:${PATH}"
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/docker /app/docker
 COPY --from=builder /app/schema.prisma /app/schema.prisma
+COPY --from=builder /app/litellm-proxy-extras/litellm_proxy_extras/migrations /app/migrations
+COPY --from=builder /app/scripts/protected_budget_cutover.py /app/scripts/protected_budget_cutover.py
 COPY --from=builder /app/litellm/proxy/prisma_migration.py /app/litellm/proxy/prisma_migration.py
 # enterprise/ is imported by source path at runtime (proxy_cli puts the
 # working directory on sys.path; litellm/proxy/hooks resolves

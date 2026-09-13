@@ -2438,3 +2438,35 @@ async def test_legacy_frozen_actual_hash_and_new_pending_raw_completion(producti
                 update={"facts": completed.facts.model_copy(update={"raw_cost_credit": Decimal("0.0000003")})}
             )
         )
+
+
+@pytest.mark.asyncio
+async def test_cutover_inspection_is_read_only_and_rejects_lost_or_expiring_proof(store):
+    import runpy
+
+    inspect_cutover = runpy.run_path('scripts/protected_budget_cutover.py')['inspect_cutover']
+    meter, db, redis, prefix = store
+    receipt = cutover_receipt()
+    authority = protected_store(meter)
+    assert not await inspect_cutover(authority, receipt)
+    await redis.set(prefix + 'spend:team:team', '100')
+    await authority.register_cutover(receipt)
+    before = await db.query_raw('SELECT * FROM "LiteLLM_BudgetCutover"')
+    assert await inspect_cutover(authority, receipt)
+    guard = prefix + 'moderation:counter:spend:team:team'
+    await redis.hset(guard, 'cutover', 'tampered-receipt-digest')
+    assert not await inspect_cutover(authority, receipt)
+    await redis.hset(guard, 'cutover', receipt.digest())
+    assert await inspect_cutover(authority, receipt)
+    await redis.expire(prefix + 'protected:mode', 3600)
+    assert not await inspect_cutover(authority, receipt)
+    assert 0 < await redis.ttl(prefix + 'protected:mode') <= 3600
+    await redis.persist(prefix + 'protected:mode')
+    await redis.expire(guard, 3600)
+    assert not await inspect_cutover(authority, receipt)
+    assert 0 < await redis.ttl(guard) <= 3600
+    await redis.persist(guard)
+    await redis.delete(prefix + 'spend:team:team')
+    assert not await inspect_cutover(authority, receipt)
+    assert await redis.get(prefix + 'spend:team:team') is None
+    assert await db.query_raw('SELECT * FROM "LiteLLM_BudgetCutover"') == before
