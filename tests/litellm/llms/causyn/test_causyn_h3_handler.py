@@ -24,7 +24,8 @@ async def fake_submit(payload, billing):
 
     async def deliver(task):
         await mod.enqueue_video_generate(
-            rewritten_video_payload(task).model_dump(mode="json"), redis_factory=lambda: None,
+            rewritten_video_payload(task).model_dump(mode="json"),
+            redis_factory=lambda: None,
             settings=mod.VideoGenerateSettings.from_environment(),
         )
 
@@ -35,8 +36,11 @@ async def fake_submit(payload, billing):
         service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, deliver=deliver, settle=settle)
         task = await service.create(
             VideoPromptInput.model_validate(payload.request).context_ir(),
-            owner="test", billing=billing, task_id="h3_ir_" + payload.task_id,
-            video_payload=payload.model_dump(mode="json"), listed=False,
+            owner="test",
+            billing=billing,
+            task_id="h3_ir_" + payload.task_id,
+            video_payload=payload.model_dump(mode="json"),
+            listed=False,
         )
         await service.process(task.id)
         assert (await service.store.get(task.id)).status == "succeeded"
@@ -244,13 +248,21 @@ async def test_h3_flag_is_independent_from_causyn_1_0(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("version", "ratio", "source", "width", "height"), [
-    ("causyn-video-billing-v3", "16:9", "1344x768", 1344, 768),
-    ("causyn-video-billing-v4", "16:9", "1344x756", 1344, 756),
-    ("causyn-video-billing-v4", "adaptive", "adaptive", 768, 1024),
-])
+@pytest.mark.parametrize(
+    ("version", "ratio", "source", "width", "height"),
+    [
+        ("causyn-video-billing-v3", "16:9", "1344x768", 1344, 768),
+        ("causyn-video-billing-v4", "16:9", "1344x756", 1344, 756),
+        ("causyn-video-billing-v4", "adaptive", "adaptive", 768, 1024),
+    ],
+)
 async def test_h3_completed_status_restores_model_and_billing(
-    monkeypatch: pytest.MonkeyPatch, version, ratio, source, width, height,
+    monkeypatch: pytest.MonkeyPatch,
+    version,
+    ratio,
+    source,
+    width,
+    height,
 ) -> None:
     async def fetch_status(task_id: str, *, redis: object) -> dict[str, object]:
         return {
@@ -331,11 +343,79 @@ def test_text_only_requires_one_of_five_deployed_ratios(ratio):
 
 
 def test_duration_budget_does_not_change_billing_profile():
-    request, duration, requested, source, _ = mod._request(
-        "causyn-1.1", "prompt", _params(seconds="15")
-    )
+    request, duration, requested, source, _ = mod._request("causyn-1.1", "prompt", _params(seconds="15"))
     assert duration == 15
     assert requested == request["resolution"] == "768p"
     width, height = map(int, source.split("x"))
     assert width < 1344 and height < 756
     assert width * 9 == height * 16
+
+
+def _ref(url: str) -> dict[str, str]:
+    return {"role": "reference", "media_type": "image", "url": url}
+
+
+def test_ref2va_references_keep_explicit_ratio_and_source_resolution():
+    params = _params(
+        aspect_ratio="9:16",
+        references=[_ref("https://source.example/r1.png"), _ref("https://source.example/r2.png")],
+    )
+    request, duration, _, source, _ = mod._request("causyn-1.1", "prompt", params)
+    assert request["ratio"] == "9:16"
+    assert source == mod._vdn_source_resolution("9:16", duration)
+    assert request["references"] == [
+        _ref("https://source.example/r1.png"),
+        _ref("https://source.example/r2.png"),
+    ]
+
+
+def test_ref2va_up_to_nine_references_accepted():
+    refs = [_ref(f"https://source.example/r{i}.png") for i in range(9)]
+    params = _params(aspect_ratio="16:9", references=refs)
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", params)
+    assert len(request["references"]) == 9
+
+
+def test_ref2va_rejects_more_than_nine_references():
+    refs = [_ref(f"https://source.example/r{i}.png") for i in range(10)]
+    params = _params(aspect_ratio="16:9", references=refs)
+    with pytest.raises(CustomLLMError) as error:
+        mod._request("causyn-1.1", "prompt", params)
+    assert error.value.status_code == 400
+
+
+@pytest.mark.parametrize("ratio", [None, "adaptive"])
+def test_ref2va_requires_explicit_ratio(ratio):
+    params = _params(aspect_ratio=ratio, references=[_ref("https://source.example/r1.png")])
+    with pytest.raises(CustomLLMError) as error:
+        mod._request("causyn-1.1", "prompt", params)
+    assert error.value.status_code == 400
+
+
+def test_ref2va_rejects_mixing_reference_role_with_keyframes():
+    params = _params(
+        aspect_ratio="16:9",
+        references=[
+            _ref("https://source.example/r1.png"),
+            {"role": "first_frame", "media_type": "image", "url": "https://source.example/first.png"},
+        ],
+    )
+    with pytest.raises(CustomLLMError) as error:
+        mod._request("causyn-1.1", "prompt", params)
+    assert error.value.status_code == 400
+
+
+async def test_h3_maps_ref2va_references_to_worker_references(enqueued: _Recorder) -> None:
+    refs = [_ref("https://source.example/r1.png"), _ref("https://source.example/r2.png")]
+    await CausynVideoHandler(
+        prompt_submit=fake_submit,
+    ).avideo_generation(
+        model="causyn-1.1",
+        prompt="a subject preserved across shots",
+        api_key=None,
+        api_base=None,
+        optional_params=_params(aspect_ratio="16:9", references=refs),
+        logging_obj=None,
+    )
+    assert enqueued.payloads[0]["request"]["references"] == refs
+    assert enqueued.payloads[0]["request"]["ratio"] == "16:9"

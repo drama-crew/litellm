@@ -449,14 +449,27 @@ def _legacy_references(
     return tuple({"role": "reference", "media_type": "image", "url": url} for url in urls)
 
 
+_H3_REF2VA_MAX_IMAGES = 9
+_H3_REF2VA_ERROR = (
+    f"references must contain first_frame and optional last_frame, or 1 to {_H3_REF2VA_MAX_IMAGES} reference images"
+)
+
+
 def _h3_shaped_references(value: object) -> tuple[dict[str, str], ...]:
     try:
         references = TypeAdapter(list[dict[str, str]]).validate_python(value, strict=True)
     except ValidationError:
-        raise _bad_request("references must contain first_frame and optional last_frame") from None
+        raise _bad_request(_H3_REF2VA_ERROR) from None
     allowed = {"role", "media_type", "url"}
     if any(set(reference) != allowed for reference in references):
-        raise _bad_request("references must contain first_frame and optional last_frame")
+        raise _bad_request(_H3_REF2VA_ERROR)
+    roles = [reference["role"] for reference in references]
+    if roles and all(role == "reference" for role in roles):
+        if not 1 <= len(references) <= _H3_REF2VA_MAX_IMAGES:
+            raise _bad_request(_H3_REF2VA_ERROR)
+        if any(reference["media_type"] != "image" or not reference["url"] for reference in references):
+            raise _bad_request(_H3_REF2VA_ERROR)
+        return tuple(references)
     by_role: dict[str, dict[str, str]] = {}
     for reference in references:
         role = reference["role"]
@@ -466,7 +479,7 @@ def _h3_shaped_references(value: object) -> tuple[dict[str, str], ...]:
             or reference["media_type"] != "image"
             or not reference["url"]
         ):
-            raise _bad_request("references must contain first_frame and optional last_frame")
+            raise _bad_request(_H3_REF2VA_ERROR)
         by_role[role] = reference
     if "last_frame" in by_role and "first_frame" not in by_role:
         raise _bad_request("last_image requires image")
@@ -555,7 +568,8 @@ def _request(
         _h3_references(optional_params) if spec.model == CAUSYN_H3_MODEL else _legacy_references(optional_params)
     )
     ratio = optional_params.get("aspect_ratio")
-    if spec.model == CAUSYN_H3_MODEL and references:
+    is_ref2va = spec.model == CAUSYN_H3_MODEL and bool(references) and references[0]["role"] == "reference"
+    if spec.model == CAUSYN_H3_MODEL and references and not is_ref2va:
         if ratio is not None and (not isinstance(ratio, str) or ratio not in {*spec.ratios, "adaptive", "21:9"}):
             raise _bad_request("unsupported aspect_ratio for keyframe generation")
         ratio = "adaptive"

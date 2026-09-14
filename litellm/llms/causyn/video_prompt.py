@@ -18,7 +18,7 @@ from litellm.proxy.video_endpoints.minimax_h3_models import ImageItem, MediaURL,
 
 
 class VideoReference(BaseModel):
-    role: Literal["first_frame", "last_frame"]
+    role: Literal["first_frame", "last_frame", "reference"]
     url: str
 
 
@@ -36,7 +36,11 @@ class VideoPromptInput(BaseModel):
             content=(
                 TextItem(type="text", text=self.prompt),
                 *(
-                    ImageItem(type="image_url", image_url=MediaURL(url=ref.url), role=ref.role)
+                    ImageItem(
+                        type="image_url",
+                        image_url=MediaURL(url=ref.url),
+                        role="reference_image" if ref.role == "reference" else ref.role,
+                    )
                     for ref in self.references
                 ),
             ),
