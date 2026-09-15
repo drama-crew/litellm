@@ -622,3 +622,79 @@ class TestRequiresCutover:
         source = inspect.getsource(MeteringStore.prepare)
         assert "requires_cutover(" in source
         assert "len(states) != len(" not in source
+
+
+class TestMemberIdentityIsOptional:
+    """没有 LiteLLM_TeamMembership 行时，省略该计费维而不是整条拒绝。
+
+    该行是 per-member-of-team 预算的载体；没有它就没有这项预算，也就没有可以
+    少算的东西。而硬失败会挡掉整个请求。
+
+    生产的 LiteLLM_TeamMembership 是全空的：平台的 key provisioning 只写
+    user_id/team_id，从不建成员行，legacy 计费路径也从不需要它。
+    """
+
+    @staticmethod
+    def _binding():
+        from litellm.proxy.video_endpoints.moderation_metering import BillingBinding
+
+        return BillingBinding(
+            intent_id="intent",
+            request_digest="digest",
+            fingerprint="key",
+            user_id="u",
+            team_id="t",
+            model="video",
+            expected_phases=("submit",),
+        )
+
+    class _Tx:
+        def __init__(self, members):
+            self._members = members
+
+        async def query_raw(self, sql, *args):
+            if "LiteLLM_VerificationToken" in sql:
+                return [
+                    {
+                        "token": "key",
+                        "user_id": "u",
+                        "team_id": "t",
+                        "organization_id": None,
+                        "spend": 0.0,
+                    }
+                ]
+            # 注意：LiteLLM_TeamTable 被查两次——一次取 organization_id，
+            # 一次由 balance() 取 spend。只按表名分派会串味。
+            if "SELECT organization_id FROM" in sql:
+                return [{"organization_id": None}]
+            if "LiteLLM_TeamMembership" in sql:
+                return self._members
+            return [{"spend": 0.0}]
+
+    async def _balances(self, members):
+        from litellm.proxy.video_endpoints.moderation_metering import MeteringStore
+
+        store = MeteringStore.__new__(MeteringStore)
+        store.db = None
+        store.transactions = None
+        store.redis = None
+        store.namespace = "ns:"
+        return await store._identity(self._Tx(members), self._binding())
+
+    @pytest.mark.asyncio
+    async def test_missing_member_row_omits_the_dimension(self):
+        balances = await self._balances([])
+        assert "spend:team_member:u:t" not in balances
+        # 其余维度必须照常给出，否则等于悄悄少算。
+        assert "spend:key:key" in balances
+
+    @pytest.mark.asyncio
+    async def test_present_member_row_still_contributes_its_dimension(self):
+        balances = await self._balances([{"spend": 7.0}])
+        assert balances["spend:team_member:u:t"] == 7.0
+
+    @pytest.mark.asyncio
+    async def test_duplicate_member_rows_are_still_refused(self):
+        """主键是 (user_id, team_id)，出现两行说明数据坏了，不能当正常处理。"""
+        with pytest.raises(ValueError, match="ambiguous"):
+            await self._balances([{"spend": 1.0}, {"spend": 2.0}])

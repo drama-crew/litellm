@@ -300,8 +300,8 @@ class MeteringStore:
                 binding.team_id,
             )
         )
-        if len(members) != 1:
-            raise ValueError("moderation metering member identity missing")
+        if len(members) > 1:
+            raise ValueError("moderation metering member identity ambiguous")
 
         async def balance(table: str, column: str, identity: str) -> Decimal:
             result = TypeAdapter(list[SpendRow]).validate_python(
@@ -325,7 +325,15 @@ class MeteringStore:
             )
         return {
             "spend:key:" + binding.fingerprint: rows[0].spend,
-            "spend:team_member:" + binding.user_id + ":" + binding.team_id: members[0].spend,
+            # 没有 LiteLLM_TeamMembership 行时省略这一维，而不是整条拒绝。该行是
+            # per-member-of-team 预算的载体；没有它就没有这项预算，也就没有可以
+            # 少算的东西。硬失败反而会挡掉整个请求。
+            #
+            # 这不是理论情况：生产的 LiteLLM_TeamMembership 是**全空**的（0 行），
+            # 平台的 key provisioning 只写 user_id/team_id，从不建成员行，legacy
+            # 计费路径也从不需要它。2026-09-15 实证：causyn 视频提交全部 500，报
+            # "moderation metering member identity missing"。
+            **({"spend:team_member:" + binding.user_id + ":" + binding.team_id: members[0].spend} if members else {}),
             **{key: await balance(table, column, identity) for key, table, column, identity in sources},
             **{window.counter_key: Decimal(0) for window in binding.windows},
         }
