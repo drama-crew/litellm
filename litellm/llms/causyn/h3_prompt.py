@@ -278,6 +278,27 @@ class H3PromptRewriter:
         )
 
 
-async def rewrite_prompt(spec: ContextIRRequest) -> RewriteResult:
+async def _rewrite_single_shot(spec: ContextIRRequest) -> RewriteResult:
     async with httpx.AsyncClient(trust_env=False) as client:
         return await H3PromptRewriter(client, os.getenv("OPENROUTER_API_KEY", "")).rewrite(spec)
+
+
+async def rewrite_prompt(spec: ContextIRRequest) -> RewriteResult:
+    """Ref2VA 在服务已配置时走多步 Context IR，其余情况保持单次改写。
+
+    两个条件都必须成立才分流：服务只实现了 Ref2VA 一种模式，而没有配置地址时
+    部署服务本身不应改变任何请求的走向。
+    """
+    from litellm.llms.causyn import context_ir_client as service
+
+    base_url = service.service_base_url()
+    if base_url is None or not service.should_use_service(spec):
+        return await _rewrite_single_shot(spec)
+    async with httpx.AsyncClient(trust_env=False) as client:
+        return await service.rewrite_via_service(
+            spec,
+            base_url=base_url,
+            api_key=service.service_api_key(),
+            idempotency_key=service.idempotency_key_for(spec),
+            http=client,
+        )
