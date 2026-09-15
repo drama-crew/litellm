@@ -152,6 +152,33 @@ def base_counter_keys(binding: BillingBinding) -> tuple[str, ...]:
     )
 
 
+def requires_cutover(registered: int, expected: int) -> bool:
+    """受保护计数器缺失时，是拒绝还是退回 legacy 记账。
+
+    受保护计数器是一层增强，不是先决条件。完全没有切换过时，spend 按本次发布
+    之前的方式记账——那也正是生产上其余全部流量此刻走的路径。
+
+    在这里一律拒绝的代价远超"少一层保护"：moderation bridge 对**任何**平台签发
+    的 key 都会介入（``moderation_bridge.configured()`` 看 metadata 里的
+    ``project_id``），所以拒绝会让每一个视频请求都挂掉，哪怕全局审核策略是关闭
+    的。2026-09-15 生产实证：causyn 视频提交全部 500，报 "explicit protected
+    counter cutover required"，下游再表现为 "moderation metering admission
+    missing"。
+
+    三种情况必须分开：
+
+    - ``registered == expected``：正常受保护路径。
+    - ``registered == 0`` 且未开启受保护预算：降级到 legacy 记账。
+    - 其余：拒绝。已开启开关却没切换，说明开关名不副实；而**部分**切换意味着
+      同一次计费里一部分计数器受保护、一部分不受，这才是真正危险的状态。
+    """
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as protected_runtime
+
+    if registered == expected:
+        return False
+    return bool(registered) or protected_runtime.configured()
+
+
 def request_id(binding: BillingBinding, phase: str) -> str:
     return "public-video:" + binding.intent_id + ":" + phase
 
@@ -311,8 +338,9 @@ class MeteringStore:
         from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore, ReservationState
 
         protected = ProtectedBudgetStore(self.db, self.transactions, self.redis, namespace=self.namespace)
-        states = await protected.assert_admission(base_counter_keys(binding))
-        if len(states) != len(base_counter_keys(binding)):
+        counter_keys = base_counter_keys(binding)
+        states = await protected.assert_admission(counter_keys)
+        if requires_cutover(len(states), len(counter_keys)):
             raise ValueError("explicit protected counter cutover required")
         if reservations and not reservation_id:
             raise ValueError("durable reservation identity required")

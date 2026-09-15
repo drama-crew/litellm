@@ -567,3 +567,58 @@ async def test_accepted_provider_cancel_finishes_bounded_private_handoff(monkeyp
     assert not runtime.HANDOFFS
     assert runtime.private_event(native)["native_id"] == native.id
     assert runtime.CONTEXT.get() is None
+
+
+class TestRequiresCutover:
+    """受保护计数器缺失时：拒绝，还是退回 legacy 记账。
+
+    这条规则此前是 prepare() 里的一个无条件判断，对「完全没切换」和「切了一半」
+    一视同仁地拒绝。前者其实就是本次发布之前、也是生产上其余全部流量此刻走的
+    legacy 路径，拒绝它会让每一个视频请求都挂掉——moderation bridge 对任何带
+    project_id 的平台 key 都会介入，所以这个拒绝不是"少一层保护"，是全量阻断。
+    """
+
+    def test_full_cutover_needs_nothing(self, monkeypatch):
+        from litellm.proxy.video_endpoints.moderation_metering import requires_cutover
+
+        monkeypatch.delenv("DRAMA_PROTECTED_BUDGETS_ENABLED", raising=False)
+        assert requires_cutover(4, 4) is False
+
+    def test_no_cutover_falls_back_when_protected_budgets_are_off(self, monkeypatch):
+        from litellm.proxy.video_endpoints.moderation_metering import requires_cutover
+
+        monkeypatch.delenv("DRAMA_PROTECTED_BUDGETS_ENABLED", raising=False)
+        assert requires_cutover(0, 4) is False
+
+    def test_no_cutover_still_fails_when_protected_budgets_are_on(self, monkeypatch):
+        """运维显式要了受保护预算就不能悄悄降级，否则开关名不副实。"""
+        from litellm.proxy.video_endpoints.moderation_metering import requires_cutover
+
+        monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
+        assert requires_cutover(0, 4) is True
+
+    @pytest.mark.parametrize("registered", [1, 3])
+    def test_partial_cutover_always_fails(self, monkeypatch, registered):
+        """半切换是真正危险的状态：同一次计费里一部分计数器受保护、一部分不受。
+
+        它与「完全没切换」必须区别对待——后者可以安全降级，前者不行。
+        """
+        from litellm.proxy.video_endpoints.moderation_metering import requires_cutover
+
+        monkeypatch.delenv("DRAMA_PROTECTED_BUDGETS_ENABLED", raising=False)
+        assert requires_cutover(registered, 4) is True
+
+    def test_partial_cutover_fails_with_protected_budgets_on_too(self, monkeypatch):
+        from litellm.proxy.video_endpoints.moderation_metering import requires_cutover
+
+        monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
+        assert requires_cutover(2, 4) is True
+
+    def test_prepare_delegates_to_the_rule(self):
+        """防止下次有人把这条规则又写回 prepare 里的内联判断。"""
+        import inspect
+        from litellm.proxy.video_endpoints.moderation_metering import MeteringStore
+
+        source = inspect.getsource(MeteringStore.prepare)
+        assert "requires_cutover(" in source
+        assert "len(states) != len(" not in source
