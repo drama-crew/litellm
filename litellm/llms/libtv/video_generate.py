@@ -422,9 +422,7 @@ async def enqueue_video_generate(
     # admission check and the stream must follow the same decision -- checking
     # liveness on the shared queue would admit a ref2va task with no ref2va
     # worker alive (and reject one when only the ref2va worker is up).
-    task_type = task_type_for_references(
-        tuple(payload["request"].get("references") or ())
-    )
+    task_type = task_type_for_references(tuple(payload["request"].get("references") or ()))
     alive = await _alive_workers(redis, task_type)
     if not alive:
         raise VideoGenerateError("no_worker_available", f"no live {task_type} worker")
@@ -463,11 +461,12 @@ async def enqueue_video_generate(
             metadata=metadata_payload or "{}",
             envelope=json.dumps(envelope),
             deadline=payload["deadline_ts"],
+            stream=stream_key(task_type),
         ):
             raise VideoGenerateError("no_capacity_available", "Causyn video queue is full")
         return task_id
 
-    await _check_capacity(redis, TASK_TYPE_VIDEO_GENERATE, alive)
+    await _check_capacity(redis, task_type, alive)
 
     # Causyn's billing facts must survive a requester crash after submission.
     # Redis transactions keep the metadata, status marker, and stream entry in

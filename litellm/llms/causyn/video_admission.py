@@ -29,13 +29,30 @@ return 1
 """
 
 
-async def admit_video(redis: RedisPort, *, task_id: str, metadata: str, envelope: str, deadline: float) -> bool:
+async def admit_video(
+    redis: RedisPort,
+    *,
+    task_id: str,
+    metadata: str,
+    envelope: str,
+    deadline: float,
+    stream: str = "worker:tasks:video_generate",
+) -> bool:
+    """Admit one causyn video task.
+
+    ``stream`` must be the stream for the task type in the envelope. Ref2VA has
+    its own stream and its own worker, so hardcoding the shared one here put
+    ref2va work on a queue whose worker cannot run it -- the envelope said
+    ``video_generate_ref2va`` while the XADD went to ``video_generate``
+    (observed in production 2026-09-15). The default keeps every non-ref2va
+    caller unchanged.
+    """
     result = await redis.eval(
         ADMIT,
         4,
         status_key(task_id),
         f"worker:task:metadata:{task_id}",
-        "worker:tasks:video_generate",
+        stream,
         ACTIVE,
         task_id,
         metadata,
