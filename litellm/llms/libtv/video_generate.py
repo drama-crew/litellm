@@ -31,6 +31,13 @@ from .transfer import STATUS_TTL_SECONDS, WORKER_HEARTBEAT_WINDOW_SECONDS, resul
 # and transfer.py only has pre-formatted constants for its own two task
 # types, so video_generate needs its own key-derivation helpers below.
 TASK_TYPE_VIDEO_GENERATE = "video_generate"
+# Ref2VA has its own queue. Claiming filters on task type only -- there is no
+# model dimension -- and one vLLM process serves exactly one task type, so a
+# shared stream hands t2v work to a worker that cannot run it (and vice versa).
+# Must stay byte-identical to the platform's
+# server/worker_runner/protocol.py:TASK_TYPE_VIDEO_GENERATE_REF2VA; a typo puts
+# tasks on a stream nobody consumes, which looks like "queued forever".
+TASK_TYPE_VIDEO_GENERATE_REF2VA = "video_generate_ref2va"
 
 STATUS_QUEUED = "queued"
 STATUS_CLAIMED = "claimed"
@@ -100,6 +107,19 @@ class VideoGenerateError(Exception):
 
 def stream_key(task_type: str) -> str:
     return f"worker:tasks:{task_type}"
+
+
+def task_type_for_references(references: "tuple[dict[str, str], ...]") -> str:
+    """Pick the queue from the reference roles.
+
+    Ref2VA is exactly "all roles are `reference`". Keyframes and the
+    no-reference (text-to-video) case both stay on the shared stream, which is
+    what the existing vdn8-backed worker serves.
+    """
+    roles = [reference.get("role") for reference in references]
+    if roles and all(role == "reference" for role in roles):
+        return TASK_TYPE_VIDEO_GENERATE_REF2VA
+    return TASK_TYPE_VIDEO_GENERATE
 
 
 def alive_zset_key(task_type: str) -> str:
@@ -398,12 +418,19 @@ async def enqueue_video_generate(
 
     redis = redis_factory()
 
-    alive = await _alive_workers(redis, TASK_TYPE_VIDEO_GENERATE)
+    # Ref2VA goes to its own queue and is served by its own worker, so both the
+    # admission check and the stream must follow the same decision -- checking
+    # liveness on the shared queue would admit a ref2va task with no ref2va
+    # worker alive (and reject one when only the ref2va worker is up).
+    task_type = task_type_for_references(
+        tuple(payload["request"].get("references") or ())
+    )
+    alive = await _alive_workers(redis, task_type)
     if not alive:
-        raise VideoGenerateError("no_worker_available", "no live video_generate worker")
+        raise VideoGenerateError("no_worker_available", f"no live {task_type} worker")
 
     envelope = {
-        "type": TASK_TYPE_VIDEO_GENERATE,
+        "type": task_type,
         "task_id": task_id,
         "deadline_ts": payload["deadline_ts"],
         "model": payload["model"],
@@ -460,7 +487,7 @@ async def enqueue_video_generate(
                     metadata_payload,
                     ex=STATUS_TTL_SECONDS,
                 )
-                pipe.xadd(stream_key(TASK_TYPE_VIDEO_GENERATE), {"payload": json.dumps(envelope)})
+                pipe.xadd(stream_key(task_type), {"payload": json.dumps(envelope)})
                 await pipe.execute()
         except redis_exceptions.WatchError:
             # Another submitter won the watched status key. Its transaction
@@ -484,7 +511,7 @@ async def enqueue_video_generate(
             )
             if metadata_ok is False:
                 raise RuntimeError("task metadata was not persisted")
-        await redis.xadd(stream_key(TASK_TYPE_VIDEO_GENERATE), {"payload": json.dumps(envelope)})
+        await redis.xadd(stream_key(task_type), {"payload": json.dumps(envelope)})
     except Exception as exc:
         # The status key landed but the stream entry didn't (F2): a bare
         # 500 here leaves a status:queued key with no matching task_id, so a
