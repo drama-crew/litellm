@@ -53,7 +53,7 @@ from litellm.llms.causyn.context_ir_store import PREFIX as CONTEXT_IR_PREFIX
 from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask, task_key
 from litellm.llms.causyn.h3_prompt import RewriteError
 from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
-from litellm.llms.causyn.vdn_geometry import pixel_budget, resolve_geometry
+from litellm.llms.causyn.vdn_geometry import GEOMETRIES, LEGACY, pixel_budget, resolve_geometry
 from litellm.llms.causyn.video_prompt import VideoPromptInput, VideoSubmission, submit_video_prompt
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError
@@ -828,10 +828,35 @@ def _metadata_resolution(metadata: _TaskMetadata) -> tuple[str, str]:
     return metadata.requested_resolution, metadata.source_resolution
 
 
+def _admitted_geometries(metadata: _TaskMetadata, source_resolution: str) -> set[str]:
+    """这个比例下允许的成品几何。
+
+    几何表把 canvas 和 output 分开：16:9 的 canvas 是 1344x768，output 是
+    1344x756（1344x768 其实是 7:4）。真 16:9 要裁到 756，而 756 不是 32 的倍数、
+    模型产不出来，所以设计是"按 canvas 生成、再裁到 output"。
+
+    但 `crop_video()` 在 litellm、h3-ark、video-worker 三处都没有调用方——裁剪
+    从未实现，流水线交付的一直是 canvas。只认 output 的话，16:9 和 9:16 的每一个
+    任务都会在这里被判成不匹配：视频生成成功、上传成功，API 却永远停在
+    in_progress，`public.collect` 无限重试（生产实测 7850 次）。
+
+    所以两个都认。认 canvas 是为了让已经产出的视频能交付；继续认 output 是为了
+    哪天裁剪真的接上时，不会反过来把它判成不匹配。
+
+    注意这不解决"用户要 16:9 拿到 7:4"——那是缺失的裁剪造成的，与本函数无关，
+    改不改这里画面比例都一样。这里只决定已经生成的视频能不能交付。
+    """
+    admitted = {source_resolution}
+    for geometry in (*GEOMETRIES.values(), LEGACY):
+        if f"{geometry.output_width}x{geometry.output_height}" == source_resolution:
+            admitted.add(f"{geometry.width}x{geometry.height}")
+    return admitted
+
+
 def _result_geometry_matches(metadata: _TaskMetadata, result: _WorkerResult) -> bool:
     _, source_resolution = _metadata_resolution(metadata)
     if not isinstance(metadata, _DurableTaskMetadataV4) or metadata.ratio != "adaptive":
-        return source_resolution == f"{result.width}x{result.height}"
+        return f"{result.width}x{result.height}" in _admitted_geometries(metadata, source_resolution)
     width, height = result.width, result.height
     frames = int(metadata.duration_seconds) * 24
     frames += (5 - frames) % 17

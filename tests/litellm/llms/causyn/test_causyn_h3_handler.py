@@ -419,3 +419,92 @@ async def test_h3_maps_ref2va_references_to_worker_references(enqueued: _Recorde
     )
     assert enqueued.payloads[0]["request"]["references"] == refs
     assert enqueued.payloads[0]["request"]["ratio"] == "16:9"
+
+
+class TestBillingAcceptsTheGeometryThePipelineProduces:
+    """16:9 与 9:16 的 canvas 和 output 不同，而裁剪从未实现。
+
+    几何表里 `Geometry("16:9", 1344, 768, 1344, 756)`：canvas 是 1344×768，
+    output 是 1344×756（1344×768 其实是 7:4）。要得到真 16:9 必须裁到 756，而
+    756 不是 32 的倍数、模型产不出来，所以设计是「按 canvas 生成、再裁到 output」。
+
+    但 `crop_video()` 在 litellm、h3-ark、video-worker 三处都没有任何调用方——
+    裁剪从未实现。计费却拿 output 去和 worker 实际产出逐字符比对，于是 16:9 和
+    9:16 必然失败：视频生成成功、上传成功，API 却永远停在 in_progress，
+    `public.collect` 无限重试（生产实测 7850 次）。
+
+    修法是让比对接受**流水线实际产出的几何**（canvas），同时仍接受 output——
+    这样哪天裁剪真的接上了，也不会反过来把它判成不匹配。
+    """
+
+    @staticmethod
+    def _metadata(ratio: str, source: str):
+        from litellm.llms.causyn.handler import _DurableTaskMetadataV4
+
+        # 这份形状抄自生产上一条真实任务的 metadata，不是我编的
+        return _DurableTaskMetadataV4.model_validate(
+            {
+                "version": "causyn-video-billing-v4",
+                "geometry_profile": "vdn-adaptive-v1",
+                "model": "causyn-1.1",
+                "duration_seconds": 5.0,
+                "source_resolution": source,
+                "requested_resolution": "768p",
+                "ratio": ratio,
+                "pricing": {"id": "causyn-1-1", "model": "causyn-1.1", "output_cost_per_second_768p": 5.0},
+                "attribution": {
+                    "api_key": "a" * 64,
+                    "user_id": "99e724bb-4938-4ecf-88b2-66f584314829",
+                    "team_id": "99e724bb-4938-4ecf-88b2-66f584314829",
+                    "organization_id": None,
+                },
+            }
+        )
+
+    @staticmethod
+    def _result(width: int, height: int):
+        from litellm.llms.causyn.handler import _WorkerResult
+
+        return _WorkerResult.model_validate(
+            {
+                "validation_version": "video-v1",
+                "staging_key": "staging/x.mp4",
+                "etag": '"0"',
+                "bytes": 1,
+                "content_type": "video/mp4",
+                "duration_seconds": 5.175,
+                "width": width,
+                "height": height,
+                "sha256": "0" * 64,
+            }
+        )
+
+    def test_landscape_canvas_is_accepted(self):
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert _result_geometry_matches(
+            self._metadata("16:9", "1344x756"), self._result(1344, 768)
+        ), "流水线产出 canvas，计费必须接受它，否则视频永远交付不了"
+
+    def test_portrait_canvas_is_accepted(self):
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert _result_geometry_matches(
+            self._metadata("9:16", "756x1344"), self._result(768, 1344)
+        )
+
+    def test_the_cropped_output_is_still_accepted(self):
+        """裁剪哪天接上了，也不能反过来被判成不匹配。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert _result_geometry_matches(
+            self._metadata("16:9", "1344x756"), self._result(1344, 756)
+        )
+
+    def test_an_unrelated_geometry_is_still_rejected(self):
+        """放宽不等于放弃：与这个比例无关的尺寸仍须拒绝。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert not _result_geometry_matches(
+            self._metadata("16:9", "1344x756"), self._result(640, 480)
+        )
