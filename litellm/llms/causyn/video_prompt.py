@@ -93,6 +93,15 @@ async def deliver_video_prompt(task: ContextIRTask) -> None:
     except VideoGenerateError as exc:
         if exc.code in {"invalid_params", "invalid_url"}:
             raise RewriteError("Invalid video generation input", 400) from None
+        if exc.code in {"no_capacity_available", "no_worker_available"}:
+            # 渲染侧饱和是背压，不是故障。不分类的话它会逃到 process() 的兜底
+            # 处理：每 2 秒重试一次、每次打一条完整栈、无退避无计数，一直到视频
+            # deadline——把"GPU 正忙"这个正常状态当成了未预期错误。
+            #
+            # 429 让 RewriteError 自带 retryable，并复用改写阶段那套指数退避
+            # （封顶 30s）。改写成果必须保住：它已经花掉了真实的模型调用，所以
+            # 这里重新排期而不是失败。上界由视频自己的 deadline 负责。
+            raise RewriteError("Render queue is saturated", 429, retryable=True) from None
         raise
 
 

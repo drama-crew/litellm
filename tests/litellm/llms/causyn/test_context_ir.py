@@ -801,3 +801,117 @@ async def test_trace_survives_durable_retry_and_reports_rewrite_attempts(redis, 
     finally:
         if telemetry._state.provider is not None:
             telemetry._state.provider.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_render_backlog_does_not_reject_new_rewrites(redis):
+    """等 GPU 的任务不得占用改写队列的准入预算。
+
+    READY 里堆的是"改写已完成、等渲染"的任务。把它和 PENDING 算进同一个上限，
+    等于让渲染积压反压到改写入口——渲染慢到堆满预算时，**所有**新的 IR 请求都被
+    429，包括根本不碰 GPU 的纯文本改写。两条队列必须各自计量。
+    """
+    from litellm.llms.causyn.context_ir_store import READY
+
+    store = ContextIRStore(redis, max_pending=3)
+    service = ContextIRService(store, rewrite=rewrite, settle=no_settle)
+
+    # 模拟渲染积压：READY 里塞满等 GPU 的任务。
+    await redis.zadd(READY, {f"stuck-{i}": 1 for i in range(10)})
+
+    # 改写队列本身是空的，所以新请求必须被接受。
+    admitted = [await service.create(spec(), owner="owner", billing=BillingIdentity()) for _ in range(3)]
+    assert len(admitted) == 3
+
+    # 改写队列自己满了，才该拒绝——这是对改写的正当背压。
+    with pytest.raises(RewriteError) as caught:
+        await service.create(spec(), owner="owner", billing=BillingIdentity())
+    assert caught.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_rewrite_queue_depth_still_bounds_admission(redis):
+    """解耦不等于取消上限：改写队列自身仍然有界。"""
+    store = ContextIRStore(redis, max_pending=2)
+    service = ContextIRService(store, rewrite=rewrite, settle=no_settle)
+    await service.create(spec(), owner="owner", billing=BillingIdentity())
+    await service.create(spec(), owner="owner", billing=BillingIdentity())
+    with pytest.raises(RewriteError) as caught:
+        await service.create(spec(), owner="owner", billing=BillingIdentity())
+    assert caught.value.status_code == 429
+
+
+@pytest.mark.asyncio
+async def test_render_saturation_reschedules_instead_of_failing_or_hot_looping(redis, monkeypatch):
+    """GPU 队列满是背压，不是故障，也不该走"未知异常"的热重试。
+
+    原先 `no_capacity_available` 是个未分类的 VideoGenerateError：complete() 的
+    `except RewriteError` 接不住，异常逃到 process() 的兜底处理，于是每 2 秒重试
+    一次、每次打一条完整栈，无退避、无计数，一直持续到视频 deadline。一个"GPU 正忙"
+    的正常状态被当成了未预期错误。
+
+    改写成果必须保住：它已经花掉了真实的模型调用。所以既不能失败，也不能空转。
+    """
+    import time
+
+    from litellm.llms.causyn.video_prompt import VideoSubmission
+    from litellm.llms.libtv.video_generate import VideoGenerateError
+
+    monkeypatch.setenv("LIBTV_VIDEO_GENERATE_SOURCE_HOSTS", "source.example")
+    monkeypatch.setenv("LIBTV_VIDEO_GENERATE_TARGET_HOSTS", "target.example")
+
+    delays: list[float] = []
+
+    async def saturated(task):
+        # 走真实的翻译层，而不是自己造一个 RewriteError：这条路径（把
+        # VideoGenerateError 分类成可重试背压）正是本测试要保护的东西。
+        from litellm.llms.causyn import video_prompt
+
+        async def refuse(*a, **k):
+            raise VideoGenerateError("no_capacity_available", "Causyn video queue is full")
+
+        original_enqueue = video_prompt.enqueue_video_generate
+        original_redis = video_prompt.get_transfer_redis
+        video_prompt.enqueue_video_generate = refuse
+        video_prompt.get_transfer_redis = lambda *_a, **_k: redis
+        try:
+            await video_prompt.deliver_video_prompt(task)
+        finally:
+            video_prompt.enqueue_video_generate = original_enqueue
+            video_prompt.get_transfer_redis = original_redis
+
+    store = ContextIRStore(redis, max_pending=8)
+    original_retry = store.retry
+
+    async def record(task_id, token, delay):
+        delays.append(delay)
+        return await original_retry(task_id, token, delay)
+
+    store.retry = record
+    service = ContextIRService(store, rewrite=rewrite, settle=no_settle, deliver=saturated)
+    task = await service.create(
+        spec(),
+        owner="owner",
+        billing=BillingIdentity(),
+        video_payload=VideoSubmission(
+            task_id="vid-sat",
+            model="causyn-1.1",
+            deadline_ts=time.time() + 1800,
+            request={"prompt": "x", "duration_seconds": 5, "resolution": "768p"},
+            task_metadata={},
+        ).model_dump(mode="json"),
+    )
+    await service.process(task.id)  # 改写阶段
+    await service.process(task.id)  # 投递阶段：遇到背压
+    stored = await store.get(task.id)
+
+    assert stored is not None
+    assert stored.status != "failed", "背压不该让已完成的改写作废"
+    assert stored.result is not None, "改写成果必须保留"
+    assert delays, "必须重新排期"
+
+    # 再撞一次背压：退避必须增长。平 2 秒的热循环会让这两个值相等——那正是
+    # 当前把背压当"未知异常"处理的症状（顺带每 2 秒打一条完整栈）。
+    await service.process(task.id)
+    assert len(delays) >= 2
+    assert delays[-1] > delays[0], f"要指数退避，实得 {delays}"

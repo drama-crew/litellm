@@ -309,6 +309,12 @@ class ContextIRService:
             with stage("causyn.gpu.admission"):
                 await self.deliver(task)
         except RewriteError as exc:
+            if exc.retryable:
+                # 渲染侧饱和：改写成果已经花掉真实模型调用，不能因为下游忙就作废。
+                # 复用改写阶段同一套退避，上界交给视频自己的 deadline——
+                # deliver_video_prompt 过期时抛的是不可重试的 503，会走下面的 fail。
+                await self.store.retry(task.id, token, exc.retry_delay(task.attempts + 1))
+                return
             await self.fail(task, token, str(exc))
             return
         if task.video_payload is not None and task.rewrite_completed_ns is not None:

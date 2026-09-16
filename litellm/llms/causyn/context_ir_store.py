@@ -103,7 +103,12 @@ class ContextIRStore:
     async def create(self, task: ContextIRTask) -> ContextIRTask:
         result = await self.redis.eval(
             "if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end "
-            "if redis.call('ZCARD', KEYS[2]) + redis.call('ZCARD', KEYS[4]) >= tonumber(ARGV[6]) then return -1 end; "
+            # 只计 PENDING（改写队列）。READY 里是"改写已完成、等 GPU"的任务；
+            # 把它算进同一个预算，等于让渲染积压反压到改写入口——渲染慢到堆满预算
+            # 时，所有新 IR 请求都被 429，包括根本不碰 GPU 的纯文本改写。
+            # READY 的深度另有界：视频准入闸(MAX_ADMITTED)与任务 deadline 会让它
+            # 自行排空，不需要靠拒绝上游来限制。
+            "if redis.call('ZCARD', KEYS[2]) >= tonumber(ARGV[6]) then return -1 end; "
             "redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2]); "
             "redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4]); "
             "if ARGV[5] == '1' then redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', tonumber(ARGV[3])-tonumber(ARGV[2])); "
