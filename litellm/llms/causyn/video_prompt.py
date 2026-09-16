@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Awaitable, Callable
 import time
 from typing import Literal
 
@@ -73,11 +74,25 @@ def rewritten_video_payload(task: ContextIRTask) -> VideoSubmission:
     )
 
 
-async def deliver_video_prompt(task: ContextIRTask) -> None:
+async def deliver_video_prompt(
+    task: ContextIRTask,
+    *,
+    redis_factory: Callable[[], RedisPort | None] | None = None,
+    enqueue: Callable[..., Awaitable[str]] | None = None,
+) -> None:
+    """Hand a finished rewrite to the render queue.
+
+    ``redis_factory`` and ``enqueue`` exist so tests can drive this exact path
+    instead of substituting their own error: the classification below is the
+    behaviour worth protecting, and patching module globals leaks across tests
+    under randomised ordering. Both default to the production collaborators.
+    """
     if task.video_payload is None:
         return
     payload = rewritten_video_payload(task)
-    redis: RedisPort | None = get_transfer_redis(os.getenv("LIBTV_VIDEO_GENERATE_REDIS_URL"))
+    resolve = redis_factory or (lambda: get_transfer_redis(os.getenv("LIBTV_VIDEO_GENERATE_REDIS_URL")))
+    submit = enqueue or enqueue_video_generate
+    redis: RedisPort | None = resolve()
     if redis is None:
         raise RuntimeError("Video task persistence is not configured")
     if await redis.get(status_key(payload.task_id)) is not None:
@@ -85,7 +100,7 @@ async def deliver_video_prompt(task: ContextIRTask) -> None:
     if time.time() >= payload.deadline_ts:
         raise RewriteError("Video submission expired before GPU admission", 503)
     try:
-        await enqueue_video_generate(
+        await submit(
             payload.model_dump(mode="json"),
             redis_factory=lambda: redis,
             settings=VideoGenerateSettings.from_environment(),

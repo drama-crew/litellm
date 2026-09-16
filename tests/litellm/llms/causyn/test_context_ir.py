@@ -215,6 +215,7 @@ def test_fixed_price_and_poll_has_no_reservation():
 async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, monkeypatch):
     import time
     import litellm.llms.causyn.context_ir as context_ir
+    from litellm.llms.causyn import video_prompt
     from litellm.llms.causyn.video_prompt import VideoSubmission, submit_video_prompt
 
     service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, deliver=no_settle)
@@ -854,6 +855,7 @@ async def test_render_saturation_reschedules_instead_of_failing_or_hot_looping(r
     """
     import time
 
+    from litellm.llms.causyn import video_prompt
     from litellm.llms.causyn.video_prompt import VideoSubmission
     from litellm.llms.libtv.video_generate import VideoGenerateError
 
@@ -863,22 +865,13 @@ async def test_render_saturation_reschedules_instead_of_failing_or_hot_looping(r
     delays: list[float] = []
 
     async def saturated(task):
-        # 走真实的翻译层，而不是自己造一个 RewriteError：这条路径（把
-        # VideoGenerateError 分类成可重试背压）正是本测试要保护的东西。
-        from litellm.llms.causyn import video_prompt
-
-        async def refuse(*a, **k):
+        # 走真实的翻译层，而不是自己造一个 RewriteError：把 VideoGenerateError
+        # 分类成可重试背压，正是本测试要保护的那条路径。依赖用参数注入，不改模块
+        # 全局状态——随机化测试顺序下猴补丁会泄漏到别的用例。
+        async def refuse(*_a, **_k):
             raise VideoGenerateError("no_capacity_available", "Causyn video queue is full")
 
-        original_enqueue = video_prompt.enqueue_video_generate
-        original_redis = video_prompt.get_transfer_redis
-        video_prompt.enqueue_video_generate = refuse
-        video_prompt.get_transfer_redis = lambda *_a, **_k: redis
-        try:
-            await video_prompt.deliver_video_prompt(task)
-        finally:
-            video_prompt.enqueue_video_generate = original_enqueue
-            video_prompt.get_transfer_redis = original_redis
+        await video_prompt.deliver_video_prompt(task, redis_factory=lambda: redis, enqueue=refuse)
 
     store = ContextIRStore(redis, max_pending=8)
     original_retry = store.retry
@@ -913,5 +906,9 @@ async def test_render_saturation_reschedules_instead_of_failing_or_hot_looping(r
     # 再撞一次背压：退避必须增长。平 2 秒的热循环会让这两个值相等——那正是
     # 当前把背压当"未知异常"处理的症状（顺带每 2 秒打一条完整栈）。
     await service.process(task.id)
-    assert len(delays) >= 2
-    assert delays[-1] > delays[0], f"要指数退避，实得 {delays}"
+    await service.process(task.id)
+    assert len(delays) >= 3
+    # 退避要按投递自己的计数增长。抖动是 uniform(0,1)，所以比较相隔两档
+    # （2**n 差 4 倍以上），不会被抖动淹没——这正是先前用改写 attempts 时
+    # 退避停在同一档、只剩抖动的那个缺陷。
+    assert delays[-1] > delays[0] + 1, f"要指数退避，实得 {delays}"

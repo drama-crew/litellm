@@ -52,6 +52,11 @@ class ContextIRTask(BaseModel):
     result: RewriteResult | None = None
     error: str | None = None
     attempts: int = 0
+    # 投递（进 GPU 队列）的重试计数，与改写的 attempts 分开。两个阶段的失败语义
+    # 不同：改写失败有 3 次上限，投递遇到的是下游背压，上界由视频 deadline 决定。
+    # 共用一个计数器会让退避永远停在同一档（改写阶段结束后它就不再增长）。
+    # 默认 0 使旧的持久化 blob 保持兼容。
+    deliver_attempts: int = 0
     billing: BillingIdentity
     price: float
     reservation: dict[str, JsonValue] | None = None

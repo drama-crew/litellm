@@ -311,9 +311,12 @@ class ContextIRService:
         except RewriteError as exc:
             if exc.retryable:
                 # 渲染侧饱和：改写成果已经花掉真实模型调用，不能因为下游忙就作废。
-                # 复用改写阶段同一套退避，上界交给视频自己的 deadline——
-                # deliver_video_prompt 过期时抛的是不可重试的 503，会走下面的 fail。
-                await self.store.retry(task.id, token, exc.retry_delay(task.attempts + 1))
+                # 用投递自己的计数器退避——改写的 attempts 在这一阶段不再增长，
+                # 共用它会让退避永远停在同一档、只剩抖动。上界交给视频自己的
+                # deadline：deliver_video_prompt 过期时抛的是不可重试的 503。
+                retried = task.model_copy(update={"deliver_attempts": task.deliver_attempts + 1})
+                await self.store.save(retried, token)
+                await self.store.retry(task.id, token, exc.retry_delay(retried.deliver_attempts))
                 return
             await self.fail(task, token, str(exc))
             return
