@@ -82,7 +82,7 @@ _REQUIRED_TOP_LEVEL_KEYS = _ALLOWED_TOP_LEVEL_KEYS - {"staging_upload"}
 # _validate_shape untouched and get forwarded verbatim into the Redis Stream
 # envelope for the worker to deal with.
 _ALLOWED_REQUEST_KEYS = frozenset(
-    {"prompt", "duration_seconds", "resolution", "ratio", "seed", "generate_audio", "references"}
+    {"prompt", "duration_seconds", "resolution", "ratio", "seed", "generate_audio", "references", "prompt_processing"}
 )
 _ALLOWED_REFERENCE_KEYS = frozenset({"role", "media_type", "url"})
 _ALLOWED_STAGING_UPLOAD_KEYS = frozenset({"url", "key", "content_type", "expires_at"})
@@ -276,6 +276,27 @@ def _reject_extra_keys(obj: dict, allowed: frozenset[str], label: str) -> None:
         raise VideoGenerateError("invalid_params", f"unrecognized {label} field(s): {', '.join(sorted(extra))}")
 
 
+def _validate_request_shape(request: object, model: object) -> None:
+    if not isinstance(request, dict):
+        raise VideoGenerateError("invalid_params", "request must be an object")
+    _reject_extra_keys(request, _ALLOWED_REQUEST_KEYS, "request")
+    if "prompt_processing" in request and (model != "causyn-1.1" or request["prompt_processing"] != "direct"):
+        raise VideoGenerateError("invalid_params", "prompt_processing must be direct and requires causyn-1.1")
+    generate_audio = request.get("generate_audio", True)
+    if not isinstance(generate_audio, bool):
+        raise VideoGenerateError("invalid_params", "request.generate_audio must be a boolean")
+    # F7: references[i]'s closed key set only applies to items that are
+    # already dicts -- a malformed (non-dict, or dict-missing-url) item is
+    # F6's job (_iter_reference_urls, run afterwards by _validate_urls), so
+    # this deliberately doesn't raise here for those; it only guards against
+    # an otherwise-well-formed reference carrying an extra unrecognized key.
+    references = request.get("references")
+    if isinstance(references, list):
+        for item in references:
+            if isinstance(item, dict):
+                _reject_extra_keys(item, _ALLOWED_REFERENCE_KEYS, "reference")
+
+
 def _validate_shape(payload: Any) -> None:
     if not isinstance(payload, dict):
         raise VideoGenerateError("invalid_params", "request body must be a JSON object")
@@ -303,23 +324,7 @@ def _validate_shape(payload: Any) -> None:
     deadline_ts = payload.get("deadline_ts")
     if isinstance(deadline_ts, bool) or not isinstance(deadline_ts, (int, float)):
         raise VideoGenerateError("invalid_params", "deadline_ts must be a number")
-    request = payload.get("request")
-    if not isinstance(request, dict):
-        raise VideoGenerateError("invalid_params", "request must be an object")
-    _reject_extra_keys(request, _ALLOWED_REQUEST_KEYS, "request")
-    generate_audio = request.get("generate_audio", True)
-    if not isinstance(generate_audio, bool):
-        raise VideoGenerateError("invalid_params", "request.generate_audio must be a boolean")
-    # F7: references[i]'s closed key set only applies to items that are
-    # already dicts -- a malformed (non-dict, or dict-missing-url) item is
-    # F6's job (_iter_reference_urls, run afterwards by _validate_urls), so
-    # this deliberately doesn't raise here for those; it only guards against
-    # an otherwise-well-formed reference carrying an extra unrecognized key.
-    references = request.get("references")
-    if isinstance(references, list):
-        for item in references:
-            if isinstance(item, dict):
-                _reject_extra_keys(item, _ALLOWED_REFERENCE_KEYS, "reference")
+    _validate_request_shape(payload.get("request"), payload["model"])
     if "staging_upload" in payload:
         staging_upload = payload["staging_upload"]
         if not isinstance(staging_upload, dict):

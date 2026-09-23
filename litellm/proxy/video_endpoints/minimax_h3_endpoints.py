@@ -105,7 +105,13 @@ async def prepare_request(request: Request) -> None:
         else:
             spec = MiniMaxH3Create.model_validate_json(raw)
             request.scope["minimax_h3_spec"] = spec
-            _safe_set_request_parsed_body(request, spec.internal_body())
+            body = spec.internal_body()
+            if request.url.path == "/v2/video_generation/direct":
+                if spec.model != "causyn-1.1":
+                    raise H3Error(400, "Direct prompt generation requires model causyn-1.1")
+                request.scope["causyn_direct_prompt"] = True
+                body["prompt_processing"] = "direct"
+            _safe_set_request_parsed_body(request, body)
     elif is_ir:
         _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
     elif public_id.startswith(moderation_bridge.PREFIX):
@@ -162,6 +168,7 @@ async def context_ir_service_for_request(request: Request) -> ContextIRService |
 router = APIRouter(route_class=MiniMaxH3Route)
 
 
+@router.post("/v2/video_generation/direct", tags=["MiniMax H3"])
 @router.post("/v2/video_generation", tags=["MiniMax H3"])
 async def create_video(
     request: Request,

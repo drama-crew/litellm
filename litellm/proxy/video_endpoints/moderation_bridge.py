@@ -25,6 +25,7 @@ INTAKE_ROUTES = frozenset(
         "/videos",
         "/v1/videos",
         "/v2/video_generation",
+        "/v2/video_generation/direct",
         "/v2/h3_context_ir",
         "/videos/{video_id}/remix",
         "/v1/videos/{video_id}/remix",

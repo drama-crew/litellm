@@ -19207,6 +19207,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/video_generation/direct": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Video */
+        post: operations["create_video_v2_video_generation_direct_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/video_generation/{video_id}": {
         parameters: {
             query?: never;
@@ -58292,6 +58309,28 @@ export interface operations {
         };
     };
     create_video_v2_video_generation_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+        };
+    };
+    create_video_v2_video_generation_direct_post: {
         parameters: {
             query?: never;
             header?: never;

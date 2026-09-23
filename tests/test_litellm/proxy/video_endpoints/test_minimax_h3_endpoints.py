@@ -293,3 +293,55 @@ def test_causyn_rejects_unsupported_official_features_before_submission(api, cha
     )
     assert response.status_code == 400, response.text
     assert not calls
+
+
+@pytest.mark.parametrize("roles", [("first_frame", "last_frame"), ("reference_image", "reference_image")])
+def test_direct_route_preserves_prompt_roles_and_shared_query(api, roles):
+    client, calls, normalized, owner = api
+    prompt = "  A kite flies.\n听见海浪。  "
+    content = [{"type": "text", "text": prompt}] + [
+        {"type": "image_url", "image_url": {"url": f"https://media.example/{i}.png"}, "role": role}
+        for i, role in enumerate(roles)
+    ]
+    result = client.post("/v2/video_generation/direct", json=body(model="causyn-1.1", content=content),
+                         headers={"Authorization": "Bearer allowed"})
+    assert result.status_code == 200, result.text
+    assert calls[0][1]["prompt"] == prompt
+    assert calls[0][1]["prompt_processing"] == "direct"
+    assert [r["role"] for r in calls[0][1]["references"]] == [
+        "reference" if role == "reference_image" else role for role in roles
+    ]
+    task_id = result.json()["task_id"]
+    assert client.get(f"/v2/query/video_generation/{task_id}",
+                      headers={"Authorization": "Bearer allowed"}).json()["task"]["status"] == "succeeded"
+
+
+def test_direct_requires_causyn_and_cannot_be_injected_into_old_route(api):
+    client, calls, _, _ = api
+    for path, payload in [
+        ("/v2/video_generation/direct", body()),
+        ("/v2/video_generation", body(model="causyn-1.1", prompt_processing="direct")),
+        ("/v2/video_generation/direct", body(model="causyn-1.1", prompt_processing="direct")),
+    ]:
+        result = client.post(path, json=payload, headers={"Authorization": "Bearer allowed"})
+        assert result.status_code == 400, result.text
+    assert not calls
+
+
+def test_direct_route_uses_video_auth_budget_and_existing_key_permissions(monkeypatch):
+    from litellm.proxy.auth.auth_utils import _is_video_mutation_route
+    from litellm.proxy.auth.route_checks import RouteChecks
+    from litellm.proxy.spend_tracking import budget_reservation
+    from litellm.proxy.video_endpoints import moderation_bridge
+    from starlette.requests import Request
+
+    path = "/v2/video_generation/direct"
+    assert _is_video_mutation_route(path)
+    assert RouteChecks.is_llm_api_route(path)
+    auth = UserAPIKeyAuth(allowed_routes=["/v2/video_generation"], metadata={"openapi_key_id": "test"})
+    assert RouteChecks.is_virtual_key_allowed_to_call_route(path, auth)
+    request = Request({"type": "http", "method": "POST", "path": path, "headers": []})
+    assert moderation_bridge.defer_budget(request, auth, path)
+    monkeypatch.setattr(budget_reservation, "get_model_from_request", lambda *args, **kwargs: "causyn-1.1")
+    monkeypatch.setattr(budget_reservation, "_estimate_request_max_cost_for_model", lambda **kwargs: 25.0)
+    assert budget_reservation.estimate_request_max_cost({"model": "causyn-1.1"}, path, None) == 25.0

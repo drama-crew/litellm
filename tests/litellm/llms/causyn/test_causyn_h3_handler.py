@@ -576,3 +576,39 @@ class TestBillingAcceptsTheGeometryThePipelineProduces:
         from litellm.llms.causyn.handler import _result_geometry_matches
 
         assert not _result_geometry_matches(self._metadata("16:9", "1344x756"), self._result(640, 480))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("roles", [("first_frame", "last_frame"), ("reference", "reference")])
+@pytest.mark.parametrize("prompt", ["  A kite flies.\n听见海浪。  ", "<scene>Caller-authored structure</scene>"])
+async def test_direct_prompt_skips_context_ir_and_preserves_text(enqueued, roles, prompt):
+    async def forbidden_rewrite(*args):
+        raise AssertionError("Context IR must not run on the direct path")
+
+    await CausynVideoHandler(prompt_submit=forbidden_rewrite).avideo_generation(
+        model="causyn-1.1", prompt=prompt, api_key=None, api_base=None, logging_obj=None,
+        optional_params=_params(prompt_processing="direct", references=[
+            {"role": role, "media_type": "image", "url": f"https://source.example/{i}.png"}
+            for i, role in enumerate(roles)
+        ]),
+    )
+    payload = enqueued.payloads[0]
+    assert payload["request"]["prompt"] == prompt
+    assert payload["request"]["prompt_processing"] == "direct"
+    from litellm.llms.libtv.video_generate import _validate_shape
+
+    _validate_shape(payload)
+    assert payload["task_metadata"]["context_ir_task_id"] is None
+    assert payload["task_metadata"]["prompt_rewrite_model"] is None
+    assert payload["task_metadata"]["version"] == "causyn-video-billing-v4"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("processing", [None, True, "raw", "context_ir"])
+async def test_unknown_prompt_processing_never_enqueues(enqueued, processing):
+    with pytest.raises(CustomLLMError):
+        await CausynVideoHandler().avideo_generation(
+            model="causyn-1.1", prompt="a kite", api_key=None, api_base=None, logging_obj=None,
+            optional_params=_params(prompt_processing=processing),
+        )
+    assert not enqueued.payloads
