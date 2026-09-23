@@ -123,6 +123,7 @@ _CAUSYN_USER_PARAMS = frozenset(
         "last_image",
         "generate_audio",
         "seed",
+        "prompt_processing",
         # LiteLLM exposes this standard request field, but it is not sent to the
         # worker request payload.
         "user",
@@ -628,6 +629,10 @@ def _request(
     )
     if unsupported:
         raise _bad_request(f"unsupported causyn video parameter: {', '.join(unsupported)}")
+    if "prompt_processing" in optional_params and (
+        spec.model != CAUSYN_H3_MODEL or optional_params["prompt_processing"] != "direct"
+    ):
+        raise _bad_request("prompt_processing must be direct and requires causyn-1.1")
     requested_resolution = _resolution(optional_params, spec)
     references = (
         _h3_references(optional_params) if spec.model == CAUSYN_H3_MODEL else _legacy_references(optional_params)
@@ -674,7 +679,7 @@ def _request(
     }
     if seed is not None:
         request["seed"] = seed
-    if _requires_direct_prompt_processing(references):
+    if optional_params.get("prompt_processing") == "direct" or _requires_direct_prompt_processing(references):
         request["prompt_processing"] = "direct"
     return request, duration, requested_resolution, source_resolution, spec
 
@@ -1337,6 +1342,17 @@ class CausynVideoHandler(CustomLLM):
     ) -> VideoObject:
         raise NotImplementedError("causyn video generation is async-only")
 
+    def _validate_h3_references(self, request: dict[str, object]) -> None:
+        prompt_input = VideoPromptInput.model_validate(request)
+        try:
+            rewrite_settings = self._settings_factory()
+            for reference in prompt_input.references:
+                validate_video_generate_url(
+                    reference.url, rewrite_settings.source_hosts, rewrite_settings, reference.role
+                )
+        except VideoGenerateError as exc:
+            raise _bad_request("invalid causyn video reference") from exc
+
     async def avideo_generation(
         self,
         model: str,
@@ -1382,15 +1398,7 @@ class CausynVideoHandler(CustomLLM):
             logger.warning("causyn video billing: deployment pricing metadata is missing or invalid")
             raise _service_error() from exc
         if spec.model == CAUSYN_H3_MODEL:
-            prompt_input = VideoPromptInput.model_validate(request)
-            try:
-                rewrite_settings = self._settings_factory()
-                for reference in prompt_input.references:
-                    validate_video_generate_url(
-                        reference.url, rewrite_settings.source_hosts, rewrite_settings, reference.role
-                    )
-            except VideoGenerateError as exc:
-                raise _bad_request("invalid causyn video reference") from exc
+            self._validate_h3_references(request)
         durable_metadata = metadata_model
         serialized_metadata = durable_metadata.model_dump()
         serialized_metadata["pricing"] = durable_metadata.pricing.model_dump(exclude_none=True)
@@ -1403,7 +1411,7 @@ class CausynVideoHandler(CustomLLM):
         }
         try:
             settings = self._settings_factory()
-            if spec.model == CAUSYN_H3_MODEL:
+            if spec.model == CAUSYN_H3_MODEL and request.get("prompt_processing") != "direct":
                 await self._prompt_submit(
                     VideoSubmission.model_validate(payload),
                     BillingIdentity.model_validate(metadata_model.attribution.model_dump()),

@@ -3,7 +3,7 @@
 from typing import Any, Dict, Optional
 
 import orjson
-from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.responses import ORJSONResponse
 
 from litellm.proxy._types import *
@@ -82,6 +82,15 @@ async def video_generation(
 
     # Read request body
     data = await _read_request_body(request=request)
+    if "prompt_processing" in data and (
+        data["prompt_processing"] != "direct"
+        or data.get("model") != "causyn-1.1"
+        or not (
+            request.scope.get("causyn_direct_prompt") is True
+            or request.scope.get("moderation_admission") is moderation_bridge.ADMITTED
+        )
+    ):
+        raise HTTPException(400, "Direct prompt processing requires /v2/video_generation/direct")
     moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_generation", input_reference)
     if moderated is not None:
         return moderated

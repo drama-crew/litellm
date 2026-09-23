@@ -31,3 +31,16 @@ Errors use `{"type":"error","error":{"type":"…","message":"…","http_code":"4
 The task encryption key is derived from `LITELLM_VIDEO_ID_SECRET`, then `LITELLM_SALT_KEY`, then `LITELLM_MASTER_KEY`. All replicas must use the same value; changing it invalidates previously issued IDs
 
 Protocol references: [MiniMax create](https://platform.minimax.io/docs/api-reference/video-generation-v2-create) and [MiniMax query](https://platform.minimax.io/docs/api-reference/video-generation-v2-query)
+
+
+## Causyn direct prompt path
+
+`POST /v2/video_generation/direct` accepts the same JSON content schema for
+`causyn-1.1`, including first/last frames and reference images, and returns the
+same task ID and query protocol. The caller's text is sent unchanged to the model:
+there is no built-in Context IR task, rewrite call, or H3 structural prompt gate.
+Natural language and caller-authored H3 prompts are both accepted. All existing
+reference, geometry, duration, audio, authentication, moderation, billing and
+ownership rules still apply. The original create path retains Context IR.
+The public JSON does not accept a `prompt_processing` override; processing is
+selected by the path. Upstream MiniMax model names are unsupported on this path.

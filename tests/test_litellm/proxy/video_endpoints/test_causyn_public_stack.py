@@ -207,7 +207,9 @@ class _Stack:
 
 
 @pytest.fixture
-def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
+def stack(monkeypatch: pytest.MonkeyPatch, request) -> _Stack:
+    model = getattr(request, "param", CAUSYN_MODEL)
+    model_id = "causyn-1-1" if model == "causyn-1.1" else CAUSYN_MODEL_ID
     state = _State()
     trace: list[str] = []
     billing = _Billing(trace)
@@ -261,14 +263,15 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
     router = Router(
         model_list=[
             {
-                "model_name": CAUSYN_MODEL,
+                "model_name": model,
                 "litellm_params": {
-                    "model": CAUSYN_MODEL,
+                    "model": model,
                     "custom_llm_provider": "causyn",
                 },
                 "model_info": {
-                    "id": CAUSYN_MODEL_ID,
+                    "id": model_id,
                     "output_cost_per_second_768x512": 0.1,
+                    "output_cost_per_second_768p": 5.0,
                 },
             }
         ],
@@ -279,7 +282,7 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
     other_model_key = "sk-other-model"
     auth_store = _AuthStore(
         {
-            allowed_key: [CAUSYN_MODEL],
+            allowed_key: [model],
             other_model_key: ["other-model"],
         }
     )
@@ -314,7 +317,12 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> _Stack:
         status_code = int(exc.code) if exc.code else 500
         return JSONResponse(status_code=status_code, content={"error": {"message": exc.message}})
 
+    from litellm.proxy.video_endpoints import minimax_h3_endpoints
+
+    monkeypatch.setenv("DRAMA_CAUSYN_1_1_ENABLED", "true")
+    monkeypatch.setenv("LITELLM_VIDEO_ID_SECRET", "synthetic-test-secret")
     app.include_router(video_endpoints.router)
+    app.include_router(minimax_h3_endpoints.router)
     client = TestClient(app, raise_server_exceptions=False)
 
     yield _Stack(
@@ -539,3 +547,36 @@ def test_legacy_causyn_id_and_other_provider_encoding_remain_decodable() -> None
     assert legacy["custom_llm_provider"] == "causyn"
     assert legacy["video_id"] == f"causyn_{TASK_ID}"
     assert other["custom_llm_provider"] == "libtv"
+
+
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+@pytest.mark.parametrize("roles", [("first_frame", "last_frame"), ("reference_image", "reference_image")])
+def test_direct_create_uses_real_auth_router_and_handler(stack, roles):
+    prompt = "  Gentle waves.\n海浪声。  "
+    payload = {"model": "causyn-1.1", "resolution": "768P", "duration": 5, "ratio": "16:9",
+               "content": [{"type": "text", "text": prompt}] + [
+                   {"type": "image_url", "role": role, "image_url": {"url": f"https://source.example/{i}.png"}}
+                   for i, role in enumerate(roles)]}
+    denied = stack.client.post("/v2/video_generation/direct", json=payload,
+                               headers=_auth_headers(stack.other_model_key))
+    assert denied.status_code == 403, denied.text
+    assert not stack.state.enqueued
+    created = stack.client.post("/v2/video_generation/direct", json=payload,
+                                headers=_auth_headers(stack.allowed_key))
+    assert created.status_code == 200, created.text
+    assert len(stack.state.enqueued) == 1
+    actual = stack.state.enqueued[0]
+    assert actual["request"]["prompt"] == prompt
+    assert actual["request"]["prompt_processing"] == "direct"
+    assert actual["task_metadata"]["context_ir_task_id"] is None
+    assert actual["task_metadata"]["pricing"]["model"] == "causyn-1.1"
+    assert actual["task_metadata"]["attribution"]["api_key"] == hash_token(stack.allowed_key)
+
+
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+def test_old_video_path_rejects_direct_flag_before_submission(stack):
+    result = stack.client.post("/v1/videos", json={"model": "causyn-1.1", "prompt": "kite",
+                                                 "prompt_processing": "direct"},
+                               headers=_auth_headers(stack.allowed_key))
+    assert result.status_code == 400, result.text
+    assert not stack.state.enqueued

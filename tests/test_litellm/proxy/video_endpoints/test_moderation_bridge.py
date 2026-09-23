@@ -335,3 +335,60 @@ async def test_bridge_timeout_is_per_call(monkeypatch):
     from starlette.requests import Request
     await bridge.platform(Request({'type': 'http', 'method': 'POST', 'path': '/', 'headers': [], 'app': app}), 'POST', '/x', {})
     assert seen == [15]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('roles', [('first_frame', 'last_frame'), ('reference_image', 'reference_image')])
+async def test_direct_prompt_survives_moderation_admission_and_resume(monkeypatch, roles):
+    from starlette.requests import Request
+
+    from litellm.proxy.video_endpoints import minimax_h3_endpoints as h3
+    from litellm.proxy.video_endpoints.moderation_execution import execution_request, invoke
+
+    monkeypatch.setenv('DRAMA_MODERATION_PLATFORM_URL', 'http://platform.test')
+    monkeypatch.setenv('DRAMA_MODERATION_SERVICE_TOKEN', 'synthetic-token')
+    monkeypatch.setenv('LITELLM_VIDEO_ID_SECRET', 'synthetic-secret')
+    app = FastAPI()
+    app.include_router(h3.router)
+    auth = UserAPIKeyAuth(api_key='a' * 64, user_id='owner', team_id='owner',
+                          metadata={'openapi_key_id': 'key-id'})
+    app.dependency_overrides[user_api_key_auth] = lambda: auth
+    captured = []
+    prompt = '  A kite.\n听见海浪。  '
+
+    async def platform_request(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json={'id': 'mod_video_direct', 'state': 'input_moderation',
+                                         'model': 'causyn-1.1', 'moderation_status': 'pending',
+                                         'created_at': 1, 'policy_source': 'model', 'output': None})
+
+    app.state.moderation_transport = httpx.MockTransport(platform_request)
+    with patch.object(ProxyBaseLLMRequestProcessing, 'base_process_llm_request', AsyncMock()) as provider:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v2/video_generation/direct', json={
+                'model': 'causyn-1.1', 'resolution': '768P', 'duration': 5, 'ratio': '16:9',
+                'content': [{'type': 'text', 'text': prompt}] + [
+                    {'type': 'image_url', 'role': role, 'image_url': {'url': f'https://media.example/{i}.png'}}
+                    for i, role in enumerate(roles)],
+            })
+        assert response.status_code == 200, response.text
+        assert response.json()['task_id'] == 'mod_video_direct'
+        assert provider.await_count == 0
+    assert captured[0]['route'] == 'avideo_generation'
+    payload = captured[0]['payload']
+    assert payload['prompt_processing'] == 'direct'
+    assert payload['prompt'] == prompt
+    request = execution_request(Request({'type': 'http', 'method': 'POST', 'path': '/',
+                                          'headers': [], 'app': app}), payload, '/v1/videos')
+    seen = []
+
+    async def process(processor, **kwargs):
+        seen.append(processor.data)
+        return VideoObject(id='native', object='video', status='queued')
+
+    with patch.object(ProxyBaseLLMRequestProcessing, 'base_process_llm_request', process):
+        result = await invoke(request, auth, payload, 'avideo_generation')
+    assert result.id == 'native'
+    assert len(captured) == 1
+    assert seen[0]['prompt'] == prompt
+    assert seen[0]['prompt_processing'] == 'direct'

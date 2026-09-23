@@ -928,8 +928,9 @@ def estimate_request_max_cost(
 ) -> Optional[float]:
     if route == "/v2/h3_context_ir":
         return 4.0
-    if route == "/v2/query/video_generation" or route.startswith(
-        ("/v2/query/video_generation/", "/v2/video_generation/")
+    if route != "/v2/video_generation/direct" and (
+        route == "/v2/query/video_generation"
+        or route.startswith(("/v2/query/video_generation/", "/v2/video_generation/"))
     ):
         return None
     model = get_model_from_request(request_body, route, llm_router=llm_router)

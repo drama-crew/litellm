@@ -1347,7 +1347,7 @@ def _is_video_mutation_route(route: str, method: str = "POST") -> bool:
     if method.upper() != "POST":
         return False
     normalized_route = route.rstrip("/")
-    if normalized_route == "/v2/video_generation":
+    if normalized_route in {"/v2/video_generation", "/v2/video_generation/direct"}:
         return True
     for prefix in ("/v1/videos", "/videos"):
         if normalized_route == prefix:
