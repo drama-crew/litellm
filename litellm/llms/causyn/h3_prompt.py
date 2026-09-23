@@ -21,7 +21,7 @@ from litellm.proxy.video_endpoints.minimax_h3_models import (
     AudioItem,
     ContentItem,
     ImageItem,
-    MiniMaxH3Create,
+    MiniMaxH3Content,
     Ratio,
     TextItem,
     VideoItem,
@@ -147,7 +147,7 @@ class ContextIRRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_content(self) -> Self:
-        MiniMaxH3Create(
+        MiniMaxH3Content(
             model="MiniMax-H3", content=list(self.content), duration=self.duration, resolution="768P", ratio=self.ratio
         )
         return self

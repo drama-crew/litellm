@@ -198,7 +198,7 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
             request,
             payload,
             {
-                "context_ir": "/v2/h3_context_ir",
+                "context_ir": "/video/minimax-h3/v2/h3_context_ir",
                 "avideo_remix": "/v1/videos/" + str(payload.get("source_video_id", "")) + "/remix",
                 "avideo_edit": "/v1/videos/edits",
                 "avideo_extension": "/v1/videos/extensions",

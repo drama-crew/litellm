@@ -3,8 +3,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi import HTTPException
 
+from litellm.proxy.video_endpoints.openapi_log_query import LogFilters, list_logs, query_conditions
 from litellm.proxy.video_endpoints.openapi_logs import encode_payload, key_owner, observe, record_spend
-from litellm.proxy.video_endpoints.openapi_log_query import LogFilters, query_conditions, list_logs
 
 
 class FakeDB:
@@ -88,7 +88,8 @@ async def test_pagination_precedes_payload_read_and_returns_count_on_empty_page(
 def test_http_query_filters_and_admin_boundary():
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-    from litellm.proxy._types import UserAPIKeyAuth, LitellmUserRoles
+
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
     from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
     from litellm.proxy.video_endpoints.openapi_log_capture import database
     from litellm.proxy.video_endpoints.openapi_log_query import router
@@ -135,8 +136,10 @@ def test_causyn_poll_timestamp_is_not_an_authoritative_finish_time():
 def test_minimax_boundary_records_original_input_and_exact_public_task_id(monkeypatch):
     import json
     from unittest.mock import AsyncMock
+
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
+
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.proxy.video_endpoints import minimax_h3_endpoints as h3
     from litellm.proxy.video_endpoints import openapi_log_capture
@@ -159,7 +162,7 @@ def test_minimax_boundary_records_original_input_and_exact_public_task_id(monkey
     app.include_router(h3.router)
     client = TestClient(app)
     result = client.post(
-        "/v2/video_generation",
+        "/video/minimax-h3/v2/video_generation",
         json={
             "model": "MiniMax-H3",
             "content": [{"type": "text", "text": "original prompt"}],
@@ -174,6 +177,6 @@ def test_minimax_boundary_records_original_input_and_exact_public_task_id(monkey
     assert json.loads(db.calls[0][1][-1])["model"] == "MiniMax-H3"
     assert db.calls[1][1][1] == "video-native"
     assert db.calls[2][1][1] == public_id
-    polled = client.get("/v2/query/video_generation/" + public_id)
+    polled = client.get("/video/minimax-h3/v2/query/video_generation/" + public_id)
     assert polled.status_code == 200, polled.text
     assert db.calls[-1][1][:3] == (key_owner("sk-owner"), "video-native", "succeeded")

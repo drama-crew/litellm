@@ -16,6 +16,7 @@ from litellm.llms.causyn.h3_prompt import ContextIRRequest, RewriteError
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.video_endpoints.minimax_h3_endpoints import MiniMaxH3Route, task_owner
+from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, IR_PREFIX
 
 router = APIRouter(route_class=MiniMaxH3Route)
 Auth = Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)]
@@ -36,13 +37,13 @@ class ListParams(BaseModel):
         default=None, alias="filter.status"
     )
     task_ids: tuple[str, ...] = Field(default=(), alias="filter.task_ids")
-    model: str | None = Field(default=None, alias="filter.model")
+    model: Literal["minimax-h3"] | None = Field(default=None, alias="filter.model")
     task_type: Literal["generation", "h3_context_ir", "regeneration"] | None = Field(
         default=None, alias="filter.task_type"
     )
 
 
-@router.post("/v2/h3_context_ir", tags=["MiniMax H3"])
+@router.post(IR_PREFIX + "/v2/h3_context_ir", tags=["MiniMax H3"])
 async def create_context_ir(request: Request, auth: Auth, service: Service) -> dict[str, str]:
     spec = request.scope.get("causyn_context_ir_spec")
     if not isinstance(spec, ContextIRRequest):
@@ -50,6 +51,11 @@ async def create_context_ir(request: Request, auth: Auth, service: Service) -> d
     from litellm.llms.causyn.h3_prompt import AUTH_MODEL
     from litellm.proxy.video_endpoints import moderation_bridge
 
+    if (
+        not moderation_bridge.configured(auth)
+        and request.scope.get("moderation_admission") is not moderation_bridge.ADMITTED
+    ):
+        raise RewriteError("Moderation control service is required", 503)
     moderated = await moderation_bridge.submit(
         request, auth, spec.model_dump(mode="json"), "context_ir", policy_model=AUTH_MODEL
     )
@@ -121,33 +127,20 @@ async def accept_context_ir(
         raise
 
 
-@router.get("/v2/query/video_generation", tags=["MiniMax H3"])
-async def list_context_ir(request: Request, auth: Auth, service: Service) -> dict[str, JsonValue]:
+@router.get(DIRECT_PREFIX + "/v2/query/video_generation", tags=["MiniMax H3"])
+@router.get(IR_PREFIX + "/v2/query/video_generation", tags=["MiniMax H3"])
+async def list_context_ir(request: Request, auth: Auth) -> dict[str, JsonValue]:
     from litellm.proxy.video_endpoints import moderation_bridge
 
     moderated = await moderation_bridge.list_tasks(request, auth, v2=True)
     if moderated is not None:
         return moderated
-    params = ListParams.model_validate(
-        {
-            key: request.query_params.getlist(key) if key == "filter.task_ids" else value
-            for key, value in request.query_params.items()
-        }
-    )
-    rows = tuple(
-        task
-        for task in await service.store.list_tasks(task_owner(auth))
-        if (params.status is None or task.status == params.status)
-        and (params.model is None or task.request.model == params.model)
-        and (not params.task_ids or task.id in params.task_ids)
-        and params.task_type in {None, "h3_context_ir"}
-    )
-    start = (params.page_num - 1) * params.page_size
-    return {"items": [task.public() for task in rows[start : start + params.page_size]], "total": len(rows)}
+    raise RewriteError("Moderation control service is required", 503)
 
 
-@router.delete("/v2/video_generation/{video_id}", tags=["MiniMax H3"])
-async def delete_context_ir(video_id: str, request: Request, auth: Auth, service: Service) -> dict[str, str]:
+@router.delete(DIRECT_PREFIX + "/v2/video_generation/{video_id}", tags=["MiniMax H3"])
+@router.delete(IR_PREFIX + "/v2/video_generation/{video_id}", tags=["MiniMax H3"])
+async def delete_context_ir(video_id: str, request: Request, auth: Auth) -> dict[str, str]:
     from litellm.proxy.video_endpoints import moderation_bridge as bridge
 
     if video_id.startswith(bridge.PREFIX):
@@ -156,7 +149,10 @@ async def delete_context_ir(video_id: str, request: Request, auth: Auth, service
         from litellm.proxy.video_endpoints.moderation_execution import Ticket, cancel
 
         outcome = await bridge.platform(
-            request, "POST", f"/intents/{video_id}/cancel", {"principal": bridge.principal(auth)}
+            request,
+            "POST",
+            f"/intents/{video_id}/cancel",
+            {"principal": bridge.principal(auth), "namespace": request.scope.get("h3_namespace")},
         )
         if isinstance(outcome.get("ticket"), str):
             outcome = await cancel(
@@ -164,5 +160,5 @@ async def delete_context_ir(video_id: str, request: Request, auth: Auth, service
             )
         action = TypeAdapter(str).validate_python(outcome["action"])
     else:
-        action = await service.cancel_or_delete(video_id, task_owner(auth))
+        raise RewriteError("Task not found", 404)
     return {"task_id": video_id, "action": action, "status": action}

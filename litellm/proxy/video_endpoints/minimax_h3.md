@@ -1,46 +1,47 @@
-# MiniMax H3 create and query API
+# MiniMax H3 video API
 
-The proxy accepts the MiniMax H3 JSON protocol at `POST /v2/video_generation` and `GET /v2/query/video_generation/{task_id}`. Send a normal proxy API key as `Authorization: Bearer …`. The key must allow `hailuo-h3` for `MiniMax-H3`, or `hailuo-h3-max` for `MiniMax-H3-Max`. Creation and retrieval use the existing video router, billing hooks and deployment selection
+API base: `https://api.causyn.cn`.
 
-This adapter covers text-to-video, first-frame-to-video and first/last-frame-to-video. `MiniMax-H3` also maps reference image/video/audio content to the backend's reference mode; `MiniMax-H3-Max` rejects reference mode. A request containing only a last frame, or a `callback_url`, currently returns HTTP 422 before submitting a paid task. These are backend capability limits, not silently ignored fields
+| Processing | Prefix | Public model |
+| --- | --- | --- |
+| Built-in Context IR then generation | `/video/minimax-h3` | `minimax-h3` |
+| Caller prompt unchanged | `/video/minimax-h3/direct` | `minimax-h3` |
 
-The request requires `model`, `content`, `resolution` and integer `duration`. H3 accepts `768P`/`2K` and 4–15 seconds; Max accepts `480P`/`768P` and 5–15 seconds. The provider may impose additional admission limits. Exactly one nonempty text item is required, at most 7000 characters. For text-only input, specify a concrete ratio such as `16:9`; image conditioning uses `adaptive` even when another valid ratio is supplied
+Each prefix exposes:
+
+| Method | Suffix | Result |
+| --- | --- | --- |
+| POST | `/v2/video_generation` | `{"task_id":"..."}` |
+| GET | `/v2/query/video_generation/{task_id}` | `{"task":{...}}` |
+| GET | `/v2/query/video_generation` | `{"items":[...],"total":0}` |
+| DELETE | `/v2/video_generation/{task_id}` | `{"task_id":"...","action":"cancelled","status":"cancelled"}` or `deleted` |
+
+Use a normal Causyn API key. The public model is normalized before authorization to the existing internal `causyn-1.1` identity, which remains the allowlist, policy and billing key. Custom route allowlists must include the new paths. The old root `/v2` H3 paths are removed, not redirected.
 
 ```json
 {
-  "model": "MiniMax-H3-Max",
+  "model": "minimax-h3",
   "content": [
-    {"type": "text", "text": "A porcelain teacup beside a brass radio in a moonlit teahouse. Steam rises slowly."},
-    {"type": "image_url", "image_url": {"url": "https://media.example/first.png"}, "role": "first_frame"},
-    {"type": "image_url", "image_url": {"url": "https://media.example/last.png"}, "role": "last_frame"}
+    {"type": "text", "text": "The kite rises over a calm beach. Gentle surf is audible."},
+    {"type": "image_url", "image_url": {"url": "https://your-media-host/first.png"}, "role": "first_frame"},
+    {"type": "image_url", "image_url": {"url": "https://your-media-host/last.png"}, "role": "last_frame"}
   ],
   "resolution": "768P",
-  "duration": 8,
+  "duration": 5,
   "ratio": "adaptive"
 }
 ```
 
-For a first-frame request, omit the last-frame item. For text-only generation, omit both image items and set a concrete ratio. Image roles are explicit, so first/last ordering in the JSON array does not change their meaning. Public HTTP(S) URLs and Base64 data URLs are accepted; private MiniMax `mm_file` identifiers are not portable to this backend. The JSON request body is limited to 64 MiB
+For reference mode, use 1–9 images with `role: reference_image` and an explicit ratio. Text-only requests also require an explicit ratio: `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, or `9:16`. First-frame or first/last-frame requests use adaptive canvas sizing. Exactly one non-empty text item is required. Duration is an integer from 4 through 15 seconds. Current deployment supports 768P with generated audio; callbacks, last-frame-only requests, video/audio references, mixed keyframe/reference input, silent output and extra fields are rejected before submission.
 
-Creation returns `{"task_id":"h3_task_…"}`. Query with the same API key; IDs are authenticated, encrypted, owner-bound and expire after seven days. Another key cannot use the ID to retrieve the task, even if it can access the same model. Polling an existing task does not create another video
+Direct text is passed unchanged: plain language and caller-authored H3 structure are both accepted. Clients cannot send `prompt_processing`, provider routing, queue selection or moderation bypass flags. The IR path performs the existing built-in rewrite after input admission. Standalone rewriting is available only at `/video/minimax-h3/v2/h3_context_ir`; it uses `model: minimax-h3` and the existing content/duration/ratio/callback contract without a video resolution field.
 
-Query returns `{"task":{…}}` with `id`, `model`, `status`, `created_at`, `resolution`, `duration`, `task_type` and `modality`. Status is `queued`, `running`, `succeeded`, `failed` or `cancelled`. A completed task includes `content.url` and usage. Adaptive ratios and completion timestamps are omitted when the backend has not supplied them; requested ratios that were ignored are never reported as measured output geometry
+Queries and lists consistently return `model: minimax-h3`. Public task states are `queued`, `running`, `succeeded`, `failed` and `cancelled`. `moderation_status` and `generation_status` explain review and generation separately. Pending or rejected media has no `content` URL. Approved video is at `task.content.url`; completed video usage includes `total_seconds`, `output_seconds` and `input_image_count`. Signed URLs expire and may be refreshed by querying with the same key.
 
-Errors use `{"type":"error","error":{"type":"…","message":"…","http_code":"422"},"request_id":"…"}`. Provider override headers, query parameters and unknown request fields are rejected. Preserve the returned task ID and poll it; do not automatically resubmit after a network timeout because the upstream operation might already have been accepted
+List parameters are `page_num` (starting at 1), `page_size` (1–100), `filter.model=minimax-h3`, `filter.status`, repeated `filter.task_ids`, and `filter.task_type`. Credential and namespace filters apply before totals and pagination. A task created in the direct namespace cannot be queried or deleted through the IR namespace, or vice versa. Use `Idempotency-Key` to avoid duplicate submission; reusing it for different content or a different namespace is rejected.
 
-The task encryption key is derived from `LITELLM_VIDEO_ID_SECRET`, then `LITELLM_SALT_KEY`, then `LITELLM_MASTER_KEY`. All replicas must use the same value; changing it invalidates previously issued IDs
+Deletion cancels a generation before provider submission. Once submission starts, deletion returns HTTP 409 and does not terminate the GPU process. Terminal tasks may be hidden from public query/list while retaining internal audit and billing records. Other keys and namespaces receive 404.
 
-Protocol references: [MiniMax create](https://platform.minimax.io/docs/api-reference/video-generation-v2-create) and [MiniMax query](https://platform.minimax.io/docs/api-reference/video-generation-v2-query)
+The facade requires durable moderation admission. Input media is reviewed by the independent CPU moderation queue before GPU dispatch. Output is private until review completes; output review starts after the GPU generation worker has reported its result and released its slot. Review retries and manual decisions do not occupy GPU workers. An explicit policy exemption is reported as `bypassed`, never as `approved`.
 
-
-## Causyn direct prompt path
-
-`POST /v2/video_generation/direct` accepts the same JSON content schema for
-`causyn-1.1`, including first/last frames and reference images, and returns the
-same task ID and query protocol. The caller's text is sent unchanged to the model:
-there is no built-in Context IR task, rewrite call, or H3 structural prompt gate.
-Natural language and caller-authored H3 prompts are both accepted. All existing
-reference, geometry, duration, audio, authentication, moderation, billing and
-ownership rules still apply. The original create path retains Context IR.
-The public JSON does not accept a `prompt_processing` override; processing is
-selected by the path. Upstream MiniMax model names are unsupported on this path.
+Errors use `{"type":"error","error":{"type":"...","message":"...","http_code":"400"},"request_id":"..."}`.
