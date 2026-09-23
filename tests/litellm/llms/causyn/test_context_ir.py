@@ -207,13 +207,24 @@ async def test_budget_refund_is_atomic_and_idempotent(redis):
 
 
 def test_fixed_price_and_poll_has_no_reservation():
-    assert estimate_request_max_cost({"model": "causyn-h3-context-ir", "price": 0}, "/v2/h3_context_ir", None) == 4
-    assert estimate_request_max_cost({"model": "causyn-h3-context-ir"}, "/v2/query/video_generation/x", None) is None
+    assert (
+        estimate_request_max_cost(
+            {"model": "causyn-h3-context-ir", "price": 0}, "/video/minimax-h3/v2/h3_context_ir", None
+        )
+        == 4
+    )
+    assert (
+        estimate_request_max_cost(
+            {"model": "causyn-h3-context-ir"}, "/video/minimax-h3/v2/query/video_generation/x", None
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
 async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, monkeypatch):
     import time
+
     import litellm.llms.causyn.context_ir as context_ir
     from litellm.llms.causyn import video_prompt
     from litellm.llms.causyn.video_prompt import VideoSubmission, submit_video_prompt
@@ -277,50 +288,40 @@ def test_mixed_media_indexes_and_audio_rejection():
 
 
 @pytest.mark.asyncio
-async def test_public_protocol_normalization_query_list_delete_and_audio(redis):
+async def test_public_ir_normalizes_model_and_requires_moderation_before_rewrite(redis, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from litellm.proxy.video_endpoints import moderation_bridge as bridge
+    from litellm.types.videos.main import VideoObject
+
     service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, settle=no_settle)
     normalized = []
 
     async def auth(request: Request):
         normalized.append(await _read_request_body(request))
-        return UserAPIKeyAuth(api_key=request.headers.get("authorization", "owner"))
+        return UserAPIKeyAuth(api_key="owner")
 
-    async def dependency():
-        return service
-
+    submit = AsyncMock(return_value=VideoObject(id="mod_video_ir", object="video", status="queued"))
+    monkeypatch.setattr(bridge, "submit", submit)
+    monkeypatch.setattr(bridge, "configured", lambda auth: True)
     app = FastAPI()
     app.dependency_overrides[h3.user_api_key_auth] = auth
-    app.dependency_overrides[ir.context_ir_service] = dependency
-    app.dependency_overrides[h3.context_ir_service_for_request] = dependency
-    app.include_router(h3.router)
+    app.dependency_overrides[ir.context_ir_service] = lambda: service
     app.include_router(ir.router)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        created = await client.post("/v2/h3_context_ir", json=spec().model_dump(mode="json"))
+        payload = {**spec().model_dump(mode="json"), "model": "minimax-h3"}
+        created = await client.post("/video/minimax-h3/v2/h3_context_ir", json=payload)
         assert created.status_code == 200, created.text
-        task_id = created.json()["task_id"]
-        assert normalized[0] == {"model": "causyn-1.1"}
-        await service.process(task_id)
-        query = await client.get("/v2/query/video_generation/" + task_id)
-        assert query.status_code == 200, query.text
-        assert query.json()["task"]["content"]["prompt"] == PROMPT
-        other = await client.get("/v2/query/video_generation/" + task_id, headers={"Authorization": "another-owner"})
-        assert other.status_code == 404
-        listing = await client.get(
-            "/v2/query/video_generation", params={"filter.task_type": "h3_context_ir", "filter.status": "succeeded"}
-        )
-        assert listing.json()["total"] == 1
-        deleted = await client.delete("/v2/video_generation/" + task_id)
-        assert deleted.json() == {"task_id": task_id, "action": "deleted", "status": "deleted"}
-        audio = spec(
-            content=[
-                {"type": "text", "text": "Hello"},
-                {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
-            ]
-        )
-        count = len(normalized)
-        rejected = await client.post("/v2/h3_context_ir", json=audio.model_dump(mode="json"))
-        assert rejected.status_code == 422
-        assert len(normalized) == count
+        assert created.json()["task_id"] == "mod_video_ir"
+        assert normalized == [{"model": "causyn-1.1"}]
+        assert submit.call_args.args[2]["model"] == "MiniMax-H3"
+        assert not await service.store.list_tasks(h3.task_owner(UserAPIKeyAuth(api_key="owner")))
+        payload["content"] = [
+            {"type": "text", "text": "hello"},
+            {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
+        ]
+        assert (await client.post("/video/minimax-h3/v2/h3_context_ir", json=payload)).status_code == 422
+        assert submit.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -364,6 +365,17 @@ async def test_actual_auth_enforces_causyn_permission_for_all_ir_routes(redis, m
         "user_custom_auth": None,
     }.items():
         monkeypatch.setattr(proxy, key, value)
+    from unittest.mock import AsyncMock
+
+    from litellm.proxy.video_endpoints import moderation_bridge as bridge
+    from litellm.types.videos.main import VideoObject
+
+    monkeypatch.setattr(bridge, "configured", lambda auth: True)
+    monkeypatch.setattr(
+        bridge, "submit", AsyncMock(return_value=VideoObject(id="mod_video_ir", object="video", status="queued"))
+    )
+    monkeypatch.setattr(bridge, "platform", AsyncMock(return_value={"action": "cancelled"}))
+    monkeypatch.setattr(bridge, "principal", lambda auth: {"user_id": "owner"})
     service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, settle=no_settle)
 
     async def dependency():
@@ -377,29 +389,38 @@ async def test_actual_auth_enforces_causyn_permission_for_all_ir_routes(redis, m
     allowed = {"Authorization": "Bearer sk-causyn"}
     denied = {"Authorization": "Bearer sk-other"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        bad = await client.post("/v2/h3_context_ir", json=spec().model_dump(mode="json"), headers=denied)
+        bad = await client.post(
+            "/video/minimax-h3/v2/h3_context_ir",
+            json={**spec().model_dump(mode="json"), "model": "minimax-h3"},
+            headers=denied,
+        )
         assert bad.status_code in (401, 403), bad.text
-        created = await client.post("/v2/h3_context_ir", json=spec().model_dump(mode="json"), headers=allowed)
+        created = await client.post(
+            "/video/minimax-h3/v2/h3_context_ir",
+            json={**spec().model_dump(mode="json"), "model": "minimax-h3"},
+            headers=allowed,
+        )
         assert created.status_code == 200, created.text
         task_id = created.json()["task_id"]
         for method, url in [
-            ("GET", "/v2/query/video_generation/" + task_id),
-            ("GET", "/v2/query/video_generation"),
-            ("DELETE", "/v2/video_generation/" + task_id),
+            ("GET", "/video/minimax-h3/v2/query/video_generation/" + task_id),
+            ("GET", "/video/minimax-h3/v2/query/video_generation"),
+            ("DELETE", "/video/minimax-h3/v2/video_generation/" + task_id),
         ]:
             rejected = await client.request(method, url, headers=denied)
             assert rejected.status_code in (401, 403), rejected.text
-        cancelled = await client.delete("/v2/video_generation/" + task_id, headers=allowed)
+        cancelled = await client.delete("/video/minimax-h3/v2/video_generation/" + task_id, headers=allowed)
         assert cancelled.status_code == 200, cancelled.text
 
 
 @pytest.mark.asyncio
 async def test_video_bridge_survives_process_loss_without_rewrite_or_duplicate_enqueue(redis, monkeypatch):
     import time
+
     import litellm.llms.causyn.video_prompt as bridge
     from litellm.llms.causyn.handler import CausynVideoHandler
-    from litellm.llms.libtv.video_generate import alive_zset_key, stream_key, TASK_TYPE_VIDEO_GENERATE
     from litellm.llms.libtv.transfer import status_key
+    from litellm.llms.libtv.video_generate import TASK_TYPE_VIDEO_GENERATE, alive_zset_key, stream_key
 
     monkeypatch.setenv("DRAMA_CAUSYN_1_1_ENABLED", "true")
     monkeypatch.setenv("LIBTV_VIDEO_GENERATE_SOURCE_HOSTS", "source.example")
@@ -483,8 +504,8 @@ async def test_video_bridge_survives_process_loss_without_rewrite_or_duplicate_e
 @pytest.mark.asyncio
 async def test_failed_video_rewrite_never_reaches_gpu_and_is_visible_in_video_status(redis):
     from litellm.llms.causyn.handler import CausynVideoHandler
+    from litellm.llms.libtv.video_generate import TASK_TYPE_VIDEO_GENERATE, stream_key
     from litellm.types.videos.utils import encode_video_id_with_provider
-    from litellm.llms.libtv.video_generate import stream_key, TASK_TYPE_VIDEO_GENERATE
 
     async def bad_rewrite(request):
         raise RewriteError("H3 prompt rewrite failed")
@@ -548,7 +569,7 @@ async def test_ir_admission_refunds_only_if_task_was_not_persisted(redis, monkey
     "failure", [429, 500, 502, 503, 504, 408, "read", "timeout", "protocol", "json", "provider_error"]
 )
 async def test_provider_interruptions_retry_then_settle_once(redis, failure):
-    from litellm.llms.causyn.h3_prompt import H3PromptRewriter, MODEL
+    from litellm.llms.causyn.h3_prompt import MODEL, H3PromptRewriter
 
     calls = Counter()
 
@@ -595,7 +616,7 @@ async def test_provider_interruptions_retry_then_settle_once(redis, failure):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", [400, 401, 403, 422, "length", "invalid"])
 async def test_permanent_provider_errors_never_retry_or_deliver(redis, failure):
-    from litellm.llms.causyn.h3_prompt import H3PromptRewriter, MODEL
+    from litellm.llms.causyn.h3_prompt import MODEL, H3PromptRewriter
 
     calls = Counter()
 
@@ -719,13 +740,14 @@ async def test_recovered_task_never_exceeds_persisted_attempt_limit(redis):
 @pytest.mark.asyncio
 async def test_gpu_admission_is_atomic_bounded_and_releases_terminal_tasks(redis):
     import time
+
     from litellm.llms.causyn.video_admission import ACTIVE, MAX_ADMITTED
     from litellm.llms.libtv.transfer import status_key
     from litellm.llms.libtv.video_generate import (
-        enqueue_video_generate,
-        VideoGenerateSettings,
         VideoGenerateError,
+        VideoGenerateSettings,
         alive_zset_key,
+        enqueue_video_generate,
         stream_key,
     )
 
@@ -766,6 +788,7 @@ async def test_gpu_admission_is_atomic_bounded_and_releases_terminal_tasks(redis
 @pytest.mark.asyncio
 async def test_trace_survives_durable_retry_and_reports_rewrite_attempts(redis, monkeypatch):
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
     from litellm.llms.causyn import task_telemetry as telemetry
 
     exporter = InMemorySpanExporter()

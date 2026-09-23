@@ -470,8 +470,8 @@ async def _get_tag_budget_counters(
     user_api_key_cache: DualCache,
     proxy_logging_obj: ProxyLogging,
 ) -> List[_BudgetCounter]:
-    from litellm.proxy.common_utils.http_parsing_utils import get_tags_from_request_body
     from litellm.proxy.auth.auth_checks import get_tag_objects_batch
+    from litellm.proxy.common_utils.http_parsing_utils import get_tags_from_request_body
 
     tag_names = _dedupe_tags(get_tags_from_request_body(request_body=request_body))
     if not tag_names:
@@ -659,10 +659,9 @@ async def _reserve_counter(
     from litellm.proxy.proxy_server import (
         _ensure_spend_counter_initialized,
         _ensure_window_spend_counter_initialized,
-        _invalidate_spend_counter,
         _increment_spend_counter_cache,
+        _invalidate_spend_counter,
     )
-
     from litellm.proxy.video_endpoints.moderation_metering_runtime import reserve_registered
 
     reserved = await reserve_registered(
@@ -926,13 +925,13 @@ def estimate_request_max_cost(
     route: str,
     llm_router: Optional[Router],
 ) -> Optional[float]:
-    if route == "/v2/h3_context_ir":
+    if route == "/video/minimax-h3/v2/h3_context_ir":
         return 4.0
-    if route != "/v2/video_generation/direct" and (
-        route == "/v2/query/video_generation"
-        or route.startswith(("/v2/query/video_generation/", "/v2/video_generation/"))
-    ):
-        return None
+    for prefix in ("/video/minimax-h3", "/video/minimax-h3/direct"):
+        if route == prefix + "/v2/query/video_generation" or route.startswith(
+            (prefix + "/v2/query/video_generation/", prefix + "/v2/video_generation/")
+        ):
+            return None
     model = get_model_from_request(request_body, route, llm_router=llm_router)
     if model is None:
         return None

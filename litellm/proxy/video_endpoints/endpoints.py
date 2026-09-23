@@ -16,6 +16,7 @@ from litellm.proxy.common_utils.openai_endpoint_utils import (
     get_custom_llm_provider_from_request_query,
 )
 from litellm.proxy.image_endpoints.endpoints import batch_to_bytesio
+from litellm.proxy.video_endpoints import moderation_bridge, openapi_log_capture
 from litellm.proxy.video_endpoints.utils import (
     encode_character_id_in_response,
     extract_model_from_target_model_names,
@@ -25,8 +26,6 @@ from litellm.types.videos.utils import (
     decode_character_id_with_provider,
     decode_video_id_with_provider,
 )
-
-from litellm.proxy.video_endpoints import openapi_log_capture, moderation_bridge
 
 router = APIRouter()
 
@@ -90,7 +89,7 @@ async def video_generation(
             or request.scope.get("moderation_admission") is moderation_bridge.ADMITTED
         )
     ):
-        raise HTTPException(400, "Direct prompt processing requires /v2/video_generation/direct")
+        raise HTTPException(400, "Direct prompt processing requires /video/minimax-h3/direct/v2/video_generation")
     moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_generation", input_reference)
     if moderated is not None:
         return moderated

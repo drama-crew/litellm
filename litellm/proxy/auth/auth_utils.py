@@ -1299,7 +1299,8 @@ _VIDEO_RETRIEVAL_ROUTES = frozenset(
         "/videos/{video_id}",
         "/v1/videos/{video_id}/content",
         "/videos/{video_id}/content",
-        "/v2/query/video_generation/{video_id}",
+        "/video/minimax-h3/v2/query/video_generation/{video_id}",
+        "/video/minimax-h3/direct/v2/query/video_generation/{video_id}",
     }
 )
 
@@ -1308,9 +1309,13 @@ def _is_video_retrieval_route(route: str) -> bool:
     normalized_route = route.rstrip("/")
     if normalized_route in _VIDEO_RETRIEVAL_ROUTES:
         return True
-    if normalized_route.startswith("/v2/query/video_generation/"):
-        suffix = normalized_route.removeprefix("/v2/query/video_generation/")
-        return bool(suffix) and "/" not in suffix
+    for prefix in (
+        "/video/minimax-h3/v2/query/video_generation/",
+        "/video/minimax-h3/direct/v2/query/video_generation/",
+    ):
+        if normalized_route.startswith(prefix):
+            suffix = normalized_route.removeprefix(prefix)
+            return bool(suffix) and "/" not in suffix
 
     # FastAPI's request-route helper may expose the concrete path instead of
     # the route template. Only a single video-id segment, optionally followed
@@ -1347,7 +1352,7 @@ def _is_video_mutation_route(route: str, method: str = "POST") -> bool:
     if method.upper() != "POST":
         return False
     normalized_route = route.rstrip("/")
-    if normalized_route in {"/v2/video_generation", "/v2/video_generation/direct"}:
+    if normalized_route in {"/video/minimax-h3/v2/video_generation", "/video/minimax-h3/direct/v2/video_generation"}:
         return True
     for prefix in ("/v1/videos", "/videos"):
         if normalized_route == prefix:

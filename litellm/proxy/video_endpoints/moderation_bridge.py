@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, IR_PREFIX
 from litellm.types.videos.main import CharacterObject, VideoObject
 
 PREFIX = "mod_video_"
@@ -24,9 +25,9 @@ INTAKE_ROUTES = frozenset(
     {
         "/videos",
         "/v1/videos",
-        "/v2/video_generation",
-        "/v2/video_generation/direct",
-        "/v2/h3_context_ir",
+        IR_PREFIX + "/v2/video_generation",
+        DIRECT_PREFIX + "/v2/video_generation",
+        IR_PREFIX + "/v2/h3_context_ir",
         "/videos/{video_id}/remix",
         "/v1/videos/{video_id}/remix",
         "/videos/edits",
@@ -49,6 +50,7 @@ class View(BaseModel):
     created_at: int
     output: dict[str, JsonValue] | None = None
     parameters: dict[str, JsonValue] = {}
+    usage: dict[str, JsonValue] | None = None
 
 
 def configured(auth: UserAPIKeyAuth) -> bool:
@@ -121,7 +123,7 @@ def video(view: View) -> VideoObject:
         moderation_status=view.moderation_status,
         generation_status=view.state,
     )
-    result._hidden_params = {"moderation_public_parameters": view.parameters}
+    result._hidden_params = {"moderation_public_parameters": view.parameters, "moderation_public_usage": view.usage}
     if view.state == "completed" and isinstance(output.get("url"), str):
         result._hidden_params = {**result._hidden_params, "url": output["url"]}
     if view.state == "completed" and isinstance(output.get("content"), dict):
@@ -140,7 +142,7 @@ def character(result: VideoObject) -> CharacterObject:
     )
 
 
-def v2_task(result: VideoObject) -> dict[str, JsonValue]:
+def v2_task(result: VideoObject, *, h3: bool = False) -> dict[str, JsonValue]:
     params = JSON_OBJECT.validate_python(result._hidden_params.get("moderation_public_parameters") or {})
     public = {
         "id": result.id,
@@ -153,6 +155,12 @@ def v2_task(result: VideoObject) -> dict[str, JsonValue]:
         "task_type": "generation",
         **params,
     }
+    if h3:
+        public["model"] = "minimax-h3"
+        if "resolution" in public:
+            public["resolution"] = str(public["resolution"]).upper()
+        if result.status == "completed" and result._hidden_params.get("moderation_public_usage"):
+            public["usage"] = result._hidden_params["moderation_public_usage"]
     return JSON_OBJECT.validate_python(
         {
             **public,
@@ -181,7 +189,8 @@ async def list_tasks(request: Request, auth: UserAPIKeyAuth, *, v2: bool = False
             "limit": params.page_size,
             "offset": (params.page_num - 1) * params.page_size,
             "status": params.status,
-            "model": params.model,
+            "model": "causyn-1.1" if params.model == "minimax-h3" else params.model,
+            "namespace": request.scope.get("h3_namespace"),
             "task_type": params.task_type,
             "task_ids": list(params.task_ids),
             "surface": "v2",
@@ -200,7 +209,9 @@ async def list_tasks(request: Request, auth: UserAPIKeyAuth, *, v2: bool = False
     for view in views:
         await model_access(auth, view.model)
     items = [
-        v2_task(video(view)) if v2 else JSON_OBJECT.validate_python(video(view).model_dump(mode="json"))
+        v2_task(video(view), h3=bool(request.scope.get("h3_namespace")))
+        if v2
+        else JSON_OBJECT.validate_python(video(view).model_dump(mode="json"))
         for view in views
     ]
     return (
@@ -291,6 +302,7 @@ async def submit(
             "route": route,
             "payload": prepared,
             "source": source,
+            "namespace": request.scope.get("h3_namespace"),
             "idempotency_key": request.headers.get("idempotency-key") or str(uuid.uuid4()),
         },
     )
@@ -459,7 +471,12 @@ async def query(request: Request, auth: UserAPIKeyAuth, task_id: str, *, purpose
         if await legacy_owner(request, auth, task_id):
             return None
         raise HTTPException(404, "Task has no verified owner registration")
-    result = await platform(request, "POST", f"/intents/{task_id}/view", {"principal": principal(auth)})
+    result = await platform(
+        request,
+        "POST",
+        f"/intents/{task_id}/view",
+        {"principal": principal(auth), "namespace": request.scope.get("h3_namespace")},
+    )
     view = View.model_validate(result)
     await model_access(auth, view.model)
     projected = video(view)

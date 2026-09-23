@@ -1,9 +1,9 @@
 import asyncio
 import os
+from contextlib import asynccontextmanager
 from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
-from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
@@ -360,6 +360,7 @@ def protected_store(meter):
 
 def cutover_receipt(*, redis_value="100", sql_value="0"):
     from datetime import datetime, timezone
+
     from litellm.proxy.spend_tracking.protected_budget import (
         BudgetIdentity,
         CounterBaseline,
@@ -447,6 +448,7 @@ async def test_protected_vertical_slice_cutover_reserve_debit_and_rollover(store
 @pytest.mark.parametrize("kind", ["reserve", "debit", "reset"])
 async def test_protected_lost_redis_response_and_restart_recover_exact_operation(store, kind):
     from datetime import datetime, timedelta, timezone
+
     from litellm.proxy.spend_tracking.protected_budget import APPLY_OPERATION, ProtectedBudgetStore
 
     meter, db, redis, prefix = store
@@ -489,6 +491,7 @@ async def test_protected_lost_redis_response_and_restart_recover_exact_operation
 @pytest.mark.asyncio
 async def test_protected_reset_sql_rollback_does_not_clear_later_increments(store):
     from datetime import datetime, timezone
+
     from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore
 
     meter, db, redis, prefix = store
@@ -570,6 +573,7 @@ async def test_unproven_redis_ahead_is_quarantined(store):
 
 async def prepare_meter(meter, bound, reservations):
     from datetime import datetime, timedelta, timezone
+
     from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, CounterBaseline
 
     authority = protected_store(meter)
@@ -638,13 +642,14 @@ async def test_new_entity_insert_creates_birth_proof_without_repeated_maintenanc
 async def test_shared_callback_mixed_dimensions_reservation_reset_and_writer_mode(store, monkeypatch):
     from datetime import datetime, timezone
     from types import SimpleNamespace
+
     from litellm.caching import DualCache, RedisCache
     from litellm.proxy import proxy_server
     from litellm.proxy._types import Litellm_EntityType, LiteLLM_TeamTable, SpendUpdateQueueItem
+    from litellm.proxy.common_utils.reset_budget_job import ResetBudgetJob
     from litellm.proxy.db.db_spend_update_writer import DBSpendUpdateWriter
     from litellm.proxy.hooks.proxy_track_cost_callback import _update_database_and_spend_counters
     from litellm.proxy.spend_tracking.budget_reservation import _BudgetCounter, _reserve_counter
-    from litellm.proxy.common_utils.reset_budget_job import ResetBudgetJob
     from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
 
     meter, db, redis, prefix = store
@@ -726,6 +731,7 @@ async def test_shared_callback_mixed_dimensions_reservation_reset_and_writer_mod
 async def test_all_dimensions_phase_receipt_and_window_rollover(store):
     import json
     from datetime import datetime, timedelta, timezone
+
     from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, CounterBaseline
     from litellm.proxy.video_endpoints.moderation_metering import BillingWindow
 
@@ -870,12 +876,13 @@ async def test_prepare_rejects_wrong_durable_reservation_binding(store):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_kind", ["causyn", "image"])
 async def test_reservation_adjustment_and_partial_identity_outbox_use_actual_authority(store, monkeypatch, event_kind):
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
+
     from litellm.caching import DualCache, RedisCache
-    from litellm.proxy import proxy_server
     from litellm.llms.causyn.context_ir_budget import settle_reservation
     from litellm.llms.libtv.billing_outbox import CausynBillingEvent, LibTVBillingReconciler, enqueue_causyn_billing
+    from litellm.proxy import proxy_server
 
     meter, db, redis, prefix = store
     cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
@@ -929,6 +936,7 @@ async def test_reservation_adjustment_and_partial_identity_outbox_use_actual_aut
             )
         else:
             import json
+
             from litellm.llms.libtv.billing_outbox import ImageBillingEvent
 
             await redis.xadd(
@@ -968,8 +976,8 @@ async def test_reservation_adjustment_and_partial_identity_outbox_use_actual_aut
 
 @pytest.mark.asyncio
 async def test_cutover_cli_replay_and_missing_evidence_fails_closed(store, monkeypatch, tmp_path):
-    from scripts.protected_budget_cutover import execute
     from litellm.proxy.spend_tracking.protected_budget import BudgetReconciliation
+    from scripts.protected_budget_cutover import execute
 
     meter, db, redis, prefix = store
     await redis.set(prefix + "spend:team:team", 100)
@@ -999,6 +1007,7 @@ async def test_cutover_cli_replay_and_missing_evidence_fails_closed(store, monke
 async def test_linked_shared_reset_carries_zero_sql_spend_reservation(store, monkeypatch, kind, identity, team_id):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
+
     from litellm.caching import DualCache, RedisCache
     from litellm.proxy import proxy_server
     from litellm.proxy.common_utils.reset_budget_job import ResetBudgetJob
@@ -1075,6 +1084,7 @@ async def test_linked_shared_reset_carries_zero_sql_spend_reservation(store, mon
 @pytest.mark.asyncio
 async def test_cutover_sql_rollback_never_creates_orphan_redis_generation(store):
     from contextlib import asynccontextmanager
+
     from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore
 
     meter, db, redis, prefix = store
@@ -1101,6 +1111,7 @@ async def test_shared_window_reset_stale_job_replay_preserves_later_actual(store
     from copy import deepcopy
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
+
     from litellm.caching import DualCache, RedisCache
     from litellm.proxy import proxy_server
     from litellm.proxy.common_utils.reset_budget_job import ResetBudgetJob
@@ -1157,7 +1168,8 @@ async def test_shared_window_reset_stale_job_replay_preserves_later_actual(store
 @pytest.mark.parametrize("kind,amount", [("resize", Decimal(3)), ("release", Decimal(0))])
 async def test_adjustment_lost_reply_recovery_and_old_replay_after_reset(store, kind, amount):
     from datetime import datetime, timedelta, timezone
-    from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore, APPLY_OPERATION
+
+    from litellm.proxy.spend_tracking.protected_budget import APPLY_OPERATION, ProtectedBudgetStore
 
     meter, db, redis, prefix = store
     authority = protected_store(meter)
@@ -1228,9 +1240,10 @@ async def test_fix1_partial_phases_retain_reservation_until_complete_manifest(st
 async def test_fix1_late_context_ir_reconciles_expired_or_released_without_actual_sql(store, monkeypatch, released):
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
+
     from litellm.caching import DualCache, RedisCache
-    from litellm.proxy import proxy_server
     from litellm.llms.causyn.context_ir_budget import settle_reservation
+    from litellm.proxy import proxy_server
 
     meter, db, redis, prefix = store
     cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
@@ -1288,6 +1301,7 @@ async def test_fix1_real_writer_dimensions_and_original_operation_identity(store
     from datetime import datetime, timezone
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+
     import litellm
     from litellm.caching import DualCache, RedisCache
     from litellm.proxy import proxy_server
@@ -1464,11 +1478,12 @@ async def create_financial_projection_tables(db):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_kind", ["image", "causyn"])
 async def test_entry_actual_outbox_commits_mixed_dimensions_and_projections_once(store, monkeypatch, event_kind):
-    from datetime import datetime, timezone
     import json
+    from datetime import datetime, timezone
     from types import SimpleNamespace
+
+    from litellm.llms.libtv.billing_outbox import CausynBillingEvent, ImageBillingEvent, LibTVBillingReconciler
     from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
-    from litellm.llms.libtv.billing_outbox import ImageBillingEvent, CausynBillingEvent, LibTVBillingReconciler
 
     meter, db, redis, prefix = store
     await create_financial_projection_tables(db)
@@ -1530,6 +1545,7 @@ async def test_entry_actual_outbox_commits_mixed_dimensions_and_projections_once
 @pytest.mark.asyncio
 async def test_entry_phase_projection_rolls_back_with_actual_then_recovers(store):
     from datetime import datetime, timezone
+
     from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
 
     meter, db, redis, prefix = store
@@ -1563,10 +1579,13 @@ async def test_entry_phase_projection_rolls_back_with_actual_then_recovers(store
 @pytest.mark.asyncio
 async def test_settlement_endpoint_recovers_private_event_and_never_regresses_unknown(store, monkeypatch):
     import time
-    import jwt
+
     import httpx
+    import jwt
     from fastapi import FastAPI
-    from litellm.proxy.video_endpoints import moderation_execution as execution, moderation_metering_runtime as runtime
+
+    from litellm.proxy.video_endpoints import moderation_execution as execution
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
 
     meter, db, redis, prefix = store
     bound = binding()
@@ -1644,8 +1663,9 @@ async def test_missing_moderated_outbox_proof_does_not_starve_valid_event(store,
     import json
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
-    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+
     from litellm.llms.libtv.billing_outbox import CausynBillingEvent, LibTVBillingReconciler
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
 
     meter, db, redis, prefix = store
     await create_financial_projection_tables(db)
@@ -1724,6 +1744,7 @@ async def production_store():
 @pytest.mark.asyncio
 async def test_phase_projection_matches_complete_production_prisma_schema(production_store):
     from datetime import datetime, timezone
+
     from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
 
     meter, db, redis, prefix = production_store
@@ -1768,12 +1789,13 @@ async def test_phase_projection_matches_complete_production_prisma_schema(produc
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_first", [False, True])
 async def test_image_own_reservation_and_actual_outbox_commute_once(store, monkeypatch, terminal_first):
-    from datetime import datetime, timezone, timedelta
-    from unittest.mock import AsyncMock
+    from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace
-    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
-    from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+    from unittest.mock import AsyncMock
+
     from litellm.llms.libtv.billing_outbox import ImageBillingEvent, LibTVBillingReconciler
+    from litellm.proxy.hooks.proxy_track_cost_callback import _ProxyDBLogger
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
     from litellm.types.utils import ImageResponse
 
     meter, db, redis, prefix = store
@@ -1856,17 +1878,25 @@ async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_o
     import json
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+
     from fastapi import Request
-    from litellm.proxy._types import UserAPIKeyAuth
-    from litellm.proxy.video_endpoints import (
-        context_ir_endpoints as endpoint,
-        moderation_bridge,
-        moderation_metering_entry as entry,
-        moderation_metering_runtime as runtime,
-    )
+
     from litellm.llms.causyn import context_ir, context_ir_store
     from litellm.llms.causyn.h3_prompt import AUTH_MODEL, ContextIRRequest, RewriteResult, RewriteUsage
     from litellm.llms.libtv import billing_outbox
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.video_endpoints import (
+        context_ir_endpoints as endpoint,
+    )
+    from litellm.proxy.video_endpoints import (
+        moderation_bridge,
+    )
+    from litellm.proxy.video_endpoints import (
+        moderation_metering_entry as entry,
+    )
+    from litellm.proxy.video_endpoints import (
+        moderation_metering_runtime as runtime,
+    )
 
     meter, db, redis, prefix = production_store
     fingerprint = "b" * 64
@@ -1914,7 +1944,13 @@ async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_o
 
     service = context_ir.ContextIRService(context_ir_store.ContextIRStore(redis), rewrite=rewrite, settle=settle)
     request = Request(
-        {"type": "http", "method": "POST", "path": "/v2/h3_context_ir", "headers": [], "query_string": b""}
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/video/minimax-h3/v2/h3_context_ir",
+            "headers": [],
+            "query_string": b"",
+        }
     )
     request.scope["causyn_context_ir_spec"] = ContextIRRequest.model_validate(
         {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat walks."}], "duration": 5, "ratio": "16:9"}
@@ -2012,11 +2048,12 @@ async def test_entry_fix1_actual_outbox_freezes_global_identity(store, monkeypat
     from datetime import datetime, timezone
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+
     import litellm
+    from litellm.llms.libtv.billing_outbox import CausynBillingEvent, ImageBillingEvent, LibTVBillingReconciler
     from litellm.proxy import proxy_server
-    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
     from litellm.proxy.spend_tracking.protected_budget import BudgetIdentity, CounterBaseline
-    from litellm.llms.libtv.billing_outbox import ImageBillingEvent, CausynBillingEvent, LibTVBillingReconciler
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
 
     meter, db, redis, prefix = store
     await create_financial_projection_tables(db)
@@ -2113,18 +2150,22 @@ async def accepted_capture_entry(store, monkeypatch, failure, source="public", p
     import json
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+
     import httpx
-    import litellm
     from fastapi import FastAPI, Request, Response
+
+    import litellm
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
     from litellm.proxy import proxy_server
     from litellm.proxy._types import UserAPIKeyAuth
     from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
-    from litellm.proxy.video_endpoints import moderation_execution as execution, moderation_metering_entry as entry
-    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime, endpoints, openapi_log_capture
+    from litellm.proxy.video_endpoints import endpoints, openapi_log_capture
+    from litellm.proxy.video_endpoints import moderation_execution as execution
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
     from litellm.types.videos.main import VideoObject
     from litellm.types.videos.utils import encode_video_id_with_provider
     from litellm.utils import client
-    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
 
     meter, db, redis, prefix = store
     for table in ("LiteLLM_VerificationToken", "LiteLLM_TeamTable"):
@@ -2305,10 +2346,11 @@ async def test_entry_fix1_actual_pre_provider_failure_keeps_trusted_outcome(stor
 async def test_entry_fix1_historical_operation_precedes_new_global_configuration(store, monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+
     import litellm
+    from litellm.llms.libtv.billing_outbox import ImageBillingEvent, LibTVBillingReconciler
     from litellm.proxy import proxy_server
     from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
-    from litellm.llms.libtv.billing_outbox import ImageBillingEvent, LibTVBillingReconciler
 
     meter, db, redis, prefix = store
     await create_financial_projection_tables(db)
@@ -2346,6 +2388,7 @@ async def test_entry_fix1_historical_operation_precedes_new_global_configuration
 )
 async def test_new_actual_quantum_is_same_in_receipt_sql_redis_and_logs(production_store, raw, charged):
     from datetime import datetime, timezone
+
     from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
     from litellm.types.videos.main import VideoObject
     from litellm.types.videos.utils import encode_video_id_with_provider
@@ -2377,6 +2420,7 @@ async def test_legacy_frozen_actual_hash_and_new_pending_raw_completion(producti
     import hashlib
     import json
     from datetime import datetime, timezone
+
     from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
     from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
     from litellm.types.videos.main import VideoObject
@@ -2444,29 +2488,29 @@ async def test_legacy_frozen_actual_hash_and_new_pending_raw_completion(producti
 async def test_cutover_inspection_is_read_only_and_rejects_lost_or_expiring_proof(store):
     import runpy
 
-    inspect_cutover = runpy.run_path('scripts/protected_budget_cutover.py')['inspect_cutover']
+    inspect_cutover = runpy.run_path("scripts/protected_budget_cutover.py")["inspect_cutover"]
     meter, db, redis, prefix = store
     receipt = cutover_receipt()
     authority = protected_store(meter)
     assert not await inspect_cutover(authority, receipt)
-    await redis.set(prefix + 'spend:team:team', '100')
+    await redis.set(prefix + "spend:team:team", "100")
     await authority.register_cutover(receipt)
     before = await db.query_raw('SELECT * FROM "LiteLLM_BudgetCutover"')
     assert await inspect_cutover(authority, receipt)
-    guard = prefix + 'moderation:counter:spend:team:team'
-    await redis.hset(guard, 'cutover', 'tampered-receipt-digest')
+    guard = prefix + "moderation:counter:spend:team:team"
+    await redis.hset(guard, "cutover", "tampered-receipt-digest")
     assert not await inspect_cutover(authority, receipt)
-    await redis.hset(guard, 'cutover', receipt.digest())
+    await redis.hset(guard, "cutover", receipt.digest())
     assert await inspect_cutover(authority, receipt)
-    await redis.expire(prefix + 'protected:mode', 3600)
+    await redis.expire(prefix + "protected:mode", 3600)
     assert not await inspect_cutover(authority, receipt)
-    assert 0 < await redis.ttl(prefix + 'protected:mode') <= 3600
-    await redis.persist(prefix + 'protected:mode')
+    assert 0 < await redis.ttl(prefix + "protected:mode") <= 3600
+    await redis.persist(prefix + "protected:mode")
     await redis.expire(guard, 3600)
     assert not await inspect_cutover(authority, receipt)
     assert 0 < await redis.ttl(guard) <= 3600
     await redis.persist(guard)
-    await redis.delete(prefix + 'spend:team:team')
+    await redis.delete(prefix + "spend:team:team")
     assert not await inspect_cutover(authority, receipt)
-    assert await redis.get(prefix + 'spend:team:team') is None
+    assert await redis.get(prefix + "spend:team:team") is None
     assert await db.query_raw('SELECT * FROM "LiteLLM_BudgetCutover"') == before

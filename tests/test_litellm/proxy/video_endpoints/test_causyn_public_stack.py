@@ -23,7 +23,6 @@ from litellm.proxy._types import (
 from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
 from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
 
-
 TASK_ID = "0123456789abcdef0123456789abcdef"
 CAUSYN_MODEL = "causyn-1.0"
 CAUSYN_MODEL_ID = "causyn-1-0"
@@ -553,16 +552,25 @@ def test_legacy_causyn_id_and_other_provider_encoding_remain_decodable() -> None
 @pytest.mark.parametrize("roles", [("first_frame", "last_frame"), ("reference_image", "reference_image")])
 def test_direct_create_uses_real_auth_router_and_handler(stack, roles):
     prompt = "  Gentle waves.\n海浪声。  "
-    payload = {"model": "causyn-1.1", "resolution": "768P", "duration": 5, "ratio": "16:9",
-               "content": [{"type": "text", "text": prompt}] + [
-                   {"type": "image_url", "role": role, "image_url": {"url": f"https://source.example/{i}.png"}}
-                   for i, role in enumerate(roles)]}
-    denied = stack.client.post("/v2/video_generation/direct", json=payload,
-                               headers=_auth_headers(stack.other_model_key))
+    payload = {
+        "model": "causyn-1.1",
+        "resolution": "768P",
+        "duration": 5,
+        "ratio": "16:9",
+        "content": [{"type": "text", "text": prompt}]
+        + [
+            {"type": "image_url", "role": role, "image_url": {"url": f"https://source.example/{i}.png"}}
+            for i, role in enumerate(roles)
+        ],
+    }
+    denied = stack.client.post(
+        "/video/minimax-h3/direct/v2/video_generation", json=payload, headers=_auth_headers(stack.other_model_key)
+    )
     assert denied.status_code == 403, denied.text
     assert not stack.state.enqueued
-    created = stack.client.post("/v2/video_generation/direct", json=payload,
-                                headers=_auth_headers(stack.allowed_key))
+    created = stack.client.post(
+        "/video/minimax-h3/direct/v2/video_generation", json=payload, headers=_auth_headers(stack.allowed_key)
+    )
     assert created.status_code == 200, created.text
     assert len(stack.state.enqueued) == 1
     actual = stack.state.enqueued[0]
@@ -575,8 +583,10 @@ def test_direct_create_uses_real_auth_router_and_handler(stack, roles):
 
 @pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
 def test_old_video_path_rejects_direct_flag_before_submission(stack):
-    result = stack.client.post("/v1/videos", json={"model": "causyn-1.1", "prompt": "kite",
-                                                 "prompt_processing": "direct"},
-                               headers=_auth_headers(stack.allowed_key))
+    result = stack.client.post(
+        "/v1/videos",
+        json={"model": "causyn-1.1", "prompt": "kite", "prompt_processing": "direct"},
+        headers=_auth_headers(stack.allowed_key),
+    )
     assert result.status_code == 400, result.text
     assert not stack.state.enqueued

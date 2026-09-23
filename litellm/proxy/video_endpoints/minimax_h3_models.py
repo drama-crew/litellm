@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import time
-from typing import Annotated, Literal
+from typing import Annotated, Generic, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from typing_extensions import Self
 
 ModelName = Literal["MiniMax-H3", "MiniMax-H3-Max", "causyn-1.1"]
+ContentModel = TypeVar("ContentModel", bound=str)
 Ratio = Literal["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
 Resolution = Literal["480P", "768P", "2K"]
 MODEL_ROUTES: dict[str, str] = {
@@ -72,8 +73,8 @@ class AudioItem(StrictModel):
 ContentItem = Annotated[TextItem | ImageItem | VideoItem | AudioItem, Field(discriminator="type")]
 
 
-class MiniMaxH3Create(StrictModel):
-    model: ModelName
+class H3Content(StrictModel, Generic[ContentModel]):
+    model: ContentModel
     content: list[ContentItem] = Field(min_length=1, max_length=16)
     resolution: Resolution
     duration: int = Field(ge=4, le=15, strict=True)
@@ -180,6 +181,43 @@ class MiniMaxH3Create(StrictModel):
             "aspect_ratio": self.effective_ratio,
             "generate_audio": True,
             **media,
+        }
+
+
+class MiniMaxH3Content(H3Content[ModelName]):
+    pass
+
+
+class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
+    @model_validator(mode="after")
+    def validate_hyperflow(self) -> Self:
+        if self.resolution != "768P":
+            raise ValueError("minimax-h3 supports 768P resolution")
+        if any(isinstance(item, (VideoItem, AudioItem)) for item in self.content):
+            raise ValueError("minimax-h3 supports image references only")
+        if self.ratio == "adaptive" and any(
+            isinstance(item, ImageItem) and item.role == "reference_image" for item in self.content
+        ):
+            raise ValueError("reference images require an explicit ratio")
+        return self
+
+    def internal_body(self) -> dict[str, object]:
+        return {
+            "model": "causyn-1.1",
+            "prompt": next(item.text for item in self.content if isinstance(item, TextItem)),
+            "seconds": str(self.duration),
+            "resolution": "768p",
+            "aspect_ratio": self.effective_ratio,
+            "generate_audio": True,
+            "references": [
+                {
+                    "role": "reference" if item.role == "reference_image" else item.role,
+                    "media_type": "image",
+                    "url": item.image_url.url,
+                }
+                for item in self.content
+                if isinstance(item, ImageItem)
+            ],
         }
 
 

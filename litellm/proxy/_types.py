@@ -301,12 +301,15 @@ class LiteLLMRoutes(enum.Enum):
         # video generation
         "/videos",
         "/v1/videos",
-        "/v2/video_generation",
-        "/v2/video_generation/direct",
-        "/v2/query/video_generation/{video_id}",
-        "/v2/h3_context_ir",
-        "/v2/query/video_generation",
-        "/v2/video_generation/{video_id}",
+        "/video/minimax-h3/v2/video_generation",
+        "/video/minimax-h3/direct/v2/video_generation",
+        "/video/minimax-h3/v2/query/video_generation/{video_id}",
+        "/video/minimax-h3/direct/v2/query/video_generation/{video_id}",
+        "/video/minimax-h3/v2/h3_context_ir",
+        "/video/minimax-h3/v2/query/video_generation",
+        "/video/minimax-h3/direct/v2/query/video_generation",
+        "/video/minimax-h3/v2/video_generation/{video_id}",
+        "/video/minimax-h3/direct/v2/video_generation/{video_id}",
         "/videos/{video_id}",
         "/v1/videos/{video_id}",
         "/videos/{video_id}/content",
@@ -1026,10 +1029,10 @@ class LiteLLM_ObjectPermissionBase(LiteLLMPydanticObjectBase):
     mcp_tool_search_enabled: Optional[bool] = None
 
 
+from litellm.models.team import BudgetLimitEntry as BudgetLimitEntry  # noqa: E402
 from litellm.types.object_permission import (  # noqa: E402
     ObjectPermissionDict as ObjectPermissionDict,
 )
-from litellm.models.team import BudgetLimitEntry as BudgetLimitEntry  # noqa: E402
 
 
 class GenerateRequestBase(LiteLLMPydanticObjectBase):
