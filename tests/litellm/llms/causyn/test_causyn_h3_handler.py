@@ -351,6 +351,80 @@ def test_duration_budget_does_not_change_billing_profile():
     assert width * 9 == height * 16
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ratio", ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"])
+@pytest.mark.parametrize(
+    "references", [[], [{"role": "reference", "url": "https://source.example/r.png", "media_type": "image"}]]
+)
+async def test_hyperflow_persists_native_geometry_for_text_and_references(monkeypatch, enqueued, ratio, references):
+    monkeypatch.setenv("DRAMA_CAUSYN_1_1_BACKEND", "hyperflow8")
+    await CausynVideoHandler(prompt_submit=fake_submit).avideo_generation(
+        model="causyn-1.1",
+        prompt="a cat crosses the room",
+        api_key=None,
+        api_base=None,
+        optional_params=_params(seconds="15", aspect_ratio=ratio, references=references),
+        logging_obj=None,
+    )
+    raw = enqueued.payloads[0]["task_metadata"]
+    assert raw["geometry_profile"] == "hyperflow-native-adaptive-v1"
+    assert raw["source_resolution"] == mod._h3_source_resolution(ratio)
+    monkeypatch.setenv("DRAMA_CAUSYN_1_1_BACKEND", "vdn8")
+    metadata = mod._TASK_METADATA_ADAPTER.validate_python(raw)
+    width, height = map(int, raw["source_resolution"].split("x"))
+    result = mod._WorkerResult(
+        validation_version="video-v1",
+        etag='"test"',
+        staging_key="staging/video-tasks/test.mp4",
+        bytes=100,
+        content_type="video/mp4",
+        duration_seconds=15.175,
+        width=width,
+        height=height,
+        sha256="0" * 64,
+    )
+    assert mod._result_geometry_matches(metadata, result)
+    assert not mod._result_geometry_matches(metadata, result.model_copy(update={"width": width - 32}))
+
+
+@pytest.mark.asyncio
+async def test_hyperflow_adaptive_canvas_and_legacy_recovery_are_distinct(monkeypatch, enqueued):
+    monkeypatch.setenv("DRAMA_CAUSYN_1_1_BACKEND", "hyperflow8")
+    await CausynVideoHandler(prompt_submit=fake_submit).avideo_generation(
+        model="causyn-1.1",
+        prompt="a cat crosses the room",
+        api_key=None,
+        api_base=None,
+        optional_params=_params(image="https://source.example/first.png"),
+        logging_obj=None,
+    )
+    raw = enqueued.payloads[0]["task_metadata"]
+    assert raw["ratio"] == raw["source_resolution"] == "adaptive"
+    metadata = mod._TASK_METADATA_ADAPTER.validate_python(raw)
+    result = mod._WorkerResult(
+        validation_version="video-v1",
+        etag='"test"',
+        staging_key="staging/video-tasks/test.mp4",
+        bytes=100,
+        content_type="video/mp4",
+        duration_seconds=5.175,
+        width=1344,
+        height=768,
+        sha256="0" * 64,
+    )
+    assert mod._result_geometry_matches(metadata, result)
+    assert not mod._result_geometry_matches(metadata, result.model_copy(update={"height": 756}))
+    legacy = mod._TASK_METADATA_ADAPTER.validate_python(
+        {
+            **raw,
+            "geometry_profile": "vdn-adaptive-v1",
+            "ratio": "16:9",
+            "source_resolution": "1344x756",
+        }
+    )
+    assert mod._result_geometry_matches(legacy, result.model_copy(update={"height": 756}))
+
+
 def _ref(url: str) -> dict[str, str]:
     return {"role": "reference", "media_type": "image", "url": url}
 
@@ -482,29 +556,23 @@ class TestBillingAcceptsTheGeometryThePipelineProduces:
     def test_landscape_canvas_is_accepted(self):
         from litellm.llms.causyn.handler import _result_geometry_matches
 
-        assert _result_geometry_matches(
-            self._metadata("16:9", "1344x756"), self._result(1344, 768)
-        ), "流水线产出 canvas，计费必须接受它，否则视频永远交付不了"
+        assert _result_geometry_matches(self._metadata("16:9", "1344x756"), self._result(1344, 768)), (
+            "流水线产出 canvas，计费必须接受它，否则视频永远交付不了"
+        )
 
     def test_portrait_canvas_is_accepted(self):
         from litellm.llms.causyn.handler import _result_geometry_matches
 
-        assert _result_geometry_matches(
-            self._metadata("9:16", "756x1344"), self._result(768, 1344)
-        )
+        assert _result_geometry_matches(self._metadata("9:16", "756x1344"), self._result(768, 1344))
 
     def test_the_cropped_output_is_still_accepted(self):
         """裁剪哪天接上了，也不能反过来被判成不匹配。"""
         from litellm.llms.causyn.handler import _result_geometry_matches
 
-        assert _result_geometry_matches(
-            self._metadata("16:9", "1344x756"), self._result(1344, 756)
-        )
+        assert _result_geometry_matches(self._metadata("16:9", "1344x756"), self._result(1344, 756))
 
     def test_an_unrelated_geometry_is_still_rejected(self):
         """放宽不等于放弃：与这个比例无关的尺寸仍须拒绝。"""
         from litellm.llms.causyn.handler import _result_geometry_matches
 
-        assert not _result_geometry_matches(
-            self._metadata("16:9", "1344x756"), self._result(640, 480)
-        )
+        assert not _result_geometry_matches(self._metadata("16:9", "1344x756"), self._result(640, 480))

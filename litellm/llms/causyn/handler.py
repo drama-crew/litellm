@@ -84,6 +84,7 @@ CAUSYN_2K_RESOLUTION = "2k"
 CAUSYN_RESOLUTIONS = frozenset({CAUSYN_RESOLUTION, CAUSYN_2K_RESOLUTION})
 CAUSYN_H3_RESOLUTION = "768p"
 CAUSYN_H3_RATIOS = frozenset({"16:9", "9:16", "1:1", "4:3", "3:4"})
+H3GeometryProfile: TypeAlias = Literal["vdn-adaptive-v1", "hyperflow-native-adaptive-v1"]
 CAUSYN_BILLING_METADATA_VERSION = "causyn-video-billing-v1"
 CAUSYN_BILLING_METADATA_VERSION_V2 = "causyn-video-billing-v2"
 CAUSYN_BILLING_METADATA_VERSION_V3 = "causyn-video-billing-v3"
@@ -552,6 +553,18 @@ def _vdn_source_resolution(ratio: str, duration: int) -> str:
     return f"{geometry.output_width}x{geometry.output_height}"
 
 
+def _h3_geometry_profile() -> H3GeometryProfile:
+    return (
+        "hyperflow-native-adaptive-v1" if os.getenv("DRAMA_CAUSYN_1_1_BACKEND") == "hyperflow8" else "vdn-adaptive-v1"
+    )
+
+
+def _profile_source_resolution(ratio: str, duration: int, profile: H3GeometryProfile) -> str:
+    if profile == "hyperflow-native-adaptive-v1":
+        return "adaptive" if ratio == "adaptive" else _h3_source_resolution(ratio)
+    return _vdn_source_resolution(ratio, duration)
+
+
 def _request(
     model: str, prompt: object, optional_params: dict[str, object]
 ) -> tuple[dict[str, object], int, str, str, _ModelSpec]:
@@ -568,13 +581,18 @@ def _request(
         _h3_references(optional_params) if spec.model == CAUSYN_H3_MODEL else _legacy_references(optional_params)
     )
     ratio = optional_params.get("aspect_ratio")
+    allowed_ratios = (
+        spec.ratios | {"21:9"}
+        if spec.model == CAUSYN_H3_MODEL and _h3_geometry_profile() == "hyperflow-native-adaptive-v1"
+        else spec.ratios
+    )
     is_ref2va = spec.model == CAUSYN_H3_MODEL and bool(references) and references[0]["role"] == "reference"
     if spec.model == CAUSYN_H3_MODEL and references and not is_ref2va:
         if ratio is not None and (not isinstance(ratio, str) or ratio not in {*spec.ratios, "adaptive", "21:9"}):
             raise _bad_request("unsupported aspect_ratio for keyframe generation")
         ratio = "adaptive"
-    elif not isinstance(ratio, str) or ratio not in spec.ratios:
-        offered = ", ".join(sorted(spec.ratios))
+    elif not isinstance(ratio, str) or ratio not in allowed_ratios:
+        offered = ", ".join(sorted(allowed_ratios))
         raise _bad_request(f"aspect_ratio must be one of {offered}")
     generate_audio = optional_params.get("generate_audio")
     if generate_audio is not None and not isinstance(generate_audio, bool):
@@ -597,7 +615,9 @@ def _request(
         raise _bad_request("seed must be an integer")
     duration = _duration(optional_params, spec)
     source_resolution = (
-        _vdn_source_resolution(ratio, duration) if spec.model == CAUSYN_H3_MODEL else _source_resolution(spec, ratio)
+        _profile_source_resolution(ratio, duration, _h3_geometry_profile())
+        if spec.model == CAUSYN_H3_MODEL
+        else _source_resolution(spec, ratio)
     )
     request: dict[str, object] = {
         "prompt": prompt,
@@ -789,12 +809,12 @@ class _DurableTaskMetadataV4(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Literal["causyn-video-billing-v4"]
-    geometry_profile: Literal["vdn-adaptive-v1"] = "vdn-adaptive-v1"
+    geometry_profile: H3GeometryProfile = "vdn-adaptive-v1"
     model: Literal["causyn-1.1"]
     duration_seconds: float = Field(ge=4, le=15)
     source_resolution: str = Field(pattern=r"^(adaptive|[1-9][0-9]*x[1-9][0-9]*)$")
     requested_resolution: Literal["768p"]
-    ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "adaptive"]
+    ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "adaptive"]
     pricing: _Pricing
     attribution: _DurableAttribution
     context_ir_task_id: str | None = None
@@ -807,7 +827,11 @@ class _DurableTaskMetadataV4(BaseModel):
             raise ValueError("matching 768p pricing is required")
         if not self.duration_seconds.is_integer():
             raise ValueError("ordered duration must be whole seconds")
-        if self.source_resolution != _vdn_source_resolution(self.ratio, int(self.duration_seconds)):
+        if self.geometry_profile == "vdn-adaptive-v1" and self.ratio == "21:9":
+            raise ValueError("VDN geometry does not support 21:9")
+        if self.source_resolution != _profile_source_resolution(
+            self.ratio, int(self.duration_seconds), self.geometry_profile
+        ):
             raise ValueError("source resolution must match the admitted geometry profile")
         return self
 
@@ -855,6 +879,11 @@ def _admitted_geometries(metadata: _TaskMetadata, source_resolution: str) -> set
 
 def _result_geometry_matches(metadata: _TaskMetadata, result: _WorkerResult) -> bool:
     _, source_resolution = _metadata_resolution(metadata)
+    if isinstance(metadata, _DurableTaskMetadataV4) and metadata.geometry_profile == "hyperflow-native-adaptive-v1":
+        if metadata.ratio != "adaptive":
+            return f"{result.width}x{result.height}" == source_resolution
+        if result.width % 32 or result.height % 32:
+            return False
     if not isinstance(metadata, _DurableTaskMetadataV4) or metadata.ratio != "adaptive":
         return f"{result.width}x{result.height}" in _admitted_geometries(metadata, source_resolution)
     width, height = result.width, result.height
@@ -1261,6 +1290,7 @@ class CausynVideoHandler(CustomLLM):
                     "version": CAUSYN_BILLING_METADATA_VERSION_V4,
                     "model": spec.model,
                     "ratio": request["ratio"],
+                    "geometry_profile": _h3_geometry_profile(),
                 }
             )
             metadata_type = _DurableTaskMetadataV4

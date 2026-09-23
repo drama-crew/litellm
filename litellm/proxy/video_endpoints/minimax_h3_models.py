@@ -12,10 +12,14 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 
-ModelName = Literal["MiniMax-H3", "MiniMax-H3-Max"]
+ModelName = Literal["MiniMax-H3", "MiniMax-H3-Max", "causyn-1.1"]
 Ratio = Literal["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
 Resolution = Literal["480P", "768P", "2K"]
-MODEL_ROUTES: dict[str, str] = {"MiniMax-H3": "hailuo-h3", "MiniMax-H3-Max": "hailuo-h3-max"}
+MODEL_ROUTES: dict[str, str] = {
+    "MiniMax-H3": "hailuo-h3",
+    "MiniMax-H3-Max": "hailuo-h3-max",
+    "causyn-1.1": "causyn-1.1",
+}
 TASK_PREFIX = "h3_task_"
 TASK_TTL = 7 * 24 * 3600
 
@@ -91,6 +95,13 @@ class MiniMaxH3Create(StrictModel):
             raise ValueError("MiniMax-H3 supports 768P/2K")
         keyframes = [item for item in images if item.role != "reference_image"]
         references = [item for item in images if item.role == "reference_image"]
+        if self.model == "causyn-1.1":
+            if self.resolution != "768P":
+                raise ValueError("causyn-1.1 supports 768P resolution")
+            if videos or audios:
+                raise ValueError("causyn-1.1 supports image references only")
+            if references and self.ratio == "adaptive":
+                raise ValueError("causyn-1.1 reference images require an explicit ratio")
         if keyframes and (references or videos or audios):
             raise ValueError("first/last frames and reference media cannot be mixed")
         if any(sum(item.role == role for item in keyframes) > 1 for role in ["first_frame", "last_frame"]):
@@ -112,6 +123,24 @@ class MiniMaxH3Create(StrictModel):
         return "adaptive" if self.keyframes else self.ratio
 
     def internal_body(self) -> dict[str, object]:
+        if self.model == "causyn-1.1":
+            return {
+                "model": "causyn-1.1",
+                "prompt": next(item.text for item in self.content if isinstance(item, TextItem)),
+                "seconds": str(self.duration),
+                "resolution": "768p",
+                "aspect_ratio": self.effective_ratio,
+                "generate_audio": True,
+                "references": [
+                    {
+                        "role": "reference" if item.role == "reference_image" else item.role,
+                        "media_type": "image",
+                        "url": item.image_url.url,
+                    }
+                    for item in self.content
+                    if isinstance(item, ImageItem)
+                ],
+            }
         media: dict[str, object] = (
             {
                 **{
