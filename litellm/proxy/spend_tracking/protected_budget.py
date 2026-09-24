@@ -608,7 +608,7 @@ END $$
                 previous.payload.kind,
                 previous.payload.amount,
                 previous.payload.reservation_id,
-                tuple(c.before.counter_key for c in previous.payload.changes),
+                tuple(sorted(c.before.counter_key for c in previous.payload.changes)),
             ) != (kind, amount, reservation_id, tuple(sorted(counter_keys))) or (
                 previous.payload.phase_request_id,
                 previous.payload.phase_hash,

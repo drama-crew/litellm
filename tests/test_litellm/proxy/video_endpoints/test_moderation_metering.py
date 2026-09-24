@@ -655,7 +655,7 @@ async def test_shared_callback_mixed_dimensions_reservation_reset_and_writer_mod
     meter, db, redis, prefix = store
     await db.execute_raw('ALTER TABLE "LiteLLM_TeamTable" ADD COLUMN budget_reset_at timestamptz')
     await db.execute_raw("UPDATE \"LiteLLM_TeamTable\" SET budget_reset_at='2026-09-01'")
-    cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
+    cache = RedisCache(url=os.environ["MODERATION_METERING_REDIS_URL"], namespace=prefix[:-1])
     monkeypatch.setattr(proxy_server, "spend_counter_cache", DualCache(redis_cache=cache))
     monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=db))
     monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
@@ -885,7 +885,7 @@ async def test_reservation_adjustment_and_partial_identity_outbox_use_actual_aut
     from litellm.proxy import proxy_server
 
     meter, db, redis, prefix = store
-    cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
+    cache = RedisCache(url=os.environ["MODERATION_METERING_REDIS_URL"], namespace=prefix[:-1])
     monkeypatch.setattr(proxy_server, "spend_counter_cache", DualCache(redis_cache=cache))
     monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=db))
     monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
@@ -1020,7 +1020,7 @@ async def test_linked_shared_reset_carries_zero_sql_spend_reservation(store, mon
     await db.execute_raw("INSERT INTO \"LiteLLM_BudgetTable\" VALUES ('linked','2026-09-01')")
     if kind in ("org", "tag", "end_user"):
         await db.execute_raw(f'INSERT INTO "{target.table}" ({target.column}) VALUES ($1)', identity)
-    cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
+    cache = RedisCache(url=os.environ["MODERATION_METERING_REDIS_URL"], namespace=prefix[:-1])
     monkeypatch.setattr(proxy_server, "spend_counter_cache", DualCache(redis_cache=cache))
     monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=db))
     monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
@@ -1123,7 +1123,7 @@ async def test_shared_window_reset_stale_job_replay_preserves_later_actual(store
         'UPDATE "LiteLLM_TeamTable" SET budget_limits=\'[{"budget_duration":"1d","max_budget":10,"reset_at":"2026-09-01T00:00:00Z"}]\''
     )
     target = BudgetIdentity(kind="team", identity="team", window="1d")
-    cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
+    cache = RedisCache(url=os.environ["MODERATION_METERING_REDIS_URL"], namespace=prefix[:-1])
     dual = DualCache(redis_cache=cache)
     monkeypatch.setattr(proxy_server, "spend_counter_cache", dual)
     monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=db))
@@ -1246,7 +1246,7 @@ async def test_fix1_late_context_ir_reconciles_expired_or_released_without_actua
     from litellm.proxy import proxy_server
 
     meter, db, redis, prefix = store
-    cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
+    cache = RedisCache(url=os.environ["MODERATION_METERING_REDIS_URL"], namespace=prefix[:-1])
     monkeypatch.setattr(proxy_server, "spend_counter_cache", DualCache(redis_cache=cache))
     monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=db))
     monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
@@ -1315,7 +1315,7 @@ async def test_fix1_real_writer_dimensions_and_original_operation_identity(store
     if scenario in ("global-ready", "global-unregistered"):
         await db.execute_raw("INSERT INTO \"LiteLLM_UserTable\" (user_id) VALUES ('global-budget')")
     await db.execute_raw('ALTER TABLE "LiteLLM_TeamTable" ADD COLUMN budget_limits jsonb')
-    cache = RedisCache(host="127.0.0.1", port=39462, namespace=prefix[:-1])
+    cache = RedisCache(url=os.environ["MODERATION_METERING_REDIS_URL"], namespace=prefix[:-1])
     monkeypatch.setattr(proxy_server, "spend_counter_cache", DualCache(redis_cache=cache))
     monkeypatch.setattr(proxy_server, "user_api_key_cache", DualCache())
     monkeypatch.setattr(proxy_server, "prisma_client", SimpleNamespace(db=db))
@@ -1742,13 +1742,18 @@ async def production_store():
 
 
 @pytest.mark.asyncio
-async def test_phase_projection_matches_complete_production_prisma_schema(production_store):
+@pytest.mark.parametrize("protected_mode", [True, False])
+async def test_phase_projection_matches_complete_production_prisma_schema(production_store, monkeypatch, protected_mode):
     from datetime import datetime, timezone
 
     from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
 
     meter, db, redis, prefix = production_store
-    await prepare_meter(meter, binding(), {})
+    monkeypatch.delenv("DRAMA_PROTECTED_BUDGETS_ENABLED", raising=False)
+    if protected_mode:
+        await prepare_meter(meter, binding(), {})
+    else:
+        await meter.prepare(binding(), {})
     facts = BillingFacts(
         started_at=datetime(2026, 9, 13, tzinfo=timezone.utc),
         ended_at=datetime(2026, 9, 13, tzinfo=timezone.utc),
@@ -1768,7 +1773,10 @@ async def test_phase_projection_matches_complete_production_prisma_schema(produc
         assert await db.query_raw(f'SELECT spend,prompt_tokens,completion_tokens,api_requests FROM "{table}"') == [
             {"spend": 20.0, "prompt_tokens": 30, "completion_tokens": 20, "api_requests": 1}
         ]
-    assert float(await redis.get(prefix + "spend:team:team")) == 20
+    if protected_mode:
+        assert float(await redis.get(prefix + "spend:team:team")) == 20
+    else:
+        assert await redis.get(prefix + "spend:team:team") is None
 
     from datetime import timedelta
 
@@ -1872,7 +1880,7 @@ async def test_image_own_reservation_and_actual_outbox_commute_once(store, monke
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("admitted,collect_first", [(False, False), (True, False), (True, True)])
-async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_once(
+async def test_context_ir_internal_execution_rewrite_outbox_production_schema_once(
     production_store, monkeypatch, admitted, collect_first
 ):
     import json
@@ -1952,6 +1960,7 @@ async def test_standalone_context_ir_endpoint_rewrite_outbox_production_schema_o
             "query_string": b"",
         }
     )
+    request.scope["moderation_admission"] = moderation_bridge.ADMITTED
     request.scope["causyn_context_ir_spec"] = ContextIRRequest.model_validate(
         {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat walks."}], "duration": 5, "ratio": "16:9"}
     )
@@ -2514,3 +2523,122 @@ async def test_cutover_inspection_is_read_only_and_rejects_lost_or_expiring_proo
     assert not await inspect_cutover(authority, receipt)
     assert await redis.get(prefix + "spend:team:team") is None
     assert await db.query_raw('SELECT * FROM "LiteLLM_BudgetCutover"') == before
+
+
+def legacy_phase(phase="completion", amount="20"):
+    from datetime import datetime, timezone
+    from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
+
+    now = datetime.now(timezone.utc)
+    return event(phase, amount).model_copy(
+        update={
+            "facts": BillingFacts(
+                started_at=now, ended_at=now, route="avideo_status" if phase == "completion" else "avideo_generation"
+            )
+        }
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("membership", [True, False])
+async def test_unprotected_phase_receipts_and_spend_commit_once_after_restart(store, monkeypatch, membership):
+    monkeypatch.delenv("DRAMA_PROTECTED_BUDGETS_ENABLED", raising=False)
+    meter, db, redis, prefix = store
+    await create_financial_projection_tables(db)
+    if not membership:
+        await db.execute_raw('DELETE FROM "LiteLLM_TeamMembership"')
+    await meter.prepare(binding(), {})
+    phases = [legacy_phase("submit", "0"), legacy_phase()]
+    for phase in phases:
+        await meter.persist(phase)
+    await asyncio.gather(*(meter.run_once() for _ in range(6)))
+    restarted = MeteringStore.from_client(db, redis, namespace=prefix)
+    for phase in phases:
+        await restarted.persist(phase)
+    assert not await restarted.run_once()
+    envelope = await restarted.settlement(binding())
+    assert envelope.complete and envelope.total_actual == Decimal(20)
+    assert set(envelope.receipts) == set(phases)
+    for table in ("LiteLLM_VerificationToken", "LiteLLM_UserTable", "LiteLLM_TeamTable"):
+        assert await db.query_raw(f'SELECT spend FROM "{table}"') == [{"spend": 20.0}]
+    for table in ("LiteLLM_DailyUserSpend", "LiteLLM_DailyTeamSpend", "LiteLLM_SpendLogs"):
+        assert (await db.query_raw(f'SELECT SUM(spend) AS total FROM "{table}"'))[0]["total"] == 20
+    assert (await db.query_raw('SELECT count(*)::int AS count FROM "LiteLLM_SpendLogs"'))[0]["count"] == 2
+    assert await db.query_raw('SELECT counter_key FROM "LiteLLM_ModerationMeteringCounter"') == []
+    assert await db.query_raw('SELECT operation_id FROM "LiteLLM_BudgetOperation"') == []
+    assert await redis.keys(prefix + "*") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure", ["projection", "existing_spend", "legacy_spend", "lease", "facts", "identity", "hash"]
+)
+async def test_unprotected_phase_failure_never_debits_without_atomic_receipt(store, monkeypatch, failure):
+    monkeypatch.delenv("DRAMA_PROTECTED_BUDGETS_ENABLED", raising=False)
+    meter, db, _, _ = store
+    await create_financial_projection_tables(db)
+    await meter.prepare(binding(), {})
+    phase = legacy_phase()
+    await meter.persist(phase if failure != "facts" else event())
+    if failure == "projection":
+        await db.execute_raw('ALTER TABLE "LiteLLM_DailyTeamSpend" ADD CONSTRAINT reject_spend CHECK(spend<0)')
+    elif failure == "existing_spend":
+        await db.execute_raw('INSERT INTO "LiteLLM_SpendLogs" (request_id,spend) VALUES($1,20)', phase.request_id)
+    elif failure == "legacy_spend":
+        await db.execute_raw(
+            'INSERT INTO "LiteLLM_SpendLogs" (request_id,spend) VALUES($1,20)', "causyn:" + phase.provider_task_id
+        )
+    elif failure == "identity":
+        await db.execute_raw("UPDATE \"LiteLLM_VerificationToken\" SET user_id='wrong'")
+    elif failure == "hash":
+        await db.execute_raw(
+            "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET payload_hash='changed' WHERE request_id=$1",
+            phase.request_id,
+        )
+    if failure == "lease":
+        await db.execute_raw(
+            "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET status='running',lease_token='expired',lease_until=NOW()-INTERVAL '1 second' WHERE request_id=$1",
+            phase.request_id,
+        )
+        with pytest.raises(ValueError, match="lease expired"):
+            await meter._apply(phase.request_id, "expired")
+    else:
+        with pytest.raises(Exception):
+            await meter.run_once()
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 0.0}]
+    assert (await meter.settlement(binding())).receipts == ()
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_DailyTeamSpend"') == []
+    if failure == "projection":
+        await db.execute_raw('ALTER TABLE "LiteLLM_DailyTeamSpend" DROP CONSTRAINT reject_spend')
+        await db.execute_raw('UPDATE "LiteLLM_ModerationMeteringPhase" SET available_at=NOW()')
+        await meter.run_once()
+        assert (await meter.settlement(binding())).receipts == (phase,)
+        assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 20.0}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("protected_state", ["enabled", "redis_mode", "birth", "partial", "reservation"])
+async def test_unprotected_phase_rejects_cutover_or_reservation_state(store, monkeypatch, protected_state):
+    monkeypatch.delenv("DRAMA_PROTECTED_BUDGETS_ENABLED", raising=False)
+    meter, db, redis, prefix = store
+    await create_financial_projection_tables(db)
+    await meter.prepare(binding(), {})
+    await meter.persist(legacy_phase())
+    if protected_state == "enabled":
+        monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", "true")
+    elif protected_state == "redis_mode":
+        await redis.set(prefix + "protected:mode", "protected-v1")
+    elif protected_state == "birth":
+        await db.execute_raw(
+            "INSERT INTO \"LiteLLM_BudgetBirth\" (counter_key,birth_id,target,initial_spend) VALUES('spend:team:team','birth','{}',0)"
+        )
+    elif protected_state == "partial":
+        await redis.set(prefix + "spend:team:team", 100)
+        await protected_store(meter).register_cutover(cutover_receipt())
+    elif protected_state == "reservation":
+        await db.execute_raw("UPDATE \"LiteLLM_ModerationMeteringTask\" SET reservation_id='reserved'")
+    with pytest.raises(ValueError):
+        await meter.run_once()
+    assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 0.0}]
+    assert await db.query_raw('SELECT request_id FROM "LiteLLM_SpendLogs"') == []
+    assert (await meter.settlement(binding())).receipts == ()

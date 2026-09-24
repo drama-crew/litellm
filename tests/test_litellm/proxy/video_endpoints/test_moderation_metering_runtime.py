@@ -698,3 +698,29 @@ class TestMemberIdentityIsOptional:
         """主键是 (user_id, team_id)，出现两行说明数据坏了，不能当正常处理。"""
         with pytest.raises(ValueError, match="ambiguous"):
             await self._balances([{"spend": 1.0}, {"spend": 2.0}])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "platform,protected,expected", [(False, False, False), (True, False, True), (False, True, True)]
+)
+async def test_recovery_starts_for_legacy_moderation_without_protected_cutover(
+    monkeypatch, platform, protected, expected
+):
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("DRAMA_PROTECTED_BUDGETS_ENABLED", str(protected).lower())
+    if platform:
+        monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "https://synthetic.invalid")
+    else:
+        monkeypatch.delenv("DRAMA_MODERATION_PLATFORM_URL", raising=False)
+    authority = AsyncMock()
+    factory = Mock(return_value=authority)
+    monkeypatch.setattr(runtime, "store", factory)
+    consumer = await runtime.start_recovery()
+    try:
+        assert (consumer is not None) == expected
+        assert factory.call_count == int(expected)
+    finally:
+        if consumer is not None:
+            await consumer.stop()

@@ -615,7 +615,7 @@ RECOVERY = RecoveryState()
 
 
 async def start_recovery() -> RecoveryConsumer | None:
-    if not configured():
+    if not configured() and not os.getenv("DRAMA_MODERATION_PLATFORM_URL"):
         return None
     consumer = RecoveryConsumer(store())
     await consumer.start()
