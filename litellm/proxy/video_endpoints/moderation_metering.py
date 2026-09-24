@@ -563,7 +563,9 @@ class MeteringStore:
     async def _apply(self, request_id: str, token: str) -> None:
         from litellm.proxy.spend_tracking.protected_budget import ProtectedBudgetStore
 
+        protected = ProtectedBudgetStore(self.db, self.transactions, self.redis, namespace=self.namespace)
         async with self.transactions() as tx:
+            await tx.execute_raw("SELECT pg_advisory_xact_lock(hashtext($1))", "protected-budget-cutover")
             rows = TypeAdapter(list[PhaseRow]).validate_python(
                 await tx.query_raw(
                     'SELECT * FROM "LiteLLM_ModerationMeteringPhase" WHERE request_id=$1 FOR UPDATE', request_id
@@ -577,6 +579,11 @@ class MeteringStore:
             event = row.payload
             if event.amount is None or not event.finalized:
                 raise ValueError("phase has no authoritative amount")
+            if row.payload_hash != event.digest():
+                raise ValueError("moderation billing payload hash mismatch")
+            counter_keys = base_counter_keys(event.binding)
+            for counter_key in counter_keys:
+                await tx.execute_raw("SELECT pg_advisory_xact_lock(hashtext($1))", "budget-birth:" + counter_key)
             await self._identity(tx, event.binding)
             tasks = TypeAdapter(list[TaskRow]).validate_python(
                 await tx.query_raw(
@@ -584,7 +591,15 @@ class MeteringStore:
                     event.binding.intent_id,
                 )
             )
-        await ProtectedBudgetStore(self.db, self.transactions, self.redis, namespace=self.namespace).mutate(
+            if len(tasks) != 1 or tasks[0].binding != event.binding:
+                raise ValueError("moderation billing task binding mismatch")
+            states = await protected.states(tx, counter_keys)
+            if not states:
+                await self._apply_legacy(tx, row, tasks[0], token, counter_keys)
+                return
+            if requires_cutover(len(states), len(counter_keys)):
+                raise ValueError("explicit protected counter cutover required")
+        await protected.mutate(
             event.request_id,
             base_counter_keys(event.binding),
             kind="debit",
@@ -594,6 +609,42 @@ class MeteringStore:
             phase_hash=row.payload_hash,
             projection=projection_for(event),
         )
+
+    async def _apply_legacy(
+        self, tx: Database, row: PhaseRow, task: TaskRow, token: str, counter_keys: tuple[str, ...]
+    ) -> None:
+        from litellm.proxy.video_endpoints.moderation_metering_projection import project
+
+        if requires_cutover(0, len(counter_keys)):
+            raise ValueError("explicit protected counter cutover required")
+        births = await tx.query_raw(
+            'SELECT counter_key FROM "LiteLLM_BudgetBirth" WHERE counter_key=ANY($1::text[])', list(counter_keys)
+        )
+        mode = await self.redis.eval('return redis.call("GET",KEYS[1])', 1, self.namespace + "protected:mode")
+        if births or mode in ("protected-v1", b"protected-v1") or task.reservations or task.reservation_id:
+            raise ValueError("legacy settlement cannot bypass protected budget state")
+        financial = projection_for(row.payload)
+        if financial is None:
+            raise ValueError("legacy settlement requires authoritative financial facts")
+        if financial.provider in {"causyn", "libtv"}:
+            previous_request_id = (
+                "causyn-context-ir:" if financial.facts.route == "h3_context_ir" else "causyn:"
+            ) + financial.provider_task_id
+            previous = await tx.query_raw(
+                'SELECT request_id FROM "LiteLLM_SpendLogs" WHERE request_id=$1', previous_request_id
+            )
+            if previous:
+                raise ValueError("legacy provider spend already exists outside phase receipt")
+        await project(tx, financial, protected=frozenset(), debit_unprotected=True)
+        changed = await tx.execute_raw(
+            "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET status='settled',receipt=payload "
+            "WHERE request_id=$1 AND status='running' AND lease_token=$2 AND lease_until>NOW() AND payload_hash=$3",
+            row.request_id,
+            token,
+            row.payload_hash,
+        )
+        if changed != 1:
+            raise ValueError("moderation billing lease expired before SQL receipt")
 
     async def settlement(self, binding: BillingBinding) -> SettlementEnvelope:
         tasks = TypeAdapter(list[TaskRow]).validate_python(
