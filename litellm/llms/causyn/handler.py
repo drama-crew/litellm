@@ -563,9 +563,15 @@ def _source_resolution(spec: _ModelSpec, ratio: str) -> str:
     return CAUSYN_RESOLUTION
 
 
-def _vdn_source_resolution(ratio: str, duration: int) -> str:
+GeometryProfile: TypeAlias = Literal["vdn-adaptive-v1", "hyperflow-official-v1"]
+
+
+def _vdn_source_resolution(ratio: str, duration: int, geometry_profile: GeometryProfile) -> str:
     if ratio == "adaptive":
         return "adaptive"
+    if geometry_profile == "hyperflow-official-v1":
+        geometry = GEOMETRIES[ratio]
+        return f"{geometry.width}x{geometry.height}"
     frames = duration * 24 + (5 - duration * 24) % 17
     geometry = resolve_geometry(ratio=ratio, frames=frames)
     return f"{geometry.output_width}x{geometry.output_height}"
@@ -630,7 +636,9 @@ def _request(
     seed = _validated_seed(optional_params)
     duration = _duration(optional_params, spec)
     source_resolution = (
-        _vdn_source_resolution(ratio, duration) if spec.model == CAUSYN_H3_MODEL else _source_resolution(spec, ratio)
+        _vdn_source_resolution(ratio, duration, "hyperflow-official-v1")
+        if spec.model == CAUSYN_H3_MODEL
+        else _source_resolution(spec, ratio)
     )
     request: dict[str, object] = {
         "prompt": prompt,
@@ -824,7 +832,7 @@ class _DurableTaskMetadataV4(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     version: Literal["causyn-video-billing-v4"]
-    geometry_profile: Literal["vdn-adaptive-v1"] = "vdn-adaptive-v1"
+    geometry_profile: GeometryProfile = "vdn-adaptive-v1"
     model: Literal["causyn-1.1"]
     duration_seconds: float = Field(ge=4, le=15)
     source_resolution: str = Field(pattern=r"^(adaptive|[1-9][0-9]*x[1-9][0-9]*)$")
@@ -842,7 +850,9 @@ class _DurableTaskMetadataV4(BaseModel):
             raise ValueError("matching 768p pricing is required")
         if not self.duration_seconds.is_integer():
             raise ValueError("ordered duration must be whole seconds")
-        if self.source_resolution != _vdn_source_resolution(self.ratio, int(self.duration_seconds)):
+        if self.source_resolution != _vdn_source_resolution(
+            self.ratio, int(self.duration_seconds), self.geometry_profile
+        ):
             raise ValueError("source resolution must match the admitted geometry profile")
         return self
 
@@ -1294,6 +1304,7 @@ class CausynVideoHandler(CustomLLM):
             task_metadata.update(
                 {
                     "version": CAUSYN_BILLING_METADATA_VERSION_V4,
+                    "geometry_profile": "hyperflow-official-v1",
                     "model": spec.model,
                     "ratio": request["ratio"],
                 }

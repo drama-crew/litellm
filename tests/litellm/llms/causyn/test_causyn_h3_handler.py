@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import fakeredis.aioredis
 import pytest
+from pydantic import ValidationError
 
 import litellm.llms.causyn.handler as mod
 from litellm.llms.causyn.handler import CausynVideoHandler
@@ -118,7 +119,7 @@ async def test_h3_enqueues_text_to_video_with_v4_metadata(enqueued: _Recorder) -
         "prompt_rewrite_model": "qwen/qwen3.8-flash",
         "prompt_rewrite_system_sha256": "a" * 64,
         "duration_seconds": 5.0,
-        "source_resolution": "1344x756",
+        "source_resolution": "1344x768",
         "requested_resolution": "768p",
         "pricing": {
             "model": "causyn-1.1",
@@ -132,7 +133,7 @@ async def test_h3_enqueues_text_to_video_with_v4_metadata(enqueued: _Recorder) -
             "organization_id": None,
         },
         "model": "causyn-1.1",
-        "geometry_profile": "vdn-adaptive-v1",
+        "geometry_profile": "hyperflow-official-v1",
         "ratio": "16:9",
     }
     decoded = decode_video_id_with_provider(video.id)
@@ -347,16 +348,62 @@ def test_text_only_requires_an_explicit_ratio(ratio):
 def test_text_only_accepts_21_9_as_one_of_the_six_deployed_ratios():
     request, duration, _, source, _ = mod._request("causyn-1.1", "prompt", _params(aspect_ratio="21:9"))
     assert request["ratio"] == "21:9"
-    assert source == mod._vdn_source_resolution("21:9", duration)
+    assert source == mod._vdn_source_resolution("21:9", duration, "hyperflow-official-v1")
 
 
 def test_duration_budget_does_not_change_billing_profile():
     request, duration, requested, source, _ = mod._request("causyn-1.1", "prompt", _params(seconds="15"))
     assert duration == 15
     assert requested == request["resolution"] == "768p"
-    width, height = map(int, source.split("x"))
-    assert width < 1344 and height < 756
-    assert width * 9 == height * 16
+    assert source == "1344x768"
+
+
+@pytest.mark.parametrize(
+    ("ratio", "duration", "expected"),
+    [
+        ("16:9", 5, "1344x768"),
+        ("16:9", 9, "1344x768"),
+        ("16:9", 10, "1344x768"),
+        ("16:9", 15, "1344x768"),
+        ("9:16", 10, "768x1344"),
+        ("9:16", 15, "768x1344"),
+        ("4:3", 11, "1024x768"),
+        ("4:3", 12, "1024x768"),
+        ("3:4", 12, "768x1024"),
+        ("21:9", 9, "1536x672"),
+        ("21:9", 15, "1536x672"),
+        ("1:1", 5, "768x768"),
+        ("1:1", 15, "768x768"),
+    ],
+)
+def test_hyperflow_official_geometry_ignores_the_duration_budget(ratio: str, duration: int, expected: str) -> None:
+    """C3: HyperFlow 的官方几何按比例固定，不随时长缩水。
+
+    旧的 vdn-adaptive-v1 画幅公式会在这些时长/比例组合下把画布缩小以适应
+    spatial-temporal 像素预算，导致 worker 按 ARK 官方公式产出的画布与计费存的
+    source_resolution 逐字节比对不上，任务永远卡在 in_progress（生产实测
+    public.collect 无限重试）。
+    """
+    assert mod._vdn_source_resolution(ratio, duration, "hyperflow-official-v1") == expected
+
+
+@pytest.mark.parametrize(("ratio", "duration"), [("16:9", 10), ("21:9", 15), ("4:3", 12), ("9:16", 15)])
+def test_the_legacy_adaptive_profile_still_shrinks_long_jobs(ratio: str, duration: int) -> None:
+    """确认 geometry_profile 真的被接线到几何计算里，而不是加了字段却没人读。
+
+    旧 profile 专门用来恢复部署前已经持久化的任务，它的画幅算法必须原样保留。
+    """
+    official = mod._vdn_source_resolution(ratio, duration, "hyperflow-official-v1")
+    legacy = mod._vdn_source_resolution(ratio, duration, "vdn-adaptive-v1")
+    assert legacy != official
+
+
+def test_geometry_profile_is_irrelevant_once_ratio_is_adaptive() -> None:
+    assert (
+        mod._vdn_source_resolution("adaptive", 10, "hyperflow-official-v1")
+        == mod._vdn_source_resolution("adaptive", 10, "vdn-adaptive-v1")
+        == "adaptive"
+    )
 
 
 def _ref(url: str) -> dict[str, str]:
@@ -370,7 +417,7 @@ def test_ref2va_references_keep_explicit_ratio_and_source_resolution():
     )
     request, duration, _, source, _ = mod._request("causyn-1.1", "prompt", params)
     assert request["ratio"] == "9:16"
-    assert source == mod._vdn_source_resolution("9:16", duration)
+    assert source == mod._vdn_source_resolution("9:16", duration, "hyperflow-official-v1")
     assert request["references"] == [
         _ref("https://source.example/r1.png"),
         _ref("https://source.example/r2.png"),
@@ -685,3 +732,83 @@ class TestBillingAcceptsTheGeometryThePipelineProduces:
         assert not _result_geometry_matches(
             self._metadata("16:9", "1344x756"), self._result(640, 480)
         )
+
+
+class TestGeometryProfileOnPersistedMetadata:
+    """C3: geometry_profile 必须真的接进校验，旧任务与新任务各走各的公式。"""
+
+    @staticmethod
+    def _base(**overrides: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "version": "causyn-video-billing-v4",
+            "model": "causyn-1.1",
+            "duration_seconds": 15.0,
+            "requested_resolution": "768p",
+            "ratio": "16:9",
+            "pricing": {"id": "causyn-1-1", "model": "causyn-1.1", "output_cost_per_second_768p": 5.0},
+            "attribution": {"api_key": None, "user_id": None, "team_id": None, "organization_id": None},
+        }
+        base.update(overrides)
+        return base
+
+    def test_a_blob_persisted_before_this_field_existed_defaults_to_the_adaptive_profile(self):
+        from litellm.llms.causyn.handler import _DurableTaskMetadataV4
+
+        stored = self._base(source_resolution=mod._vdn_source_resolution("16:9", 15, "vdn-adaptive-v1"))
+        assert "geometry_profile" not in stored
+        metadata = _DurableTaskMetadataV4.model_validate(stored)
+        assert metadata.geometry_profile == "vdn-adaptive-v1"
+
+    def test_a_new_task_persists_the_official_fixed_canvas_at_a_long_duration(self):
+        from litellm.llms.causyn.handler import _DurableTaskMetadataV4
+
+        stored = self._base(geometry_profile="hyperflow-official-v1", source_resolution="1344x768")
+        metadata = _DurableTaskMetadataV4.model_validate(stored)
+        assert metadata.geometry_profile == "hyperflow-official-v1"
+
+    def test_the_official_profile_rejects_the_stale_adaptive_shrunk_resolution(self):
+        from litellm.llms.causyn.handler import _DurableTaskMetadataV4
+
+        stored = self._base(
+            geometry_profile="hyperflow-official-v1",
+            source_resolution=mod._vdn_source_resolution("16:9", 15, "vdn-adaptive-v1"),
+        )
+        with pytest.raises(ValidationError):
+            _DurableTaskMetadataV4.model_validate(stored)
+
+
+@pytest.mark.asyncio
+async def test_h3_long_duration_text_to_video_persists_the_fixed_hyperflow_canvas(enqueued: _Recorder) -> None:
+    """回归 C3：15s 的 16:9 t2va 过去会把 source_resolution 缩到自适应预算算出的
+    更小画幅，worker 按 ARK 官方几何交付 1344x768 后计费判不匹配，任务永远卡在
+    in_progress。"""
+    await CausynVideoHandler(
+        prompt_submit=fake_submit, task_id_factory=lambda: TASK_ID, clock=lambda: 2_000_000_000.0
+    ).avideo_generation(
+        model="causyn-1.1",
+        prompt="a long take across the market",
+        api_key=None,
+        api_base=None,
+        optional_params=_params(seconds="15"),
+        logging_obj=None,
+    )
+    metadata = enqueued.payloads[0]["task_metadata"]
+    assert metadata["geometry_profile"] == "hyperflow-official-v1"
+    assert metadata["source_resolution"] == "1344x768"
+
+    from litellm.llms.causyn.handler import _DurableTaskMetadataV4, _WorkerResult, _result_geometry_matches
+
+    result = _WorkerResult.model_validate(
+        {
+            "validation_version": "video-v1",
+            "staging_key": "staging/x.mp4",
+            "etag": '"0"',
+            "bytes": 1,
+            "content_type": "video/mp4",
+            "duration_seconds": 15.2,
+            "width": 1344,
+            "height": 768,
+            "sha256": "0" * 64,
+        }
+    )
+    assert _result_geometry_matches(_DurableTaskMetadataV4.model_validate(metadata), result)
