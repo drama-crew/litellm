@@ -68,17 +68,21 @@ class AudioItem(StrictModel):
 ContentItem = Annotated[TextItem | ImageItem | VideoItem | AudioItem, Field(discriminator="type")]
 
 
-def _reference_dict(item: ImageItem | VideoItem | AudioItem) -> dict[str, str]:
-    if isinstance(item, ImageItem):
-        return {"role": "reference", "media_type": "image", "url": item.image_url.url}
-    if isinstance(item, VideoItem):
-        return {"role": "reference", "media_type": "video", "url": item.video_url.url}
-    return {"role": "reference", "media_type": "audio", "url": item.audio_url.url}
-
-
 def _reference_media(content: list[ContentItem]) -> dict[str, object]:
-    references = [_reference_dict(item) for item in content if isinstance(item, (ImageItem, VideoItem, AudioItem))]
-    return {"references": references} if references else {}
+    # This is the wire shape the LibTV backend actually reads (typed lists plus
+    # modeType); every route this facade drives resolves to LibTV, which has no
+    # concept of a flat "references" list, so building anything else here means
+    # LibTV silently drops the reference media and bills a plain text-to-video.
+    grouped = {
+        kind: values
+        for kind, values in (
+            ("reference_images", [item.image_url.url for item in content if isinstance(item, ImageItem)]),
+            ("reference_videos", [item.video_url.url for item in content if isinstance(item, VideoItem)]),
+            ("reference_audios", [item.audio_url.url for item in content if isinstance(item, AudioItem)]),
+        )
+        if values
+    }
+    return {**grouped, **({"parameters": {"modeType": "mixed2video"}} if len(content) > 1 else {})}
 
 
 class MiniMaxH3Create(StrictModel):

@@ -116,7 +116,7 @@ def test_keyframe_role_order_and_h3_max_modes():
         MiniMaxH3Create.model_validate(body(content=content + [first]))
 
 
-def test_reference_media_preserves_order_and_seed_is_forwarded():
+def test_reference_media_is_shaped_for_the_libtv_backend_with_seed_forwarded():
     content = [
         body()["content"][0],
         {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
@@ -126,12 +126,11 @@ def test_reference_media_preserves_order_and_seed_is_forwarded():
     spec = MiniMaxH3Create.model_validate(body(content=content, seed=42))
     actual = spec.internal_body()
     assert actual["seed"] == 42
-    assert actual["references"] == [
-        {"role": "reference", "media_type": "audio", "url": "https://media.example/a.mp3"},
-        {"role": "reference", "media_type": "image", "url": "https://media.example/ref.png"},
-        {"role": "reference", "media_type": "video", "url": "https://media.example/ref.mp4"},
-    ]
-    assert "parameters" not in actual
+    assert actual["reference_images"] == ["https://media.example/ref.png"]
+    assert actual["reference_videos"] == ["https://media.example/ref.mp4"]
+    assert actual["reference_audios"] == ["https://media.example/a.mp3"]
+    assert actual["parameters"] == {"modeType": "mixed2video"}
+    assert "references" not in actual
 
 
 def test_seed_is_optional_and_omitted_when_absent():
@@ -161,7 +160,7 @@ def test_reference_caps_and_audio_pairing_are_enforced():
         MiniMaxH3Create.model_validate(body(content=body()["content"] + [audio_ref]))
 
 
-def test_end_to_end_mixed_references_are_submitted_in_order_with_seed(api):
+def test_end_to_end_mixed_references_are_grouped_by_type_with_seed(api):
     client, calls, _, _ = api
     content = body()["content"] + [
         {"type": "video_url", "video_url": {"url": "https://media.example/ref.mp4"}},
@@ -173,7 +172,9 @@ def test_end_to_end_mixed_references_are_submitted_in_order_with_seed(api):
     assert result.status_code == 200, result.text
     submitted = calls[0][1]
     assert submitted["seed"] == 7
-    assert [reference["media_type"] for reference in submitted["references"]] == ["video", "image"]
+    assert submitted["reference_videos"] == ["https://media.example/ref.mp4"]
+    assert submitted["reference_images"] == ["https://media.example/ref.png"]
+    assert submitted["parameters"] == {"modeType": "mixed2video"}
 
 
 def test_task_authentication_and_expiry(monkeypatch):
