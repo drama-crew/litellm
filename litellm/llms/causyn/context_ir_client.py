@@ -7,6 +7,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from litellm.llms.causyn.h3_prompt import ContextIRRequest, RewriteError
+from litellm.proxy.video_endpoints.minimax_h3_models import AudioItem, ImageItem, VideoItem
 
 
 class ContextIRImage(BaseModel):
@@ -58,7 +59,7 @@ def service_api_key() -> str | None:
 
 
 def should_use_service(spec: ContextIRRequest) -> bool:
-    return spec.mode == "ref2va"
+    return spec.mode == "ref2va" and all(isinstance(item, ImageItem) for item in spec.ordered_media)
 
 
 def _headers(api_key: str | None) -> dict[str, str]:
@@ -68,11 +69,19 @@ def _headers(api_key: str | None) -> dict[str, str]:
     return headers
 
 
+def _media_url(item: ImageItem | VideoItem | AudioItem) -> str:
+    if isinstance(item, ImageItem):
+        return item.image_url.url
+    if isinstance(item, VideoItem):
+        return item.video_url.url
+    return item.audio_url.url
+
+
 def _payload(spec: ContextIRRequest, idempotency_key: str) -> ContextIRSubmission:
     return ContextIRSubmission(
         prompt=spec.prompt,
         images=tuple(
-            ContextIRImage(slot=index, url=str(item.image_url.url)) for index, item in enumerate(spec.ordered_media, 1)
+            ContextIRImage(slot=index, url=_media_url(item)) for index, item in enumerate(spec.ordered_media, 1)
         ),
         duration_s=spec.duration,
         ratio=str(spec.ratio),
@@ -214,7 +223,7 @@ def idempotency_key_for(spec: ContextIRRequest) -> str:
             spec.prompt,
             str(spec.duration),
             str(spec.ratio),
-            *[str(item.image_url.url) for item in spec.ordered_media],
+            *[_media_url(item) for item in spec.ordered_media],
         ]
     )
     return hashlib.sha256(material.encode()).hexdigest()
