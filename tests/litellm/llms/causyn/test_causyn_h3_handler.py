@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import fakeredis.aioredis
@@ -9,9 +10,10 @@ import litellm.llms.causyn.handler as mod
 from litellm.llms.causyn.handler import CausynVideoHandler
 from litellm.llms.causyn.context_ir import ContextIRService
 from litellm.llms.causyn.context_ir_store import ContextIRStore
-from litellm.llms.causyn.video_prompt import VideoPromptInput, rewritten_video_payload
+from litellm.llms.causyn.video_prompt import VideoPromptInput, deliver_video_prompt, rewritten_video_payload
 from litellm.llms.causyn.h3_prompt import RewriteResult, RewriteUsage
 from litellm.llms.custom_llm import CustomLLMError
+from litellm.llms.libtv.video_generate import alive_zset_key, task_type_for_references
 from litellm.types.videos.utils import (
     decode_video_id_with_provider,
     encode_video_id_with_provider,
@@ -525,6 +527,57 @@ async def test_h3_forwards_prompt_processing_direct_to_the_worker_after_the_ir_r
     )
     assert enqueued.payloads[0]["request"]["prompt_processing"] == "direct"
     assert enqueued.payloads[0]["request"]["prompt"] == "structured: a subject preserved across shots"
+
+
+async def test_h3_video_reference_request_clears_the_real_worker_gate() -> None:
+    """`enqueued` swaps in a recorder for `enqueue_video_generate`, so it never
+    runs the real `libtv.video_generate._validate_shape`. That shape gate's
+    closed request-key set didn't know about `prompt_processing`, so every H3
+    request carrying a video or audio reference was rejected at the render
+    queue with `invalid_params: unrecognized request field(s): prompt_processing`
+    -- the rewrite ran (and billed a real model call) but the video never
+    rendered. This drives the real `enqueue_video_generate` (via the real
+    `deliver_video_prompt`) end to end against a fake Redis, so a regression
+    here fails the task instead of a mocked call."""
+    refs = [_media_ref("video", "https://source.example/r1.mp4")]
+
+    async def real_submit(payload, billing):
+        async def rewrite(spec):
+            return RewriteResult(prompt="structured: " + spec.prompt, usage=RewriteUsage(), system_sha256="a" * 64)
+
+        async def settle(task):
+            pass
+
+        async with fakeredis.aioredis.FakeRedis() as ir_redis, fakeredis.aioredis.FakeRedis() as worker_redis:
+            task_type = task_type_for_references(tuple(refs))
+            await worker_redis.zadd(alive_zset_key(task_type), {"worker-1": time.time()})
+
+            async def deliver(task):
+                await deliver_video_prompt(task, redis_factory=lambda: worker_redis)
+
+            service = ContextIRService(ContextIRStore(ir_redis), rewrite=rewrite, deliver=deliver, settle=settle)
+            task = await service.create(
+                VideoPromptInput.model_validate(payload.request).context_ir(),
+                owner="test",
+                billing=billing,
+                task_id="h3_ir_" + payload.task_id,
+                video_payload=payload.model_dump(mode="json"),
+                listed=False,
+            )
+            await service.process(task.id)
+            stored = await service.store.get(task.id)
+            assert stored.status == "succeeded", stored.error
+
+    await CausynVideoHandler(
+        prompt_submit=real_submit,
+    ).avideo_generation(
+        model="causyn-1.1",
+        prompt="a subject preserved across shots",
+        api_key=None,
+        api_base=None,
+        optional_params=_params(aspect_ratio="16:9", references=refs),
+        logging_obj=None,
+    )
 
 
 @pytest.mark.parametrize("seed", [0, 4294967295, 42])

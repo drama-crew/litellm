@@ -82,8 +82,9 @@ _REQUIRED_TOP_LEVEL_KEYS = _ALLOWED_TOP_LEVEL_KEYS - {"staging_upload"}
 # _validate_shape untouched and get forwarded verbatim into the Redis Stream
 # envelope for the worker to deal with.
 _ALLOWED_REQUEST_KEYS = frozenset(
-    {"prompt", "duration_seconds", "resolution", "ratio", "seed", "generate_audio", "references"}
+    {"prompt", "duration_seconds", "resolution", "ratio", "seed", "generate_audio", "references", "prompt_processing"}
 )
+_ALLOWED_PROMPT_PROCESSING_VALUES = frozenset({"direct"})
 _ALLOWED_REFERENCE_KEYS = frozenset({"role", "media_type", "url"})
 _ALLOWED_STAGING_UPLOAD_KEYS = frozenset({"url", "key", "content_type", "expires_at"})
 TASK_METADATA_KEY_PREFIX = "worker:task:metadata:"
@@ -276,6 +277,14 @@ def _reject_extra_keys(obj: dict, allowed: frozenset[str], label: str) -> None:
         raise VideoGenerateError("invalid_params", f"unrecognized {label} field(s): {', '.join(sorted(extra))}")
 
 
+def _reject_invalid_prompt_processing(request: dict) -> None:
+    if "prompt_processing" in request and request["prompt_processing"] not in _ALLOWED_PROMPT_PROCESSING_VALUES:
+        raise VideoGenerateError(
+            "invalid_params",
+            f"request.prompt_processing must be one of: {', '.join(sorted(_ALLOWED_PROMPT_PROCESSING_VALUES))}",
+        )
+
+
 def _validate_shape(payload: Any) -> None:
     if not isinstance(payload, dict):
         raise VideoGenerateError("invalid_params", "request body must be a JSON object")
@@ -310,6 +319,7 @@ def _validate_shape(payload: Any) -> None:
     generate_audio = request.get("generate_audio", True)
     if not isinstance(generate_audio, bool):
         raise VideoGenerateError("invalid_params", "request.generate_audio must be a boolean")
+    _reject_invalid_prompt_processing(request)
     # F7: references[i]'s closed key set only applies to items that are
     # already dicts -- a malformed (non-dict, or dict-missing-url) item is
     # F6's job (_iter_reference_urls, run afterwards by _validate_urls), so

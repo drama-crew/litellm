@@ -782,6 +782,44 @@ async def test_worker_envelope_rejects_non_boolean_generate_audio() -> None:
     assert exc_info.value.code == "invalid_params"
 
 
+def test_worker_envelope_accepts_prompt_processing_direct() -> None:
+    envelope = {
+        "task_id": TASK_ID,
+        "model": "causyn-1.1",
+        "deadline_ts": 2_000_001_800.0,
+        "request": {
+            "prompt": "animate",
+            "duration_seconds": 5,
+            "ratio": "16:9",
+            "prompt_processing": "direct",
+        },
+        "task_metadata": {},
+    }
+
+    video_generate_module._validate_shape(envelope)
+
+
+@pytest.mark.parametrize("value", ["rewrite", "", 1, True, None])
+def test_worker_envelope_rejects_non_direct_prompt_processing(value: object) -> None:
+    envelope = {
+        "task_id": TASK_ID,
+        "model": "causyn-1.1",
+        "deadline_ts": 2_000_001_800.0,
+        "request": {
+            "prompt": "animate",
+            "duration_seconds": 5,
+            "ratio": "16:9",
+            "prompt_processing": value,
+        },
+        "task_metadata": {},
+    }
+
+    with pytest.raises(video_generate_module.VideoGenerateError) as exc_info:
+        video_generate_module._validate_shape(envelope)
+
+    assert exc_info.value.code == "invalid_params"
+
+
 def test_worker_envelope_rejects_explicit_null_staging_upload() -> None:
     envelope = {
         "task_id": TASK_ID,
