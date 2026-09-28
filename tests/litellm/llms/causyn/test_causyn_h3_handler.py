@@ -335,11 +335,17 @@ def test_keyframe_requests_normalize_valid_ratios_to_adaptive(ratio, last):
     assert source == "adaptive"
 
 
-@pytest.mark.parametrize("ratio", [None, "adaptive", "21:9"])
-def test_text_only_requires_one_of_five_deployed_ratios(ratio):
+@pytest.mark.parametrize("ratio", [None, "adaptive"])
+def test_text_only_requires_an_explicit_ratio(ratio):
     with pytest.raises(CustomLLMError) as error:
         mod._request("causyn-1.1", "prompt", _params(aspect_ratio=ratio))
     assert error.value.status_code == 400
+
+
+def test_text_only_accepts_21_9_as_one_of_the_six_deployed_ratios():
+    request, duration, _, source, _ = mod._request("causyn-1.1", "prompt", _params(aspect_ratio="21:9"))
+    assert request["ratio"] == "21:9"
+    assert source == mod._vdn_source_resolution("21:9", duration)
 
 
 def test_duration_budget_does_not_change_billing_profile():
@@ -419,6 +425,124 @@ async def test_h3_maps_ref2va_references_to_worker_references(enqueued: _Recorde
     )
     assert enqueued.payloads[0]["request"]["references"] == refs
     assert enqueued.payloads[0]["request"]["ratio"] == "16:9"
+
+
+def _media_ref(media_type: str, url: str) -> dict[str, str]:
+    return {"role": "reference", "media_type": media_type, "url": url}
+
+
+def test_ref2va_preserves_mixed_media_reference_order():
+    refs = [
+        _media_ref("audio", "https://source.example/a.mp3"),
+        _media_ref("image", "https://source.example/r1.png"),
+        _media_ref("video", "https://source.example/r1.mp4"),
+    ]
+    params = _params(aspect_ratio="16:9", references=refs)
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", params)
+    assert request["references"] == refs
+
+
+def test_ref2va_rejects_more_than_three_videos():
+    refs = [_media_ref("video", f"https://source.example/v{i}.mp4") for i in range(4)]
+    params = _params(aspect_ratio="16:9", references=refs)
+    with pytest.raises(CustomLLMError) as error:
+        mod._request("causyn-1.1", "prompt", params)
+    assert error.value.status_code == 400
+
+
+def test_ref2va_rejects_more_than_three_audios():
+    refs = [_media_ref("image", "https://source.example/r1.png")] + [
+        _media_ref("audio", f"https://source.example/a{i}.mp3") for i in range(4)
+    ]
+    params = _params(aspect_ratio="16:9", references=refs)
+    with pytest.raises(CustomLLMError) as error:
+        mod._request("causyn-1.1", "prompt", params)
+    assert error.value.status_code == 400
+
+
+def test_ref2va_rejects_audio_without_image_or_video():
+    refs = [_media_ref("audio", "https://source.example/a.mp3")]
+    params = _params(aspect_ratio="16:9", references=refs)
+    with pytest.raises(CustomLLMError) as error:
+        mod._request("causyn-1.1", "prompt", params)
+    assert error.value.status_code == 400
+
+
+def test_ref2va_accepts_audio_paired_with_video():
+    refs = [
+        _media_ref("video", "https://source.example/r1.mp4"),
+        _media_ref("audio", "https://source.example/a.mp3"),
+    ]
+    params = _params(aspect_ratio="16:9", references=refs)
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", params)
+    assert request["references"] == refs
+
+
+def test_prompt_processing_direct_when_a_video_reference_is_present():
+    refs = [_media_ref("video", "https://source.example/r1.mp4")]
+    params = _params(aspect_ratio="16:9", references=refs)
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", params)
+    assert request["prompt_processing"] == "direct"
+
+
+def test_prompt_processing_direct_when_an_audio_reference_is_present():
+    refs = [
+        _media_ref("image", "https://source.example/r1.png"),
+        _media_ref("audio", "https://source.example/a.mp3"),
+    ]
+    params = _params(aspect_ratio="16:9", references=refs)
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", params)
+    assert request["prompt_processing"] == "direct"
+
+
+@pytest.mark.parametrize(
+    "refs",
+    [
+        [],
+        [_ref("https://source.example/r1.png")],
+        [{"role": "first_frame", "media_type": "image", "url": "https://source.example/first.png"}],
+    ],
+)
+def test_prompt_processing_omitted_for_image_only_or_text_only_requests(refs):
+    params = _params(aspect_ratio="16:9", references=refs) if refs else _params(aspect_ratio="16:9")
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", params)
+    assert "prompt_processing" not in request
+
+
+async def test_h3_forwards_prompt_processing_direct_to_the_worker_after_the_ir_rewrite(
+    enqueued: _Recorder,
+) -> None:
+    refs = [_media_ref("video", "https://source.example/r1.mp4")]
+    await CausynVideoHandler(
+        prompt_submit=fake_submit,
+    ).avideo_generation(
+        model="causyn-1.1",
+        prompt="a subject preserved across shots",
+        api_key=None,
+        api_base=None,
+        optional_params=_params(aspect_ratio="16:9", references=refs),
+        logging_obj=None,
+    )
+    assert enqueued.payloads[0]["request"]["prompt_processing"] == "direct"
+    assert enqueued.payloads[0]["request"]["prompt"] == "structured: a subject preserved across shots"
+
+
+@pytest.mark.parametrize("seed", [0, 4294967295, 42])
+def test_seed_within_range_is_forwarded(seed):
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", _params(seed=seed))
+    assert request["seed"] == seed
+
+
+def test_seed_omitted_when_not_provided():
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", _params())
+    assert "seed" not in request
+
+
+@pytest.mark.parametrize("seed", [-1, 4294967296, True, 1.5, "42"])
+def test_seed_out_of_range_or_wrong_type_is_rejected(seed):
+    with pytest.raises(CustomLLMError) as error:
+        mod._request("causyn-1.1", "prompt", _params(seed=seed))
+    assert error.value.status_code == 400
 
 
 class TestBillingAcceptsTheGeometryThePipelineProduces:

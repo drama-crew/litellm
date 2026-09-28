@@ -116,6 +116,66 @@ def test_keyframe_role_order_and_h3_max_modes():
         MiniMaxH3Create.model_validate(body(content=content + [first]))
 
 
+def test_reference_media_preserves_order_and_seed_is_forwarded():
+    content = [
+        body()["content"][0],
+        {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
+        {"type": "image_url", "image_url": {"url": "https://media.example/ref.png"}, "role": "reference_image"},
+        {"type": "video_url", "video_url": {"url": "https://media.example/ref.mp4"}},
+    ]
+    spec = MiniMaxH3Create.model_validate(body(content=content, seed=42))
+    actual = spec.internal_body()
+    assert actual["seed"] == 42
+    assert actual["references"] == [
+        {"role": "reference", "media_type": "audio", "url": "https://media.example/a.mp3"},
+        {"role": "reference", "media_type": "image", "url": "https://media.example/ref.png"},
+        {"role": "reference", "media_type": "video", "url": "https://media.example/ref.mp4"},
+    ]
+    assert "parameters" not in actual
+
+
+def test_seed_is_optional_and_omitted_when_absent():
+    actual = MiniMaxH3Create.model_validate(body()).internal_body()
+    assert "seed" not in actual
+
+
+@pytest.mark.parametrize("seed", [-1, 4294967296, 1.5])
+def test_seed_out_of_range_or_wrong_type_is_rejected(seed):
+    with pytest.raises(ValueError):
+        MiniMaxH3Create.model_validate(body(seed=seed))
+
+
+def test_reference_caps_and_audio_pairing_are_enforced():
+    image_ref = {"type": "image_url", "image_url": {"url": "https://media.example/ref.png"}, "role": "reference_image"}
+    video_ref = {"type": "video_url", "video_url": {"url": "https://media.example/ref.mp4"}}
+    audio_ref = {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}}
+    with pytest.raises(ValueError, match="9 images, 3 videos or 3 audio"):
+        MiniMaxH3Create.model_validate(body(content=body()["content"] + [image_ref] * 10))
+    with pytest.raises(ValueError, match="9 images, 3 videos or 3 audio"):
+        MiniMaxH3Create.model_validate(body(content=body()["content"] + [video_ref] * 4))
+    with pytest.raises(ValueError, match="total reference count exceeds 12"):
+        MiniMaxH3Create.model_validate(
+            body(content=body()["content"] + [image_ref] * 9 + [video_ref] * 3 + [audio_ref] * 1)
+        )
+    with pytest.raises(ValueError, match="reference audio requires at least one reference image or video"):
+        MiniMaxH3Create.model_validate(body(content=body()["content"] + [audio_ref]))
+
+
+def test_end_to_end_mixed_references_are_submitted_in_order_with_seed(api):
+    client, calls, _, _ = api
+    content = body()["content"] + [
+        {"type": "video_url", "video_url": {"url": "https://media.example/ref.mp4"}},
+        {"type": "image_url", "image_url": {"url": "https://media.example/ref.png"}, "role": "reference_image"},
+    ]
+    result = client.post(
+        "/v2/video_generation", json=body(content=content, seed=7), headers={"Authorization": "Bearer allowed"}
+    )
+    assert result.status_code == 200, result.text
+    submitted = calls[0][1]
+    assert submitted["seed"] == 7
+    assert [reference["media_type"] for reference in submitted["references"]] == ["video", "image"]
+
+
 def test_task_authentication_and_expiry(monkeypatch):
     monkeypatch.setenv("LITELLM_VIDEO_ID_SECRET", "test-secret")
     task = MiniMaxTask(

@@ -68,12 +68,26 @@ class AudioItem(StrictModel):
 ContentItem = Annotated[TextItem | ImageItem | VideoItem | AudioItem, Field(discriminator="type")]
 
 
+def _reference_dict(item: ImageItem | VideoItem | AudioItem) -> dict[str, str]:
+    if isinstance(item, ImageItem):
+        return {"role": "reference", "media_type": "image", "url": item.image_url.url}
+    if isinstance(item, VideoItem):
+        return {"role": "reference", "media_type": "video", "url": item.video_url.url}
+    return {"role": "reference", "media_type": "audio", "url": item.audio_url.url}
+
+
+def _reference_media(content: list[ContentItem]) -> dict[str, object]:
+    references = [_reference_dict(item) for item in content if isinstance(item, (ImageItem, VideoItem, AudioItem))]
+    return {"references": references} if references else {}
+
+
 class MiniMaxH3Create(StrictModel):
     model: ModelName
     content: list[ContentItem] = Field(min_length=1, max_length=16)
     resolution: Resolution
-    duration: int = Field(ge=4, le=15, strict=True)
+    duration: int = Field(ge=5, le=15, strict=True)
     ratio: Ratio = "adaptive"
+    seed: int | None = Field(default=None, ge=0, le=4294967295)
     callback_url: str | None = None
 
     @model_validator(mode="after")
@@ -85,7 +99,7 @@ class MiniMaxH3Create(StrictModel):
         if len(text) != 1 or not text[0].text.strip():
             raise ValueError("content must include exactly one non-empty text item")
         if self.model == "MiniMax-H3-Max":
-            if self.duration < 5 or self.resolution == "2K":
+            if self.resolution == "2K":
                 raise ValueError("MiniMax-H3-Max supports 5-15 seconds and 480P/768P")
         elif self.resolution == "480P":
             raise ValueError("MiniMax-H3 supports 768P/2K")
@@ -97,6 +111,10 @@ class MiniMaxH3Create(StrictModel):
             raise ValueError("at most one first_frame and one last_frame are allowed")
         if len(references) > 9 or len(videos) > 3 or len(audios) > 3:
             raise ValueError("reference count exceeds 9 images, 3 videos or 3 audio clips")
+        if len(references) + len(videos) + len(audios) > 12:
+            raise ValueError("total reference count exceeds 12")
+        if audios and not references and not videos:
+            raise ValueError("reference audio requires at least one reference image or video")
         if self.model == "MiniMax-H3-Max" and (references or videos or audios):
             raise ValueError("MiniMax-H3-Max does not support reference-to-video")
         if len(self.content) == 1 and self.ratio == "adaptive":
@@ -121,27 +139,7 @@ class MiniMaxH3Create(StrictModel):
                 "parameters": {"modeType": "frames2video"},
             }
             if self.keyframes
-            else {
-                **{
-                    kind: values
-                    for kind, values in (
-                        (
-                            "reference_images",
-                            [item.image_url.url for item in self.content if isinstance(item, ImageItem)],
-                        ),
-                        (
-                            "reference_videos",
-                            [item.video_url.url for item in self.content if isinstance(item, VideoItem)],
-                        ),
-                        (
-                            "reference_audios",
-                            [item.audio_url.url for item in self.content if isinstance(item, AudioItem)],
-                        ),
-                    )
-                    if values
-                },
-                **({"parameters": {"modeType": "mixed2video"}} if len(self.content) > 1 else {}),
-            }
+            else _reference_media(self.content)
         )
         return {
             "model": MODEL_ROUTES[self.model],
@@ -151,6 +149,7 @@ class MiniMaxH3Create(StrictModel):
             "aspect_ratio": self.effective_ratio,
             "generate_audio": True,
             **media,
+            **({"seed": self.seed} if self.seed is not None else {}),
         }
 
 

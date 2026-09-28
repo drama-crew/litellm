@@ -76,6 +76,23 @@ async def test_reference_bytes_are_frozen_and_total_duration_checked():
 
 
 @pytest.mark.asyncio
+async def test_mixed_reference_order_is_preserved_after_preparation():
+    audio_url = "data:audio/mpeg;base64," + base64.b64encode(b"id3-fake-audio").decode()
+    image_url = "data:image/png;base64," + base64.b64encode(picture()).decode()
+    image = {"type": "image_url", "image_url": {"url": image_url}, "role": "reference_image"}
+    video_raw = clip(seconds=2)
+    video = {
+        "type": "video_url",
+        "video_url": {"url": "data:video/mp4;base64," + base64.b64encode(video_raw).decode()},
+    }
+    audio = {"type": "audio_url", "audio_url": {"url": audio_url}}
+    async with httpx.AsyncClient(trust_env=False) as client:
+        prepared = await prepare_media(client, request([audio, image, video]))
+        assert [type(item).__name__ for item in prepared.content[1:]] == ["AudioItem", "ImageItem", "VideoItem"]
+        assert prepared.content[1].audio_url.url == audio_url
+
+
+@pytest.mark.asyncio
 async def test_private_reference_and_callback_are_rejected():
     async with httpx.AsyncClient(trust_env=False) as client:
         with pytest.raises(RewriteError, match="could not be validated"):

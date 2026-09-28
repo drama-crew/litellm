@@ -83,7 +83,7 @@ CAUSYN_RESOLUTION = "768x512"
 CAUSYN_2K_RESOLUTION = "2k"
 CAUSYN_RESOLUTIONS = frozenset({CAUSYN_RESOLUTION, CAUSYN_2K_RESOLUTION})
 CAUSYN_H3_RESOLUTION = "768p"
-CAUSYN_H3_RATIOS = frozenset({"16:9", "9:16", "1:1", "4:3", "3:4"})
+CAUSYN_H3_RATIOS = frozenset({"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"})
 CAUSYN_BILLING_METADATA_VERSION = "causyn-video-billing-v1"
 CAUSYN_BILLING_METADATA_VERSION_V2 = "causyn-video-billing-v2"
 CAUSYN_BILLING_METADATA_VERSION_V3 = "causyn-video-billing-v3"
@@ -167,7 +167,7 @@ _MODEL_SPECS: Mapping[str, _ModelSpec] = MappingProxyType(
             flag_alias=_CAUSYN_H3_FLAG_ALIAS,
             resolutions=frozenset({CAUSYN_H3_RESOLUTION}),
             ratios=CAUSYN_H3_RATIOS,
-            duration_min=4,
+            duration_min=5,
             duration_max=15,
             # One admitted 15s request measured 420.368s P100 and uses a 600s
             # H3 execution cap. This deadline starts earlier, at queue entry,
@@ -450,8 +450,14 @@ def _legacy_references(
 
 
 _H3_REF2VA_MAX_IMAGES = 9
+_H3_REF2VA_MAX_VIDEOS = 3
+_H3_REF2VA_MAX_AUDIOS = 3
+_H3_REF2VA_MAX_TOTAL = 12
+_H3_REF2VA_MEDIA_TYPES = frozenset({"image", "video", "audio"})
 _H3_REF2VA_ERROR = (
-    f"references must contain first_frame and optional last_frame, or 1 to {_H3_REF2VA_MAX_IMAGES} reference images"
+    "references must contain first_frame and optional last_frame (image only), or 1 to "
+    f"{_H3_REF2VA_MAX_TOTAL} reference items (up to {_H3_REF2VA_MAX_IMAGES} images, "
+    f"{_H3_REF2VA_MAX_VIDEOS} videos and {_H3_REF2VA_MAX_AUDIOS} audio clips)"
 )
 
 
@@ -465,10 +471,23 @@ def _h3_shaped_references(value: object) -> tuple[dict[str, str], ...]:
         raise _bad_request(_H3_REF2VA_ERROR)
     roles = [reference["role"] for reference in references]
     if roles and all(role == "reference" for role in roles):
-        if not 1 <= len(references) <= _H3_REF2VA_MAX_IMAGES:
+        if len(references) > _H3_REF2VA_MAX_TOTAL:
             raise _bad_request(_H3_REF2VA_ERROR)
-        if any(reference["media_type"] != "image" or not reference["url"] for reference in references):
+        if any(
+            reference["media_type"] not in _H3_REF2VA_MEDIA_TYPES or not reference["url"] for reference in references
+        ):
             raise _bad_request(_H3_REF2VA_ERROR)
+        images = [reference for reference in references if reference["media_type"] == "image"]
+        videos = [reference for reference in references if reference["media_type"] == "video"]
+        audios = [reference for reference in references if reference["media_type"] == "audio"]
+        if (
+            len(images) > _H3_REF2VA_MAX_IMAGES
+            or len(videos) > _H3_REF2VA_MAX_VIDEOS
+            or len(audios) > _H3_REF2VA_MAX_AUDIOS
+        ):
+            raise _bad_request(_H3_REF2VA_ERROR)
+        if audios and not images and not videos:
+            raise _bad_request("reference audio requires at least one reference image or video")
         return tuple(references)
     by_role: dict[str, dict[str, str]] = {}
     for reference in references:
@@ -552,6 +571,22 @@ def _vdn_source_resolution(ratio: str, duration: int) -> str:
     return f"{geometry.output_width}x{geometry.output_height}"
 
 
+_H3_DIRECT_PROMPT_PROCESSING_MEDIA_TYPES = frozenset({"video", "audio"})
+
+
+def _requires_direct_prompt_processing(references: tuple[dict[str, str], ...]) -> bool:
+    return any(reference["media_type"] in _H3_DIRECT_PROMPT_PROCESSING_MEDIA_TYPES for reference in references)
+
+
+def _validated_seed(optional_params: dict[str, object]) -> int | None:
+    seed = optional_params.get("seed")
+    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+        raise _bad_request("seed must be an integer")
+    if isinstance(seed, int) and not isinstance(seed, bool) and not 0 <= seed <= 4294967295:
+        raise _bad_request("seed must be from 0 through 4294967295")
+    return seed
+
+
 def _request(
     model: str, prompt: object, optional_params: dict[str, object]
 ) -> tuple[dict[str, object], int, str, str, _ModelSpec]:
@@ -592,9 +627,7 @@ def _request(
         for unsupported_param in ("image", "last_image"):
             if optional_params.get(unsupported_param) is not None:
                 raise _bad_request(f"{unsupported_param} is not supported")
-    seed = optional_params.get("seed")
-    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
-        raise _bad_request("seed must be an integer")
+    seed = _validated_seed(optional_params)
     duration = _duration(optional_params, spec)
     source_resolution = (
         _vdn_source_resolution(ratio, duration) if spec.model == CAUSYN_H3_MODEL else _source_resolution(spec, ratio)
@@ -609,6 +642,8 @@ def _request(
     }
     if seed is not None:
         request["seed"] = seed
+    if _requires_direct_prompt_processing(references):
+        request["prompt_processing"] = "direct"
     return request, duration, requested_resolution, source_resolution, spec
 
 
@@ -794,7 +829,7 @@ class _DurableTaskMetadataV4(BaseModel):
     duration_seconds: float = Field(ge=4, le=15)
     source_resolution: str = Field(pattern=r"^(adaptive|[1-9][0-9]*x[1-9][0-9]*)$")
     requested_resolution: Literal["768p"]
-    ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "adaptive"]
+    ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "adaptive"]
     pricing: _Pricing
     attribution: _DurableAttribution
     context_ir_task_id: str | None = None

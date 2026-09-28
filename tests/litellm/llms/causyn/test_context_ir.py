@@ -8,6 +8,7 @@ import fakeredis.aioredis
 import httpx
 import pytest
 from fastapi import FastAPI, Request
+from pydantic import ValidationError
 
 from litellm.llms.causyn.context_ir import ContextIRService
 from litellm.llms.causyn.context_ir_budget import REFUND_SCRIPT
@@ -265,15 +266,13 @@ def test_mixed_media_indexes_and_audio_rejection():
     assert request.mode == "ref2va"
     assert request.user_content()[0]["text"].startswith("<Picture 1>")
     assert request.user_content()[2]["text"].startswith("<Video 1>")
-    audio = spec(
-        content=[
-            {"type": "text", "text": "Hello"},
-            {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
-        ]
-    )
-    with pytest.raises(RewriteError) as failure:
-        audio.require_supported()
-    assert failure.value.status_code == 422
+    with pytest.raises(ValidationError, match="reference audio requires at least one reference image or video"):
+        spec(
+            content=[
+                {"type": "text", "text": "Hello"},
+                {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
+            ]
+        )
 
 
 @pytest.mark.asyncio
@@ -311,15 +310,20 @@ async def test_public_protocol_normalization_query_list_delete_and_audio(redis):
         assert listing.json()["total"] == 1
         deleted = await client.delete("/v2/video_generation/" + task_id)
         assert deleted.json() == {"task_id": task_id, "action": "deleted", "status": "deleted"}
-        audio = spec(
-            content=[
-                {"type": "text", "text": "Hello"},
-                {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
-            ]
-        )
         count = len(normalized)
-        rejected = await client.post("/v2/h3_context_ir", json=audio.model_dump(mode="json"))
-        assert rejected.status_code == 422
+        rejected = await client.post(
+            "/v2/h3_context_ir",
+            json={
+                "model": "MiniMax-H3",
+                "content": [
+                    {"type": "text", "text": "Hello"},
+                    {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
+                ],
+                "duration": 5,
+                "ratio": "16:9",
+            },
+        )
+        assert rejected.status_code == 400
         assert len(normalized) == count
 
 

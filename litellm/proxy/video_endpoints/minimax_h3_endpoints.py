@@ -99,7 +99,6 @@ async def prepare_request(request: Request) -> None:
         raw = await read_json_body(request)
         if is_ir_create:
             spec_ir = ContextIRRequest.model_validate_json(raw)
-            spec_ir.require_supported()
             request.scope["causyn_context_ir_spec"] = spec_ir
             _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
         else:

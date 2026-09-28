@@ -15,11 +15,19 @@ from litellm.llms.libtv.video_generate import (
     VideoGenerateSettings,
     enqueue_video_generate,  # pyright: ignore[reportUnknownVariableType]  # shared engine has untyped Redis ports
 )
-from litellm.proxy.video_endpoints.minimax_h3_models import ImageItem, MediaURL, Ratio, TextItem
+from litellm.proxy.video_endpoints.minimax_h3_models import (
+    AudioItem,
+    ImageItem,
+    MediaURL,
+    Ratio,
+    TextItem,
+    VideoItem,
+)
 
 
 class VideoReference(BaseModel):
     role: Literal["first_frame", "last_frame", "reference"]
+    media_type: Literal["image", "video", "audio"] = "image"
     url: str
 
 
@@ -36,16 +44,23 @@ class VideoPromptInput(BaseModel):
             ratio=self.ratio,
             content=(
                 TextItem(type="text", text=self.prompt),
-                *(
-                    ImageItem(
-                        type="image_url",
-                        image_url=MediaURL(url=ref.url),
-                        role="reference_image" if ref.role == "reference" else ref.role,
-                    )
-                    for ref in self.references
-                ),
+                *(_h3_content_item(ref) for ref in self.references),
             ),
         )
+
+
+def _h3_content_item(ref: VideoReference) -> ImageItem | VideoItem | AudioItem:
+    match ref.media_type:
+        case "image":
+            return ImageItem(
+                type="image_url",
+                image_url=MediaURL(url=ref.url),
+                role="reference_image" if ref.role == "reference" else ref.role,
+            )
+        case "video":
+            return VideoItem(type="video_url", video_url=MediaURL(url=ref.url))
+        case "audio":
+            return AudioItem(type="audio_url", audio_url=MediaURL(url=ref.url))
 
 
 class VideoSubmission(BaseModel):

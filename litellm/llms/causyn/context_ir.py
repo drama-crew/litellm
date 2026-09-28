@@ -205,7 +205,6 @@ class ContextIRService:
         reservation: dict[str, JsonValue] | None = None,
         video_payload: dict[str, JsonValue] | None = None,
     ) -> ContextIRTask:
-        spec.require_supported()
         now = int(time.time())
         from litellm.proxy.video_endpoints.moderation_metering_runtime import CONTEXT
 

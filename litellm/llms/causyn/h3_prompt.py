@@ -69,7 +69,7 @@ class ContextIRRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     model: Literal["MiniMax-H3", "causyn-1.1"]
     content: tuple[ContentItem, ...] = Field(min_length=1, max_length=16)
-    duration: int = Field(ge=4, le=15, strict=True)
+    duration: int = Field(ge=5, le=15, strict=True)
     ratio: Ratio = "adaptive"
     callback_url: str | None = None
 
@@ -103,10 +103,6 @@ class ContextIRRequest(BaseModel):
     @property
     def effective_ratio(self) -> Ratio:
         return "adaptive" if self.mode in {"i2va", "l2va", "fl2va"} else self.ratio
-
-    def require_supported(self) -> None:
-        if any(isinstance(item, AudioItem) for item in self.content):
-            raise RewriteError("Reference audio is not supported by this Context IR service", 422)
 
     def user_content(self) -> list[dict[str, JsonValue]]:
         task = {"t2va": "t2av", "i2va": "i2av", "l2va": "l2av", "fl2va": "fl2av", "ref2va": "Ref2VA"}[self.mode]
@@ -145,7 +141,7 @@ class ContextIRRequest(BaseModel):
                 {"type": "text", "text": f"<Video {index}> reference video:\n"},
                 {"type": "video_url", "video_url": {"url": item.video_url.url}},
             )
-        raise RewriteError("Reference audio is not supported", 422)
+        return ({"type": "text", "text": f"<Audio {index}> reference audio:\n{item.audio_url.url}\n"},)
 
 
 class RewriteUsage(BaseModel):
@@ -226,7 +222,6 @@ class H3PromptRewriter:
         self.api_key = api_key
 
     async def rewrite(self, spec: ContextIRRequest) -> RewriteResult:
-        spec.require_supported()
         if not self.api_key:
             raise RewriteError("H3 prompt rewrite is not configured", 503)
         from litellm.llms.causyn.h3_media import prepare_media

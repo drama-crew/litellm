@@ -103,23 +103,15 @@ async def prepare_reference(
 async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> ContextIRRequest:
     try:
         async with asyncio.timeout(60):
-            media = tuple(
+            prepared = tuple(
                 [
-                    await prepare_reference(client, item)
-                    for item in spec.ordered_media
-                    if isinstance(item, (ImageItem, VideoItem))
+                    await prepare_reference(client, item) if isinstance(item, (ImageItem, VideoItem)) else (item, 0.0)
+                    for item in spec.content
                 ]
             )
-        if sum(duration for _, duration in media) > 15.000001:
+        if sum(duration for _, duration in prepared) > 15.000001:
             raise RewriteError("Combined reference video duration exceeds 15 seconds", 400)
-        return spec.model_copy(
-            update={
-                "content": (
-                    *(item for item in spec.content if not isinstance(item, (ImageItem, VideoItem))),
-                    *(item for item, _ in media),
-                )
-            }
-        )
+        return spec.model_copy(update={"content": tuple(item for item, _ in prepared)})
     except RewriteError:
         raise
     except (httpx.TransportError, TimeoutError) as exc:
