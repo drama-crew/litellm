@@ -99,6 +99,8 @@ async def prepare_request(request: Request) -> None:
         raw = await read_json_body(request)
         if is_ir_create:
             spec_ir = ContextIRRequest.model_validate_json(raw)
+            if spec_ir.model == AUTH_MODEL and spec_ir.duration < 5:
+                raise H3Error(400, "duration must be from 5 through 15 seconds for causyn-1.1")
             request.scope["causyn_context_ir_spec"] = spec_ir
             _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
         else:

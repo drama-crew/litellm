@@ -23,6 +23,7 @@ from litellm.llms.causyn.context_ir_store import (
     new_task_id,
 )
 from litellm.llms.causyn.h3_prompt import (
+    AUTH_MODEL,
     PRICE_CREDITS,
     PUBLIC_MODEL,
     ContextIRRequest,
@@ -205,6 +206,8 @@ class ContextIRService:
         reservation: dict[str, JsonValue] | None = None,
         video_payload: dict[str, JsonValue] | None = None,
     ) -> ContextIRTask:
+        if spec.model == AUTH_MODEL and spec.duration < 5:
+            raise RewriteError("duration must be from 5 through 15 seconds for causyn-1.1", 400)
         now = int(time.time())
         from litellm.proxy.video_endpoints.moderation_metering_runtime import CONTEXT
 

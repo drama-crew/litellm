@@ -89,7 +89,7 @@ class MiniMaxH3Create(StrictModel):
     model: ModelName
     content: list[ContentItem] = Field(min_length=1, max_length=16)
     resolution: Resolution
-    duration: int = Field(ge=5, le=15, strict=True)
+    duration: int = Field(ge=4, le=15, strict=True)
     ratio: Ratio = "adaptive"
     seed: int | None = Field(default=None, ge=0, le=4294967295)
     callback_url: str | None = None
@@ -103,7 +103,7 @@ class MiniMaxH3Create(StrictModel):
         if len(text) != 1 or not text[0].text.strip():
             raise ValueError("content must include exactly one non-empty text item")
         if self.model == "MiniMax-H3-Max":
-            if self.resolution == "2K":
+            if self.duration < 5 or self.resolution == "2K":
                 raise ValueError("MiniMax-H3-Max supports 5-15 seconds and 480P/768P")
         elif self.resolution == "480P":
             raise ValueError("MiniMax-H3 supports 768P/2K")

@@ -113,7 +113,10 @@ def test_keyframe_role_order_and_h3_max_modes():
     with pytest.raises(ValueError):
         MiniMaxH3Create.model_validate(body(model="MiniMax-H3-Max", resolution="2K"))
     with pytest.raises(ValueError):
+        MiniMaxH3Create.model_validate(body(model="MiniMax-H3-Max", duration=4))
+    with pytest.raises(ValueError):
         MiniMaxH3Create.model_validate(body(content=content + [first]))
+    assert MiniMaxH3Create.model_validate(body(duration=4)).duration == 4
 
 
 def test_reference_media_is_shaped_for_the_libtv_backend_with_seed_forwarded():

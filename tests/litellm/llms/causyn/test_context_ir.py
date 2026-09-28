@@ -255,6 +255,56 @@ async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, 
     assert payload["moderation_intent_id"] is None
 
 
+@pytest.mark.asyncio
+async def test_legacy_four_second_minimax_h3_task_still_round_trips_through_redis(redis):
+    store = ContextIRStore(redis)
+    task = await ContextIRService(store, settle=no_settle).create(
+        spec(duration=4), owner="owner", billing=BillingIdentity()
+    )
+    fetched = await store.get(task.id)
+    assert fetched is not None
+    assert fetched.request.duration == 4
+    listed = await store.list_tasks("owner")
+    assert [item.id for item in listed] == [task.id]
+
+
+@pytest.mark.asyncio
+async def test_causyn_model_requires_five_seconds_but_minimax_h3_allows_four(redis):
+    service = ContextIRService(ContextIRStore(redis), settle=no_settle)
+    accepted = await service.create(spec(duration=4), owner="owner", billing=BillingIdentity())
+    assert accepted.request.duration == 4
+    with pytest.raises(RewriteError, match="5 through 15"):
+        await service.create(spec(model="causyn-1.1", duration=4), owner="owner", billing=BillingIdentity())
+
+
+@pytest.mark.asyncio
+async def test_h3_context_ir_endpoint_enforces_five_second_minimum_only_for_causyn_model(redis):
+    service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, settle=no_settle)
+
+    async def auth(request: Request):
+        return UserAPIKeyAuth(api_key="owner")
+
+    async def dependency():
+        return service
+
+    app = FastAPI()
+    app.dependency_overrides[h3.user_api_key_auth] = auth
+    app.dependency_overrides[ir.context_ir_service] = dependency
+    app.dependency_overrides[h3.context_ir_service_for_request] = dependency
+    app.include_router(h3.router)
+    app.include_router(ir.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        minimax_four = await client.post(
+            "/v2/h3_context_ir", json=spec(model="MiniMax-H3", duration=4).model_dump(mode="json")
+        )
+        assert minimax_four.status_code == 200, minimax_four.text
+        causyn_four = await client.post(
+            "/v2/h3_context_ir", json=spec(model="causyn-1.1", duration=4).model_dump(mode="json")
+        )
+        assert causyn_four.status_code == 400, causyn_four.text
+        assert "5 through 15" in causyn_four.json()["error"]["message"]
+
+
 def test_mixed_media_indexes_and_audio_rejection():
     request = spec(
         content=[

@@ -69,7 +69,7 @@ class ContextIRRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     model: Literal["MiniMax-H3", "causyn-1.1"]
     content: tuple[ContentItem, ...] = Field(min_length=1, max_length=16)
-    duration: int = Field(ge=5, le=15, strict=True)
+    duration: int = Field(ge=4, le=15, strict=True)
     ratio: Ratio = "adaptive"
     callback_url: str | None = None
 
