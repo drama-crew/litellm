@@ -1240,3 +1240,32 @@ async def test_rewriter_captures_upstream_status_and_message_on_non_200():
     assert caught.value.upstream_status == 429
     assert caught.value.retryable is True
     assert "rate-limited upstream" in caught.value.describe()
+
+
+def test_rewrite_window_covers_a_full_context_ir_service_task():
+    from litellm.llms.causyn import context_ir_client as service
+    from litellm.llms.causyn.context_ir import REWRITE_RETRY_WINDOW_S, rewrite_policy
+
+    assert REWRITE_RETRY_WINDOW_S == 900.0
+    assert REWRITE_RETRY_WINDOW_S >= service.SERVICE_TASK_BOUND_S + 60
+    task = _causyn_task()
+    # the task must not expire while a rewrite attempt that starts inside the window is running
+    assert rewrite_policy(task).expiry_s >= REWRITE_RETRY_WINDOW_S + 155
+
+
+def test_still_running_poll_is_rescheduled_quickly_until_the_service_bound():
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    task = _causyn_task(attempts=9)
+    still_running = RewriteError("Context IR task x is still running", 503, retryable=True, poll=True)
+    policy = rewrite_policy(task)
+    assert policy.next_delay(task, still_running, now=task.created_at + 840) == 1.0
+    assert policy.next_delay(task, still_running, now=task.created_at + 900) is None
+
+
+def test_minimax_h3_poll_error_keeps_legacy_backoff():
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    task = _causyn_task(request=spec(), attempts=1)
+    still_running = RewriteError("still running", 503, retryable=True, poll=True)
+    assert rewrite_policy(task).next_delay(task, still_running, now=task.created_at) >= 2.0

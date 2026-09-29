@@ -84,12 +84,15 @@ class RewriteError(Exception):
         retry_after: str | None = None,
         upstream_status: int | None = None,
         detail: str | None = None,
+        poll: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = status_code == 429 if retryable is None else retryable
         self.retry_after = retry_after
         self.upstream_status = upstream_status
+        # True: "task still running, check again" - not a failure, so no backoff.
+        self.poll = poll
         self.detail = redact_provider_detail(detail)
 
     def describe(self) -> str:
@@ -102,8 +105,16 @@ class RewriteError(Exception):
         return f"{self} ({': '.join(extras)})" if extras else str(self)
 
     def retry_delay(
-        self, attempt: int, *, cap: float = 30.0, jitter: float = 1.0, retry_after_cap: float = 60.0
+        self,
+        attempt: int,
+        *,
+        cap: float = 30.0,
+        jitter: float = 1.0,
+        retry_after_cap: float = 60.0,
+        poll_fast: bool = False,
     ) -> float:
+        if self.poll and poll_fast:
+            return 1.0
         backoff = min(cap, 2.0**attempt) + random.uniform(0.0, jitter)
         if self.retry_after is None:
             return backoff

@@ -49,7 +49,11 @@ Notify = Callable[[str, dict[str, JsonValue]], Awaitable[bool]]
 # 所以预算按任务自己的 deadline 而不是固定次数；MiniMax-H3 共用同一代码路径，保持原来
 # 的 3 次 / 30s 封顶退避。
 LEGACY_MAX_ATTEMPTS = 3
-REWRITE_RETRY_WINDOW_S = 360.0
+REWRITE_RETRY_WINDOW_S = float(os.getenv("CAUSYN_REWRITE_RETRY_WINDOW_SECONDS", "900"))
+# 一次改写尝试最长 155s，加上租约收尾余量；任务在此之后仍没有结果才算过期。
+ATTEMPT_TIMEOUT_S = 155.0
+EXPIRY_MARGIN_S = 85.0
+LEGACY_EXPIRY_S = 600.0
 REWRITE_BACKOFF_CAP_S = 60.0
 RENDER_RESERVE_S = 600.0
 DEFAULT_TASK_DEADLINE_S = 3600.0
@@ -61,6 +65,7 @@ class RewritePolicy:
     window_s: float
     backoff_cap_s: float
     render_reserve_s: float
+    expiry_s: float
 
     def next_delay(self, task: ContextIRTask, exc: RewriteError, *, now: float | None = None) -> float | None:
         """Seconds to wait before the next rewrite attempt, or None to give up."""
@@ -73,10 +78,11 @@ class RewritePolicy:
         delay = exc.retry_delay(
             task.attempts,
             cap=self.backoff_cap_s,
+            poll_fast=not legacy_cap,
             jitter=1.0 if legacy_cap else max(1.0, 0.5 * min(self.backoff_cap_s, 2.0**task.attempts)),
         )
         if legacy_cap:
-            return min(delay, max(0.0, task.created_at + 600 - now))
+            return min(delay, max(0.0, task.created_at + self.expiry_s - now))
         if now + delay - task.created_at > self.window_s:
             return None
         if task_deadline(task) - (now + delay) < self.render_reserve_s:
@@ -97,8 +103,14 @@ def task_deadline(task: ContextIRTask) -> float:
 
 def rewrite_policy(task: ContextIRTask) -> RewritePolicy:
     if task.request.model == AUTH_MODEL:
-        return RewritePolicy(None, REWRITE_RETRY_WINDOW_S, REWRITE_BACKOFF_CAP_S, RENDER_RESERVE_S)
-    return RewritePolicy(LEGACY_MAX_ATTEMPTS, 600.0, 30.0, 0.0)
+        return RewritePolicy(
+            None,
+            REWRITE_RETRY_WINDOW_S,
+            REWRITE_BACKOFF_CAP_S,
+            RENDER_RESERVE_S,
+            REWRITE_RETRY_WINDOW_S + ATTEMPT_TIMEOUT_S + EXPIRY_MARGIN_S,
+        )
+    return RewritePolicy(LEGACY_MAX_ATTEMPTS, LEGACY_EXPIRY_S, 30.0, 0.0, LEGACY_EXPIRY_S)
 
 
 async def settle_task(task: ContextIRTask) -> None:
@@ -317,7 +329,7 @@ class ContextIRService:
                 await self.settle(original)
             await self.finish(original.model_copy(update={"settled": True}), token)
             return
-        if original.result is None and time.time() - original.created_at > 600:
+        if original.result is None and time.time() - original.created_at > rewrite_policy(original).expiry_s:
             await self.fail(original, token, "Context IR task expired")
             return
         running = original.model_copy(update={"status": "running", "updated_at": int(time.time())})
@@ -342,7 +354,9 @@ class ContextIRService:
         attempted = running.model_copy(update={"attempts": running.attempts + 1})
         await self.store.save(attempted, token)
         try:
-            async with asyncio.timeout(max(0.0, min(155.0, attempted.created_at + 600 - time.time()))):
+            async with asyncio.timeout(
+                max(0.0, min(ATTEMPT_TIMEOUT_S, attempted.created_at + policy.expiry_s - time.time()))
+            ):
                 with stage("causyn.prompt.rewrite", attempt=attempted.attempts):
                     result = await self.rewrite(attempted.request)
         except RewriteError as exc:

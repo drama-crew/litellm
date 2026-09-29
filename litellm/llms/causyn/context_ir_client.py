@@ -188,6 +188,10 @@ SERVICE_MODEL = "h3-context-ir-online"
 DEFAULT_POLL_INTERVAL_S = 3.0
 # 调用点给单次 rewrite 的上限是 155s；留出提交与收尾的余量。
 DEFAULT_BUDGET_S = 120.0
+# 服务自己把整个任务限定在 840s 内（内部会重试上游 429）。单次调用只轮询 DEFAULT_BUDGET_S
+# （必须小于任务租约 LEASE），其余靠 poll=True 的 1s 重入接力；总等待由
+# context_ir.REWRITE_RETRY_WINDOW_S 兜底，它必须 >= SERVICE_TASK_BOUND_S + 余量。
+SERVICE_TASK_BOUND_S = 840.0
 
 
 async def rewrite_via_service(
@@ -244,7 +248,7 @@ async def rewrite_via_service(
             # 永久失败是终态；瞬时失败抛 retryable，外层退避后重入并走到下一个幂等键。
             raise _failure(task, retryable=is_transient_failure(task) and attempt < MAX_RESUBMISSIONS)
         if time.monotonic() >= deadline:
-            raise RewriteError(f"Context IR task {task_id} is still running", 503, retryable=True)
+            raise RewriteError(f"Context IR task {task_id} is still running", 503, retryable=True, poll=True)
         if poll_interval_s:
             await asyncio.sleep(poll_interval_s)
         task = await poll(task_id, base_url=base_url, api_key=api_key, http=http)
