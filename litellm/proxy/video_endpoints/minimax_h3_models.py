@@ -91,7 +91,6 @@ class MiniMaxH3Create(StrictModel):
     resolution: Resolution
     duration: int = Field(ge=4, le=15, strict=True)
     ratio: Ratio = "adaptive"
-    seed: int | None = Field(default=None, ge=0, le=4294967295)
     callback_url: str | None = None
 
     @model_validator(mode="after")

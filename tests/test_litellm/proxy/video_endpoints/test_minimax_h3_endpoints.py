@@ -119,14 +119,14 @@ def test_keyframe_role_order_and_h3_max_modes():
     assert MiniMaxH3Create.model_validate(body(duration=4)).duration == 4
 
 
-def test_reference_media_is_shaped_for_the_libtv_backend_without_seed_forwarded():
+def test_reference_media_is_shaped_for_the_libtv_backend():
     content = [
         body()["content"][0],
         {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
         {"type": "image_url", "image_url": {"url": "https://media.example/ref.png"}, "role": "reference_image"},
         {"type": "video_url", "video_url": {"url": "https://media.example/ref.mp4"}},
     ]
-    spec = MiniMaxH3Create.model_validate(body(content=content, seed=42))
+    spec = MiniMaxH3Create.model_validate(body(content=content))
     actual = spec.internal_body()
     assert "seed" not in actual
     assert actual["reference_images"] == ["https://media.example/ref.png"]
@@ -136,14 +136,9 @@ def test_reference_media_is_shaped_for_the_libtv_backend_without_seed_forwarded(
     assert "references" not in actual
 
 
-def test_seed_is_optional_and_omitted_when_absent():
-    actual = MiniMaxH3Create.model_validate(body()).internal_body()
-    assert "seed" not in actual
-
-
-@pytest.mark.parametrize("seed", [-1, 4294967296, 1.5])
-def test_seed_out_of_range_or_wrong_type_is_rejected(seed):
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize("seed", [42, -1, 4294967296, 1.5])
+def test_seed_is_rejected_as_an_unknown_field(seed):
+    with pytest.raises(ValueError, match="extra_forbidden"):
         MiniMaxH3Create.model_validate(body(seed=seed))
 
 
@@ -159,21 +154,27 @@ def test_per_type_reference_caps_are_enforced_but_total_cap_and_audio_pairing_ar
     MiniMaxH3Create.model_validate(body(content=body()["content"] + [audio_ref]))
 
 
-def test_end_to_end_mixed_references_are_grouped_by_type_without_seed_forwarded(api):
+def test_end_to_end_mixed_references_are_grouped_by_type(api):
     client, calls, _, _ = api
     content = body()["content"] + [
         {"type": "video_url", "video_url": {"url": "https://media.example/ref.mp4"}},
         {"type": "image_url", "image_url": {"url": "https://media.example/ref.png"}, "role": "reference_image"},
     ]
     result = client.post(
-        "/v2/video_generation", json=body(content=content, seed=7), headers={"Authorization": "Bearer allowed"}
+        "/v2/video_generation", json=body(content=content), headers={"Authorization": "Bearer allowed"}
     )
     assert result.status_code == 200, result.text
     submitted = calls[0][1]
-    assert "seed" not in submitted
     assert submitted["reference_videos"] == ["https://media.example/ref.mp4"]
     assert submitted["reference_images"] == ["https://media.example/ref.png"]
     assert submitted["parameters"] == {"modeType": "mixed2video"}
+
+
+def test_end_to_end_seed_on_the_libtv_route_is_rejected_with_400(api):
+    client, calls, _, _ = api
+    result = client.post("/v2/video_generation", json=body(seed=7), headers={"Authorization": "Bearer allowed"})
+    assert result.status_code == 400, result.text
+    assert not calls
 
 
 def test_task_authentication_and_expiry(monkeypatch):
