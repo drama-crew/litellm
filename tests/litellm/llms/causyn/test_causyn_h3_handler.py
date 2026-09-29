@@ -720,32 +720,26 @@ class TestBillingAcceptsTheGeometryThePipelineProduces:
     def test_landscape_canvas_is_accepted(self):
         from litellm.llms.causyn.handler import _result_geometry_matches
 
-        assert _result_geometry_matches(
-            self._metadata("16:9", "1344x756"), self._result(1344, 768)
-        ), "流水线产出 canvas，计费必须接受它，否则视频永远交付不了"
+        assert _result_geometry_matches(self._metadata("16:9", "1344x756"), self._result(1344, 768)), (
+            "流水线产出 canvas，计费必须接受它，否则视频永远交付不了"
+        )
 
     def test_portrait_canvas_is_accepted(self):
         from litellm.llms.causyn.handler import _result_geometry_matches
 
-        assert _result_geometry_matches(
-            self._metadata("9:16", "756x1344"), self._result(768, 1344)
-        )
+        assert _result_geometry_matches(self._metadata("9:16", "756x1344"), self._result(768, 1344))
 
     def test_the_cropped_output_is_still_accepted(self):
         """裁剪哪天接上了，也不能反过来被判成不匹配。"""
         from litellm.llms.causyn.handler import _result_geometry_matches
 
-        assert _result_geometry_matches(
-            self._metadata("16:9", "1344x756"), self._result(1344, 756)
-        )
+        assert _result_geometry_matches(self._metadata("16:9", "1344x756"), self._result(1344, 756))
 
     def test_an_unrelated_geometry_is_still_rejected(self):
         """放宽不等于放弃：与这个比例无关的尺寸仍须拒绝。"""
         from litellm.llms.causyn.handler import _result_geometry_matches
 
-        assert not _result_geometry_matches(
-            self._metadata("16:9", "1344x756"), self._result(640, 480)
-        )
+        assert not _result_geometry_matches(self._metadata("16:9", "1344x756"), self._result(640, 480))
 
 
 class TestAdmittedGeometriesSurviveAnyArkRollout:

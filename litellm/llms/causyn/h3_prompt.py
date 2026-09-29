@@ -7,6 +7,7 @@ import os
 import random
 import re
 import time
+from contextvars import ContextVar
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from importlib.resources import files
@@ -49,9 +50,13 @@ REFERENCE_FIELDS = (
 _SECRET_PATTERNS = (
     re.compile(r"(?i)bearer\s+\S+"),
     re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"(?i)\b(?:access[-_ ]?key(?:[-_ ]?(?:id|secret))?|secret|token|api[-_ ]?key|password)\s*[=:]\s*\S+"),
     re.compile(r"[A-Za-z0-9_\-]{32,}"),
 )
 _DETAIL_LIMIT = 160
+# Monotonic deadline of the rewrite attempt in flight; lets the context-ir service call
+# size its poll budget to what the attempt timeout still allows.
+ATTEMPT_DEADLINE: ContextVar[float | None] = ContextVar("causyn_attempt_deadline", default=None)
 
 
 def redact_provider_detail(value: object) -> str | None:
@@ -95,14 +100,18 @@ class RewriteError(Exception):
         self.poll = poll
         self.detail = redact_provider_detail(detail)
 
-    def describe(self) -> str:
-        """Message including the upstream status and short provider detail, for the stored error."""
+    def describe_upstream(self) -> str | None:
+        """Upstream status plus short redacted provider detail, for diagnosis (not public)."""
         extras = []
         if self.upstream_status is not None:
             extras.append(f"upstream {self.upstream_status}")
         if self.detail:
             extras.append(self.detail)
-        return f"{self} ({': '.join(extras)})" if extras else str(self)
+        return ": ".join(extras) or None
+
+    def describe(self) -> str:
+        detail = self.describe_upstream()
+        return f"{self} ({detail})" if detail else str(self)
 
     def retry_delay(
         self,
@@ -369,11 +378,18 @@ async def rewrite_prompt(spec: ContextIRRequest) -> RewriteResult:
     base_url = service.service_base_url()
     if base_url is None or not service.should_use_service(spec):
         return await _rewrite_single_shot(spec)
+    from litellm.llms.causyn.task_telemetry import current_task
+
+    kwargs = {}
+    deadline = ATTEMPT_DEADLINE.get()
+    if deadline is not None:
+        kwargs["budget_s"] = service.poll_budget(deadline - time.monotonic())
     async with httpx.AsyncClient(trust_env=False) as client:
         return await service.rewrite_via_service(
             spec,
             base_url=base_url,
             api_key=service.service_api_key(),
-            idempotency_key=service.idempotency_key_for(spec),
+            idempotency_key=service.idempotency_key_for(spec, current_task()),
             http=client,
+            **kwargs,
         )

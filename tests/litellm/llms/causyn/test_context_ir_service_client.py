@@ -405,13 +405,20 @@ class TestTransientFailureResubmission:
     async def _run(self, handler):
         async with _transport(handler) as http:
             return await client.rewrite_via_service(
-                _spec(), base_url="http://ctx:8030", api_key=None, idempotency_key="v", http=http,
-                poll_interval_s=0, budget_s=5,
+                _spec(),
+                base_url="http://ctx:8030",
+                api_key=None,
+                idempotency_key="v",
+                http=http,
+                poll_interval_s=0,
+                budget_s=5,
             )
 
     @pytest.mark.asyncio
     async def test_transient_failure_raises_retryable_then_reentry_uses_a_fresh_key(self):
-        handler, posts = self._service({"failed_step": "observations", "retryable": True, "error_kind": "upstream_transient"})
+        handler, posts = self._service(
+            {"failed_step": "observations", "retryable": True, "error_kind": "upstream_transient"}
+        )
         with pytest.raises(RewriteError) as caught:
             await self._run(handler)
         assert caught.value.retryable is True
@@ -444,7 +451,12 @@ class TestTransientFailureResubmission:
     @pytest.mark.asyncio
     async def test_upstream_status_from_the_service_is_recorded(self):
         handler, _ = self._service(
-            {"failed_step": "observations", "retryable": True, "error_kind": "upstream_transient", "upstream_status": 429}
+            {
+                "failed_step": "observations",
+                "retryable": True,
+                "error_kind": "upstream_transient",
+                "upstream_status": 429,
+            }
         )
         with pytest.raises(RewriteError) as caught:
             await self._run(handler)
@@ -468,9 +480,7 @@ class TestTransientFailureResubmission:
     @pytest.mark.asyncio
     async def test_resubmission_chain_is_bounded(self):
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                200, json={"id": "cir-x", "status": "failed", "failed_step": "s", "retryable": True}
-            )
+            return httpx.Response(200, json={"id": "cir-x", "status": "failed", "failed_step": "s", "retryable": True})
 
         with pytest.raises(RewriteError) as caught:
             await self._run(handler)

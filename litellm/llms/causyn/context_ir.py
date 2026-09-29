@@ -24,6 +24,7 @@ from litellm.llms.causyn.context_ir_store import (
     new_task_id,
 )
 from litellm.llms.causyn.h3_prompt import (
+    ATTEMPT_DEADLINE,
     AUTH_MODEL,
     PRICE_CREDITS,
     PUBLIC_MODEL,
@@ -55,7 +56,7 @@ ATTEMPT_TIMEOUT_S = 155.0
 EXPIRY_MARGIN_S = 85.0
 LEGACY_EXPIRY_S = 600.0
 REWRITE_BACKOFF_CAP_S = 60.0
-RENDER_RESERVE_S = 600.0
+RENDER_RESERVE_S = 1800.0
 DEFAULT_TASK_DEADLINE_S = 3600.0
 
 
@@ -66,6 +67,12 @@ class RewritePolicy:
     backoff_cap_s: float
     render_reserve_s: float
     expiry_s: float
+
+    def anchor(self, task: ContextIRTask, now: float) -> float:
+        """Where the retry window starts: queue entry for the legacy budget, the first attempt otherwise."""
+        if self.max_attempts is not None:
+            return float(task.created_at)
+        return task.rewrite_started_at if task.rewrite_started_at is not None else now
 
     def next_delay(self, task: ContextIRTask, exc: RewriteError, *, now: float | None = None) -> float | None:
         """Seconds to wait before the next rewrite attempt, or None to give up."""
@@ -82,8 +89,8 @@ class RewritePolicy:
             jitter=1.0 if legacy_cap else max(1.0, 0.5 * min(self.backoff_cap_s, 2.0**task.attempts)),
         )
         if legacy_cap:
-            return min(delay, max(0.0, task.created_at + self.expiry_s - now))
-        if now + delay - task.created_at > self.window_s:
+            return min(delay, max(0.0, self.anchor(task, now) + self.expiry_s - now))
+        if now + delay - self.anchor(task, now) > self.window_s:
             return None
         if task_deadline(task) - (now + delay) < self.render_reserve_s:
             return None
@@ -329,7 +336,7 @@ class ContextIRService:
                 await self.settle(original)
             await self.finish(original.model_copy(update={"settled": True}), token)
             return
-        if original.result is None and time.time() - original.created_at > rewrite_policy(original).expiry_s:
+        if original.result is None and self.expired(original):
             await self.fail(original, token, "Context IR task expired")
             return
         running = original.model_copy(update={"status": "running", "updated_at": int(time.time())})
@@ -343,22 +350,42 @@ class ContextIRService:
             return
         await self.rewrite_and_complete(running, token, defer_completion=defer_completion)
 
+    @staticmethod
+    def expired(task: ContextIRTask, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        policy = rewrite_policy(task)
+        if policy.max_attempts is not None:
+            return now - task.created_at > policy.expiry_s
+        # Queue wait does not eat the rewrite window, but a render must still fit.
+        if task_deadline(task) - now < policy.render_reserve_s:
+            return True
+        return task.rewrite_started_at is not None and now - task.rewrite_started_at > policy.expiry_s
+
     async def rewrite_and_complete(self, running: ContextIRTask, token: str, *, defer_completion: bool = False) -> None:
         task_id = running.id
         policy = rewrite_policy(running)
         if policy.max_attempts is not None and running.attempts >= policy.max_attempts:
             await self.fail(running, token, "H3 prompt rewrite retry limit exceeded")
             return
-        if running.attempts == 0:
+        now = time.time()
+        first_attempt = running.rewrite_started_at is None and running.attempts == 0
+        if first_attempt:
             interval("causyn.ir.queue", running.trace_created_ns or running.created_at * 1_000_000_000, time.time_ns())
+            running = running.model_copy(update={"rewrite_started_at": now if policy.max_attempts is None else None})
         attempted = running.model_copy(update={"attempts": running.attempts + 1})
         await self.store.save(attempted, token)
+        attempt_timeout = max(0.0, min(ATTEMPT_TIMEOUT_S, policy.anchor(attempted, now) + policy.expiry_s - now))
+        deadline_token = ATTEMPT_DEADLINE.set(time.monotonic() + attempt_timeout)
         try:
-            async with asyncio.timeout(
-                max(0.0, min(ATTEMPT_TIMEOUT_S, attempted.created_at + policy.expiry_s - time.time()))
-            ):
-                with stage("causyn.prompt.rewrite", attempt=attempted.attempts):
-                    result = await self.rewrite(attempted.request)
+            try:
+                async with asyncio.timeout(attempt_timeout):
+                    with stage("causyn.prompt.rewrite", attempt=attempted.attempts):
+                        result = await self.rewrite(attempted.request)
+            except TimeoutError as exc:
+                if policy.max_attempts is not None:
+                    raise
+                # 尝试超时不是终态：服务侧任务多半还在跑，走 poll 路径让窗口决定何时放弃。
+                raise RewriteError("H3 prompt rewrite attempt timed out", 503, retryable=True, poll=True) from exc
         except RewriteError as exc:
             delay = policy.next_delay(attempted, exc)
             if exc.retryable and delay is not None:
@@ -369,7 +396,13 @@ class ContextIRService:
                     exc.upstream_status,
                     delay,
                 )
-                await self.store.save(self.with_notification(attempted.model_copy(update={"status": "queued"})), token)
+                if exc.poll and policy.max_attempts is None:
+                    # 仍在运行的轮询重入不是失败：不涨退避指数，也不发 queued 通知。
+                    await self.store.save(attempted.model_copy(update={"attempts": running.attempts}), token)
+                else:
+                    await self.store.save(
+                        self.with_notification(attempted.model_copy(update={"status": "queued"})), token
+                    )
                 await self.store.retry(task_id, token, delay)
                 return
             logger.warning(
@@ -379,12 +412,14 @@ class ContextIRService:
                 exc.upstream_status,
                 exc.detail,
             )
-            await self.fail(attempted, token, exc.describe())
+            await self.fail(attempted, token, str(exc), detail=exc.describe_upstream())
             return
         except Exception:
             logger.exception("Context IR rewrite failed for %s", task_id)
             await self.fail(attempted, token, "H3 prompt rewrite failed")
             return
+        finally:
+            ATTEMPT_DEADLINE.reset(deadline_token)
         completed = attempted.model_copy(
             update={"result": result, "updated_at": int(time.time()), "rewrite_completed_ns": time.time_ns()}
         )
@@ -422,9 +457,11 @@ class ContextIRService:
             token,
         )
 
-    async def fail(self, task: ContextIRTask, token: str, message: str) -> None:
+    async def fail(self, task: ContextIRTask, token: str, message: str, *, detail: str | None = None) -> None:
         failed = self.with_notification(
-            task.model_copy(update={"status": "failed", "error": message, "updated_at": int(time.time())})
+            task.model_copy(
+                update={"status": "failed", "error": message, "error_detail": detail, "updated_at": int(time.time())}
+            )
         )
         failed = freeze_financial(failed)
         await self.store.save(failed, token)

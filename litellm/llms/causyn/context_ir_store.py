@@ -51,6 +51,10 @@ class ContextIRTask(BaseModel):
     status: Literal["queued", "running", "succeeded", "failed", "cancelled"] = "queued"
     result: RewriteResult | None = None
     error: str | None = None
+    # Redacted upstream status/message; stored for diagnosis, never in public().
+    error_detail: str | None = None
+    # Start of the first rewrite attempt (unix seconds); the retry window runs from here.
+    rewrite_started_at: float | None = None
     attempts: int = 0
     # 投递（进 GPU 队列）的重试计数，与改写的 attempts 分开。两个阶段的失败语义
     # 不同：改写失败有 3 次上限，投递遇到的是下游背压，上界由视频 deadline 决定。

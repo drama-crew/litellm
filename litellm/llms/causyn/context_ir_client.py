@@ -192,6 +192,13 @@ DEFAULT_BUDGET_S = 120.0
 # （必须小于任务租约 LEASE），其余靠 poll=True 的 1s 重入接力；总等待由
 # context_ir.REWRITE_RETRY_WINDOW_S 兜底，它必须 >= SERVICE_TASK_BOUND_S + 余量。
 SERVICE_TASK_BOUND_S = 840.0
+# 单次尝试超时里要留给提交（SUBMIT_TIMEOUT_S）和收尾的余量。
+ATTEMPT_MARGIN_S = 35.0
+
+
+def poll_budget(remaining_attempt_s: float) -> float:
+    """Poll budget that fits inside what is left of the attempt timeout."""
+    return max(1.0, min(DEFAULT_BUDGET_S, remaining_attempt_s - ATTEMPT_MARGIN_S))
 
 
 async def rewrite_via_service(
@@ -254,7 +261,7 @@ async def rewrite_via_service(
         task = await poll(task_id, base_url=base_url, api_key=api_key, http=http)
 
 
-def idempotency_key_for(spec: ContextIRRequest) -> str:
+def idempotency_key_for(spec: ContextIRRequest, task_id: str = "") -> str:
     """从请求内容派生幂等键。
 
     rewrite_prompt 拿不到任务 id，但同一个视频任务的 spec 是恒定的，所以内容哈希
@@ -268,6 +275,7 @@ def idempotency_key_for(spec: ContextIRRequest) -> str:
             str(spec.duration),
             str(spec.ratio),
             *[_media_url(item) for item in spec.ordered_media],
+            *([task_id] if task_id else []),
         ]
     )
     return hashlib.sha256(material.encode()).hexdigest()

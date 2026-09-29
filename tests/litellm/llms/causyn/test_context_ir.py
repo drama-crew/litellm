@@ -226,7 +226,7 @@ async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, 
         VideoSubmission(
             task_id=video_id,
             model="causyn-1.1",
-            deadline_ts=time.time() + 300,
+            deadline_ts=time.time() + 3600,
             request={"prompt": "A cat walks.", "duration_seconds": 5, "ratio": "16:9"},
             task_metadata={},
         ),
@@ -348,11 +348,10 @@ async def test_stored_base_era_task_over_the_relocated_causyn_caps_still_deseria
 async def test_causyn_1_1_create_rejects_the_relocated_reference_caps(redis, content):
     service = ContextIRService(ContextIRStore(redis), settle=no_settle)
     with pytest.raises(
-        RewriteError, match="reference audio requires at least one reference image or video|total reference count exceeds 12"
+        RewriteError,
+        match="reference audio requires at least one reference image or video|total reference count exceeds 12",
     ):
-        await service.create(
-            spec(model="causyn-1.1", content=content), owner="owner", billing=BillingIdentity()
-        )
+        await service.create(spec(model="causyn-1.1", content=content), owner="owner", billing=BillingIdentity())
 
 
 def test_audio_numbering_counts_only_explicit_audio_items_not_a_reference_videos_soundtrack():
@@ -1036,7 +1035,10 @@ async def test_render_saturation_reschedules_instead_of_failing_or_hot_looping(r
 
 
 def _image(n):
-    return [{"type": "image_url", "image_url": {"url": f"https://media.example/{i}.png"}, "role": "reference_image"} for i in range(n)]
+    return [
+        {"type": "image_url", "image_url": {"url": f"https://media.example/{i}.png"}, "role": "reference_image"}
+        for i in range(n)
+    ]
 
 
 VIDEO_ITEM = {"type": "video_url", "video_url": {"url": "https://media.example/a.mp4"}}
@@ -1139,7 +1141,10 @@ def test_causyn_rewrite_backoff_grows_and_is_capped_at_sixty_seconds(monkeypatch
 
     monkeypatch.setattr(h3_prompt.random, "uniform", lambda a, b: 0.0)
     policy = rewrite_policy(_causyn_task())
-    delays = [policy.next_delay(_causyn_task(attempts=n), _rate_limited(), now=_causyn_task().created_at) for n in (1, 2, 3, 5, 9)]
+    delays = [
+        policy.next_delay(_causyn_task(attempts=n), _rate_limited(), now=_causyn_task().created_at)
+        for n in (1, 2, 3, 5, 9)
+    ]
     assert delays == [2.0, 4.0, 8.0, 32.0, 60.0]
 
 
@@ -1155,13 +1160,14 @@ def test_causyn_rewrite_gives_up_after_the_retry_window():
     from litellm.llms.causyn.context_ir import REWRITE_RETRY_WINDOW_S, rewrite_policy
 
     task = _causyn_task(attempts=4)
+    task = task.model_copy(update={"rewrite_started_at": float(task.created_at)})
     assert rewrite_policy(task).next_delay(task, _rate_limited(), now=task.created_at + REWRITE_RETRY_WINDOW_S) is None
 
 
 def test_causyn_rewrite_gives_up_when_a_render_no_longer_fits_the_deadline():
     from litellm.llms.causyn.context_ir import rewrite_policy
 
-    task = _causyn_task(attempts=2, video_payload={"deadline_ts": _causyn_task().created_at + 300})
+    task = _causyn_task(attempts=2, video_payload={"deadline_ts": _causyn_task().created_at + 1700})
     assert rewrite_policy(task).next_delay(task, _rate_limited(), now=task.created_at + 10) is None
 
 
@@ -1220,9 +1226,12 @@ async def test_stored_error_records_upstream_status_and_redacted_detail(redis):
     service = ContextIRService(ContextIRStore(redis), rewrite=limited, settle=no_settle)
     task = await service.create(spec(model="causyn-1.1"), owner="owner", billing=BillingIdentity())
     await service.process(task.id)
-    error = (await service.store.get(task.id)).error
-    assert "upstream 400" in error and "bad key" in error
-    assert "sk-abcdefghijklmnop" not in error
+    stored = await service.store.get(task.id)
+    assert "upstream 400" in stored.error_detail and "bad key" in stored.error_detail
+    assert "sk-abcdefghijklmnop" not in stored.error_detail
+    # public status keeps exposing only the original short message
+    assert stored.error == "H3 prompt rewrite provider unavailable"
+    assert "upstream" not in json.dumps(stored.public())
 
 
 @pytest.mark.asyncio
@@ -1257,6 +1266,7 @@ def test_still_running_poll_is_rescheduled_quickly_until_the_service_bound():
     from litellm.llms.causyn.context_ir import rewrite_policy
 
     task = _causyn_task(attempts=9)
+    task = task.model_copy(update={"rewrite_started_at": float(task.created_at)})
     still_running = RewriteError("Context IR task x is still running", 503, retryable=True, poll=True)
     policy = rewrite_policy(task)
     assert policy.next_delay(task, still_running, now=task.created_at + 840) == 1.0
@@ -1269,3 +1279,113 @@ def test_minimax_h3_poll_error_keeps_legacy_backoff():
     task = _causyn_task(request=spec(), attempts=1)
     still_running = RewriteError("still running", 503, retryable=True, poll=True)
     assert rewrite_policy(task).next_delay(task, still_running, now=task.created_at) >= 2.0
+
+
+def test_queue_wait_does_not_consume_the_rewrite_window():
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    task = _causyn_task(attempts=1)
+    started = task.created_at + 1000  # sat in the queue for 1000s first
+    task = task.model_copy(update={"rewrite_started_at": float(started)})
+    assert rewrite_policy(task).next_delay(task, _rate_limited(), now=started + 30) is not None
+    assert not ContextIRService.expired(task, now=started + 30)
+
+
+def test_task_expires_when_a_render_no_longer_fits_even_before_the_first_attempt():
+    task = _causyn_task()
+    assert ContextIRService.expired(task, now=task.created_at + 3600 - 1799)
+    assert not ContextIRService.expired(task, now=task.created_at + 3600 - 1801)
+
+
+def test_render_reserve_covers_a_heavy_render():
+    from litellm.llms.causyn.context_ir import RENDER_RESERVE_S
+
+    assert RENDER_RESERVE_S == 1800.0
+
+
+@pytest.mark.asyncio
+async def test_first_attempt_records_when_rewriting_started(redis):
+    seen = {}
+
+    async def slow(request):
+        seen["started"] = (await service.store.get(task.id)).rewrite_started_at
+        return RESULT
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=slow, settle=no_settle)
+    task = await service.create(spec(model="causyn-1.1"), owner="owner", billing=BillingIdentity())
+    await service.process(task.id)
+    assert seen["started"] is not None
+
+
+@pytest.mark.asyncio
+async def test_attempt_timeout_is_retried_not_failed(redis, monkeypatch):
+    from litellm.llms.causyn import context_ir
+
+    monkeypatch.setattr(context_ir, "ATTEMPT_TIMEOUT_S", 0.05)
+    calls = Counter()
+
+    async def hang_then_ok(request):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await asyncio.sleep(5)
+        return RESULT
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=hang_then_ok, settle=no_settle)
+    task = await service.create(spec(model="causyn-1.1"), owner="owner", billing=BillingIdentity())
+    await service.process(task.id)
+    assert (await service.store.get(task.id)).status == "running"
+    await asyncio.sleep(1.2)  # poll-style 1s re-entry
+    await service.process(task.id)
+    assert (await service.store.get(task.id)).status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_poll_reentry_keeps_attempts_and_sends_no_notifications(redis):
+    calls = Counter()
+
+    async def running_then_ok(request):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise RewriteError("still running", 503, retryable=True, poll=True)
+        return RESULT
+
+    sent = []
+
+    async def notify(url, body):
+        sent.append(body["task"]["status"])
+        return True
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=running_then_ok, settle=no_settle, notify=notify)
+    task = await service.create(
+        spec(model="causyn-1.1", callback_url="https://example.com/cb"), owner="owner", billing=BillingIdentity()
+    )
+    await service.process(task.id)
+    after_first = await service.store.get(task.id)
+    assert after_first.attempts == 0
+    await asyncio.sleep(1.1)
+    await service.process(task.id)
+    assert (await service.store.get(task.id)).attempts == 0
+    assert "queued" not in sent[1:]  # only the creation notification may be queued
+
+
+def test_context_ir_key_is_scoped_per_task_and_stable():
+    from litellm.llms.causyn import context_ir_client as service
+
+    request = spec(model="causyn-1.1")
+    assert service.idempotency_key_for(request, "h3_ir_a") != service.idempotency_key_for(request, "h3_ir_b")
+    assert service.idempotency_key_for(request, "h3_ir_a") == service.idempotency_key_for(request, "h3_ir_a")
+
+
+def test_poll_budget_fits_inside_the_attempt_timeout():
+    from litellm.llms.causyn import context_ir_client as service
+
+    assert service.poll_budget(155.0) == 120.0
+    assert service.poll_budget(60.0) == 25.0
+    assert service.poll_budget(10.0) == 1.0
+
+
+def test_redaction_covers_short_access_keys():
+    from litellm.llms.causyn.h3_prompt import redact_provider_detail
+
+    out = redact_provider_detail("denied AccessKeyId=LTAI5tAbCdEf12 and api_key: abc123")
+    assert "LTAI5tAbCdEf12" not in out and "abc123" not in out
