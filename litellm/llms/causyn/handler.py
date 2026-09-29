@@ -566,14 +566,17 @@ def _source_resolution(spec: _ModelSpec, ratio: str) -> str:
 GeometryProfile: TypeAlias = Literal["vdn-adaptive-v1", "hyperflow-official-v1"]
 
 
+def _frames_for_duration(duration: int) -> int:
+    return duration * 24 + (5 - duration * 24) % 17
+
+
 def _vdn_source_resolution(ratio: str, duration: int, geometry_profile: GeometryProfile) -> str:
     if ratio == "adaptive":
         return "adaptive"
     if geometry_profile == "hyperflow-official-v1":
         geometry = GEOMETRIES[ratio]
         return f"{geometry.width}x{geometry.height}"
-    frames = duration * 24 + (5 - duration * 24) % 17
-    geometry = resolve_geometry(ratio=ratio, frames=frames)
+    geometry = resolve_geometry(ratio=ratio, frames=_frames_for_duration(duration))
     return f"{geometry.output_width}x{geometry.output_height}"
 
 
@@ -875,8 +878,40 @@ def _metadata_resolution(metadata: _TaskMetadata) -> tuple[str, str]:
     return metadata.requested_resolution, metadata.source_resolution
 
 
+def _h3_ratio_and_duration(metadata: _TaskMetadata) -> tuple[str, int] | tuple[None, None]:
+    if isinstance(metadata, _DurableTaskMetadataV3):
+        return metadata.ratio, round(metadata.duration_seconds)
+    if isinstance(metadata, _DurableTaskMetadataV4) and metadata.ratio != "adaptive":
+        return metadata.ratio, round(metadata.duration_seconds)
+    return None, None
+
+
+def _known_ark_geometries(ratio: str, duration: int) -> frozenset[str]:
+    """这个 ratio+duration 下，三种已知 ARK 后端各自可能交付的几何。
+
+    任务持久化时记录的 `geometry_profile` 只用于写入时的自我一致性检查
+    （见 `_requires_h3_contract`），不代表任务实际经过的 ARK 一定是那个
+    后端——灰度切换、回滚都会让两者不一致，而 ARK 后端由部署环境变量
+    `H3_ARK_BACKEND` 独立选择，LiteLLM 侧完全没有这个信号。
+
+    所以交付判定改成按 ratio+duration 接受所有已知后端的几何，与记录的
+    profile 无关：hyperflow8 的固定 canvas（与 duration 无关）、vdn8 按像素
+    预算收缩后的 canvas 与 output（duration 越长收缩越明显），以及旧
+    （非 vdn）h3 后端的单一几何。"""
+    hyperflow = GEOMETRIES[ratio]
+    vdn = resolve_geometry(ratio=ratio, frames=_frames_for_duration(duration))
+    return frozenset(
+        {
+            f"{hyperflow.width}x{hyperflow.height}",
+            f"{vdn.width}x{vdn.height}",
+            f"{vdn.output_width}x{vdn.output_height}",
+            _h3_source_resolution(ratio),
+        }
+    )
+
+
 def _admitted_geometries(metadata: _TaskMetadata, source_resolution: str) -> set[str]:
-    """这个比例下允许的成品几何。
+    """这个任务允许的成品几何。
 
     几何表把 canvas 和 output 分开：16:9 的 canvas 是 1344x768，output 是
     1344x756（1344x768 其实是 7:4）。真 16:9 要裁到 756，而 756 不是 32 的倍数、
@@ -892,11 +927,19 @@ def _admitted_geometries(metadata: _TaskMetadata, source_resolution: str) -> set
 
     注意这不解决"用户要 16:9 拿到 7:4"——那是缺失的裁剪造成的，与本函数无关，
     改不改这里画面比例都一样。这里只决定已经生成的视频能不能交付。
+
+    对固定比例的 H3 任务（V3、V4 非 adaptive），进一步接受该 ratio+duration 下
+    每一个已知 ARK 后端可能产生的几何（见 `_known_ark_geometries`），与任务
+    自己记录的 `geometry_profile` 无关，这样任务才能在 ARK/LiteLLM 的任意
+    发布顺序或回滚下都正常结算。
     """
     admitted = {source_resolution}
     for geometry in (*GEOMETRIES.values(), LEGACY):
         if f"{geometry.output_width}x{geometry.output_height}" == source_resolution:
             admitted.add(f"{geometry.width}x{geometry.height}")
+    ratio, duration = _h3_ratio_and_duration(metadata)
+    if ratio is not None and duration is not None:
+        admitted |= _known_ark_geometries(ratio, duration)
     return admitted
 
 

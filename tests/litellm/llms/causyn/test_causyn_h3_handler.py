@@ -748,6 +748,112 @@ class TestBillingAcceptsTheGeometryThePipelineProduces:
         )
 
 
+class TestAdmittedGeometriesSurviveAnyArkRollout:
+    """I-A：几何 profile 只是记账用的审计字段，不能决定任务能否交付。
+
+    生产 ARK 在 hyperflow8、vdn8（vdn-adaptive-v1）与旧版非 vdn 的 h3 后端之间
+    切换时不会通知 LiteLLM，回滚也一样。持久化的 `geometry_profile` 只反映任务
+    创建那一刻的假设；worker 最终按哪台 ARK 的几何交付，`_admitted_geometries`
+    必须与之独立，接受三套后端已知会产出的每一种几何。
+    """
+
+    @staticmethod
+    def _metadata(ratio: str, geometry_profile: str, source: str, duration: float = 15.0):
+        from litellm.llms.causyn.handler import _DurableTaskMetadataV4
+
+        return _DurableTaskMetadataV4.model_validate(
+            {
+                "version": "causyn-video-billing-v4",
+                "geometry_profile": geometry_profile,
+                "model": "causyn-1.1",
+                "duration_seconds": duration,
+                "source_resolution": source,
+                "requested_resolution": "768p",
+                "ratio": ratio,
+                "pricing": {"id": "causyn-1-1", "model": "causyn-1.1", "output_cost_per_second_768p": 5.0},
+                "attribution": {"api_key": None, "user_id": None, "team_id": None, "organization_id": None},
+            }
+        )
+
+    @staticmethod
+    def _result(width: int, height: int):
+        from litellm.llms.causyn.handler import _WorkerResult
+
+        return _WorkerResult.model_validate(
+            {
+                "validation_version": "video-v1",
+                "staging_key": "staging/x.mp4",
+                "etag": '"0"',
+                "bytes": 1,
+                "content_type": "video/mp4",
+                "duration_seconds": 15.2,
+                "width": width,
+                "height": height,
+                "sha256": "0" * 64,
+            }
+        )
+
+    @staticmethod
+    def _vdn_canvas(ratio: str, duration: int):
+        frames = duration * 24 + (5 - duration * 24) % 17
+        return mod.resolve_geometry(ratio=ratio, frames=frames)
+
+    def test_a_new_profile_task_delivered_at_the_vdn_canvas_geometry_settles(self):
+        """15s、16:9 上，hyperflow 的固定 canvas（1344x768）与 vdn-adaptive-v1
+        按像素预算收缩出的 canvas（992x576）截然不同。记录的是新 profile，但
+        回滚后由一台 vdn8 ARK 交付——必须仍然结算。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        duration = 15
+        vdn_canvas = self._vdn_canvas("16:9", duration)
+        source = mod._vdn_source_resolution("16:9", duration, "hyperflow-official-v1")
+        assert _result_geometry_matches(
+            self._metadata("16:9", "hyperflow-official-v1", source, duration=duration),
+            self._result(vdn_canvas.width, vdn_canvas.height),
+        )
+
+    def test_an_old_profile_task_delivered_at_the_hyperflow_canvas_still_settles(self):
+        """反方向：记录的是旧 profile（vdn-adaptive-v1 收缩后的几何），但一台
+        hyperflow8 ARK 按官方固定 canvas 交付——例如任务在后端切换前后被重试。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        duration = 15
+        hyperflow = mod.GEOMETRIES["16:9"]
+        source = mod._vdn_source_resolution("16:9", duration, "vdn-adaptive-v1")
+        assert _result_geometry_matches(
+            self._metadata("16:9", "vdn-adaptive-v1", source, duration=duration),
+            self._result(hyperflow.width, hyperflow.height),
+        )
+
+    def test_a_legacy_non_vdn_h3_backend_delivering_21_9_settles_regardless_of_profile(self):
+        """生产 ARK 环境曾经跑过不带 vdn 的旧 h3 后端；它对 21:9 的几何是
+        1792x768（`_h3_source_resolution`），既不是 hyperflow 也不是 vdn-adaptive-v1
+        算出的几何。两种记录的 profile 都必须接受它。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        duration = 15
+        hyperflow_source = mod._vdn_source_resolution("21:9", duration, "hyperflow-official-v1")
+        vdn_source = mod._vdn_source_resolution("21:9", duration, "vdn-adaptive-v1")
+        assert _result_geometry_matches(
+            self._metadata("21:9", "hyperflow-official-v1", hyperflow_source, duration=duration),
+            self._result(1792, 768),
+        )
+        assert _result_geometry_matches(
+            self._metadata("21:9", "vdn-adaptive-v1", vdn_source, duration=duration),
+            self._result(1792, 768),
+        )
+
+    def test_a_geometry_unrelated_to_any_known_ark_backend_is_still_rejected(self):
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        duration = 15
+        source = mod._vdn_source_resolution("16:9", duration, "hyperflow-official-v1")
+        assert not _result_geometry_matches(
+            self._metadata("16:9", "hyperflow-official-v1", source, duration=duration),
+            self._result(640, 480),
+        )
+
+
 class TestGeometryProfileOnPersistedMetadata:
     """C3: geometry_profile 必须真的接进校验，旧任务与新任务各走各的公式。"""
 
