@@ -123,12 +123,15 @@ async def test_maps_openai_params_onto_the_task_envelope(enqueued):
 
 
 @pytest.mark.asyncio
-async def test_the_vdn8_backed_model_only_supports_3_2_and_rejects_21_9(enqueued):
-    """causyn-1.0 renders on the vdn8 worker, whose ARK geometry table has no
-    21:9 entry. HyperFlow's 21:9 is only wired up for causyn-1.1 (h3_media's
-    GEOMETRIES); causyn-1.0's model spec still advertises the single 3:2
-    ratio, so the generic aspect_ratio allowlist in _request already turns
-    21:9 away with a 400 before it can reach the vdn8 worker."""
+async def test_causyn_1_0_only_supports_3_2_and_rejects_21_9(enqueued):
+    """causyn-1.0's model spec advertises a single ratio (3:2), so the generic
+    aspect_ratio allowlist in _request turns anything else away with a 400.
+    This is unrelated to which ARK backend is deployed: causyn-1.1, not
+    causyn-1.0, is the model ARK's vdn8 backend actually serves, and
+    causyn-1.1 accepts 21:9 at submit time regardless of backend (see
+    tests/litellm/llms/causyn/test_causyn_h3_handler.py,
+    test_text_only_accepts_21_9_as_one_of_the_six_deployed_ratios and
+    TestAdmittedGeometriesSurviveAnyArkRollout)."""
     with pytest.raises(CustomLLMError) as error:
         await CausynVideoHandler().avideo_generation(
             model="causyn-1.0",

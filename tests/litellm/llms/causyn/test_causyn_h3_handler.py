@@ -853,6 +853,26 @@ class TestAdmittedGeometriesSurviveAnyArkRollout:
             self._result(640, 480),
         )
 
+    def test_a_genuine_vdn8_native_21_9_canvas_settles_regardless_of_profile(self):
+        """causyn-1.1 是真正跑在 vdn8 上的型号，而 vdn8 自己的几何公式
+        (`vdn_geometry.GEOMETRIES`) 本就有一条原生 21:9 几何——与旧版非 vdn
+        h3 后端的 1792x768 是两码事，且随 duration 收缩。无论持久化的
+        profile 是哪个，vdn8 真实交付的这张 canvas 都必须结算。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        duration = 15
+        vdn_native = self._vdn_canvas("21:9", duration)
+        hyperflow_source = mod._vdn_source_resolution("21:9", duration, "hyperflow-official-v1")
+        vdn_source = mod._vdn_source_resolution("21:9", duration, "vdn-adaptive-v1")
+        assert _result_geometry_matches(
+            self._metadata("21:9", "hyperflow-official-v1", hyperflow_source, duration=duration),
+            self._result(vdn_native.width, vdn_native.height),
+        )
+        assert _result_geometry_matches(
+            self._metadata("21:9", "vdn-adaptive-v1", vdn_source, duration=duration),
+            self._result(vdn_native.width, vdn_native.height),
+        )
+
 
 class TestAdaptiveGeometryWindowMatchesArkRounding:
     """I-C：FL2VA 的宽高比窗口曾用 0.399-2.506 这两个写死的数字，但 ARK 的
