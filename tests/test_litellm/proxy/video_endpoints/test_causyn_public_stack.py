@@ -550,10 +550,10 @@ def test_legacy_causyn_id_and_other_provider_encoding_remain_decodable() -> None
 
 @pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
 @pytest.mark.parametrize("roles", [("first_frame", "last_frame"), ("reference_image", "reference_image")])
-def test_direct_create_uses_real_auth_router_and_handler(stack, roles):
+def test_direct_create_uses_real_auth_and_never_bypasses_moderation(stack, roles):
     prompt = "  Gentle waves.\n海浪声。  "
     payload = {
-        "model": "causyn-1.1",
+        "model": "minimax-h3",
         "resolution": "768P",
         "duration": 5,
         "ratio": "16:9",
@@ -571,14 +571,8 @@ def test_direct_create_uses_real_auth_router_and_handler(stack, roles):
     created = stack.client.post(
         "/video/minimax-h3/direct/v2/video_generation", json=payload, headers=_auth_headers(stack.allowed_key)
     )
-    assert created.status_code == 200, created.text
-    assert len(stack.state.enqueued) == 1
-    actual = stack.state.enqueued[0]
-    assert actual["request"]["prompt"] == prompt
-    assert actual["request"]["prompt_processing"] == "direct"
-    assert actual["task_metadata"]["context_ir_task_id"] is None
-    assert actual["task_metadata"]["pricing"]["model"] == "causyn-1.1"
-    assert actual["task_metadata"]["attribution"]["api_key"] == hash_token(stack.allowed_key)
+    assert created.status_code == 503, created.text
+    assert not stack.state.enqueued
 
 
 @pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
