@@ -9,7 +9,14 @@ import pytest
 from PIL import Image
 
 from litellm.llms.causyn.context_ir_callback import verify_callback
-from litellm.llms.causyn.h3_media import fetch_media, inspect_audio, inspect_video, prepare_image, prepare_media
+from litellm.llms.causyn.h3_media import (
+    BASE_VIDEO_LIMITS,
+    fetch_media,
+    inspect_audio,
+    inspect_video,
+    prepare_image,
+    prepare_media,
+)
 from litellm.llms.causyn.h3_prompt import ContextIRRequest, RewriteError, validate_prompt
 
 
@@ -156,10 +163,10 @@ def test_image_limits_are_checked_before_thumbnail():
 
 
 def test_video_codec_geometry_fps_and_duration():
-    assert inspect_video(clip()) == 2
+    assert inspect_video(clip(), BASE_VIDEO_LIMITS) == 2
     for raw in (clip(seconds=1), clip(fps=20)):
         with pytest.raises(RewriteError):
-            inspect_video(raw)
+            inspect_video(raw, BASE_VIDEO_LIMITS)
 
 
 @pytest.mark.parametrize("name", sorted(AUDIO_FORMATS))
@@ -313,18 +320,47 @@ def video_item(seconds):
     return {"type": "video_url", "video_url": {"url": url}}
 
 
-def test_inspect_video_max_seconds_is_parametrised():
-    assert inspect_video(clip(seconds=6)) == 6
-    with pytest.raises(RewriteError, match="2-5 seconds"):
-        inspect_video(clip(seconds=6), 5)
-    assert inspect_video(clip(seconds=5), 5) == 5
+def test_inspect_video_limits_are_required_and_tolerance_is_per_model():
+    from litellm.llms.causyn.h3_media import BASE_VIDEO_LIMITS, CAUSYN_VIDEO_LIMITS
+
+    assert inspect_video(clip(seconds=6), BASE_VIDEO_LIMITS) == 6
+    with pytest.raises(RewriteError, match=r"measured 6.0s; each must be 2-5 seconds"):
+        inspect_video(clip(seconds=6), CAUSYN_VIDEO_LIMITS)
+    assert inspect_video(clip(seconds=5), CAUSYN_VIDEO_LIMITS) == 5
+
+
+def _fractional_clip(seconds, fps=25):
+    return clip_frames(round(seconds * fps), fps)
+
+
+def clip_frames(frames, fps):
+    output = io.BytesIO()
+    with av.open(output, "w", format="mp4") as container:
+        stream = container.add_stream("libx264", rate=fps)
+        stream.width = stream.height = 256
+        stream.pix_fmt = "yuv420p"
+        for _ in range(frames):
+            for packet in stream.encode(av.VideoFrame.from_image(Image.new("RGB", (256, 256), "red"))):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return output.getvalue()
+
+
+def test_causyn_video_tolerance_is_point_one_second_and_base_keeps_epsilon():
+    from litellm.llms.causyn.h3_media import BASE_VIDEO_LIMITS, CAUSYN_VIDEO_LIMITS
+
+    assert inspect_video(_fractional_clip(5.04), CAUSYN_VIDEO_LIMITS) == pytest.approx(5.04, abs=0.02)
+    with pytest.raises(RewriteError, match=r"measured 5\.2s; each must be 2-5 seconds"):
+        inspect_video(_fractional_clip(5.2), CAUSYN_VIDEO_LIMITS)
+    assert inspect_video(_fractional_clip(5.2), BASE_VIDEO_LIMITS) == pytest.approx(5.2, abs=0.02)
 
 
 @pytest.mark.asyncio
 async def test_causyn_1_1_rejects_a_reference_video_longer_than_five_seconds():
     async with httpx.AsyncClient(trust_env=False) as client:
         await prepare_media(client, causyn_request([video_item(5)]))
-        with pytest.raises(RewriteError, match="2-5 seconds"):
+        with pytest.raises(RewriteError, match="each must be 2-5 seconds"):
             await prepare_media(client, causyn_request([video_item(6)]))
         # the public MiniMax-H3 / LibTV path keeps the 2-15 s window
         await prepare_media(client, request([video_item(6)]))

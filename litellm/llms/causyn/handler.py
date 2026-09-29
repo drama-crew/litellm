@@ -171,10 +171,9 @@ _MODEL_SPECS: Mapping[str, _ModelSpec] = MappingProxyType(
             ratios=CAUSYN_H3_RATIOS,
             duration_min=5,
             duration_max=15,
-            # One admitted 15s request measured 420.368s P100 and uses a 600s
-            # H3 execution cap. This deadline starts earlier, at queue entry,
-            # so it is 60 minutes to cover the ~26 min heaviest ref2va run plus
-            # waiting behind prior jobs at the measured production concurrency. Keep it independent
+            # The deadline starts at queue entry, so it covers waiting behind
+            # prior jobs plus the run itself (heaviest ref2va ~26 min, H3
+            # execution cap 600s for a plain 15s request). Keep it independent
             # from the historical 1.0 pipeline and the downstream call cap.
             deadline_seconds=CAUSYN_H3_DEADLINE_SECONDS,
             native_audio_required=True,

@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import math
+from typing import NamedTuple
 
 import httpx
 from pydantic import TypeAdapter
@@ -73,7 +74,21 @@ def prepare_image(raw: bytes) -> str:
             return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
 
 
-def inspect_video(raw: bytes, max_seconds: float = 15) -> float:
+class VideoLimits(NamedTuple):
+    """Nominal reference-video limits plus the tolerance applied to measured durations."""
+
+    min_each: float
+    max_each: float
+    max_total: float
+    tolerance: float
+
+
+BASE_VIDEO_LIMITS = VideoLimits(2.0, 15.0, 15.0, 1e-6)
+# causyn-1.1 runs on the 2-GPU Ref2VA lane; 0.1 s tolerance is shared with ARK and the platform backend.
+CAUSYN_VIDEO_LIMITS = VideoLimits(2.0, CAUSYN_VIDEO_REF_MAX_SECONDS, CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS, 0.1)
+
+
+def inspect_video(raw: bytes, limits: VideoLimits) -> float:
     import av
 
     with av.open(io.BytesIO(raw), mode="r", format="mov", options={"enable_drefs": "0"}) as container:
@@ -89,8 +104,14 @@ def inspect_video(raw: bytes, max_seconds: float = 15) -> float:
         if not 23.976 <= fps <= 60:
             raise RewriteError("Reference video frame rate must be 23.976-60 fps", 400)
         duration = float(container.duration or 0) / av.time_base
-        if not math.isfinite(duration) or not 2 <= duration <= max_seconds + 1e-6:
-            raise RewriteError(f"Each reference video must last 2-{max_seconds:g} seconds", 400)
+        if not math.isfinite(duration) or not (
+            limits.min_each - limits.tolerance <= duration <= limits.max_each + limits.tolerance
+        ):
+            raise RewriteError(
+                f"reference video measured {duration:.1f}s; each must be "
+                f"{limits.min_each:g}-{limits.max_each:g} seconds",
+                400,
+            )
         return duration
 
 
@@ -111,14 +132,14 @@ def inspect_audio(raw: bytes) -> float:
 
 
 async def prepare_reference(
-    client: httpx.AsyncClient, item: ImageItem | VideoItem, video_max_seconds: float = 15
+    client: httpx.AsyncClient, item: ImageItem | VideoItem, limits: VideoLimits
 ) -> tuple[ImageItem | VideoItem, float]:
     if isinstance(item, ImageItem):
         raw = await fetch_media(client, item.image_url.url, 30 * 1024 * 1024)
         url = await asyncio.to_thread(prepare_image, raw)
         return item.model_copy(update={"image_url": MediaURL(url=url)}), 0.0
     raw = await fetch_media(client, item.video_url.url, 50 * 1024 * 1024)
-    duration = await asyncio.to_thread(inspect_video, raw, video_max_seconds)
+    duration = await asyncio.to_thread(inspect_video, raw, limits)
     url = "data:video/mp4;base64," + base64.b64encode(raw).decode("ascii")
     return item.model_copy(update={"video_url": MediaURL(url=url)}), duration
 
@@ -130,16 +151,12 @@ async def prepare_audio(client: httpx.AsyncClient, item: AudioItem) -> tuple[Aud
 
 
 async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> ContextIRRequest:
-    # causyn-1.1 runs on the 2-GPU Ref2VA lane, which only fits 5 s of reference
-    # video in total; the public MiniMax-H3 / LibTV path keeps 2-15 s / 15 s.
-    video_each, video_total = (
-        (CAUSYN_VIDEO_REF_MAX_SECONDS, CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS) if spec.model == AUTH_MODEL else (15.0, 15.0)
-    )
+    limits = CAUSYN_VIDEO_LIMITS if spec.model == AUTH_MODEL else BASE_VIDEO_LIMITS
     try:
         async with asyncio.timeout(60):
             prepared = tuple(
                 [
-                    await prepare_reference(client, item, video_each)
+                    await prepare_reference(client, item, limits)
                     if isinstance(item, (ImageItem, VideoItem))
                     else await prepare_audio(client, item)
                     if isinstance(item, AudioItem)
@@ -147,8 +164,11 @@ async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> Co
                     for item in spec.content
                 ]
             )
-        if sum(duration for item, duration in prepared if isinstance(item, VideoItem)) > video_total + 0.000001:
-            raise RewriteError(f"Combined reference video duration exceeds {video_total:g} seconds", 400)
+        if (
+            sum(duration for item, duration in prepared if isinstance(item, VideoItem))
+            > limits.max_total + limits.tolerance
+        ):
+            raise RewriteError(f"Combined reference video duration exceeds {limits.max_total:g} seconds", 400)
         if sum(duration for item, duration in prepared if isinstance(item, AudioItem)) > 15.000001:
             raise RewriteError("Combined reference audio duration exceeds 15 seconds", 400)
         return spec.model_copy(update={"content": tuple(item for item, _ in prepared)})
