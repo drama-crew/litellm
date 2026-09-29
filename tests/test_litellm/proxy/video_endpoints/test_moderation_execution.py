@@ -270,3 +270,41 @@ async def test_actual_endpoint_error_wrapping_preserves_submission_evidence(monk
         )
     assert isinstance(wrapped.value, (HTTPException, ProxyException))
     assert execution.failure_outcome(wrapped.value) == expected
+
+
+@pytest.mark.asyncio
+async def test_settlement_without_admission_is_typed_404(monkeypatch):
+    import time
+    import jwt
+    import httpx
+    from types import SimpleNamespace
+    from fastapi import FastAPI
+    from litellm.proxy.video_endpoints import moderation_execution as execution, moderation_metering_runtime as runtime
+    from litellm.proxy.video_endpoints.moderation_metering import MeteringStore
+
+    class EmptyDb:
+        async def query_raw(self, *args):
+            return []
+
+    meter = MeteringStore.__new__(MeteringStore)
+    meter.db = EmptyDb()
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    secret = "synthetic-settlement-secret-long-enough-32-bytes"
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", secret)
+
+    async def platform(request, method, path, payload):
+        return dict(binding=None, native_id="native", events={})
+
+    monkeypatch.setattr(execution.bridge, "platform", platform)
+    app = FastAPI()
+    app.include_router(execution.router)
+    token = jwt.encode(
+        dict(intent_id="never-admitted", request_digest="digest", input_digest="input", model="video",
+             policy_version="v1", policy_digest="policy", purpose="settlement", iat=int(time.time()),
+             exp=int(time.time()) + 60, aud="moderation-fork"),
+        secret, algorithm="HS256")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://synthetic") as client:
+        response = await client.post("/internal/moderation/settlement",
+            headers={"Authorization": "Bearer " + secret}, json={"ticket": token})
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "admission_missing"

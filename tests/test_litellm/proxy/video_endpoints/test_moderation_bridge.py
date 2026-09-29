@@ -265,3 +265,73 @@ async def test_stable_context_ir_cancel_preserves_protocol_before_provider(monke
     assert response.status_code == 200, response.text
     assert response.json() == {'task_id': 'mod_video_stable', 'action': 'cancelled', 'status': 'cancelled'}
     service.cancel_or_delete.assert_not_called()
+
+
+def _admission_app(monkeypatch, handler):
+    monkeypatch.setenv('DRAMA_MODERATION_PLATFORM_URL', 'http://platform.test')
+    monkeypatch.setenv('DRAMA_MODERATION_SERVICE_TOKEN', 'test-token')
+    app = FastAPI()
+    app.include_router(endpoints.router)
+    app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(
+        api_key='a' * 64, user_id='owner', team_id='owner', metadata={'openapi_key_id': 'key-id'})
+    app.state.moderation_transport = httpx.MockTransport(handler)
+    return app
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['timeout', 'connect', 'http500', 'http503'])
+async def test_admission_failure_is_typed_not_sent(monkeypatch, failure):
+    async def control(request):
+        assert request.url.path == '/internal/moderation/generation-admission'
+        if failure == 'timeout':
+            raise httpx.ReadTimeout('slow', request=request)
+        if failure == 'connect':
+            raise httpx.ConnectError('down', request=request)
+        return httpx.Response(500 if failure == 'http500' else 503, json={'detail': 'boom'})
+    app = _admission_app(monkeypatch, control)
+    with patch.object(ProxyBaseLLMRequestProcessing, 'base_process_llm_request', AsyncMock()) as provider:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post('/v1/videos', headers={'x-drama-moderation-admission': 'ticket'},
+                json={'model': 'hailuo-h3', 'prompt': 'synthetic'})
+    assert provider.call_count == 0
+    assert response.status_code == 503, response.text
+    assert response.headers['x-drama-submission'] == 'not_sent'
+    assert 'admission_unavailable' in response.text
+
+
+@pytest.mark.asyncio
+async def test_admission_client_error_keeps_original_status(monkeypatch):
+    async def control(request):
+        return httpx.Response(403, json={'detail': 'no'})
+    app = _admission_app(monkeypatch, control)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        response = await client.post('/v1/videos', headers={'x-drama-moderation-admission': 'ticket'},
+            json={'model': 'hailuo-h3', 'prompt': 'synthetic'})
+    assert response.status_code == 403
+    assert 'x-drama-submission' not in response.headers
+
+
+@pytest.mark.asyncio
+async def test_bridge_timeout_is_per_call(monkeypatch):
+    from litellm.proxy.video_endpoints import moderation_bridge as bridge
+    seen = []
+    real = httpx.AsyncClient
+    class Spy(real):
+        def __init__(self, *a, **k):
+            if k.get('base_url') == 'http://platform.test':
+                seen.append(k['timeout'])
+            super().__init__(*a, **k)
+    monkeypatch.setattr(bridge.httpx, 'AsyncClient', Spy)
+    async def control(request):
+        return httpx.Response(200, json={'acquired': False, 'native_id': 'mod_video_x'})
+    app = _admission_app(monkeypatch, control)
+    monkeypatch.delenv('DRAMA_MODERATION_ADMISSION_TIMEOUT_S', raising=False)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        await client.post('/v1/videos', headers={'x-drama-moderation-admission': 'ticket'}, json={'model': 'hailuo-h3', 'prompt': 'p'})
+        monkeypatch.setenv('DRAMA_MODERATION_ADMISSION_TIMEOUT_S', '7')
+        await client.post('/v1/videos', headers={'x-drama-moderation-admission': 'ticket'}, json={'model': 'hailuo-h3', 'prompt': 'p'})
+    assert seen == [30.0, 7.0]
+    seen.clear()
+    from starlette.requests import Request
+    await bridge.platform(Request({'type': 'http', 'method': 'POST', 'path': '/', 'headers': [], 'app': app}), 'POST', '/x', {})
+    assert seen == [15]

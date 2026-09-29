@@ -84,13 +84,44 @@ def principal(auth: UserAPIKeyAuth) -> dict[str, JsonValue]:
     }
 
 
-async def platform(request: Request, method: str, path: str, payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
+ADMISSION_TIMEOUT_DEFAULT_S = 30.0
+
+
+def admission_timeout() -> float:
+    try:
+        value = float(os.getenv("DRAMA_MODERATION_ADMISSION_TIMEOUT_S", ""))
+    except ValueError:
+        return ADMISSION_TIMEOUT_DEFAULT_S
+    return value if value > 0 else ADMISSION_TIMEOUT_DEFAULT_S
+
+
+def admission_unavailable(reason: str) -> HTTPException:
+    return HTTPException(
+        503,
+        detail={
+            "error": {
+                "code": "admission_unavailable",
+                "message": "Moderation generation admission is unavailable; no submission was sent: " + reason,
+            }
+        },
+        headers={"x-drama-submission": "not_sent"},
+    )
+
+
+async def platform(
+    request: Request,
+    method: str,
+    path: str,
+    payload: dict[str, JsonValue],
+    *,
+    timeout: float = 15,
+) -> dict[str, JsonValue]:
     url = os.getenv("DRAMA_MODERATION_PLATFORM_URL")
     secret = os.getenv("DRAMA_MODERATION_SERVICE_TOKEN")
     if not url or not secret:
         raise HTTPException(503, "Moderation control service is not configured")
     transport = getattr(request.app.state, "moderation_transport", None)
-    async with httpx.AsyncClient(base_url=url, transport=transport, timeout=15, follow_redirects=False) as client:
+    async with httpx.AsyncClient(base_url=url, transport=transport, timeout=timeout, follow_redirects=False) as client:
         response = await client.request(
             method, "/internal/moderation" + path, json=payload, headers={"Authorization": "Bearer " + secret}
         )
@@ -227,16 +258,24 @@ async def submit(
     owner = principal(auth)
     ticket = request.headers.get("x-drama-moderation-admission")
     if ticket:
-        admission = await platform(
-            request,
-            "POST",
-            "/generation-admission",
-            {
-                "ticket": ticket,
-                "payload": payload,
-                "fingerprint": owner["fingerprint"],
-            },
-        )
+        try:
+            admission = await platform(
+                request,
+                "POST",
+                "/generation-admission",
+                {
+                    "ticket": ticket,
+                    "payload": payload,
+                    "fingerprint": owner["fingerprint"],
+                },
+                timeout=admission_timeout(),
+            )
+        except httpx.HTTPError as error:
+            raise admission_unavailable(type(error).__name__) from error
+        except HTTPException as error:
+            if error.status_code >= 500:
+                raise admission_unavailable("HTTP %d" % error.status_code) from error
+            raise
         if admission.get("acquired") is not True:
             return VideoObject(
                 id=TypeAdapter(str).validate_python(admission["native_id"]), object="video", status="queued"

@@ -36,6 +36,10 @@ class BillingWindow(BaseModel):
         return f"spend:{self.kind}:{self.identity}:window:{self.duration}"
 
 
+class AdmissionMissing(ValueError):
+    """No metering task was ever registered for the intent."""
+
+
 class BillingBinding(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     intent_id: str
@@ -622,7 +626,7 @@ class MeteringStore:
             )
         )
         if not tasks:
-            raise ValueError("moderation metering admission missing")
+            raise AdmissionMissing("moderation metering admission missing")
         return tasks[0].binding
 
     async def phase(self, intent_id: str, phase: str) -> PhaseEvent | None:

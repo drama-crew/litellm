@@ -9,6 +9,7 @@ from typing import Annotated, Literal
 import httpx
 import jwt
 from fastapi import APIRouter, Header, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
@@ -414,14 +415,17 @@ async def cancel(body: Ticket, request: Request, authorization: Annotated[str | 
 @router.post("/settlement", include_in_schema=False)
 async def settlement(body: Ticket, request: Request, authorization: Annotated[str | None, Header()] = None):
     from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
-    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, PhaseEvent
+    from litellm.proxy.video_endpoints.moderation_metering import AdmissionMissing, BillingBinding, PhaseEvent
 
     claims = authorize(body.ticket, authorization, "settlement")
     authority = await bridge.platform(
         request, "POST", f"/intents/{claims.intent_id}/settlement-authority", {"ticket": body.ticket}
     )
     store = metering.store()
-    binding = await store.binding(claims.intent_id)
+    try:
+        binding = await store.binding(claims.intent_id)
+    except AdmissionMissing as error:
+        return JSONResponse(status_code=404, content={"error": {"code": "admission_missing", "message": str(error)}})
     if binding.intent_id != claims.intent_id or binding.request_digest != claims.request_digest:
         raise HTTPException(403, "Settlement intent identity mismatch")
     if authority.get("binding") is not None and BillingBinding.model_validate(authority["binding"]) != binding:
