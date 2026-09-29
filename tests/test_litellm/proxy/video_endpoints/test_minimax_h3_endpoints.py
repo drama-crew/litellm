@@ -197,7 +197,8 @@ def test_task_authentication_and_expiry(monkeypatch):
         decode_task(encode_task(task.model_copy(update={"created_at": int(time.time()) - 8 * 86400})))
 
 
-def test_real_key_allowlist_is_applied_before_create_and_query(api, monkeypatch):
+@pytest.mark.parametrize("public_model,route_model", [("MiniMax-H3", "hailuo-h3"), ("causyn-1.1", "causyn-1.1")])
+def test_real_key_allowlist_is_applied_before_create_and_query(api, monkeypatch, public_model, route_model):
     import litellm.proxy.proxy_server as proxy_server
     import litellm
     from litellm import Router
@@ -219,7 +220,7 @@ def test_real_key_allowlist_is_applied_before_create_and_query(api, monkeypatch)
     router = Router(
         model_list=[
             {
-                "model_name": "hailuo-h3",
+                "model_name": route_model,
                 "litellm_params": {"model": "hailuo-h3", "custom_llm_provider": "libtv"},
                 "model_info": {"id": "h3-active"},
             }
@@ -233,7 +234,7 @@ def test_real_key_allowlist_is_applied_before_create_and_query(api, monkeypatch)
         "proxy_config": _ProxyConfig(),
         "general_settings": {"disable_budget_reservation": True},
         "master_key": "sk-master",
-        "prisma_client": _AuthStore({"sk-h3": ["hailuo-h3"], "sk-other": ["other-model"]}),
+        "prisma_client": _AuthStore({"sk-h3": [route_model], "sk-other": ["other-model"]}),
         "user_api_key_cache": UserApiKeyCache(),
         "user_custom_auth": None,
     }.items():
@@ -246,10 +247,14 @@ def test_real_key_allowlist_is_applied_before_create_and_query(api, monkeypatch)
         return VideoObject(id=native_id, object="video", status="queued")
 
     monkeypatch.setattr(h3.endpoints, "video_generation", create)
-    denied = client.post("/v2/video_generation", json=body(), headers={"Authorization": "Bearer sk-other"})
+    denied = client.post(
+        "/v2/video_generation", json=body(model=public_model), headers={"Authorization": "Bearer sk-other"}
+    )
     assert denied.status_code in (401, 403), denied.text
     assert not calls
-    created = client.post("/v2/video_generation", json=body(), headers={"Authorization": "Bearer sk-h3"})
+    created = client.post(
+        "/v2/video_generation", json=body(model=public_model), headers={"Authorization": "Bearer sk-h3"}
+    )
     assert created.status_code == 200, created.text
     task_id = created.json()["task_id"]
     url = "/v2/query/video_generation/" + task_id
@@ -290,4 +295,62 @@ def test_routing_overrides_cannot_bypass_official_auth(api):
             "/v2/video_generation" + suffix, json=body(), headers={"Authorization": "Bearer allowed", **extra}
         )
         assert result.status_code == 400
+    assert not calls
+
+
+@pytest.mark.parametrize(
+    "roles,ratio", [([], "21:9"), (["first_frame", "last_frame"], "adaptive"), (["reference_image"] * 9, "9:16")]
+)
+def test_causyn_official_protocol_preserves_reference_modes_and_owner(api, roles, ratio):
+    client, calls, normalized, owner = api
+    content = body()["content"] + [
+        {"type": "image_url", "image_url": {"url": f"https://media.example/{i}.png"}, "role": role}
+        for i, role in enumerate(roles)
+    ]
+    headers = {"Authorization": "Bearer allowed"}
+    created = client.post(
+        "/v2/video_generation", json=body(model="causyn-1.1", content=content, ratio=ratio), headers=headers
+    )
+    assert created.status_code == 200, created.text
+    payload = calls[0][1]
+    assert normalized[0]["model"] == payload["model"] == "causyn-1.1"
+    assert payload["resolution"] == "768p"
+    assert payload["generate_audio"] is True
+    assert payload["aspect_ratio"] == ratio
+    assert payload["references"] == [
+        {
+            "role": "reference" if role == "reference_image" else role,
+            "media_type": "image",
+            "url": f"https://media.example/{i}.png",
+        }
+        for i, role in enumerate(roles)
+    ]
+    url = "/v2/query/video_generation/" + created.json()["task_id"]
+    queried = client.get(url, headers=headers)
+    assert queried.status_code == 200, queried.text
+    assert queried.json()["task"]["model"] == "causyn-1.1"
+    assert queried.json()["task"]["status"] == "succeeded"
+    owner["key"] = "sk-someone-else"
+    assert client.get(url, headers=headers).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"resolution": "2K"},
+        {"content": body()["content"] + [{"type": "video_url", "video_url": {"url": "https://media.example/v.mp4"}}]},
+        {"content": body()["content"] + [{"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}}]},
+        {
+            "ratio": "adaptive",
+            "content": body()["content"]
+            + [{"type": "image_url", "image_url": {"url": "https://media.example/r.png"}, "role": "reference_image"}],
+        },
+    ],
+)
+def test_causyn_rejects_unsupported_official_features_before_submission(api, changes):
+    client, calls, _, _ = api
+    response = client.post(
+        "/v2/video_generation", json=body(model="causyn-1.1", **changes), headers={"Authorization": "Bearer allowed"}
+    )
+    assert response.status_code == 400, response.text
     assert not calls
