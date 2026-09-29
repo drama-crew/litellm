@@ -78,6 +78,13 @@ class ContextIRRequest(BaseModel):
         MiniMaxH3Create(
             model="MiniMax-H3", content=list(self.content), duration=self.duration, resolution="768P", ratio=self.ratio
         )
+        references = [item for item in self.content if isinstance(item, ImageItem) and item.role == "reference_image"]
+        videos = [item for item in self.content if isinstance(item, VideoItem)]
+        audios = [item for item in self.content if isinstance(item, AudioItem)]
+        if len(references) + len(videos) + len(audios) > 12:
+            raise ValueError("total reference count exceeds 12")
+        if audios and not references and not videos:
+            raise ValueError("reference audio requires at least one reference image or video")
         return self
 
     @property

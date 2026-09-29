@@ -115,10 +115,6 @@ class MiniMaxH3Create(StrictModel):
             raise ValueError("at most one first_frame and one last_frame are allowed")
         if len(references) > 9 or len(videos) > 3 or len(audios) > 3:
             raise ValueError("reference count exceeds 9 images, 3 videos or 3 audio clips")
-        if len(references) + len(videos) + len(audios) > 12:
-            raise ValueError("total reference count exceeds 12")
-        if audios and not references and not videos:
-            raise ValueError("reference audio requires at least one reference image or video")
         if self.model == "MiniMax-H3-Max" and (references or videos or audios):
             raise ValueError("MiniMax-H3-Max does not support reference-to-video")
         if len(self.content) == 1 and self.ratio == "adaptive":
@@ -153,7 +149,6 @@ class MiniMaxH3Create(StrictModel):
             "aspect_ratio": self.effective_ratio,
             "generate_audio": True,
             **media,
-            **({"seed": self.seed} if self.seed is not None else {}),
         }
 
 

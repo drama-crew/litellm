@@ -325,6 +325,16 @@ def test_mixed_media_indexes_and_audio_rejection():
         )
 
 
+def test_total_reference_count_over_12_is_rejected():
+    image_ref = {"type": "image_url", "image_url": {"url": "https://media.example/a.png"}, "role": "reference_image"}
+    video_ref = {"type": "video_url", "video_url": {"url": "https://media.example/a.mp4"}}
+    audio_ref = {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}}
+    with pytest.raises(ValidationError, match="total reference count exceeds 12"):
+        spec(
+            content=[{"type": "text", "text": "Hello"}, *([image_ref] * 9), *([video_ref] * 3), audio_ref],
+        )
+
+
 def test_audio_numbering_counts_only_explicit_audio_items_not_a_reference_videos_soundtrack():
     """H3's ARK worker mixes a reference video's own soundtrack into the
     render without treating it as a separate audio reference, so the

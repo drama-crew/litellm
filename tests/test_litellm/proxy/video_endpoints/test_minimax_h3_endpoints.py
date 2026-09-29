@@ -119,7 +119,7 @@ def test_keyframe_role_order_and_h3_max_modes():
     assert MiniMaxH3Create.model_validate(body(duration=4)).duration == 4
 
 
-def test_reference_media_is_shaped_for_the_libtv_backend_with_seed_forwarded():
+def test_reference_media_is_shaped_for_the_libtv_backend_without_seed_forwarded():
     content = [
         body()["content"][0],
         {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
@@ -128,7 +128,7 @@ def test_reference_media_is_shaped_for_the_libtv_backend_with_seed_forwarded():
     ]
     spec = MiniMaxH3Create.model_validate(body(content=content, seed=42))
     actual = spec.internal_body()
-    assert actual["seed"] == 42
+    assert "seed" not in actual
     assert actual["reference_images"] == ["https://media.example/ref.png"]
     assert actual["reference_videos"] == ["https://media.example/ref.mp4"]
     assert actual["reference_audios"] == ["https://media.example/a.mp3"]
@@ -147,7 +147,7 @@ def test_seed_out_of_range_or_wrong_type_is_rejected(seed):
         MiniMaxH3Create.model_validate(body(seed=seed))
 
 
-def test_reference_caps_and_audio_pairing_are_enforced():
+def test_per_type_reference_caps_are_enforced_but_total_cap_and_audio_pairing_are_not():
     image_ref = {"type": "image_url", "image_url": {"url": "https://media.example/ref.png"}, "role": "reference_image"}
     video_ref = {"type": "video_url", "video_url": {"url": "https://media.example/ref.mp4"}}
     audio_ref = {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}}
@@ -155,15 +155,11 @@ def test_reference_caps_and_audio_pairing_are_enforced():
         MiniMaxH3Create.model_validate(body(content=body()["content"] + [image_ref] * 10))
     with pytest.raises(ValueError, match="9 images, 3 videos or 3 audio"):
         MiniMaxH3Create.model_validate(body(content=body()["content"] + [video_ref] * 4))
-    with pytest.raises(ValueError, match="total reference count exceeds 12"):
-        MiniMaxH3Create.model_validate(
-            body(content=body()["content"] + [image_ref] * 9 + [video_ref] * 3 + [audio_ref] * 1)
-        )
-    with pytest.raises(ValueError, match="reference audio requires at least one reference image or video"):
-        MiniMaxH3Create.model_validate(body(content=body()["content"] + [audio_ref]))
+    MiniMaxH3Create.model_validate(body(content=body()["content"] + [image_ref] * 9 + [video_ref] * 3 + [audio_ref]))
+    MiniMaxH3Create.model_validate(body(content=body()["content"] + [audio_ref]))
 
 
-def test_end_to_end_mixed_references_are_grouped_by_type_with_seed(api):
+def test_end_to_end_mixed_references_are_grouped_by_type_without_seed_forwarded(api):
     client, calls, _, _ = api
     content = body()["content"] + [
         {"type": "video_url", "video_url": {"url": "https://media.example/ref.mp4"}},
@@ -174,7 +170,7 @@ def test_end_to_end_mixed_references_are_grouped_by_type_with_seed(api):
     )
     assert result.status_code == 200, result.text
     submitted = calls[0][1]
-    assert submitted["seed"] == 7
+    assert "seed" not in submitted
     assert submitted["reference_videos"] == ["https://media.example/ref.mp4"]
     assert submitted["reference_images"] == ["https://media.example/ref.png"]
     assert submitted["parameters"] == {"modeType": "mixed2video"}
