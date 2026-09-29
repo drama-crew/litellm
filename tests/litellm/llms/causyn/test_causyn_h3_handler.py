@@ -854,10 +854,12 @@ class TestAdmittedGeometriesSurviveAnyArkRollout:
         )
 
     def test_a_genuine_vdn8_native_21_9_canvas_settles_regardless_of_profile(self):
-        """causyn-1.1 是真正跑在 vdn8 上的型号，而 vdn8 自己的几何公式
-        (`vdn_geometry.GEOMETRIES`) 本就有一条原生 21:9 几何——与旧版非 vdn
-        h3 后端的 1792x768 是两码事，且随 duration 收缩。无论持久化的
-        profile 是哪个，vdn8 真实交付的这张 canvas 都必须结算。"""
+        """vdn8 自己的几何公式 (`vdn_geometry.GEOMETRIES`) 为 21:9 定义了一条
+        原生几何，随 duration 收缩，且与旧版非 vdn h3 后端的 1792x768 是两码
+        事。这里只断言准入门（`_admitted_geometries`/`_result_geometry_matches`）
+        对这条几何一视同仁地放行，不代表 ARK 真实的 vdn8 后端会对纯文本请求
+        接受 21:9（`config.py` 的 `validate_request` 其实会拒绝）。无论持久化
+        的 profile 是哪个，这条准入检查都必须放行同一张 canvas。"""
         from litellm.llms.causyn.handler import _result_geometry_matches
 
         duration = 15
