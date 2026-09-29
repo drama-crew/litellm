@@ -354,6 +354,84 @@ async def test_avideo_generation__delegates_with_async_flag():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("account", [1, 2])
+async def test_libtv_router_submission_freezes_deployment_price(account, monkeypatch):
+    import asyncio
+    from decimal import Decimal
+
+    from litellm.llms.libtv.handler import LibTVLLM, _video_completion_cost
+    from litellm.litellm_core_utils.logging_worker import GLOBAL_LOGGING_WORKER
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, PhaseEvent
+    from litellm.utils import custom_llm_setup
+
+    GLOBAL_LOGGING_WORKER.start()
+    deployment_id = f"libtv-seedance-2-mini-account-{account}"
+    monkeypatch.setenv("LITELLM_VIDEO_ID_SECRET", "synthetic-video-id-secret")
+    model_info = {"id": deployment_id, "output_cost_per_second_480p": 10, "output_cost_per_second_720p": 17.5}
+    authority = AsyncMock()
+    binding = BillingBinding(
+        intent_id="intent",
+        request_digest="digest",
+        fingerprint="key",
+        user_id="user",
+        team_id="team",
+        model="seedance-2.0-mini",
+        expected_phases=("submit", "completion"),
+    )
+
+    def accepted(*, model: str, optional_params: dict[str, object], **kwargs: object) -> VideoObject:
+        return LibTVLLM()._build_video_object(model, {"task_id": "native-task"}, optional_params)
+
+    handler = MagicMock()
+    handler.avideo_generation = AsyncMock(side_effect=accepted)
+    monkeypatch.setattr(litellm, "custom_provider_map", [{"provider": "libtv", "custom_handler": handler}])
+    custom_llm_setup()
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "seedance-2.0-mini",
+                "litellm_params": {
+                    "model": "libtv/star-video2-fast",
+                    "api_key": "synthetic-token",
+                    "libtv_status_model": deployment_id,
+                },
+                "model_info": model_info,
+            }
+        ],
+        num_retries=0,
+    )
+    token = runtime.CONTEXT.set(runtime.Scope(binding, "submit", authority))
+    try:
+        result = await router._ageneric_api_call_with_fallbacks(
+            model="seedance-2.0-mini",
+            original_function=litellm.avideo_generation,
+            prompt="synthetic",
+            seconds="8",
+            resolution="480p",
+            extra_body={"model_info": {"id": "forged", "output_cost_per_second_480p": 999}},
+            caching=False,
+        )
+    finally:
+        runtime.CONTEXT.reset(token)
+        await asyncio.sleep(0)
+        await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=5)
+        await GLOBAL_LOGGING_WORKER.stop()
+
+    event = PhaseEvent.model_validate(runtime.private_event(result))
+    assert handler.avideo_generation.await_count == 1
+    assert authority.persist.await_count == 1
+    assert event.deployment_id == deployment_id
+    assert result._hidden_params["billing_pricing_snapshot"]["output_cost_per_second_480p"] == 10
+    assert event.facts.pricing == (
+        ("output_cost_per_second_480p", Decimal("10")),
+        ("output_cost_per_second_720p", Decimal("17.5")),
+    )
+    assert event.facts.duration_seconds == Decimal("8")
+    assert _video_completion_cost({"model_info": dict(event.facts.pricing)}, result.usage) == 80
+
+
+@pytest.mark.asyncio
 async def test_avideo_status__delegates_untouched():
     sentinel = VideoObject(id="v-async", object="video", status="queued")
     with patch.object(
