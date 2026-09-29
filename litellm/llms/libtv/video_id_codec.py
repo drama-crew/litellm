@@ -30,12 +30,7 @@ def _secret() -> str:
     # Existing production workers already share LITELLM_MASTER_KEY.  Dedicated
     # and salt values remain useful for isolated deployments, but every source
     # is domain-separated below and no generated/plaintext fallback is allowed.
-    return (
-        os.getenv(VIDEO_ID_SECRET_ENV)
-        or os.getenv("LITELLM_SALT_KEY")
-        or os.getenv("LITELLM_MASTER_KEY")
-        or ""
-    )
+    return os.getenv(VIDEO_ID_SECRET_ENV) or os.getenv("LITELLM_SALT_KEY") or os.getenv("LITELLM_MASTER_KEY") or ""
 
 
 def _key() -> bytes:
@@ -84,9 +79,7 @@ def decode_libtv_video_id(value: str) -> DecodedVideoId | None:
         blob = _unb64(value[len(OPAQUE_VIDEO_ID_PREFIX) :])
         if len(blob) <= 12 + 16:
             return None
-        payload = AESGCM(_key()).decrypt(
-            blob[:12], blob[12:], OPAQUE_VIDEO_ID_PREFIX.encode("ascii")
-        )
+        payload = AESGCM(_key()).decrypt(blob[:12], blob[12:], OPAQUE_VIDEO_ID_PREFIX.encode("ascii"))
         data: Any = json.loads(payload.decode("utf-8"))
         if not isinstance(data, dict) or data.get("v") != 2 or data.get("p") != "libtv":
             return None

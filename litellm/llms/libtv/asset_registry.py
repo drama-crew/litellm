@@ -247,9 +247,7 @@ def get_third_asset_limiter(redis_client: Any = None) -> ThirdAssetRateLimiter:
         _limiters.pop(stale, None)
     limiter = _limiters.get(loop)
     if limiter is None:
-        limiter = ThirdAssetRateLimiter(
-            redis_client if redis_client is not None else _resolve_limiter_redis()
-        )
+        limiter = ThirdAssetRateLimiter(redis_client if redis_client is not None else _resolve_limiter_redis())
         _limiters[loop] = limiter
     return limiter
 

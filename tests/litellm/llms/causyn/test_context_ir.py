@@ -288,31 +288,33 @@ async def test_causyn_model_requires_five_seconds_but_minimax_h3_allows_four(red
 
 
 @pytest.mark.asyncio
-async def test_h3_context_ir_endpoint_enforces_five_second_minimum_only_for_causyn_model(redis):
+async def test_minimax_h3_context_ir_endpoint_enforces_the_causyn_five_second_minimum(redis, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from litellm.proxy.video_endpoints import moderation_bridge as bridge
+    from litellm.types.videos.main import VideoObject
+
     service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, settle=no_settle)
+    submit = AsyncMock(return_value=VideoObject(id="mod_video_ir", object="video", status="queued"))
+    monkeypatch.setattr(bridge, "submit", submit)
+    monkeypatch.setattr(bridge, "configured", lambda auth: True)
 
     async def auth(request: Request):
         return UserAPIKeyAuth(api_key="owner")
 
-    async def dependency():
-        return service
-
     app = FastAPI()
     app.dependency_overrides[h3.user_api_key_auth] = auth
-    app.dependency_overrides[ir.context_ir_service] = dependency
-    app.dependency_overrides[h3.context_ir_service_for_request] = dependency
-    app.include_router(h3.router)
+    app.dependency_overrides[ir.context_ir_service] = lambda: service
     app.include_router(ir.router)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        minimax_four = await client.post(
-            "/v2/h3_context_ir", json=spec(model="MiniMax-H3", duration=4).model_dump(mode="json")
-        )
-        assert minimax_four.status_code == 200, minimax_four.text
-        causyn_four = await client.post(
-            "/v2/h3_context_ir", json=spec(model="causyn-1.1", duration=4).model_dump(mode="json")
-        )
-        assert causyn_four.status_code == 400, causyn_four.text
-        assert "5 through 15" in causyn_four.json()["error"]["message"]
+        payload = {**spec(duration=4).model_dump(mode="json"), "model": "minimax-h3"}
+        four = await client.post("/video/minimax-h3/v2/h3_context_ir", json=payload)
+        assert four.status_code == 400, four.text
+        assert "5 through 15" in four.json()["error"]["message"]
+        assert submit.await_count == 0
+        five = await client.post("/video/minimax-h3/v2/h3_context_ir", json={**payload, "duration": 5})
+        assert five.status_code == 200, five.text
+        assert submit.await_count == 1
 
 
 def test_mixed_media_indexes_ref2va_ordering():
@@ -1090,30 +1092,36 @@ async def test_causyn_1_1_create_rejects_five_images_with_video_but_base_stays_l
 
 
 @pytest.mark.asyncio
-async def test_h3_context_ir_endpoint_rejects_five_images_with_video_for_causyn_model(redis):
+async def test_minimax_h3_context_ir_endpoint_rejects_five_images_with_video(redis, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from litellm.proxy.video_endpoints import moderation_bridge as bridge
+    from litellm.types.videos.main import VideoObject
+
     service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, settle=no_settle)
+    submit = AsyncMock(return_value=VideoObject(id="mod_video_ir", object="video", status="queued"))
+    monkeypatch.setattr(bridge, "submit", submit)
+    monkeypatch.setattr(bridge, "configured", lambda auth: True)
 
     async def auth(request: Request):
         return UserAPIKeyAuth(api_key="owner")
 
-    async def dependency():
-        return service
-
     app = FastAPI()
     app.dependency_overrides[h3.user_api_key_auth] = auth
-    app.dependency_overrides[ir.context_ir_service] = dependency
-    app.dependency_overrides[h3.context_ir_service_for_request] = dependency
-    app.include_router(h3.router)
+    app.dependency_overrides[ir.context_ir_service] = lambda: service
     app.include_router(ir.router)
-    content = [{"type": "text", "text": "Hello"}, *_image(5), VIDEO_ITEM]
+    base = {**spec().model_dump(mode="json"), "model": "minimax-h3"}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
         rejected = await client.post(
-            "/v2/h3_context_ir", json=spec(model="causyn-1.1", content=content).model_dump(mode="json")
+            "/video/minimax-h3/v2/h3_context_ir",
+            json={**base, "content": [{"type": "text", "text": "Hello"}, *_image(5), VIDEO_ITEM]},
         )
         assert rejected.status_code == 400, rejected.text
         assert "at most 4 reference images" in rejected.json()["error"]["message"]
+        assert submit.await_count == 0
         allowed = await client.post(
-            "/v2/h3_context_ir", json=spec(model="MiniMax-H3", content=content).model_dump(mode="json")
+            "/video/minimax-h3/v2/h3_context_ir",
+            json={**base, "content": [{"type": "text", "text": "Hello"}, *_image(4), VIDEO_ITEM]},
         )
         assert allowed.status_code == 200, allowed.text
 

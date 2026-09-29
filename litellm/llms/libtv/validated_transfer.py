@@ -157,7 +157,18 @@ class ValidatedTransferRequest:
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ValidatedTransferRequest":
-        allowed = {"type", "task_id", "mode", "source", "target", "expected", "hard_cap", "quota_bytes", "deadline_ts", "created_ts"}
+        allowed = {
+            "type",
+            "task_id",
+            "mode",
+            "source",
+            "target",
+            "expected",
+            "hard_cap",
+            "quota_bytes",
+            "deadline_ts",
+            "created_ts",
+        }
         if set(payload) - allowed or payload.get("type") != VALIDATED_TASK_TYPE:
             raise ValidatedTransferError("invalid validated transfer request")
         task_id = payload.get("task_id")
@@ -174,17 +185,25 @@ class ValidatedTransferRequest:
             raise ValidatedTransferError("source URL is required")
         if source_bytes is not None:
             _positive_int(source_bytes, "source bytes")
-        if source_sha256 is not None and (not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256.lower())):
+        if source_sha256 is not None and (
+            not isinstance(source_sha256, str) or not _SHA256_RE.fullmatch(source_sha256.lower())
+        ):
             raise ValidatedTransferError("source SHA-256 must be lowercase hex")
         target = payload.get("target")
         parts: tuple[PartTarget, ...] = ()
         part_size: int | None = None
         if mode != "probe":
-            if not isinstance(target, Mapping) or target.get("kind") != "presigned_parts" or not isinstance(target.get("parts"), list):
+            if (
+                not isinstance(target, Mapping)
+                or target.get("kind") != "presigned_parts"
+                or not isinstance(target.get("parts"), list)
+            ):
                 raise ValidatedTransferError("transfer target parts are required")
             raw_parts = target["parts"]
             part_size = _positive_int(target.get("part_size"), "target part size")
-            parts = tuple({"n": part.get("n"), "url": part.get("url")} for part in raw_parts if isinstance(part, Mapping))
+            parts = tuple(
+                {"n": part.get("n"), "url": part.get("url")} for part in raw_parts if isinstance(part, Mapping)
+            )
             if len(parts) != len(raw_parts):
                 raise ValidatedTransferError("invalid target part")
         expected = payload.get("expected", {})
@@ -198,7 +217,18 @@ class ValidatedTransferRequest:
             _positive_int(quota_bytes, "quota bytes")
         if mode == "transfer" and quota_bytes is None:
             raise ValidatedTransferError("quota bytes are required for transfer")
-        return cls(task_id, mode, source_url, source_bytes, source_sha256.lower() if source_sha256 else None, parts, part_size, expected, hard_cap, quota_bytes)
+        return cls(
+            task_id,
+            mode,
+            source_url,
+            source_bytes,
+            source_sha256.lower() if source_sha256 else None,
+            parts,
+            part_size,
+            expected,
+            hard_cap,
+            quota_bytes,
+        )
 
 
 OwnershipCheck = Callable[[], Awaitable[bool]]
@@ -270,7 +300,9 @@ class StrictValidatedTransferExecutor:
         ):
             raise ValidatedTransferError(f"invalid {role} URL")
 
-    async def execute(self, request: ValidatedTransferRequest, *, ownership_check: OwnershipCheck | None = None) -> dict[str, Any]:
+    async def execute(
+        self, request: ValidatedTransferRequest, *, ownership_check: OwnershipCheck | None = None
+    ) -> dict[str, Any]:
         if self._slots.locked() and self._waiting >= self.settings.local_queue_limit:
             raise ValidatedTransferError("validated transfer local queue is saturated", validation=False)
         self._waiting += 1
@@ -283,7 +315,9 @@ class StrictValidatedTransferExecutor:
         finally:
             self._slots.release()
 
-    async def _execute_reserved(self, request: ValidatedTransferRequest, *, ownership_check: OwnershipCheck | None = None) -> dict[str, Any]:
+    async def _execute_reserved(
+        self, request: ValidatedTransferRequest, *, ownership_check: OwnershipCheck | None = None
+    ) -> dict[str, Any]:
         self.validate_request(request)
         if not self.ready():
             raise ValidatedTransferError("validated transfer spool is unavailable", validation=False)
@@ -304,7 +338,12 @@ class StrictValidatedTransferExecutor:
                 await client.aclose()
 
     async def _download(self, client: httpx.AsyncClient, request: ValidatedTransferRequest) -> tuple[Path, int, str]:
-        effective_cap = min(self.settings.hard_cap, self.settings.quota_bytes, request.hard_cap or self.settings.hard_cap, request.quota_bytes or self.settings.quota_bytes)
+        effective_cap = min(
+            self.settings.hard_cap,
+            self.settings.quota_bytes,
+            request.hard_cap or self.settings.hard_cap,
+            request.quota_bytes or self.settings.quota_bytes,
+        )
         self.settings.spool_dir.mkdir(parents=True, exist_ok=True)
         descriptor, filename = tempfile.mkstemp(prefix="validated-transfer-", dir=self.settings.spool_dir)
         spool = Path(filename)
@@ -316,7 +355,9 @@ class StrictValidatedTransferExecutor:
                 response_context = client.stream("GET", request.source_url, follow_redirects=False)
                 async with response_context as response:
                     if response.status_code != 200:
-                        raise ValidatedTransferError(f"source HTTP {response.status_code}", validation=400 <= response.status_code < 500)
+                        raise ValidatedTransferError(
+                            f"source HTTP {response.status_code}", validation=400 <= response.status_code < 500
+                        )
                     content_length = response.headers.get("content-length")
                     if content_length:
                         if not content_length.isdigit():
@@ -364,7 +405,12 @@ class StrictValidatedTransferExecutor:
                     width, height = image.size
             if mime is None:
                 raise ValidatedTransferError("image MIME is not accepted")
-            if width <= 0 or height <= 0 or width > self.settings.max_dimensions or height > self.settings.max_dimensions:
+            if (
+                width <= 0
+                or height <= 0
+                or width > self.settings.max_dimensions
+                or height > self.settings.max_dimensions
+            ):
                 raise ValidatedTransferError("image dimensions exceed limit")
             if width * height > self.settings.max_pixels:
                 raise ValidatedTransferError("image pixels exceed limit")
@@ -376,7 +422,14 @@ class StrictValidatedTransferExecutor:
         for key, value in {"bytes": size, "sha256": digest, "mime": mime, "width": width, "height": height}.items():
             if key in expected and expected[key] != value:
                 raise ValidatedTransferError(f"expected {key} mismatch")
-        return {"validation_version": VALIDATION_VERSION, "bytes": size, "mime": mime, "width": width, "height": height, "sha256": digest}
+        return {
+            "validation_version": VALIDATION_VERSION,
+            "bytes": size,
+            "mime": mime,
+            "width": width,
+            "height": height,
+            "sha256": digest,
+        }
 
     async def _upload_parts(
         self,
@@ -488,7 +541,9 @@ class ValidatedTransferRouter:
             raw = await self.redis.brpop(result_key(task_id), timeout=self.wait_timeout)
         except Exception as exc:
             if await self._claim_fallback(task_id):
-                return await self._execute_local(request, "local_worker_failure", ownership_check=self._ownership_check(task_id))
+                return await self._execute_local(
+                    request, "local_worker_failure", ownership_check=self._ownership_check(task_id)
+                )
             raise ValidatedTransferError("validated transfer result wait is ambiguous", validation=False) from exc
         if raw is not None:
             result = self._parse_remote_result(raw)
@@ -496,15 +551,17 @@ class ValidatedTransferRouter:
                 result["route"] = "remote"
                 return result
         if await self._claim_fallback(task_id):
-            return await self._execute_local(request, "local_worker_failure", ownership_check=self._ownership_check(task_id))
+            return await self._execute_local(
+                request, "local_worker_failure", ownership_check=self._ownership_check(task_id)
+            )
         raise ValidatedTransferError("validated transfer fallback ownership conflict", validation=False)
 
     async def _has_fresh_worker(self) -> bool:
         assert self.redis is not None
         try:
-            return await self.redis.zcount(
-                VALIDATED_WORKERS_ZSET, time.time() - self.heartbeat_window_seconds, "+inf"
-            ) > 0
+            return (
+                await self.redis.zcount(VALIDATED_WORKERS_ZSET, time.time() - self.heartbeat_window_seconds, "+inf") > 0
+            )
         except Exception:
             return False
 
@@ -533,7 +590,9 @@ class ValidatedTransferRouter:
             payload["source"]["sha256"] = request.source_sha256
         if request.mode != "probe":
             payload["target"] = {
-                "kind": "presigned_parts", "parts": list(request.target_parts), "part_size": request.target_part_size
+                "kind": "presigned_parts",
+                "parts": list(request.target_parts),
+                "part_size": request.target_part_size,
             }
         else:
             payload["target"] = {}
@@ -555,7 +614,11 @@ class ValidatedTransferRouter:
             return None
         result = envelope.get("result")
         required = {"validation_version", "bytes", "mime", "width", "height", "sha256"}
-        if not isinstance(result, dict) or not required.issubset(result) or result.get("validation_version") != VALIDATION_VERSION:
+        if (
+            not isinstance(result, dict)
+            or not required.issubset(result)
+            or result.get("validation_version") != VALIDATION_VERSION
+        ):
             raise ValidatedTransferError("validated worker result has invalid metadata", validation=False)
         if (
             not isinstance(result["bytes"], int)
@@ -606,9 +669,7 @@ class ValidatedTransferRouter:
             if self.redis is None:
                 return False
             try:
-                status, owner = await self.redis.mget(
-                    status_key(task_id), f"worker:task:owner:{task_id}"
-                )
+                status, owner = await self.redis.mget(status_key(task_id), f"worker:task:owner:{task_id}")
                 status = status.decode() if isinstance(status, bytes) else status
                 owner = owner.decode() if isinstance(owner, bytes) else owner
                 return status == "fallback_claimed" and owner == f"fallback:{self.instance_id}"

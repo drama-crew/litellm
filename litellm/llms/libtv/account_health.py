@@ -128,9 +128,7 @@ def discover_libtv_accounts(llm_router: Any) -> list[LibTVAccount]:
             continue
         seen.add(key)
         label = model_info.get("id") if isinstance(model_info.get("id"), str) else None
-        accounts.append(
-            LibTVAccount(label=label or key, token=token, webid=webid, account_key=key)
-        )
+        accounts.append(LibTVAccount(label=label or key, token=token, webid=webid, account_key=key))
     return accounts
 
 
@@ -290,9 +288,7 @@ class LibTVAccountHealthProber:
             try:
                 await self.probe_and_publish(account)
             except Exception:  # noqa: BLE001  # one bad account must not stop the rest of the sweep
-                logger.warning(
-                    "libtv account health: probe cycle failed for %s", account.label, exc_info=True
-                )
+                logger.warning("libtv account health: probe cycle failed for %s", account.label, exc_info=True)
         await self._prune_registry(accounts)
 
     async def _prune_registry(self, accounts: Sequence[LibTVAccount]) -> None:
@@ -361,9 +357,7 @@ async def start_libtv_account_health_prober(llm_router: Any) -> Optional[LibTVAc
         logger.warning("libtv account health: no redis configured, prober not started")
         return None
     prober = LibTVAccountHealthProber(redis_client, router=llm_router)
-    logger.info(
-        "libtv account health: probing %d account(s) every %.0fs", len(accounts), prober._interval
-    )
+    logger.info("libtv account health: probing %d account(s) every %.0fs", len(accounts), prober._interval)
     return await prober.start()
 
 

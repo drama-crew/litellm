@@ -1418,7 +1418,7 @@ class CausynVideoHandler(CustomLLM):
         }
         try:
             settings = self._settings_factory()
-            if spec.model == CAUSYN_H3_MODEL and request.get("prompt_processing") != "direct":
+            if spec.model == CAUSYN_H3_MODEL and optional_params.get("prompt_processing") != "direct":
                 await self._prompt_submit(
                     VideoSubmission.model_validate(payload),
                     BillingIdentity.model_validate(metadata_model.attribution.model_dump()),
