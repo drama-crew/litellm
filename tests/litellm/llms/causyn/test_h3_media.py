@@ -64,6 +64,76 @@ def audio(seconds=2.0, container_format="wav", codec="pcm_s16le", fmt="s16", opt
     return output.getvalue()
 
 
+COVER_ART_AUDIO_FORMATS = {
+    "mp3": {"container_format": "mp3", "codec": "mp3", "fmt": "s16p", "samples": 1152},
+    "m4a": {"container_format": "mp4", "codec": "aac", "fmt": "fltp", "samples": 1024},
+}
+
+
+def audio_with_cover_art(container_format, codec, fmt, samples, sample_rate=44100):
+    output = io.BytesIO()
+    with av.open(output, "w", format=container_format) as container:
+        astream = container.add_stream(codec, rate=sample_rate)
+        vstream = container.add_stream("mjpeg", rate=1)
+        vstream.width = vstream.height = 16
+        vstream.pix_fmt = "yuvj420p"
+        vstream.disposition = av.stream.Disposition.attached_pic
+        for packet in vstream.encode(av.VideoFrame.from_image(Image.new("RGB", (16, 16), "red"))):
+            container.mux(packet)
+        for packet in vstream.encode():
+            container.mux(packet)
+        frame = av.AudioFrame(format=fmt, layout="mono", samples=samples)
+        frame.sample_rate = sample_rate
+        frame.pts = 0
+        for plane in frame.planes:
+            plane.update(bytes(plane.buffer_size))
+        for packet in astream.encode(frame):
+            container.mux(packet)
+        for packet in astream.encode():
+            container.mux(packet)
+    return output.getvalue()
+
+
+def audio_with_real_video(container_format="mp4", codec="aac", fmt="fltp", samples=1024, sample_rate=44100):
+    output = io.BytesIO()
+    with av.open(output, "w", format=container_format) as container:
+        astream = container.add_stream(codec, rate=sample_rate)
+        vstream = container.add_stream("libx264", rate=24)
+        vstream.width = vstream.height = 64
+        vstream.pix_fmt = "yuv420p"
+        for packet in vstream.encode(av.VideoFrame.from_image(Image.new("RGB", (64, 64), "red"))):
+            container.mux(packet)
+        for packet in vstream.encode():
+            container.mux(packet)
+        frame = av.AudioFrame(format=fmt, layout="mono", samples=samples)
+        frame.sample_rate = sample_rate
+        frame.pts = 0
+        for plane in frame.planes:
+            plane.update(bytes(plane.buffer_size))
+        for packet in astream.encode(frame):
+            container.mux(packet)
+        for packet in astream.encode():
+            container.mux(packet)
+    return output.getvalue()
+
+
+def audio_with_two_audio_streams(sample_rate=44100):
+    output = io.BytesIO()
+    with av.open(output, "w", format="mp4") as container:
+        streams = [container.add_stream("aac", rate=sample_rate) for _ in range(2)]
+        for stream in streams:
+            frame = av.AudioFrame(format="fltp", layout="mono", samples=1024)
+            frame.sample_rate = sample_rate
+            frame.pts = 0
+            for plane in frame.planes:
+                plane.update(bytes(plane.buffer_size))
+            for packet in stream.encode(frame):
+                container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+    return output.getvalue()
+
+
 def request(content):
     return ContextIRRequest.model_validate(
         {
@@ -107,9 +177,45 @@ def test_audio_rejects_a_video_stream_disguised_as_audio():
         inspect_audio(clip())
 
 
+@pytest.mark.parametrize("name", sorted(COVER_ART_AUDIO_FORMATS))
+def test_audio_accepts_cover_art_alongside_the_audio_stream(name):
+    """I-B: real-world MP3/M4A files commonly embed a cover-art thumbnail as an
+    attached_pic video stream (ID3 APIC / MP4 cover art). ARK's own validation
+    ignores attached_pic streams; ours must too, or every downloaded music file
+    with album art gets rejected after the task was already accepted and paid for."""
+    raw = audio_with_cover_art(**COVER_ART_AUDIO_FORMATS[name])
+    assert inspect_audio(raw) >= 0
+
+
+def test_audio_still_rejects_a_real_video_stream_even_with_an_audio_stream_present():
+    with pytest.raises(RewriteError, match="must not contain a video stream"):
+        inspect_audio(audio_with_real_video())
+
+
+def test_audio_accepts_more_than_one_audio_stream():
+    """ARK's _validate_audio only requires at least one decodable audio stream,
+    not exactly one; a stricter check here would reject files ARK accepts."""
+    assert inspect_audio(audio_with_two_audio_streams()) >= 0
+
+
 def test_audio_rejects_clips_longer_than_15_seconds():
     with pytest.raises(RewriteError):
         inspect_audio(audio(seconds=16))
+
+
+@pytest.mark.asyncio
+async def test_audio_reference_size_cap_matches_arks_20mb_default():
+    """I-B: LiteLLM capped reference audio at 50MB while ARK's default
+    H3_ARK_MAX_AUDIO_REFERENCE_BYTES is 20MB, so a 20-50MB file would pass here
+    and only fail at ARK after the rewrite already ran and was billed."""
+    raw = b"0" * (20 * 1024 * 1024 + 1)
+    url = "data:audio/wav;base64," + base64.b64encode(raw).decode()
+    audio_item = {"type": "audio_url", "audio_url": {"url": url}}
+    image_url = "data:image/png;base64," + base64.b64encode(picture()).decode()
+    image_item = {"type": "image_url", "image_url": {"url": image_url}, "role": "reference_image"}
+    async with httpx.AsyncClient(trust_env=False) as client:
+        with pytest.raises(RewriteError, match="permitted size"):
+            await prepare_media(client, request([image_item, audio_item]))
 
 
 @pytest.mark.asyncio

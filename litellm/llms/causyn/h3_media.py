@@ -93,10 +93,10 @@ def inspect_audio(raw: bytes) -> float:
     with av.open(io.BytesIO(raw), mode="r", options={"enable_drefs": "0"}) as container:
         if container.format.name not in {"wav", "mp3", "aac", "flac", "ogg", "mov,mp4,m4a,3gp,3g2,mj2"}:
             raise RewriteError("Reference audio must be WAV, MP3, M4A, AAC, FLAC or OGG", 400)
-        if len(container.streams.video) != 0:
+        if any(av.stream.Disposition.attached_pic not in video.disposition for video in container.streams.video):
             raise RewriteError("Reference audio must not contain a video stream", 400)
-        if len(container.streams.audio) != 1:
-            raise RewriteError("Reference audio must contain exactly one audio stream", 400)
+        if len(container.streams.audio) == 0:
+            raise RewriteError("Reference audio must contain at least one audio stream", 400)
         duration = float(container.duration or 0) / av.time_base
         if not math.isfinite(duration) or not 0 < duration <= 15:
             raise RewriteError("Each reference audio clip must last at most 15 seconds", 400)
@@ -117,7 +117,7 @@ async def prepare_reference(
 
 
 async def prepare_audio(client: httpx.AsyncClient, item: AudioItem) -> tuple[AudioItem, float]:
-    raw = await fetch_media(client, item.audio_url.url, 50 * 1024 * 1024)
+    raw = await fetch_media(client, item.audio_url.url, 20 * 1024 * 1024)
     duration = await asyncio.to_thread(inspect_audio, raw)
     return item, duration
 
