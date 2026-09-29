@@ -1097,3 +1097,146 @@ async def test_h3_context_ir_endpoint_rejects_five_images_with_video_for_causyn_
             "/v2/h3_context_ir", json=spec(model="MiniMax-H3", content=content).model_dump(mode="json")
         )
         assert allowed.status_code == 200, allowed.text
+
+
+# --- deadline-bounded rewrite retry (causyn-1.1 upstream rate limiting) ---------------
+
+
+def _causyn_task(**update):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import ContextIRTask
+
+    now = int(time.time())
+    base = {
+        "id": "t1",
+        "owner": "o",
+        "request": spec(model="causyn-1.1"),
+        "created_at": now,
+        "updated_at": now,
+        "billing": BillingIdentity(),
+        "price": 1.0,
+    }
+    return ContextIRTask(**{**base, **update})
+
+
+def _rate_limited(**kwargs):
+    return RewriteError("H3 prompt rewrite provider unavailable", 429, retryable=True, upstream_status=429, **kwargs)
+
+
+def test_causyn_rewrite_keeps_retrying_past_three_attempts_within_the_window():
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    task = _causyn_task(attempts=5)
+    policy = rewrite_policy(task)
+    delay = policy.next_delay(task, _rate_limited(), now=task.created_at + 60)
+    assert delay is not None and 0 < delay <= 60 + 32  # cap 60s + bounded jitter
+
+
+def test_causyn_rewrite_backoff_grows_and_is_capped_at_sixty_seconds(monkeypatch):
+    from litellm.llms.causyn import h3_prompt
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    monkeypatch.setattr(h3_prompt.random, "uniform", lambda a, b: 0.0)
+    policy = rewrite_policy(_causyn_task())
+    delays = [policy.next_delay(_causyn_task(attempts=n), _rate_limited(), now=_causyn_task().created_at) for n in (1, 2, 3, 5, 9)]
+    assert delays == [2.0, 4.0, 8.0, 32.0, 60.0]
+
+
+def test_causyn_rewrite_honours_retry_after():
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    task = _causyn_task(attempts=1)
+    delay = rewrite_policy(task).next_delay(task, _rate_limited(retry_after="45"), now=task.created_at)
+    assert delay is not None and delay >= 45
+
+
+def test_causyn_rewrite_gives_up_after_the_retry_window():
+    from litellm.llms.causyn.context_ir import REWRITE_RETRY_WINDOW_S, rewrite_policy
+
+    task = _causyn_task(attempts=4)
+    assert rewrite_policy(task).next_delay(task, _rate_limited(), now=task.created_at + REWRITE_RETRY_WINDOW_S) is None
+
+
+def test_causyn_rewrite_gives_up_when_a_render_no_longer_fits_the_deadline():
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    task = _causyn_task(attempts=2, video_payload={"deadline_ts": _causyn_task().created_at + 300})
+    assert rewrite_policy(task).next_delay(task, _rate_limited(), now=task.created_at + 10) is None
+
+
+def test_causyn_rewrite_never_retries_a_non_transient_error():
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    task = _causyn_task()
+    bad = RewriteError("nope", 502, retryable=False, upstream_status=400)
+    assert rewrite_policy(task).next_delay(task, bad, now=task.created_at) is None
+
+
+def test_minimax_h3_keeps_the_legacy_three_attempt_budget():
+    from litellm.llms.causyn.context_ir import rewrite_policy
+
+    task = _causyn_task(request=spec())
+    policy = rewrite_policy(task)
+    assert policy.max_attempts == 3
+    assert policy.next_delay(task.model_copy(update={"attempts": 2}), _rate_limited(), now=task.created_at) is not None
+    assert policy.next_delay(task.model_copy(update={"attempts": 3}), _rate_limited(), now=task.created_at) is None
+
+
+@pytest.mark.asyncio
+async def test_causyn_task_survives_many_429s_then_succeeds(redis):
+    calls = Counter()
+
+    async def flaky(request):
+        calls["n"] += 1
+        if calls["n"] <= 5:
+            raise _rate_limited()
+        return RESULT
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=flaky, settle=no_settle)
+    task = await service.create(spec(model="causyn-1.1"), owner="owner", billing=BillingIdentity())
+    for _ in range(6):
+        await service.process(task.id)
+        await redis.delete(task_key(task.id) + ":lease")
+        current = await service.store.get(task.id)
+        if current.status == "succeeded":
+            break
+        assert current.status != "failed"
+    assert calls["n"] == 6
+    assert (await service.store.get(task.id)).status == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_stored_error_records_upstream_status_and_redacted_detail(redis):
+    async def limited(request):
+        raise RewriteError(
+            "H3 prompt rewrite provider unavailable",
+            502,
+            retryable=False,
+            upstream_status=400,
+            detail="bad key Bearer sk-abcdefghijklmnop rejected",
+        )
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=limited, settle=no_settle)
+    task = await service.create(spec(model="causyn-1.1"), owner="owner", billing=BillingIdentity())
+    await service.process(task.id)
+    error = (await service.store.get(task.id)).error
+    assert "upstream 400" in error and "bad key" in error
+    assert "sk-abcdefghijklmnop" not in error
+
+
+@pytest.mark.asyncio
+async def test_rewriter_captures_upstream_status_and_message_on_non_200():
+    from litellm.llms.causyn.h3_prompt import H3PromptRewriter
+
+    def transport(request):
+        return httpx.Response(
+            429, headers={"retry-after": "7"}, json={"error": {"message": "qwen is temporarily rate-limited upstream"}}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "k").rewrite(spec(model="causyn-1.1"))
+    assert caught.value.upstream_status == 429
+    assert caught.value.retryable is True
+    assert "rate-limited upstream" in caught.value.describe()

@@ -46,17 +46,65 @@ REFERENCE_FIELDS = (
 )
 
 
+_SECRET_PATTERNS = (
+    re.compile(r"(?i)bearer\s+\S+"),
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"[A-Za-z0-9_\-]{32,}"),
+)
+_DETAIL_LIMIT = 160
+
+
+def redact_provider_detail(value: object) -> str | None:
+    """Short, secret-free provider message for logs and stored task errors."""
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    for pattern in _SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    return text[:_DETAIL_LIMIT] or None
+
+
+def provider_error_detail(response: httpx.Response) -> str | None:
+    try:
+        body = response.json()
+    except (ValueError, UnicodeDecodeError):
+        return None
+    error = body.get("error") if isinstance(body, dict) else None
+    message = error.get("message") if isinstance(error, dict) else error
+    return redact_provider_detail(message)
+
+
 class RewriteError(Exception):
     def __init__(
-        self, message: str, status_code: int = 502, *, retryable: bool | None = None, retry_after: str | None = None
+        self,
+        message: str,
+        status_code: int = 502,
+        *,
+        retryable: bool | None = None,
+        retry_after: str | None = None,
+        upstream_status: int | None = None,
+        detail: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = status_code == 429 if retryable is None else retryable
         self.retry_after = retry_after
+        self.upstream_status = upstream_status
+        self.detail = redact_provider_detail(detail)
 
-    def retry_delay(self, attempt: int) -> float:
-        backoff = min(30.0, 2.0**attempt) + random.uniform(0.0, 1.0)
+    def describe(self) -> str:
+        """Message including the upstream status and short provider detail, for the stored error."""
+        extras = []
+        if self.upstream_status is not None:
+            extras.append(f"upstream {self.upstream_status}")
+        if self.detail:
+            extras.append(self.detail)
+        return f"{self} ({': '.join(extras)})" if extras else str(self)
+
+    def retry_delay(
+        self, attempt: int, *, cap: float = 30.0, jitter: float = 1.0, retry_after_cap: float = 60.0
+    ) -> float:
+        backoff = min(cap, 2.0**attempt) + random.uniform(0.0, jitter)
         if self.retry_after is None:
             return backoff
         try:
@@ -66,7 +114,7 @@ class RewriteError(Exception):
                 seconds = parsedate_to_datetime(self.retry_after).timestamp() - time.time()
             except (ValueError, TypeError, OverflowError):
                 return backoff
-        return max(backoff, min(60.0, seconds))
+        return max(backoff, min(retry_after_cap, seconds))
 
 
 class ContextIRRequest(BaseModel):
@@ -271,13 +319,17 @@ class H3PromptRewriter:
                     follow_redirects=False,
                 )
         except (httpx.TransportError, TimeoutError) as exc:
-            raise RewriteError("H3 prompt rewrite provider interrupted", retryable=True) from exc
+            raise RewriteError(
+                "H3 prompt rewrite provider interrupted", retryable=True, detail=type(exc).__name__
+            ) from exc
         if response.status_code != 200:
             raise RewriteError(
                 "H3 prompt rewrite provider unavailable",
                 429 if response.status_code == 429 else 502,
                 retryable=response.status_code in RETRYABLE_STATUS_CODES,
                 retry_after=response.headers.get("retry-after"),
+                upstream_status=response.status_code,
+                detail=provider_error_detail(response),
             )
         try:
             completed = _Completion.model_validate(response.json())

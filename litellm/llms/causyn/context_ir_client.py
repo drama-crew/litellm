@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from typing import Literal
 
 import httpx
@@ -39,6 +40,10 @@ class ContextIRTaskView(BaseModel):
     caption: str | None = None
     error: str | None = None
     failed_step: str | None = None
+    # 服务侧并行改动会给失败任务带上这两个字段；旧服务没有，缺省即 None。
+    retryable: bool | None = None
+    error_kind: str | None = None
+    upstream_status: int | None = None
 
 
 TASKS_PATH = "/v1/context-ir/tasks"
@@ -47,6 +52,36 @@ POLL_TIMEOUT_S = 30.0
 _BASE_URL_ENV = "DRAMA_CONTEXT_IR_BASE_URL"
 _API_KEY_ENV = "DRAMA_CONTEXT_IR_API_KEY"
 _RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+
+
+_LEGACY_TRANSIENT = re.compile(r"HTTP (?:429|408|5\d\d)\b")
+MAX_RESUBMISSIONS = 8
+
+
+def is_transient_failure(task: ContextIRTaskView) -> bool:
+    """Whether a failed service task died of an upstream hiccup (worth a fresh task).
+
+    Explicit signals win; only when the service says nothing do we fall back to
+    sniffing the legacy error text. Unknown stays terminal.
+    """
+    if task.retryable is not None:
+        return task.retryable
+    if task.error_kind is not None:
+        return task.error_kind == "upstream_transient"
+    return bool(task.error and _LEGACY_TRANSIENT.search(task.error))
+
+
+def _failure(task: ContextIRTaskView, *, retryable: bool) -> RewriteError:
+    from litellm.llms.causyn.h3_prompt import redact_provider_detail
+
+    step = task.failed_step or "unknown"
+    return RewriteError(
+        f"Context IR service failed at step {step}",
+        502,
+        retryable=retryable,
+        upstream_status=task.upstream_status,
+        detail=redact_provider_detail(task.error),
+    )
 
 
 def service_base_url() -> str | None:
@@ -177,13 +212,19 @@ async def rewrite_via_service(
 
     from litellm.llms.causyn.h3_prompt import RewriteResult, RewriteUsage
 
-    submitted = await submit(
-        spec,
-        base_url=base_url,
-        api_key=api_key,
-        idempotency_key=idempotency_key,
-        http=http,
-    )
+    # 服务判定失败但原因是上游瞬时错误时，用带后缀的新幂等键开一个新任务。
+    # 已经失败的旧任务在重入时会被幂等命中并立刻返回 failed，沿链走到第一个没死的任务即可；
+    # 退避与总预算由外层（deadline 约束的重试）负责，这里只在"刚提交就已失败"时才前进。
+    attempt = 0
+    while True:
+        key = idempotency_key if attempt == 0 else f"{idempotency_key}:retry-{attempt}"
+        submitted = await submit(spec, base_url=base_url, api_key=api_key, idempotency_key=key, http=http)
+        if submitted.status == "failed" and is_transient_failure(submitted):
+            attempt += 1
+            if attempt > MAX_RESUBMISSIONS:
+                raise _failure(submitted, retryable=False)
+            continue
+        break
     task_id = submitted.id
     deadline = time.monotonic() + budget_s
     task = submitted
@@ -200,9 +241,8 @@ async def rewrite_via_service(
                 system_sha256=hashlib.sha256(SERVICE_MODEL.encode()).hexdigest(),
             )
         if status == "failed":
-            # 服务已判定失败是终态；继续重试只会把同一个失败重放三遍。
-            step = task.failed_step or "unknown"
-            raise RewriteError(f"Context IR service failed at step {step}", 502, retryable=False)
+            # 永久失败是终态；瞬时失败抛 retryable，外层退避后重入并走到下一个幂等键。
+            raise _failure(task, retryable=is_transient_failure(task) and attempt < MAX_RESUBMISSIONS)
         if time.monotonic() >= deadline:
             raise RewriteError(f"Context IR task {task_id} is still running", 503, retryable=True)
         if poll_interval_s:

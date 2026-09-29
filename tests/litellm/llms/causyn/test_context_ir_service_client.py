@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 
@@ -375,3 +377,101 @@ class TestPayloadRobustnessAgainstNonImageReferences:
         assert client.idempotency_key_for(_spec_with_video_reference()) != client.idempotency_key_for(
             _spec_with_audio_reference()
         )
+
+
+class TestTransientFailureResubmission:
+    @staticmethod
+    def _service(failure: dict, *, fail_first: int = 1):
+        posts: list[str] = []
+        failed_keys: set[str] = set()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                key = json.loads(request.content)["idempotency_key"]
+                posts.append(key)
+                if key in failed_keys:
+                    return httpx.Response(200, json={"id": f"cir-{key}", "status": "failed", **failure})
+                return httpx.Response(200, json={"id": f"cir-{key}", "status": "queued"})
+            task_id = str(request.url).rsplit("/", 1)[-1]
+            key = task_id.removeprefix("cir-")
+            if len(failed_keys) < fail_first:
+                failed_keys.add(key)
+            if key in failed_keys:
+                return httpx.Response(200, json={"id": task_id, "status": "failed", **failure})
+            return httpx.Response(200, json={"id": task_id, "status": "succeeded", "caption": "ok"})
+
+        return handler, posts
+
+    async def _run(self, handler):
+        async with _transport(handler) as http:
+            return await client.rewrite_via_service(
+                _spec(), base_url="http://ctx:8030", api_key=None, idempotency_key="v", http=http,
+                poll_interval_s=0, budget_s=5,
+            )
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_raises_retryable_then_reentry_uses_a_fresh_key(self):
+        handler, posts = self._service({"failed_step": "observations", "retryable": True, "error_kind": "upstream_transient"})
+        with pytest.raises(RewriteError) as caught:
+            await self._run(handler)
+        assert caught.value.retryable is True
+        got = await self._run(handler)  # outer retry re-enters with the same base key
+        assert got.prompt == "ok"
+        assert posts == ["v", "v", "v:retry-1"]
+
+    @pytest.mark.asyncio
+    async def test_error_kind_alone_marks_the_failure_transient(self):
+        handler, _ = self._service({"failed_step": "x", "error_kind": "upstream_transient"})
+        with pytest.raises(RewriteError) as caught:
+            await self._run(handler)
+        assert caught.value.retryable is True
+
+    @pytest.mark.asyncio
+    async def test_legacy_failure_message_with_429_is_treated_as_transient(self):
+        handler, _ = self._service({"failed_step": "observations", "error": "OpenRouterError: HTTP 429: rate-limited"})
+        with pytest.raises(RewriteError) as caught:
+            await self._run(handler)
+        assert caught.value.retryable is True
+        assert "429" in caught.value.describe()
+
+    @pytest.mark.asyncio
+    async def test_legacy_text_without_an_http_status_stays_terminal(self):
+        handler, _ = self._service({"failed_step": "observations", "error": "the model was temporarily rate limited"})
+        with pytest.raises(RewriteError) as caught:
+            await self._run(handler)
+        assert caught.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_upstream_status_from_the_service_is_recorded(self):
+        handler, _ = self._service(
+            {"failed_step": "observations", "retryable": True, "error_kind": "upstream_transient", "upstream_status": 429}
+        )
+        with pytest.raises(RewriteError) as caught:
+            await self._run(handler)
+        assert caught.value.upstream_status == 429
+        assert "upstream 429" in caught.value.describe()
+
+    @pytest.mark.asyncio
+    async def test_explicit_non_retryable_stays_terminal(self):
+        handler, _ = self._service({"failed_step": "plan", "retryable": False, "error": "HTTP 429 but service says no"})
+        with pytest.raises(RewriteError) as caught:
+            await self._run(handler)
+        assert caught.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_opaque_legacy_failure_stays_terminal(self):
+        handler, _ = self._service({"failed_step": "observations"})
+        with pytest.raises(RewriteError) as caught:
+            await self._run(handler)
+        assert caught.value.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_resubmission_chain_is_bounded(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"id": "cir-x", "status": "failed", "failed_step": "s", "retryable": True}
+            )
+
+        with pytest.raises(RewriteError) as caught:
+            await self._run(handler)
+        assert caught.value.retryable is False
