@@ -8,7 +8,6 @@ import fakeredis.aioredis
 import httpx
 import pytest
 from fastapi import FastAPI, Request
-from pydantic import ValidationError
 
 from litellm.llms.causyn.context_ir import ContextIRService
 from litellm.llms.causyn.context_ir_budget import REFUND_SCRIPT
@@ -305,7 +304,7 @@ async def test_h3_context_ir_endpoint_enforces_five_second_minimum_only_for_caus
         assert "5 through 15" in causyn_four.json()["error"]["message"]
 
 
-def test_mixed_media_indexes_and_audio_rejection():
+def test_mixed_media_indexes_ref2va_ordering():
     request = spec(
         content=[
             {"type": "text", "text": "Follow the actor from the picture and movement in the video."},
@@ -316,22 +315,43 @@ def test_mixed_media_indexes_and_audio_rejection():
     assert request.mode == "ref2va"
     assert request.user_content()[0]["text"].startswith("<Picture 1>")
     assert request.user_content()[2]["text"].startswith("<Video 1>")
-    with pytest.raises(ValidationError, match="reference audio requires at least one reference image or video"):
-        spec(
-            content=[
-                {"type": "text", "text": "Hello"},
-                {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
-            ]
-        )
 
 
-def test_total_reference_count_over_12_is_rejected():
-    image_ref = {"type": "image_url", "image_url": {"url": "https://media.example/a.png"}, "role": "reference_image"}
-    video_ref = {"type": "video_url", "video_url": {"url": "https://media.example/a.mp4"}}
-    audio_ref = {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}}
-    with pytest.raises(ValidationError, match="total reference count exceeds 12"):
-        spec(
-            content=[{"type": "text", "text": "Hello"}, *([image_ref] * 9), *([video_ref] * 3), audio_ref],
+AUDIO_ONLY_CONTENT = [
+    {"type": "text", "text": "Hello"},
+    {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
+]
+FOURTEEN_REFERENCE_CONTENT = [
+    {"type": "text", "text": "Hello"},
+    *([{"type": "image_url", "image_url": {"url": "https://media.example/a.png"}, "role": "reference_image"}] * 9),
+    *([{"type": "video_url", "video_url": {"url": "https://media.example/a.mp4"}}] * 3),
+    *([{"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}}] * 2),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [AUDIO_ONLY_CONTENT, FOURTEEN_REFERENCE_CONTENT])
+async def test_stored_base_era_task_over_the_relocated_causyn_caps_still_deserializes_and_lists(redis, content):
+    store = ContextIRStore(redis)
+    task = await ContextIRService(store, settle=no_settle).create(
+        spec(model="MiniMax-H3", content=content), owner="owner", billing=BillingIdentity()
+    )
+    fetched = await store.get(task.id)
+    assert fetched is not None
+    assert len(fetched.request.content) == len(content)
+    listed = await store.list_tasks("owner")
+    assert [item.id for item in listed] == [task.id]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [AUDIO_ONLY_CONTENT, FOURTEEN_REFERENCE_CONTENT])
+async def test_causyn_1_1_create_rejects_the_relocated_reference_caps(redis, content):
+    service = ContextIRService(ContextIRStore(redis), settle=no_settle)
+    with pytest.raises(
+        RewriteError, match="reference audio requires at least one reference image or video|total reference count exceeds 12"
+    ):
+        await service.create(
+            spec(model="causyn-1.1", content=content), owner="owner", billing=BillingIdentity()
         )
 
 
@@ -406,20 +426,21 @@ async def test_public_protocol_normalization_query_list_delete_and_audio(redis):
         assert listing.json()["total"] == 1
         deleted = await client.delete("/v2/video_generation/" + task_id)
         assert deleted.json() == {"task_id": task_id, "action": "deleted", "status": "deleted"}
+        audio_only_content = [
+            {"type": "text", "text": "Hello"},
+            {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
+        ]
+        accepted_minimax = await client.post(
+            "/v2/h3_context_ir",
+            json={"model": "MiniMax-H3", "content": audio_only_content, "duration": 5, "ratio": "16:9"},
+        )
+        assert accepted_minimax.status_code == 200, accepted_minimax.text
         count = len(normalized)
         rejected = await client.post(
             "/v2/h3_context_ir",
-            json={
-                "model": "MiniMax-H3",
-                "content": [
-                    {"type": "text", "text": "Hello"},
-                    {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
-                ],
-                "duration": 5,
-                "ratio": "16:9",
-            },
+            json={"model": "causyn-1.1", "content": audio_only_content, "duration": 5, "ratio": "16:9"},
         )
-        assert rejected.status_code == 400
+        assert rejected.status_code == 400, rejected.text
         assert len(normalized) == count
 
 

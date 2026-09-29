@@ -29,6 +29,7 @@ from litellm.llms.causyn.h3_prompt import (
     ContextIRRequest,
     RewriteError,
     RewriteResult,
+    causyn_reference_limit_violation,
     rewrite_prompt,
 )
 from litellm.llms.causyn.video_prompt import deliver_video_prompt
@@ -206,8 +207,12 @@ class ContextIRService:
         reservation: dict[str, JsonValue] | None = None,
         video_payload: dict[str, JsonValue] | None = None,
     ) -> ContextIRTask:
-        if spec.model == AUTH_MODEL and spec.duration < 5:
-            raise RewriteError("duration must be from 5 through 15 seconds for causyn-1.1", 400)
+        if spec.model == AUTH_MODEL:
+            if spec.duration < 5:
+                raise RewriteError("duration must be from 5 through 15 seconds for causyn-1.1", 400)
+            violation = causyn_reference_limit_violation(spec)
+            if violation is not None:
+                raise RewriteError(violation, 400)
         now = int(time.time())
         from litellm.proxy.video_endpoints.moderation_metering_runtime import CONTEXT
 

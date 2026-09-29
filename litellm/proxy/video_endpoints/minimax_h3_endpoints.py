@@ -14,7 +14,12 @@ from pydantic import TypeAdapter, ValidationError
 from litellm._logging import verbose_proxy_logger
 from litellm.llms.causyn.context_ir import ContextIRService, get_context_ir_service
 from litellm.llms.causyn.context_ir_store import PREFIX
-from litellm.llms.causyn.h3_prompt import AUTH_MODEL, ContextIRRequest, RewriteError
+from litellm.llms.causyn.h3_prompt import (
+    AUTH_MODEL,
+    ContextIRRequest,
+    RewriteError,
+    causyn_reference_limit_violation,
+)
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_utils.http_parsing_utils import _safe_set_request_parsed_body
@@ -99,8 +104,12 @@ async def prepare_request(request: Request) -> None:
         raw = await read_json_body(request)
         if is_ir_create:
             spec_ir = ContextIRRequest.model_validate_json(raw)
-            if spec_ir.model == AUTH_MODEL and spec_ir.duration < 5:
-                raise H3Error(400, "duration must be from 5 through 15 seconds for causyn-1.1")
+            if spec_ir.model == AUTH_MODEL:
+                if spec_ir.duration < 5:
+                    raise H3Error(400, "duration must be from 5 through 15 seconds for causyn-1.1")
+                violation = causyn_reference_limit_violation(spec_ir)
+                if violation is not None:
+                    raise H3Error(400, violation)
             request.scope["causyn_context_ir_spec"] = spec_ir
             _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
         else:
