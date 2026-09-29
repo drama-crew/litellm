@@ -90,7 +90,9 @@ CAUSYN_BILLING_METADATA_VERSION_V3 = "causyn-video-billing-v3"
 CAUSYN_BILLING_METADATA_VERSION_V4 = "causyn-video-billing-v4"
 CAUSYN_RATIO = "3:2"
 CAUSYN_DEADLINE_SECONDS = 1800.0
-CAUSYN_H3_DEADLINE_SECONDS = 1800.0
+# Heaviest supported ref2va (10 s + 1 image + 3x5 s video) measured ~26 min on the
+# 2-GPU lane; the deadline counts from queue entry, so leave room to wait.
+CAUSYN_H3_DEADLINE_SECONDS = 3600.0
 _INTERNAL_VIDEO_FLAG = "DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_FLAG_ALIAS = "OH_DRAMA_INTERNAL_VIDEO_ENABLED"
 _CAUSYN_H3_FLAG = "DRAMA_CAUSYN_1_1_ENABLED"
@@ -171,8 +173,8 @@ _MODEL_SPECS: Mapping[str, _ModelSpec] = MappingProxyType(
             duration_max=15,
             # One admitted 15s request measured 420.368s P100 and uses a 600s
             # H3 execution cap. This deadline starts earlier, at queue entry,
-            # so it stays at 30 minutes to cover waiting behind prior jobs at
-            # the measured production concurrency of one. Keep it independent
+            # so it is 60 minutes to cover the ~26 min heaviest ref2va run plus
+            # waiting behind prior jobs at the measured production concurrency. Keep it independent
             # from the historical 1.0 pipeline and the downstream call cap.
             deadline_seconds=CAUSYN_H3_DEADLINE_SECONDS,
             native_audio_required=True,

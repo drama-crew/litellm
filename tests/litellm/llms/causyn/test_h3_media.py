@@ -302,3 +302,37 @@ async def test_reference_download_classifies_retryable_failure(monkeypatch, fail
                 client, request([{"type": "image_url", "image_url": {"url": "https://source.example/ref.png"}}])
             )
     assert error.value.retryable is (failure != 404)
+
+
+def causyn_request(content):
+    return request(content).model_copy(update={"model": "causyn-1.1"})
+
+
+def video_item(seconds):
+    url = "data:video/mp4;base64," + base64.b64encode(clip(seconds=seconds)).decode()
+    return {"type": "video_url", "video_url": {"url": url}}
+
+
+def test_inspect_video_max_seconds_is_parametrised():
+    assert inspect_video(clip(seconds=6)) == 6
+    with pytest.raises(RewriteError, match="2-5 seconds"):
+        inspect_video(clip(seconds=6), 5)
+    assert inspect_video(clip(seconds=5), 5) == 5
+
+
+@pytest.mark.asyncio
+async def test_causyn_1_1_rejects_a_reference_video_longer_than_five_seconds():
+    async with httpx.AsyncClient(trust_env=False) as client:
+        await prepare_media(client, causyn_request([video_item(5)]))
+        with pytest.raises(RewriteError, match="2-5 seconds"):
+            await prepare_media(client, causyn_request([video_item(6)]))
+        # the public MiniMax-H3 / LibTV path keeps the 2-15 s window
+        await prepare_media(client, request([video_item(6)]))
+
+
+@pytest.mark.asyncio
+async def test_causyn_1_1_total_reference_video_is_capped_at_five_seconds():
+    async with httpx.AsyncClient(trust_env=False) as client:
+        with pytest.raises(RewriteError, match="Combined reference video duration exceeds 5 seconds"):
+            await prepare_media(client, causyn_request([video_item(3), video_item(3)]))
+        await prepare_media(client, request([video_item(3), video_item(3)]))

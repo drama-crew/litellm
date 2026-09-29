@@ -1033,3 +1033,67 @@ async def test_render_saturation_reschedules_instead_of_failing_or_hot_looping(r
     # （2**n 差 4 倍以上），不会被抖动淹没——这正是先前用改写 attempts 时
     # 退避停在同一档、只剩抖动的那个缺陷。
     assert delays[-1] > delays[0] + 1, f"要指数退避，实得 {delays}"
+
+
+def _image(n):
+    return [{"type": "image_url", "image_url": {"url": f"https://media.example/{i}.png"}, "role": "reference_image"} for i in range(n)]
+
+
+VIDEO_ITEM = {"type": "video_url", "video_url": {"url": "https://media.example/a.mp4"}}
+
+
+@pytest.mark.parametrize(
+    ("images", "videos", "expected_ok"),
+    [(4, 1, True), (5, 1, False), (4, 3, True), (9, 0, True), (5, 3, False)],
+)
+def test_causyn_reference_image_cap_with_video(images, videos, expected_ok):
+    from litellm.llms.causyn.h3_prompt import causyn_reference_limit_violation
+
+    content = [{"type": "text", "text": "Hello"}, *_image(images), *([VIDEO_ITEM] * videos)]
+    violation = causyn_reference_limit_violation(spec(model="causyn-1.1", content=content))
+    assert (violation is None) is expected_ok
+    if not expected_ok:
+        assert "at most 4 reference images" in violation
+
+
+@pytest.mark.asyncio
+async def test_causyn_1_1_create_rejects_five_images_with_video_but_base_stays_lenient(redis):
+    content = [{"type": "text", "text": "Hello"}, *_image(5), VIDEO_ITEM]
+    service = ContextIRService(ContextIRStore(redis), settle=no_settle)
+    with pytest.raises(RewriteError, match="at most 4 reference images") as error:
+        await service.create(spec(model="causyn-1.1", content=content), owner="owner", billing=BillingIdentity())
+    assert error.value.status_code == 400
+    store = ContextIRStore(redis)
+    task = await ContextIRService(store, settle=no_settle).create(
+        spec(model="MiniMax-H3", content=content), owner="owner", billing=BillingIdentity()
+    )
+    assert (await store.get(task.id)) is not None
+
+
+@pytest.mark.asyncio
+async def test_h3_context_ir_endpoint_rejects_five_images_with_video_for_causyn_model(redis):
+    service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, settle=no_settle)
+
+    async def auth(request: Request):
+        return UserAPIKeyAuth(api_key="owner")
+
+    async def dependency():
+        return service
+
+    app = FastAPI()
+    app.dependency_overrides[h3.user_api_key_auth] = auth
+    app.dependency_overrides[ir.context_ir_service] = dependency
+    app.dependency_overrides[h3.context_ir_service_for_request] = dependency
+    app.include_router(h3.router)
+    app.include_router(ir.router)
+    content = [{"type": "text", "text": "Hello"}, *_image(5), VIDEO_ITEM]
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        rejected = await client.post(
+            "/v2/h3_context_ir", json=spec(model="causyn-1.1", content=content).model_dump(mode="json")
+        )
+        assert rejected.status_code == 400, rejected.text
+        assert "at most 4 reference images" in rejected.json()["error"]["message"]
+        allowed = await client.post(
+            "/v2/h3_context_ir", json=spec(model="MiniMax-H3", content=content).model_dump(mode="json")
+        )
+        assert allowed.status_code == 200, allowed.text
