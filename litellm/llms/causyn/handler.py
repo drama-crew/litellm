@@ -1352,6 +1352,8 @@ class CausynVideoHandler(CustomLLM):
             status_code = 400 if error.code in {"invalid_params", "invalid_url"} else 503
             message = "invalid causyn video request" if status_code == 400 else "causyn video service unavailable"
             raise CustomLLMError(status_code=status_code, message=message) from None
+        except ValidationError:
+            raise _bad_request("invalid causyn video request") from None
         except Exception:  # noqa: BLE001  # replace unknown driver details with a stable public error
             raise _service_error() from None
         response = VideoObject(

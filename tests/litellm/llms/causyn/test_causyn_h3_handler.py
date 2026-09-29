@@ -645,6 +645,20 @@ def test_seed_out_of_range_or_wrong_type_is_rejected(seed):
     assert error.value.status_code == 400
 
 
+@pytest.mark.asyncio
+async def test_h3_prompt_over_7000_characters_is_a_bad_request_not_a_service_error() -> None:
+    with pytest.raises(CustomLLMError) as error:
+        await CausynVideoHandler(prompt_submit=fake_submit, task_id_factory=lambda: TASK_ID).avideo_generation(
+            model="causyn-1.1",
+            prompt="x" * 7001,
+            api_key=None,
+            api_base=None,
+            optional_params=_params(),
+            logging_obj=None,
+        )
+    assert error.value.status_code == 400
+
+
 class TestBillingAcceptsTheGeometryThePipelineProduces:
     """16:9 与 9:16 的 canvas 和 output 不同，而裁剪从未实现。
 
