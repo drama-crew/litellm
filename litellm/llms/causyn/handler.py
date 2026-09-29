@@ -586,9 +586,11 @@ def _requires_direct_prompt_processing(references: tuple[dict[str, str], ...]) -
 
 def _validated_seed(optional_params: dict[str, object]) -> int | None:
     seed = optional_params.get("seed")
-    if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+    if seed is None:
+        return None
+    if isinstance(seed, bool) or not isinstance(seed, int):
         raise _bad_request("seed must be an integer")
-    if isinstance(seed, int) and not isinstance(seed, bool) and not 0 <= seed <= 4294967295:
+    if not 0 <= seed <= 4294967295:
         raise _bad_request("seed must be from 0 through 4294967295")
     return seed
 
