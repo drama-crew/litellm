@@ -10,7 +10,7 @@ from pydantic import TypeAdapter
 
 from litellm.litellm_core_utils.url_utils import validate_url
 from litellm.llms.causyn.h3_prompt import RETRYABLE_STATUS_CODES, ContextIRRequest, RewriteError
-from litellm.proxy.video_endpoints.minimax_h3_models import ImageItem, MediaURL, VideoItem
+from litellm.proxy.video_endpoints.minimax_h3_models import AudioItem, ImageItem, MediaURL, VideoItem
 
 
 async def fetch_media(client: httpx.AsyncClient, url: str, limit: int, redirects: int = 0) -> bytes:
@@ -87,6 +87,22 @@ def inspect_video(raw: bytes) -> float:
         return duration
 
 
+def inspect_audio(raw: bytes) -> float:
+    import av
+
+    with av.open(io.BytesIO(raw), mode="r", options={"enable_drefs": "0"}) as container:
+        if container.format.name not in {"wav", "mp3", "aac", "flac", "ogg", "mov,mp4,m4a,3gp,3g2,mj2"}:
+            raise RewriteError("Reference audio must be WAV, MP3, M4A, AAC, FLAC or OGG", 400)
+        if len(container.streams.video) != 0:
+            raise RewriteError("Reference audio must not contain a video stream", 400)
+        if len(container.streams.audio) != 1:
+            raise RewriteError("Reference audio must contain exactly one audio stream", 400)
+        duration = float(container.duration or 0) / av.time_base
+        if not math.isfinite(duration) or not 0 < duration <= 15:
+            raise RewriteError("Each reference audio clip must last at most 15 seconds", 400)
+        return duration
+
+
 async def prepare_reference(
     client: httpx.AsyncClient, item: ImageItem | VideoItem
 ) -> tuple[ImageItem | VideoItem, float]:
@@ -100,17 +116,29 @@ async def prepare_reference(
     return item.model_copy(update={"video_url": MediaURL(url=url)}), duration
 
 
+async def prepare_audio(client: httpx.AsyncClient, item: AudioItem) -> tuple[AudioItem, float]:
+    raw = await fetch_media(client, item.audio_url.url, 50 * 1024 * 1024)
+    duration = await asyncio.to_thread(inspect_audio, raw)
+    return item, duration
+
+
 async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> ContextIRRequest:
     try:
         async with asyncio.timeout(60):
             prepared = tuple(
                 [
-                    await prepare_reference(client, item) if isinstance(item, (ImageItem, VideoItem)) else (item, 0.0)
+                    await prepare_reference(client, item)
+                    if isinstance(item, (ImageItem, VideoItem))
+                    else await prepare_audio(client, item)
+                    if isinstance(item, AudioItem)
+                    else (item, 0.0)
                     for item in spec.content
                 ]
             )
-        if sum(duration for _, duration in prepared) > 15.000001:
+        if sum(duration for item, duration in prepared if isinstance(item, VideoItem)) > 15.000001:
             raise RewriteError("Combined reference video duration exceeds 15 seconds", 400)
+        if sum(duration for item, duration in prepared if isinstance(item, AudioItem)) > 15.000001:
+            raise RewriteError("Combined reference audio duration exceeds 15 seconds", 400)
         return spec.model_copy(update={"content": tuple(item for item, _ in prepared)})
     except RewriteError:
         raise
