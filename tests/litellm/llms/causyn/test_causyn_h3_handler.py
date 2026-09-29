@@ -1035,11 +1035,18 @@ async def test_direct_prompt_skips_context_ir_and_preserves_text(enqueued, roles
         raise AssertionError("Context IR must not run on the direct path")
 
     await CausynVideoHandler(prompt_submit=forbidden_rewrite).avideo_generation(
-        model="causyn-1.1", prompt=prompt, api_key=None, api_base=None, logging_obj=None,
-        optional_params=_params(prompt_processing="direct", references=[
-            {"role": role, "media_type": "image", "url": f"https://source.example/{i}.png"}
-            for i, role in enumerate(roles)
-        ]),
+        model="causyn-1.1",
+        prompt=prompt,
+        api_key=None,
+        api_base=None,
+        logging_obj=None,
+        optional_params=_params(
+            prompt_processing="direct",
+            references=[
+                {"role": role, "media_type": "image", "url": f"https://source.example/{i}.png"}
+                for i, role in enumerate(roles)
+            ],
+        ),
     )
     payload = enqueued.payloads[0]
     assert payload["request"]["prompt"] == prompt
@@ -1057,7 +1064,46 @@ async def test_direct_prompt_skips_context_ir_and_preserves_text(enqueued, roles
 async def test_unknown_prompt_processing_never_enqueues(enqueued, processing):
     with pytest.raises(CustomLLMError):
         await CausynVideoHandler().avideo_generation(
-            model="causyn-1.1", prompt="a kite", api_key=None, api_base=None, logging_obj=None,
+            model="causyn-1.1",
+            prompt="a kite",
+            api_key=None,
+            api_base=None,
+            logging_obj=None,
             optional_params=_params(prompt_processing=processing),
         )
     assert not enqueued.payloads
+
+
+@pytest.mark.parametrize("ratio", ["16:9", "9:16", "1:1", "4:3", "3:4", "21:9", "adaptive"])
+def test_tasks_persisted_with_the_native_adaptive_profile_still_deserialize_and_settle(ratio: str) -> None:
+    from litellm.llms.causyn.handler import _DurableTaskMetadataV4, _WorkerResult, _result_geometry_matches
+
+    source = "adaptive" if ratio == "adaptive" else mod._h3_source_resolution(ratio)
+    metadata = _DurableTaskMetadataV4.model_validate(
+        {
+            "version": "causyn-video-billing-v4",
+            "geometry_profile": "hyperflow-native-adaptive-v1",
+            "model": "causyn-1.1",
+            "duration_seconds": 5.0,
+            "source_resolution": source,
+            "requested_resolution": "768p",
+            "ratio": ratio,
+            "pricing": {"id": "causyn-1-1", "model": "causyn-1.1", "output_cost_per_second_768p": 5.0},
+            "attribution": {"api_key": None, "user_id": None, "team_id": None, "organization_id": None},
+        }
+    )
+    width, height = (1344, 768) if ratio == "adaptive" else map(int, source.split("x"))
+    result = _WorkerResult.model_validate(
+        {
+            "validation_version": "video-v1",
+            "staging_key": "staging/x.mp4",
+            "etag": '"0"',
+            "bytes": 1,
+            "content_type": "video/mp4",
+            "duration_seconds": 5.2,
+            "width": width,
+            "height": height,
+            "sha256": "0" * 64,
+        }
+    )
+    assert _result_geometry_matches(metadata, result)

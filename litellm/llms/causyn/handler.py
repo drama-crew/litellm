@@ -565,7 +565,7 @@ def _source_resolution(spec: _ModelSpec, ratio: str) -> str:
     return CAUSYN_RESOLUTION
 
 
-GeometryProfile: TypeAlias = Literal["vdn-adaptive-v1", "hyperflow-official-v1"]
+GeometryProfile: TypeAlias = Literal["vdn-adaptive-v1", "hyperflow-official-v1", "hyperflow-native-adaptive-v1"]
 
 
 def _frames_for_duration(duration: int) -> int:
@@ -593,6 +593,8 @@ _ADAPTIVE_MAX_ASPECT: float = max(_ADAPTIVE_ASPECT_SAMPLES)
 def _vdn_source_resolution(ratio: str, duration: int, geometry_profile: GeometryProfile) -> str:
     if ratio == "adaptive":
         return "adaptive"
+    if geometry_profile == "hyperflow-native-adaptive-v1":
+        return _h3_source_resolution(ratio)
     if geometry_profile == "hyperflow-official-v1":
         geometry = GEOMETRIES[ratio]
         return f"{geometry.width}x{geometry.height}"
