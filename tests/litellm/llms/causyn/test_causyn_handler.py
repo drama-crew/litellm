@@ -123,6 +123,26 @@ async def test_maps_openai_params_onto_the_task_envelope(enqueued):
 
 
 @pytest.mark.asyncio
+async def test_the_vdn8_backed_model_only_supports_3_2_and_rejects_21_9(enqueued):
+    """causyn-1.0 renders on the vdn8 worker, whose ARK geometry table has no
+    21:9 entry. HyperFlow's 21:9 is only wired up for causyn-1.1 (h3_media's
+    GEOMETRIES); causyn-1.0's model spec still advertises the single 3:2
+    ratio, so the generic aspect_ratio allowlist in _request already turns
+    21:9 away with a 400 before it can reach the vdn8 worker."""
+    with pytest.raises(CustomLLMError) as error:
+        await CausynVideoHandler().avideo_generation(
+            model="causyn-1.0",
+            prompt="a cat",
+            api_key=None,
+            api_base=None,
+            optional_params=_params(aspect_ratio="21:9"),
+            logging_obj=None,
+        )
+    assert error.value.status_code == 400
+    assert enqueued.payloads == []
+
+
+@pytest.mark.asyncio
 async def test_accepts_already_shaped_references(enqueued):
     """drama-cli and the platform build reference lists differently; neither
     should need a per-caller branch in here."""
