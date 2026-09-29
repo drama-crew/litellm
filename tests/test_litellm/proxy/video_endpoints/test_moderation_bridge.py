@@ -4,11 +4,13 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 from fastapi import FastAPI
+from starlette.requests import Request
 
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.common_request_processing import ProxyBaseLLMRequestProcessing
 from litellm.proxy.video_endpoints import endpoints
+from litellm.proxy.video_endpoints import moderation_bridge as bridge
 from litellm.types.videos.main import VideoObject
 
 
@@ -550,3 +552,119 @@ async def test_direct_prompt_survives_moderation_admission_and_resume(monkeypatc
     assert len(captured) == 1
     assert seen[0]["prompt"] == prompt
     assert seen[0]["prompt_processing"] == "direct"
+
+
+def _producer_request():
+    from starlette.requests import Request
+
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/videos",
+            "headers": [(b"x-drama-moderation-admission", b"ticket")],
+            "query_string": b"",
+        }
+    )
+
+
+async def _admit(monkeypatch, admission):
+    from litellm.proxy.video_endpoints import moderation_execution as execution
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "http://platform.test")
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", "test-token")
+    cleared = []
+    monkeypatch.setattr(bridge, "platform", AsyncMock(return_value=admission))
+    monkeypatch.setattr(entry, "attest", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "litellm.proxy.auth.user_api_key_auth._run_centralized_common_checks", AsyncMock(return_value=None)
+    )
+
+    async def clear(intent_id):
+        cleared.append(intent_id)
+
+    monkeypatch.setattr(execution, "clear_submission_failure", clear)
+    request = _producer_request()
+    auth = UserAPIKeyAuth(api_key="a" * 64, user_id="owner", team_id="owner", metadata={"openapi_key_id": "key-id"})
+    assert await bridge.submit(request, auth, {"model": "hailuo-h3", "prompt": "p"}, "avideo_generation") is None
+    return request, cleared
+
+
+@pytest.mark.asyncio
+async def test_producer_admission_with_a_nonce_clears_the_stale_marker_and_remembers_the_attempt(monkeypatch):
+    request, cleared = await _admit(
+        monkeypatch, {"acquired": True, "metering": {"intent_id": "intent-1"}, "nonce": "nonce-9"}
+    )
+    assert cleared == ["intent-1"]
+    assert request.scope["moderation_producer_attempt"] == ("intent-1", "nonce-9")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("nonce", [None, "", 7])
+async def test_producer_admission_from_an_old_app_never_writes_or_clears_markers(monkeypatch, nonce):
+    admission = {"acquired": True, "metering": {"intent_id": "intent-1"}}
+    if nonce is not None:
+        admission["nonce"] = nonce
+    request, cleared = await _admit(monkeypatch, admission)
+    assert cleared == []
+    assert "moderation_producer_attempt" not in request.scope
+
+
+async def _run_execute(monkeypatch, attempt, call, request_scope_extra=None):
+    from starlette.requests import Request
+
+    from litellm.proxy.video_endpoints import moderation_execution as execution
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+
+    recorded = []
+
+    async def record(intent_id, attempt_token, error):
+        recorded.append((intent_id, attempt_token, type(error).__name__))
+
+    monkeypatch.setattr(execution, "record_submission_failure", record)
+    monkeypatch.setattr(entry, "scope_for", AsyncMock(return_value=None))
+    monkeypatch.setattr(bridge, "capture", AsyncMock())
+    scope = {"type": "http", "method": "POST", "path": "/v1/videos", "headers": []}
+    if attempt is not None:
+        scope["moderation_producer_attempt"] = attempt
+    request = Request(scope)
+    outcome = None
+    try:
+        await entry.execute(request, UserAPIKeyAuth(api_key="a" * 64), "avideo_generation", call())
+    except Exception as exc:
+        outcome = exc
+    return recorded, outcome
+
+
+@pytest.mark.asyncio
+async def test_producer_post_admission_create_failure_records_a_marker_bound_to_the_nonce(monkeypatch):
+    async def fail():
+        raise httpx.ReadTimeout("lost reply")
+
+    recorded, outcome = await _run_execute(monkeypatch, ("intent-1", "nonce-9"), fail)
+    assert recorded == [("intent-1", "nonce-9", "ReadTimeout")]
+    assert isinstance(outcome, httpx.ReadTimeout)
+
+
+@pytest.mark.asyncio
+async def test_producer_failure_without_an_attempt_or_after_acceptance_records_nothing(monkeypatch):
+    async def fail():
+        raise httpx.ReadTimeout("lost reply")
+
+    async def ok():
+        return VideoObject(id="native", object="video", status="queued")
+
+    recorded, _ = await _run_execute(monkeypatch, None, fail)
+    assert recorded == []
+    recorded, _ = await _run_execute(monkeypatch, ("intent-1", "nonce-9"), ok)
+    assert recorded == []
+
+
+@pytest.mark.asyncio
+async def test_producer_not_sent_failures_keep_their_existing_path_and_record_nothing(monkeypatch):
+    async def refused():
+        raise httpx.ConnectError("refused")
+
+    recorded, _ = await _run_execute(monkeypatch, ("intent-1", "nonce-9"), refused)
+    assert recorded == []

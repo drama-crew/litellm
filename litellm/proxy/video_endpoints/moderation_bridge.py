@@ -297,6 +297,15 @@ async def submit(
         from litellm.proxy.video_endpoints.moderation_metering_entry import attest
 
         attest(request, admission["metering"])
+        nonce = admission.get("nonce")
+        if isinstance(nonce, str) and nonce:
+            from litellm.proxy.video_endpoints.moderation_execution import clear_submission_failure
+
+            intent_id = TypeAdapter(str).validate_python(
+                JSON_OBJECT.validate_python(admission["metering"])["intent_id"]
+            )
+            await clear_submission_failure(intent_id)
+            request.scope["moderation_producer_attempt"] = (intent_id, nonce)
         from litellm.proxy.auth.user_api_key_auth import _run_centralized_common_checks
 
         await _run_centralized_common_checks(auth, request, payload, "/v1/videos")

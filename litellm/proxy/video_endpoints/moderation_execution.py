@@ -192,7 +192,7 @@ def _provider_response_status(error: BaseException, depth: int = 0) -> int | Non
         return error.response.status_code
     if isinstance(error, openai.APIStatusError) and not type(error).__module__.startswith("litellm"):
         return error.status_code
-    original = error.__cause__ or error.__context__
+    original = error.__cause__
     if original is None or original is error or depth >= 16:
         return None
     return _provider_response_status(original, depth + 1)

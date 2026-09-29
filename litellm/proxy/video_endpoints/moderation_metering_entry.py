@@ -169,8 +169,11 @@ async def execute(
         await moderation_bridge.capture(request, result)
         return result
     except Exception as exc:
-        from litellm.proxy.video_endpoints.moderation_execution import failure_outcome
+        from litellm.proxy.video_endpoints.moderation_execution import failure_outcome, record_submission_failure
 
+        producer = request.scope.get("moderation_producer_attempt")
+        if producer is not None and not accepted and failure_outcome(exc) == "ambiguous":
+            await record_submission_failure(producer[0], producer[1], exc)
         if scope is not None and not accepted and failure_outcome(exc) in {"not_sent", "rejected"}:
             from litellm.proxy.spend_tracking import budget_reservation
             from litellm.proxy.video_endpoints.openapi_log_capture import raw_method

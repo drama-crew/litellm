@@ -533,3 +533,14 @@ async def test_settlement_surfaces_submission_failures_as_typed_409_with_the_att
     assert response.status_code == 409
     error = response.json()["error"]
     assert (error["code"], error["provider_status"], error["attempt"]) == (code, status, "attempt-7")
+
+
+def test_provider_status_proof_ignores_the_implicit_context_chain():
+    try:
+        try:
+            raise _http_status(413)
+        except httpx.HTTPStatusError:
+            raise RuntimeError("unrelated failure raised while handling another error")
+    except RuntimeError as outer:
+        assert outer.__context__ is not None and outer.__cause__ is None
+        assert execution.provider_status_proof(outer) is None
