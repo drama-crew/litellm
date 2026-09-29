@@ -570,6 +570,24 @@ def _frames_for_duration(duration: int) -> int:
     return duration * 24 + (5 - duration * 24) % 17
 
 
+_ADAPTIVE_DURATIONS: tuple[int, ...] = tuple(range(4, 16))
+_ADAPTIVE_EDGE_KEYFRAME_SIZES: tuple[tuple[int, int], ...] = ((400, 1000), (1000, 400))
+
+
+def _adaptive_extreme_aspect(keyframe_size: tuple[int, int], duration: int) -> float:
+    geometry = resolve_geometry(first_size=keyframe_size, frames=_frames_for_duration(duration))
+    return geometry.width / geometry.height
+
+
+_ADAPTIVE_ASPECT_SAMPLES: tuple[float, ...] = tuple(
+    _adaptive_extreme_aspect(keyframe_size, duration)
+    for duration in _ADAPTIVE_DURATIONS
+    for keyframe_size in _ADAPTIVE_EDGE_KEYFRAME_SIZES
+)
+_ADAPTIVE_MIN_ASPECT: float = min(_ADAPTIVE_ASPECT_SAMPLES)
+_ADAPTIVE_MAX_ASPECT: float = max(_ADAPTIVE_ASPECT_SAMPLES)
+
+
 def _vdn_source_resolution(ratio: str, duration: int, geometry_profile: GeometryProfile) -> str:
     if ratio == "adaptive":
         return "adaptive"
@@ -953,7 +971,7 @@ def _result_geometry_matches(metadata: _TaskMetadata, result: _WorkerResult) -> 
     budget = pixel_budget(frames)
     return (
         all(256 <= value <= 1536 and value % 2 == 0 for value in (width, height))
-        and 0.399 <= width / height <= 2.506
+        and _ADAPTIVE_MIN_ASPECT <= width / height <= _ADAPTIVE_MAX_ASPECT
         and math.ceil(width / 32) * math.ceil(height / 32) * 1024 <= budget
         and width * height >= 0.9 * min(768 * 768, budget)
     )

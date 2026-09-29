@@ -854,6 +854,74 @@ class TestAdmittedGeometriesSurviveAnyArkRollout:
         )
 
 
+class TestAdaptiveGeometryWindowMatchesArkRounding:
+    """I-C：FL2VA 的宽高比窗口曾用 0.399-2.506 这两个写死的数字，但 ARK 的
+    `_fit_geometry` 在输入关键帧取到 [0.4, 2.5] 边界、再按 32 像素取整之后，
+    实际产出的画幅比可以跑到 [0.3846, 2.6]（例如 11-14s 的 1248x480，比值
+    2.6）。窗口现在从 `_fit_geometry` 本身在这些边界上的输出反推，而不是
+    手写一个近似值。"""
+
+    @staticmethod
+    def _metadata(source: str, duration: float = 15.0):
+        from litellm.llms.causyn.handler import _DurableTaskMetadataV4
+
+        return _DurableTaskMetadataV4.model_validate(
+            {
+                "version": "causyn-video-billing-v4",
+                "geometry_profile": "vdn-adaptive-v1",
+                "model": "causyn-1.1",
+                "duration_seconds": duration,
+                "source_resolution": source,
+                "requested_resolution": "768p",
+                "ratio": "adaptive",
+                "pricing": {"id": "causyn-1-1", "model": "causyn-1.1", "output_cost_per_second_768p": 5.0},
+                "attribution": {"api_key": None, "user_id": None, "team_id": None, "organization_id": None},
+            }
+        )
+
+    @staticmethod
+    def _result(width: int, height: int):
+        from litellm.llms.causyn.handler import _WorkerResult
+
+        return _WorkerResult.model_validate(
+            {
+                "validation_version": "video-v1",
+                "staging_key": "staging/x.mp4",
+                "etag": '"0"',
+                "bytes": 1,
+                "content_type": "video/mp4",
+                "duration_seconds": 5.175,
+                "width": width,
+                "height": height,
+                "sha256": "0" * 64,
+            }
+        )
+
+    def test_1536x608_from_a_near_5_2_keyframe_at_5s_settles(self):
+        """review 报告里明确举出的例子：2.526 的宽高比，5-8s 都会产出这张 canvas。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert _result_geometry_matches(self._metadata("adaptive", duration=5.0), self._result(1536, 608))
+
+    def test_1248x480_at_13s_is_the_true_extreme_and_settles(self):
+        """13s 的预算收缩让比值推到 2.6，比 review 建议的 0.39-2.56 兜底还宽——
+        这正是要求"从 ARK 的数学推导，而不是写死一个近似值"的原因。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert _result_geometry_matches(self._metadata("adaptive", duration=13.0), self._result(1248, 480))
+
+    def test_the_portrait_mirror_at_13s_settles(self):
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert _result_geometry_matches(self._metadata("adaptive", duration=13.0), self._result(480, 1248))
+
+    def test_a_result_beyond_the_true_extreme_is_still_rejected(self):
+        """放宽不等于放弃：比 ARK 实际能产出的最极端画幅比还夸张的结果仍须拒绝。"""
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert not _result_geometry_matches(self._metadata("adaptive", duration=13.0), self._result(1280, 480))
+
+
 class TestGeometryProfileOnPersistedMetadata:
     """C3: geometry_profile 必须真的接进校验，旧任务与新任务各走各的公式。"""
 
