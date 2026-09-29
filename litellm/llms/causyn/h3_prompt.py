@@ -141,7 +141,7 @@ class ContextIRRequest(BaseModel):
                 {"type": "text", "text": f"<Video {index}> reference video:\n"},
                 {"type": "video_url", "video_url": {"url": item.video_url.url}},
             )
-        return ({"type": "text", "text": f"<Audio {index}> reference audio:\n{item.audio_url.url}\n"},)
+        return ({"type": "text", "text": f"<Audio {index}> reference audio:\n"},)
 
 
 class RewriteUsage(BaseModel):

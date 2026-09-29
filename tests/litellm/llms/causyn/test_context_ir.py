@@ -325,6 +325,42 @@ def test_mixed_media_indexes_and_audio_rejection():
         )
 
 
+def test_audio_numbering_counts_only_explicit_audio_items_not_a_reference_videos_soundtrack():
+    """H3's ARK worker mixes a reference video's own soundtrack into the
+    render without treating it as a separate audio reference, so the
+    rewriter's <Audio j> numbering must count only explicit audio_url content
+    items -- a reference video ahead of it in ``content`` must not consume an
+    audio slot."""
+    request = spec(
+        content=[
+            {"type": "text", "text": "Follow the actor from the picture and movement in the video."},
+            {"type": "video_url", "video_url": {"url": "https://media.example/a.mp4"}},
+            {"type": "audio_url", "audio_url": {"url": "https://media.example/a.mp3"}},
+        ]
+    )
+    parts = request.user_content()
+    video_part, audio_part = (part for part in parts if part["type"] == "text" and part["text"].startswith("<"))
+    assert video_part["text"].startswith("<Video 1>")
+    assert audio_part["text"] == "<Audio 1> reference audio:\n"
+
+
+def test_audio_reference_label_never_carries_the_audio_url():
+    """I3: the rewritten prompt is sent to a third-party (OpenRouter) model.
+    Unlike images/videos, audio has no structured multimodal content part, so
+    it must never be embedded in the text either -- only the <Audio j> label
+    may reach the provider."""
+    request = spec(
+        content=[
+            {"type": "text", "text": "Follow the movement in the video and match the reference audio."},
+            {"type": "video_url", "video_url": {"url": "https://media.example/a.mp4"}},
+            {"type": "audio_url", "audio_url": {"url": "https://private.example/secret-reference.mp3"}},
+        ]
+    )
+    rendered = json.dumps(request.user_content())
+    assert "https://private.example/secret-reference.mp3" not in rendered
+    assert "<Audio 1> reference audio:" in rendered
+
+
 @pytest.mark.asyncio
 async def test_public_protocol_normalization_query_list_delete_and_audio(redis):
     service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, settle=no_settle)
