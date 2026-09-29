@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 from contextvars import ContextVar
 from typing import Annotated, Literal
@@ -181,6 +182,35 @@ def failure_outcome(error: BaseException) -> str:
     return "ambiguous"
 
 
+def provider_status_proof(error: BaseException, depth: int = 0) -> int | None:
+    import openai
+
+    from litellm.exceptions import APIError
+
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+    elif isinstance(error, (openai.APIStatusError, APIError)) and isinstance(error.status_code, int):
+        status = error.status_code
+    else:
+        original = error.__cause__ or error.__context__
+        if original is None or original is error or depth >= 16:
+            return None
+        return provider_status_proof(original, depth + 1)
+    return status if 400 <= status <= 599 and status not in {408, 504} else None
+
+
+async def record_provider_not_submitted(intent_id: str, error: BaseException) -> None:
+    status = provider_status_proof(error)
+    if status is None:
+        return
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
+
+    try:
+        await metering.store().record_provider_not_submitted(intent_id, status, "provider request failed")
+    except Exception:  # noqa: BLE001  # the marker is best effort and must never mask the provider failure
+        logging.getLogger(__name__).warning("provider_not_submitted marker not recorded", exc_info=True)
+
+
 router = APIRouter(prefix="/internal/moderation")
 
 
@@ -248,6 +278,8 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
             await bridge.platform(
                 request, "POST", f"/intents/{claims.intent_id}/not-sent", {"token": token, "outcome": outcome}
             )
+        else:
+            await record_provider_not_submitted(claims.intent_id, exc)
         raise
     if route != "context_ir":
         await bridge.capture(execution, result)
@@ -440,9 +472,24 @@ async def settlement(body: Ticket, request: Request, authorization: Annotated[st
         if event.binding != binding or event.native_id != authority["native_id"]:
             raise HTTPException(403, "Settlement provider binding mismatch")
         await store.persist(event)
+    manual = await store.manual_settlement_reason(binding.intent_id)
+    if manual is not None:
+        return JSONResponse(status_code=409, content={"error": {"code": "key_identity_mismatch", "message": manual}})
     events: list[PhaseEvent] = []
     for phase in binding.expected_phases:
         event = await store.phase(binding.intent_id, phase)
         if event is not None and event.native_id:
             events.append(event)
+    not_submitted = None if events else await store.provider_not_submitted(binding.intent_id)
+    if not_submitted is not None:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "provider_not_submitted",
+                    "provider_status": not_submitted[0],
+                    "message": not_submitted[1],
+                }
+            },
+        )
     return (await store.settlement(binding)).model_copy(update={"events": tuple(events)}).model_dump(mode="json")

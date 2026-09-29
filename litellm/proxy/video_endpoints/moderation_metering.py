@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from datetime import datetime
@@ -38,6 +39,14 @@ class BillingWindow(BaseModel):
 
 class AdmissionMissing(ValueError):
     """No metering task was ever registered for the intent."""
+
+
+class KeyIdentityMismatch(ValueError):
+    """The metered API key no longer exists or changed owner; retrying can never succeed."""
+
+
+MANUAL_SETTLEMENT = "needs_manual_settlement"
+RETRY_BACKOFF_CAP_SECONDS = 600
 
 
 class BillingBinding(BaseModel):
@@ -262,7 +271,7 @@ class MeteringStore:
             binding.team_id,
             binding.organization_id,
         ):
-            raise ValueError("moderation metering key identity mismatch")
+            raise KeyIdentityMismatch("moderation metering key identity mismatch")
         teams = TypeAdapter(list[TeamIdentity]).validate_python(
             await tx.query_raw(
                 'SELECT organization_id FROM "LiteLLM_TeamTable" WHERE team_id=$1 FOR UPDATE', binding.team_id
@@ -533,7 +542,7 @@ class MeteringStore:
                 "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET status='running',lease_token=$1,lease_until=NOW()+INTERVAL '20 seconds',attempts=attempts+1 "
                 'WHERE request_id=(SELECT request_id FROM "LiteLLM_ModerationMeteringPhase" '
                 "WHERE (status='pending' OR (status='running' AND lease_until<NOW())) AND available_at<=NOW() "
-                "ORDER BY created_at,request_id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *",
+                "ORDER BY available_at,request_id FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING *",
                 token,
             )
         )
@@ -550,12 +559,26 @@ class MeteringStore:
                 token,
             )
             raise
-        except Exception:
+        except KeyIdentityMismatch as error:
             await self.db.execute_raw(
-                "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET status='pending',available_at=NOW()+INTERVAL '2 seconds' "
+                'UPDATE "LiteLLM_ModerationMeteringPhase" SET status=$3,failure_reason=$4,lease_token=NULL,lease_until=NULL '
                 "WHERE request_id=$1 AND lease_token=$2 AND status='running'",
                 row.request_id,
                 token,
+                MANUAL_SETTLEMENT,
+                "key_identity_mismatch: " + str(error),
+            )
+            logging.getLogger(__name__).error(
+                "moderation metering phase %s parked for manual settlement: %s", row.request_id, error
+            )
+        except Exception:
+            await self.db.execute_raw(
+                "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET status='pending',"
+                "available_at=NOW()+make_interval(secs => LEAST($3::double precision,2*POWER(2,LEAST(attempts-1,20)))) "
+                "WHERE request_id=$1 AND lease_token=$2 AND status='running'",
+                row.request_id,
+                token,
+                float(RETRY_BACKOFF_CAP_SECONDS),
             )
             raise
         return True
@@ -668,6 +691,39 @@ class MeteringStore:
             complete=complete,
             total_actual=sum((receipt.amount or Decimal(0) for receipt in receipts), Decimal(0)) if complete else None,
         )
+
+    async def manual_settlement_reason(self, intent_id: str) -> str | None:
+        rows = TypeAdapter(tuple[dict[str, str | None], ...]).validate_python(
+            await self.db.query_raw(
+                'SELECT failure_reason FROM "LiteLLM_ModerationMeteringPhase" WHERE intent_id=$1 AND status=$2 '
+                "ORDER BY phase LIMIT 1",
+                intent_id,
+                MANUAL_SETTLEMENT,
+            )
+        )
+        return (rows[0]["failure_reason"] or MANUAL_SETTLEMENT) if rows else None
+
+    async def record_provider_not_submitted(self, intent_id: str, provider_status: int, message: str) -> bool:
+        changed = await self.db.execute_raw(
+            'UPDATE "LiteLLM_ModerationMeteringTask" SET submission_failure=$2::jsonb WHERE intent_id=$1 '
+            'AND submission_failure IS NULL AND NOT EXISTS (SELECT 1 FROM "LiteLLM_ModerationMeteringPhase" '
+            "WHERE intent_id=$1 AND COALESCE(payload->>'native_id','')<>'')",
+            intent_id,
+            _json({"code": "provider_not_submitted", "provider_status": provider_status, "message": message}),
+        )
+        return changed == 1
+
+    async def provider_not_submitted(self, intent_id: str) -> tuple[int, str] | None:
+        rows = TypeAdapter(tuple[dict[str, JsonValue], ...]).validate_python(
+            await self.db.query_raw(
+                'SELECT submission_failure FROM "LiteLLM_ModerationMeteringTask" WHERE intent_id=$1', intent_id
+            )
+        )
+        failure = rows[0]["submission_failure"] if rows else None
+        if not isinstance(failure, dict) or failure.get("code") != "provider_not_submitted":
+            return None
+        status = failure.get("provider_status")
+        return (status, str(failure.get("message") or "")) if isinstance(status, int) else None
 
     async def binding(self, intent_id: str) -> BillingBinding:
         tasks = TypeAdapter(list[TaskRow]).validate_python(

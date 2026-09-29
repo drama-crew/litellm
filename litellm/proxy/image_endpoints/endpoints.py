@@ -487,8 +487,7 @@ def _image_upscale_collection_identity_is_complete(receipt: StoredReceipt) -> bo
     the only path that emits the billing event and persists the terminal result.
     """
     return all(
-        isinstance(value, str) and value.strip()
-        for value in (receipt.team_id, receipt.api_key, receipt.user_id)
+        isinstance(value, str) and value.strip() for value in (receipt.team_id, receipt.api_key, receipt.user_id)
     )
 
 

@@ -299,12 +299,203 @@ async def test_settlement_without_admission_is_typed_404(monkeypatch):
     app = FastAPI()
     app.include_router(execution.router)
     token = jwt.encode(
-        dict(intent_id="never-admitted", request_digest="digest", input_digest="input", model="video",
-             policy_version="v1", policy_digest="policy", purpose="settlement", iat=int(time.time()),
-             exp=int(time.time()) + 60, aud="moderation-fork"),
-        secret, algorithm="HS256")
+        dict(
+            intent_id="never-admitted",
+            request_digest="digest",
+            input_digest="input",
+            model="video",
+            policy_version="v1",
+            policy_digest="policy",
+            purpose="settlement",
+            iat=int(time.time()),
+            exp=int(time.time()) + 60,
+            aud="moderation-fork",
+        ),
+        secret,
+        algorithm="HS256",
+    )
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://synthetic") as client:
-        response = await client.post("/internal/moderation/settlement",
-            headers={"Authorization": "Bearer " + secret}, json={"ticket": token})
+        response = await client.post(
+            "/internal/moderation/settlement", headers={"Authorization": "Bearer " + secret}, json={"ticket": token}
+        )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "admission_missing"
+
+
+def _bad_gateway():
+    from litellm.exceptions import BadGatewayError
+
+    response = httpx.Response(502, request=httpx.Request("POST", "https://provider.invalid/video"))
+    return BadGatewayError(message="provider request failed", model="m", llm_provider="libtv", response=response)
+
+
+def _timeout():
+    from litellm.exceptions import Timeout
+
+    return Timeout(message="provider request failed", model="m", llm_provider="libtv", exception_status_code=504)
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (_bad_gateway(), 502),
+        (httpx.HTTPStatusError("boom", request=httpx.Request("POST", "https://p"), response=httpx.Response(500)), 500),
+        (_timeout(), None),
+        (httpx.ReadTimeout("lost"), None),
+        (httpx.ConnectError("refused"), None),
+        (RuntimeError("bug"), None),
+        (httpx.HTTPStatusError("t", request=httpx.Request("POST", "https://p"), response=httpx.Response(504)), None),
+    ],
+)
+def test_provider_status_proof_only_for_provider_http_answers(error, expected):
+    assert execution.provider_status_proof(error) == expected
+
+
+def test_provider_status_proof_follows_the_cause_chain():
+    try:
+        try:
+            raise httpx.HTTPStatusError(
+                "boom", request=httpx.Request("POST", "https://p"), response=httpx.Response(503)
+            )
+        except httpx.HTTPStatusError as inner:
+            raise RuntimeError("wrapped") from inner
+    except RuntimeError as outer:
+        assert execution.provider_status_proof(outer) == 503
+
+
+class _RecordingMeter:
+    def __init__(self):
+        self.marks = []
+        self.manual = None
+        self.not_submitted = None
+        self.events = {}
+
+    async def record_provider_not_submitted(self, intent_id, status, message):
+        self.marks.append((intent_id, status, message))
+        return True
+
+    async def binding(self, intent_id):
+        from litellm.proxy.video_endpoints.moderation_metering import BillingBinding
+
+        return BillingBinding(
+            intent_id=intent_id,
+            request_digest="a" * 64,
+            fingerprint="key",
+            user_id="user",
+            team_id="team",
+            model="video",
+            expected_phases=("submit",),
+        )
+
+    async def manual_settlement_reason(self, intent_id):
+        return self.manual
+
+    async def provider_not_submitted(self, intent_id):
+        return self.not_submitted
+
+    async def phase(self, intent_id, phase):
+        return self.events.get(phase)
+
+    async def persist(self, event):
+        raise AssertionError("no events expected")
+
+    async def settlement(self, binding):
+        raise AssertionError("must not settle")
+
+
+async def _post_submit(monkeypatch, error):
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", SECRET)
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "http://platform.test")
+    meter = _RecordingMeter()
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+    app = FastAPI()
+    app.include_router(execution.router)
+    calls = []
+
+    async def platform(request):
+        calls.append(request.url.path)
+        if request.url.path.endswith("/begin"):
+            return httpx.Response(
+                200,
+                json={
+                    "acquired": True,
+                    "token": "attempt",
+                    "metering": {
+                        "intent_id": "intent",
+                        "request_digest": "a" * 64,
+                        "actor_user_id": "actor",
+                        "model": "hailuo-h3",
+                    },
+                    "credential": "sk-original",
+                    "route": "avideo_generation",
+                    "request": {"model": "hailuo-h3", "prompt": "synthetic"},
+                },
+            )
+        return httpx.Response(200, json={})
+
+    app.state.moderation_transport = httpx.MockTransport(platform)
+    monkeypatch.setattr(execution, "authenticate", AsyncMock(return_value=UserAPIKeyAuth(api_key="original")))
+    monkeypatch.setattr(execution, "invoke", AsyncMock(side_effect=error))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False), base_url="http://fork"
+    ) as client:
+        await client.post(
+            "/internal/moderation/submit", json={"ticket": ticket()}, headers={"Authorization": "Bearer " + SECRET}
+        )
+    return meter, calls
+
+
+@pytest.mark.asyncio
+async def test_post_admission_provider_http_failure_records_provider_not_submitted(monkeypatch):
+    meter, calls = await _post_submit(monkeypatch, _bad_gateway())
+    assert meter.marks == [("intent", 502, "provider request failed")]
+    assert not any(path.endswith("/not-sent") for path in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [httpx.ReadTimeout("lost reply"), RuntimeError("unknown")])
+async def test_ambiguous_failures_never_record_provider_not_submitted(monkeypatch, error):
+    meter, _ = await _post_submit(monkeypatch, error)
+    assert meter.marks == []
+
+
+async def _settle(monkeypatch, meter):
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", SECRET)
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "http://platform.test")
+    monkeypatch.setattr(runtime, "store", lambda: meter)
+
+    async def platform(request, method, path, payload):
+        return dict(binding=None, native_id="native", events={}, recovery_binding={"intent_id": "intent"})
+
+    monkeypatch.setattr(execution.bridge, "platform", platform)
+    app = FastAPI()
+    app.include_router(execution.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fork") as client:
+        return await client.post(
+            "/internal/moderation/settlement",
+            headers={"Authorization": "Bearer " + SECRET},
+            json={"ticket": ticket("settlement")},
+        )
+
+
+@pytest.mark.asyncio
+async def test_settlement_surfaces_key_identity_mismatch_as_typed_409(monkeypatch):
+    meter = _RecordingMeter()
+    meter.manual = "key_identity_mismatch: moderation metering key identity mismatch"
+    response = await _settle(monkeypatch, meter)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "key_identity_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_settlement_surfaces_provider_not_submitted_as_typed_409(monkeypatch):
+    meter = _RecordingMeter()
+    meter.not_submitted = (502, "provider request failed")
+    response = await _settle(monkeypatch, meter)
+    assert response.status_code == 409
+    error = response.json()["error"]
+    assert (error["code"], error["provider_status"]) == ("provider_not_submitted", 502)

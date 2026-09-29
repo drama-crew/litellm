@@ -25,9 +25,7 @@ _VIDEO_ID_CODECS: dict[str, tuple[str, Callable[[str], Optional[DecodedVideoId]]
 _VIDEO_ID_CODEC_MODULES = {"video_v2_": "litellm.llms.libtv.video_id_codec"}
 
 
-def register_video_id_codec(
-    provider: str, prefix: str, decoder: Callable[[str], Optional[DecodedVideoId]]
-) -> None:
+def register_video_id_codec(provider: str, prefix: str, decoder: Callable[[str], Optional[DecodedVideoId]]) -> None:
     """Register a provider-neutral decoder for a versioned public ID."""
     if provider and prefix and callable(decoder):
         _VIDEO_ID_CODECS[prefix] = (provider, decoder)
@@ -121,9 +119,7 @@ def decode_video_id_with_provider(encoded_video_id: str) -> DecodedVideoId:
             if registered is None:
                 return DecodedVideoId(custom_llm_provider=None, model_id=None, video_id=encoded_video_id)
             decoded = registered[1](encoded_video_id)
-            return decoded or DecodedVideoId(
-                custom_llm_provider=None, model_id=None, video_id=encoded_video_id
-            )
+            return decoded or DecodedVideoId(custom_llm_provider=None, model_id=None, video_id=encoded_video_id)
 
     try:
         cleaned_id = encoded_video_id[len(VIDEO_ID_PREFIX) :]

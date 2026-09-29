@@ -38,7 +38,8 @@ async def store():
             "litellm-proxy-extras/litellm_proxy_extras/migrations/20260913000000_moderation_metering/migration.sql"
         )
         admission = migration.parent.parent / "20260913010000_legacy_financial_admission" / "migration.sql"
-        for statement in (migration.read_text() + admission.read_text()).split(";"):
+        terminal = migration.parent.parent / "20260930000000_metering_terminal_states" / "migration.sql"
+        for statement in (migration.read_text() + admission.read_text() + terminal.read_text()).split(";"):
             if statement.strip():
                 await db.execute_raw(statement)
         for statement in (
@@ -153,8 +154,12 @@ async def test_wrong_debit_identity_rolls_back_without_receipt(store, change):
         await db.execute_raw('DELETE FROM "LiteLLM_UserTable"')
     else:
         await db.execute_raw(f"UPDATE \"LiteLLM_VerificationToken\" SET {change}_id='other'")
-    with pytest.raises(ValueError):
-        await meter.run_once()
+    if change == "missing":
+        with pytest.raises(ValueError):
+            await meter.run_once()
+    else:
+        assert await meter.run_once()
+        assert (await meter.manual_settlement_reason("intent")).startswith("key_identity_mismatch")
     assert (await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"')) == [{"spend": 0.0}]
     assert not (await meter.settlement(binding())).complete
 
@@ -1743,7 +1748,9 @@ async def production_store():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("protected_mode", [True, False])
-async def test_phase_projection_matches_complete_production_prisma_schema(production_store, monkeypatch, protected_mode):
+async def test_phase_projection_matches_complete_production_prisma_schema(
+    production_store, monkeypatch, protected_mode
+):
     from datetime import datetime, timezone
 
     from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
@@ -1939,7 +1946,11 @@ async def test_context_ir_internal_execution_rewrite_outbox_production_schema_on
     import time
 
     clock = [time.time()]
-    monkeypatch.setattr(context_ir, "time", SimpleNamespace(time=lambda: clock[0], time_ns=lambda: int(clock[0] * 1e9)))
+    monkeypatch.setattr(
+        context_ir,
+        "time",
+        SimpleNamespace(time=lambda: clock[0], time_ns=lambda: int(clock[0] * 1e9), monotonic=time.monotonic),
+    )
     delivered_events = []
 
     async def settle(task):
@@ -2602,6 +2613,9 @@ async def test_unprotected_phase_failure_never_debits_without_atomic_receipt(sto
         )
         with pytest.raises(ValueError, match="lease expired"):
             await meter._apply(phase.request_id, "expired")
+    elif failure == "identity":
+        assert await meter.run_once()
+        assert (await meter.manual_settlement_reason("intent")).startswith("key_identity_mismatch")
     else:
         with pytest.raises(Exception):
             await meter.run_once()
@@ -2642,3 +2656,123 @@ async def test_unprotected_phase_rejects_cutover_or_reservation_state(store, mon
     assert await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"') == [{"spend": 0.0}]
     assert await db.query_raw('SELECT request_id FROM "LiteLLM_SpendLogs"') == []
     assert (await meter.settlement(binding())).receipts == ()
+
+
+def scoped_binding(intent_id):
+    return binding().model_copy(update={"intent_id": intent_id})
+
+
+def scoped_event(intent_id, phase="completion", amount="20", native_id="native"):
+    return event(phase, amount).model_copy(
+        update={
+            "binding": scoped_binding(intent_id),
+            "request_id": "public-video:" + intent_id + ":" + phase,
+            "native_id": native_id,
+        }
+    )
+
+
+async def phase_state(db, intent_id):
+    return (
+        await db.query_raw(
+            'SELECT status,attempts,failure_reason,available_at > NOW() AS delayed FROM "LiteLLM_ModerationMeteringPhase" '
+            "WHERE intent_id=$1 AND phase='completion'",
+            intent_id,
+        )
+    )[0]
+
+
+@pytest.mark.asyncio
+async def test_claim_orders_by_available_at_so_a_delayed_poison_row_cannot_starve_ready_work(store):
+    meter, db, _, _ = store
+    for intent in ("old-poison", "young-ready"):
+        await prepare_meter(meter, scoped_binding(intent), {})
+        await meter.persist(scoped_event(intent))
+    await db.execute_raw(
+        "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET created_at=NOW()-INTERVAL '1 hour',"
+        "available_at=NOW()-INTERVAL '5 minutes' WHERE intent_id='old-poison'"
+    )
+    await db.execute_raw(
+        "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET available_at=NOW()-INTERVAL '10 minutes' "
+        "WHERE intent_id='young-ready'"
+    )
+    assert await meter.run_once()
+    assert (await phase_state(db, "young-ready"))["status"] == "settled"
+    assert (await phase_state(db, "old-poison"))["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_failures_back_off_exponentially_up_to_the_cap(store):
+    meter, db, _, _ = store
+    await prepare_meter(meter, binding(), {})
+    await meter.persist(event())
+    await db.execute_raw('DELETE FROM "LiteLLM_UserTable"')
+    delays = []
+    for attempts in (1, 2, 3, 40):
+        await db.execute_raw(
+            "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET status='pending',available_at=NOW()-INTERVAL '1 second',"
+            "attempts=$1 WHERE phase='completion'",
+            attempts - 1,
+        )
+        with pytest.raises(ValueError):
+            await meter.run_once()
+        delays.append(
+            (
+                await db.query_raw(
+                    "SELECT (EXTRACT(EPOCH FROM available_at)-EXTRACT(EPOCH FROM NOW()))::float8 AS d "
+                    "FROM \"LiteLLM_ModerationMeteringPhase\" WHERE phase='completion'"
+                )
+            )[0]["d"]
+        )
+    assert [round(d) for d in delays[:3]] == [2, 4, 8]
+    assert 590 < delays[3] <= 600
+    assert not await meter.run_once()
+
+
+@pytest.mark.asyncio
+async def test_deleted_key_parks_the_phase_for_manual_settlement_without_debit(store):
+    meter, db, _, _ = store
+    await prepare_meter(meter, binding(), {})
+    await meter.persist(event())
+    await db.execute_raw('DELETE FROM "LiteLLM_VerificationToken"')
+    assert await meter.run_once()
+    state = await phase_state(db, "intent")
+    assert state["status"] == "needs_manual_settlement"
+    assert state["failure_reason"].startswith("key_identity_mismatch")
+    assert not await meter.run_once()
+    assert (await db.query_raw('SELECT spend FROM "LiteLLM_TeamTable"')) == [{"spend": 0.0}]
+    assert (await db.query_raw('SELECT spend FROM "LiteLLM_UserTable"')) == [{"spend": 0.0}]
+    assert (await meter.manual_settlement_reason("intent")).startswith("key_identity_mismatch")
+    assert not (await meter.settlement(binding())).complete
+
+
+@pytest.mark.asyncio
+async def test_transient_identity_failure_other_than_key_mismatch_keeps_retrying(store):
+    meter, db, _, _ = store
+    await prepare_meter(meter, binding(), {})
+    await meter.persist(event())
+    await db.execute_raw('DELETE FROM "LiteLLM_UserTable"')
+    with pytest.raises(ValueError):
+        await meter.run_once()
+    state = await phase_state(db, "intent")
+    assert (state["status"], state["delayed"]) == ("pending", True)
+    assert await meter.manual_settlement_reason("intent") is None
+
+
+@pytest.mark.asyncio
+async def test_provider_not_submitted_marker_is_recorded_once_and_read_back(store):
+    meter, _, _, _ = store
+    await prepare_meter(meter, binding(), {})
+    assert await meter.provider_not_submitted("intent") is None
+    assert await meter.record_provider_not_submitted("intent", 502, "provider request failed")
+    assert not await meter.record_provider_not_submitted("intent", 500, "later")
+    assert await meter.provider_not_submitted("intent") == (502, "provider request failed")
+
+
+@pytest.mark.asyncio
+async def test_provider_not_submitted_is_refused_once_a_provider_task_id_exists(store):
+    meter, _, _, _ = store
+    await prepare_meter(meter, binding(), {})
+    await meter.persist(event("submit", "0"))
+    assert not await meter.record_provider_not_submitted("intent", 502, "provider request failed")
+    assert await meter.provider_not_submitted("intent") is None
