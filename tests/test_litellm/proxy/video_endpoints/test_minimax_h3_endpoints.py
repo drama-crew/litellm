@@ -14,7 +14,13 @@ from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
 from litellm.proxy.video_endpoints import context_ir_endpoints
 from litellm.proxy.video_endpoints import minimax_h3_endpoints as h3
 from litellm.proxy.video_endpoints import moderation_bridge as bridge
-from litellm.proxy.video_endpoints.minimax_h3_models import MiniMaxH3Content, MiniMaxH3Create, MiniMaxTask, decode_task, encode_task
+from litellm.proxy.video_endpoints.minimax_h3_models import (
+    MiniMaxH3Content,
+    MiniMaxH3Create,
+    MiniMaxTask,
+    decode_task,
+    encode_task,
+)
 from litellm.proxy.video_endpoints.minimax_h3_paths import PREFIXES
 
 

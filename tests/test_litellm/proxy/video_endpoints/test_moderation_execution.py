@@ -335,32 +335,53 @@ def _timeout():
     return Timeout(message="provider request failed", model="m", llm_provider="libtv", exception_status_code=504)
 
 
+def _http_status(code):
+    return httpx.HTTPStatusError("boom", request=httpx.Request("POST", "https://p"), response=httpx.Response(code))
+
+
+def _openai_status(code):
+    import openai
+
+    response = httpx.Response(code, request=httpx.Request("POST", "https://p"))
+    return openai.APIStatusError("boom", response=response, body=None)
+
+
+@pytest.mark.parametrize("code", [405, 406, 410, 411, 413, 414, 415, 431, 451])
+def test_provider_status_proof_accepts_only_refused_before_processing_statuses(code):
+    assert execution.provider_status_proof(_http_status(code)) == code
+    assert execution.provider_status_proof(_openai_status(code)) == code
+
+
+@pytest.mark.parametrize("code", [408, 409, 425, 429, 500, 502, 503, 504])
+def test_provider_status_proof_rejects_statuses_that_may_follow_acceptance(code):
+    assert execution.provider_status_proof(_http_status(code)) is None
+    assert execution.provider_status_proof(_openai_status(code)) is None
+
+
 @pytest.mark.parametrize(
-    ("error", "expected"),
-    [
-        (_bad_gateway(), 502),
-        (httpx.HTTPStatusError("boom", request=httpx.Request("POST", "https://p"), response=httpx.Response(500)), 500),
-        (_timeout(), None),
-        (httpx.ReadTimeout("lost"), None),
-        (httpx.ConnectError("refused"), None),
-        (RuntimeError("bug"), None),
-        (httpx.HTTPStatusError("t", request=httpx.Request("POST", "https://p"), response=httpx.Response(504)), None),
-    ],
+    "error",
+    [_bad_gateway(), _timeout(), httpx.ReadTimeout("lost"), httpx.ConnectError("refused"), RuntimeError("bug")],
 )
-def test_provider_status_proof_only_for_provider_http_answers(error, expected):
-    assert execution.provider_status_proof(error) == expected
+def test_provider_status_proof_never_trusts_synthesized_or_transport_errors(error):
+    assert execution.provider_status_proof(error) is None
+
+
+def test_litellm_synthesized_status_is_not_proof_even_when_refusal_like():
+    from litellm.exceptions import APIError
+    from litellm.llms.custom_llm import CustomLLMError
+
+    assert execution.provider_status_proof(APIError(415, "m", "libtv", "m")) is None
+    assert execution.provider_status_proof(CustomLLMError(status_code=413, message="x")) is None
 
 
 def test_provider_status_proof_follows_the_cause_chain():
     try:
         try:
-            raise httpx.HTTPStatusError(
-                "boom", request=httpx.Request("POST", "https://p"), response=httpx.Response(503)
-            )
+            raise _http_status(413)
         except httpx.HTTPStatusError as inner:
             raise RuntimeError("wrapped") from inner
     except RuntimeError as outer:
-        assert execution.provider_status_proof(outer) == 503
+        assert execution.provider_status_proof(outer) == 413
 
 
 class _RecordingMeter:
@@ -370,9 +391,12 @@ class _RecordingMeter:
         self.not_submitted = None
         self.events = {}
 
-    async def record_provider_not_submitted(self, intent_id, status, message):
-        self.marks.append((intent_id, status, message))
+    async def record_submission_failure(self, intent_id, code, status, message, attempt):
+        self.marks.append((intent_id, code, status, message, attempt))
         return True
+
+    async def clear_submission_failure(self, intent_id):
+        self.cleared = getattr(self, "cleared", 0) + 1
 
     async def binding(self, intent_id):
         from litellm.proxy.video_endpoints.moderation_metering import BillingBinding
@@ -390,7 +414,7 @@ class _RecordingMeter:
     async def manual_settlement_reason(self, intent_id):
         return self.manual
 
-    async def provider_not_submitted(self, intent_id):
+    async def submission_failure(self, intent_id):
         return self.not_submitted
 
     async def phase(self, intent_id, phase):
@@ -448,17 +472,26 @@ async def _post_submit(monkeypatch, error):
 
 
 @pytest.mark.asyncio
-async def test_post_admission_provider_http_failure_records_provider_not_submitted(monkeypatch):
-    meter, calls = await _post_submit(monkeypatch, _bad_gateway())
-    assert meter.marks == [("intent", 502, "provider request failed")]
+async def test_refused_before_processing_records_provider_not_submitted_bound_to_the_attempt(monkeypatch):
+    meter, calls = await _post_submit(monkeypatch, _http_status(413))
+    assert meter.marks == [("intent", "provider_not_submitted", 413, "provider request failed", "attempt")]
+    assert meter.cleared == 1
     assert not any(path.endswith("/not-sent") for path in calls)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("error", [httpx.ReadTimeout("lost reply"), RuntimeError("unknown")])
-async def test_ambiguous_failures_never_record_provider_not_submitted(monkeypatch, error):
+@pytest.mark.parametrize(
+    ("error", "status"),
+    [
+        (_bad_gateway(), 502),
+        (_http_status(503), 503),
+        (httpx.ReadTimeout("lost reply"), None),
+        (RuntimeError("unknown"), None),
+    ],
+)
+async def test_other_post_admission_failures_record_provider_submission_ambiguous(monkeypatch, error, status):
     meter, _ = await _post_submit(monkeypatch, error)
-    assert meter.marks == []
+    assert meter.marks == [("intent", "provider_submission_ambiguous", status, "provider request failed", "attempt")]
 
 
 async def _settle(monkeypatch, meter):
@@ -492,10 +525,11 @@ async def test_settlement_surfaces_key_identity_mismatch_as_typed_409(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_settlement_surfaces_provider_not_submitted_as_typed_409(monkeypatch):
+@pytest.mark.parametrize(("code", "status"), [("provider_not_submitted", 413), ("provider_submission_ambiguous", None)])
+async def test_settlement_surfaces_submission_failures_as_typed_409_with_the_attempt(monkeypatch, code, status):
     meter = _RecordingMeter()
-    meter.not_submitted = (502, "provider request failed")
+    meter.not_submitted = (code, status, "provider request failed", "attempt-7")
     response = await _settle(monkeypatch, meter)
     assert response.status_code == 409
     error = response.json()["error"]
-    assert (error["code"], error["provider_status"]) == ("provider_not_submitted", 502)
+    assert (error["code"], error["provider_status"], error["attempt"]) == (code, status, "attempt-7")

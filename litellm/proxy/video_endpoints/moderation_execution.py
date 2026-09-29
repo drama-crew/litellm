@@ -182,33 +182,64 @@ def failure_outcome(error: BaseException) -> str:
     return "ambiguous"
 
 
-def provider_status_proof(error: BaseException, depth: int = 0) -> int | None:
+REFUSED_BEFORE_PROCESSING = frozenset({405, 406, 410, 411, 413, 414, 415, 431, 451})
+
+
+def _provider_response_status(error: BaseException, depth: int = 0) -> int | None:
     import openai
 
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code
+    if isinstance(error, openai.APIStatusError) and not type(error).__module__.startswith("litellm"):
+        return error.status_code
+    original = error.__cause__ or error.__context__
+    if original is None or original is error or depth >= 16:
+        return None
+    return _provider_response_status(original, depth + 1)
+
+
+def _reported_status(error: BaseException, depth: int = 0) -> int | None:
     from litellm.exceptions import APIError
 
-    if isinstance(error, httpx.HTTPStatusError):
-        status = error.response.status_code
-    elif isinstance(error, (openai.APIStatusError, APIError)) and isinstance(error.status_code, int):
-        status = error.status_code
-    else:
-        original = error.__cause__ or error.__context__
-        if original is None or original is error or depth >= 16:
-            return None
-        return provider_status_proof(original, depth + 1)
-    return status if 400 <= status <= 599 and status not in {408, 504} else None
+    status = _provider_response_status(error)
+    if status is not None:
+        return status
+    if isinstance(error, APIError) and isinstance(error.status_code, int):
+        return error.status_code
+    status_code = getattr(error, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code
+    original = error.__cause__ or error.__context__
+    if original is None or original is error or depth >= 16:
+        return None
+    return _reported_status(original, depth + 1)
 
 
-async def record_provider_not_submitted(intent_id: str, error: BaseException) -> None:
-    status = provider_status_proof(error)
-    if status is None:
-        return
+def provider_status_proof(error: BaseException) -> int | None:
+    status = _provider_response_status(error)
+    return status if status in REFUSED_BEFORE_PROCESSING else None
+
+
+async def clear_submission_failure(intent_id: str) -> None:
     from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
 
     try:
-        await metering.store().record_provider_not_submitted(intent_id, status, "provider request failed")
+        await metering.store().clear_submission_failure(intent_id)
+    except Exception:  # noqa: BLE001  # a new attempt must proceed even when the store is unavailable
+        logging.getLogger(__name__).warning("stale submission failure marker not cleared", exc_info=True)
+
+
+async def record_submission_failure(intent_id: str, attempt: str, error: BaseException) -> None:
+    proof = provider_status_proof(error)
+    code = "provider_not_submitted" if proof is not None else "provider_submission_ambiguous"
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
+
+    try:
+        await metering.store().record_submission_failure(
+            intent_id, code, proof if proof is not None else _reported_status(error), "provider request failed", attempt
+        )
     except Exception:  # noqa: BLE001  # the marker is best effort and must never mask the provider failure
-        logging.getLogger(__name__).warning("provider_not_submitted marker not recorded", exc_info=True)
+        logging.getLogger(__name__).warning("provider submission failure marker not recorded", exc_info=True)
 
 
 router = APIRouter(prefix="/internal/moderation")
@@ -221,6 +252,7 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
     if begin.get("acquired") is not True:
         return {"accepted": True, "state": begin.get("state")}
     token = TypeAdapter(str).validate_python(begin["token"])
+    await clear_submission_failure(claims.intent_id)
     try:
         payload = bridge.JSON_OBJECT.validate_python(begin["request"])
         route = TypeAdapter(str).validate_python(begin["route"])
@@ -279,7 +311,7 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
                 request, "POST", f"/intents/{claims.intent_id}/not-sent", {"token": token, "outcome": outcome}
             )
         else:
-            await record_provider_not_submitted(claims.intent_id, exc)
+            await record_submission_failure(claims.intent_id, token, exc)
         raise
     if route != "context_ir":
         await bridge.capture(execution, result)
@@ -480,15 +512,16 @@ async def settlement(body: Ticket, request: Request, authorization: Annotated[st
         event = await store.phase(binding.intent_id, phase)
         if event is not None and event.native_id:
             events.append(event)
-    not_submitted = None if events else await store.provider_not_submitted(binding.intent_id)
-    if not_submitted is not None:
+    failure = None if events else await store.submission_failure(binding.intent_id)
+    if failure is not None:
         return JSONResponse(
             status_code=409,
             content={
                 "error": {
-                    "code": "provider_not_submitted",
-                    "provider_status": not_submitted[0],
-                    "message": not_submitted[1],
+                    "code": failure[0],
+                    "provider_status": failure[1],
+                    "message": failure[2],
+                    "attempt": failure[3],
                 }
             },
         )

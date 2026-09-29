@@ -47,6 +47,7 @@ class KeyIdentityMismatch(ValueError):
 
 MANUAL_SETTLEMENT = "needs_manual_settlement"
 RETRY_BACKOFF_CAP_SECONDS = 600
+SUBMISSION_FAILURE_CODES = frozenset({"provider_not_submitted", "provider_submission_ambiguous"})
 
 
 class BillingBinding(BaseModel):
@@ -703,27 +704,43 @@ class MeteringStore:
         )
         return (rows[0]["failure_reason"] or MANUAL_SETTLEMENT) if rows else None
 
-    async def record_provider_not_submitted(self, intent_id: str, provider_status: int, message: str) -> bool:
+    async def record_submission_failure(
+        self, intent_id: str, code: str, provider_status: int | None, message: str, attempt: str
+    ) -> bool:
+        if code not in SUBMISSION_FAILURE_CODES:
+            raise ValueError("unknown submission failure code")
         changed = await self.db.execute_raw(
             'UPDATE "LiteLLM_ModerationMeteringTask" SET submission_failure=$2::jsonb WHERE intent_id=$1 '
-            'AND submission_failure IS NULL AND NOT EXISTS (SELECT 1 FROM "LiteLLM_ModerationMeteringPhase" '
+            "AND (submission_failure IS NULL OR submission_failure->>'attempt' IS DISTINCT FROM $3) "
+            'AND NOT EXISTS (SELECT 1 FROM "LiteLLM_ModerationMeteringPhase" '
             "WHERE intent_id=$1 AND COALESCE(payload->>'native_id','')<>'')",
             intent_id,
-            _json({"code": "provider_not_submitted", "provider_status": provider_status, "message": message}),
+            _json({"code": code, "provider_status": provider_status, "message": message, "attempt": attempt}),
+            attempt,
         )
         return changed == 1
 
-    async def provider_not_submitted(self, intent_id: str) -> tuple[int, str] | None:
+    async def clear_submission_failure(self, intent_id: str) -> None:
+        await self.db.execute_raw(
+            'UPDATE "LiteLLM_ModerationMeteringTask" SET submission_failure=NULL WHERE intent_id=$1', intent_id
+        )
+
+    async def submission_failure(self, intent_id: str) -> tuple[str, int | None, str, str] | None:
         rows = TypeAdapter(tuple[dict[str, JsonValue], ...]).validate_python(
             await self.db.query_raw(
                 'SELECT submission_failure FROM "LiteLLM_ModerationMeteringTask" WHERE intent_id=$1', intent_id
             )
         )
         failure = rows[0]["submission_failure"] if rows else None
-        if not isinstance(failure, dict) or failure.get("code") != "provider_not_submitted":
+        if not isinstance(failure, dict) or failure.get("code") not in SUBMISSION_FAILURE_CODES:
             return None
         status = failure.get("provider_status")
-        return (status, str(failure.get("message") or "")) if isinstance(status, int) else None
+        return (
+            str(failure["code"]),
+            status if isinstance(status, int) and not isinstance(status, bool) else None,
+            str(failure.get("message") or ""),
+            str(failure.get("attempt") or ""),
+        )
 
     async def binding(self, intent_id: str) -> BillingBinding:
         tasks = TypeAdapter(list[TaskRow]).validate_python(

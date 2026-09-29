@@ -2760,19 +2760,38 @@ async def test_transient_identity_failure_other_than_key_mismatch_keeps_retrying
 
 
 @pytest.mark.asyncio
-async def test_provider_not_submitted_marker_is_recorded_once_and_read_back(store):
+async def test_submission_failure_marker_is_bound_to_its_attempt_and_replaced_by_a_later_one(store):
     meter, _, _, _ = store
     await prepare_meter(meter, binding(), {})
-    assert await meter.provider_not_submitted("intent") is None
-    assert await meter.record_provider_not_submitted("intent", 502, "provider request failed")
-    assert not await meter.record_provider_not_submitted("intent", 500, "later")
-    assert await meter.provider_not_submitted("intent") == (502, "provider request failed")
+    assert await meter.submission_failure("intent") is None
+    assert await meter.record_submission_failure("intent", "provider_not_submitted", 413, "m", "attempt-1")
+    assert not await meter.record_submission_failure("intent", "provider_submission_ambiguous", None, "m", "attempt-1")
+    assert await meter.submission_failure("intent") == ("provider_not_submitted", 413, "m", "attempt-1")
+    assert await meter.record_submission_failure("intent", "provider_submission_ambiguous", None, "m", "attempt-2")
+    assert await meter.submission_failure("intent") == ("provider_submission_ambiguous", None, "m", "attempt-2")
 
 
 @pytest.mark.asyncio
-async def test_provider_not_submitted_is_refused_once_a_provider_task_id_exists(store):
+async def test_a_new_attempt_clears_a_stale_marker(store):
+    meter, _, _, _ = store
+    await prepare_meter(meter, binding(), {})
+    await meter.record_submission_failure("intent", "provider_not_submitted", 413, "m", "attempt-1")
+    await meter.clear_submission_failure("intent")
+    assert await meter.submission_failure("intent") is None
+
+
+@pytest.mark.asyncio
+async def test_submission_failure_is_refused_once_a_provider_task_id_exists(store):
     meter, _, _, _ = store
     await prepare_meter(meter, binding(), {})
     await meter.persist(event("submit", "0"))
-    assert not await meter.record_provider_not_submitted("intent", 502, "provider request failed")
-    assert await meter.provider_not_submitted("intent") is None
+    assert not await meter.record_submission_failure("intent", "provider_submission_ambiguous", None, "m", "a")
+    assert await meter.submission_failure("intent") is None
+
+
+@pytest.mark.asyncio
+async def test_unknown_submission_failure_code_is_rejected(store):
+    meter, _, _, _ = store
+    await prepare_meter(meter, binding(), {})
+    with pytest.raises(ValueError):
+        await meter.record_submission_failure("intent", "anything", None, "m", "a")

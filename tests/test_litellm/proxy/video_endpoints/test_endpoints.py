@@ -63,9 +63,7 @@ AZURE_VIDEO_ID = encode_video_id_with_provider("video_orig123", "azure", VIDEO_M
 # A real model-encoded character id: decodes to provider "azure", VIDEO_MODEL_ID,
 # original character id "char_orig". Distinct from the video id so a test cannot
 # pass by reusing the wrong constant.
-AZURE_CHARACTER_ID = encode_character_id_with_provider(
-    "char_orig", "azure", VIDEO_MODEL_ID
-)
+AZURE_CHARACTER_ID = encode_character_id_with_provider("char_orig", "azure", VIDEO_MODEL_ID)
 RESOLVED_MODELS: Dict[str, str] = {VIDEO_MODEL_ID: "azure-sora"}
 
 # Sentinel propagated by base_process for the passthrough endpoints.
@@ -118,9 +116,7 @@ def harness():
     logging = MagicMock(spec=ProxyLogging)
 
     router = MagicMock(spec=Router)
-    resolve_model = MagicMock(
-        side_effect=lambda model_id: RESOLVED_MODELS.get(model_id)
-    )
+    resolve_model = MagicMock(side_effect=lambda model_id: RESOLVED_MODELS.get(model_id))
     resolve_video_alias = MagicMock(
         side_effect=lambda provider, model_id: {
             ("azure", VIDEO_MODEL_ID): VIDEO_MODEL_ID,
@@ -153,9 +149,7 @@ def harness():
             )
         )
         stack.enter_context(patch.object(endpoints, "_read_request_body", read_body))
-        stack.enter_context(
-            patch.object(endpoints, "batch_to_bytesio", batch_to_bytesio)
-        )
+        stack.enter_context(patch.object(endpoints, "batch_to_bytesio", batch_to_bytesio))
         stack.enter_context(
             patch.object(
                 endpoints,
@@ -181,9 +175,7 @@ def harness():
         stack.enter_context(patch.object(proxy_server, "proxy_logging_obj", logging))
         stack.enter_context(patch.object(proxy_server, "general_settings", {}))
         stack.enter_context(patch.object(proxy_server, "proxy_config", MagicMock()))
-        stack.enter_context(
-            patch.object(proxy_server, "select_data_generator", MagicMock())
-        )
+        stack.enter_context(patch.object(proxy_server, "select_data_generator", MagicMock()))
         stack.enter_context(patch.object(proxy_server, "user_model", None))
         stack.enter_context(patch.object(proxy_server, "user_temperature", None))
         stack.enter_context(patch.object(proxy_server, "user_request_timeout", None))
@@ -214,9 +206,7 @@ def _user() -> UserAPIKeyAuth:
 # =========================================================================== #
 
 
-async def call_generation(
-    harness: Harness, *, body: Dict[str, Any], input_reference=None
-):
+async def call_generation(harness: Harness, *, body: Dict[str, Any], input_reference=None):
     harness.read_body.return_value = body
     return await endpoints.video_generation(
         request=FakeRequest(),
@@ -346,10 +336,7 @@ async def test_content__wraps_raw_bytes_in_response(harness):
     assert isinstance(resp, Response)
     assert resp.body == b"VIDEOBYTES"
     assert resp.media_type == "video/mp4"
-    assert (
-        resp.headers["content-disposition"]
-        == "attachment; filename=video.mp4"
-    )
+    assert resp.headers["content-disposition"] == "attachment; filename=video.mp4"
 
 
 @pytest.mark.asyncio
@@ -396,9 +383,7 @@ async def test_content__model_encoded_id(harness):
 # =========================================================================== #
 
 
-async def call_edit(
-    harness: Harness, *, body: Dict[str, Any], headers=None, query=None
-):
+async def call_edit(harness: Harness, *, body: Dict[str, Any], headers=None, query=None):
     return await endpoints.video_edit(
         request=FakeRequest(headers=headers, query=query, raw_body=orjson.dumps(body)),
         fastapi_response=Response(),
@@ -408,9 +393,7 @@ async def call_edit(
 
 @pytest.mark.asyncio
 async def test_edit__extracts_nested_video_id_full_contract(harness):
-    resp = await call_edit(
-        harness, body={"prompt": "brighter", "video": {"id": AZURE_VIDEO_ID}}
-    )
+    resp = await call_edit(harness, body={"prompt": "brighter", "video": {"id": AZURE_VIDEO_ID}})
 
     assert resp is SENTINEL
     assert harness.route_type() == "avideo_edit"
@@ -495,9 +478,7 @@ async def test_list__provider_from_header(harness):
 # =========================================================================== #
 
 
-async def call_remix(
-    harness: Harness, video_id: str, *, body, headers=None, query=None
-):
+async def call_remix(harness: Harness, video_id: str, *, body, headers=None, query=None):
     return await endpoints.video_remix(
         video_id=video_id,
         request=FakeRequest(headers=headers, query=query, raw_body=orjson.dumps(body)),
@@ -594,9 +575,7 @@ async def test_create_character__target_model_sets_model_and_encodes_id(harness)
     assert data["model"] == "azure-sora-model"
     assert data["custom_llm_provider"] == "azure"
     # response id re-encoded with the resolved provider + model for the round-trip.
-    assert resp["id"] == encode_character_id_with_provider(
-        "char_raw", "azure", "azure-sora-model"
-    )
+    assert resp["id"] == encode_character_id_with_provider("char_raw", "azure", "azure-sora-model")
 
 
 # =========================================================================== #
@@ -604,9 +583,7 @@ async def test_create_character__target_model_sets_model_and_encodes_id(harness)
 # =========================================================================== #
 
 
-async def call_get_character(
-    harness: Harness, character_id: str, *, headers=None, query=None
-):
+async def call_get_character(harness: Harness, character_id: str, *, headers=None, query=None):
     return await endpoints.video_get_character(
         character_id=character_id,
         request=FakeRequest(headers=headers, query=query),
@@ -630,9 +607,7 @@ async def test_get_character__encoded_id_full_contract(harness):
         "model": "azure-sora",
     }
     # response id re-encoded for the client round-trip.
-    assert resp["id"] == encode_character_id_with_provider(
-        "char_raw2", "azure", VIDEO_MODEL_ID
-    )
+    assert resp["id"] == encode_character_id_with_provider("char_raw2", "azure", VIDEO_MODEL_ID)
 
 
 @pytest.mark.asyncio
@@ -665,9 +640,7 @@ async def call_extension(harness: Harness, *, body, headers=None, query=None):
 
 @pytest.mark.asyncio
 async def test_extension__extracts_nested_video_id_full_contract(harness):
-    resp = await call_extension(
-        harness, body={"prompt": "continue", "video": {"id": AZURE_VIDEO_ID}}
-    )
+    resp = await call_extension(harness, body={"prompt": "continue", "video": {"id": AZURE_VIDEO_ID}})
 
     assert resp is SENTINEL
     assert harness.route_type() == "avideo_extension"
