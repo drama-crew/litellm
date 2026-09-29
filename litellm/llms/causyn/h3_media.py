@@ -56,7 +56,7 @@ def validate_dimensions(width: int, height: int) -> None:
         raise RewriteError("Reference dimensions must be 256-5760 pixels and aspect ratio 0.4-2.5", 400)
 
 
-def prepare_image(raw: bytes) -> str:
+def prepare_image(raw: bytes, max_side: int = 1024) -> str:
     from PIL import Image, ImageOps
     from pillow_heif import (  # pyright: ignore[reportMissingTypeStubs]  # pillow-heif ships no stubs
         register_heif_opener,  # pyright: ignore[reportUnknownVariableType]  # the zero-argument API is supported
@@ -68,10 +68,14 @@ def prepare_image(raw: bytes) -> str:
             raise RewriteError("Reference image must be JPG, PNG, WEBP, HEIC or HEIF", 400)
         validate_dimensions(*source.size)
         image = ImageOps.exif_transpose(source).convert("RGB")
-        image.thumbnail((1024, 1024), Image.Resampling.LANCZOS)
+        image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
         with io.BytesIO() as output:
             image.save(output, format="JPEG", quality=88, optimize=True)
             return "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
+
+
+MANY_IMAGES_THRESHOLD = 4
+MANY_IMAGES_MAX_SIDE = 768
 
 
 class VideoLimits(NamedTuple):
@@ -132,11 +136,11 @@ def inspect_audio(raw: bytes) -> float:
 
 
 async def prepare_reference(
-    client: httpx.AsyncClient, item: ImageItem | VideoItem, limits: VideoLimits
+    client: httpx.AsyncClient, item: ImageItem | VideoItem, limits: VideoLimits, image_max_side: int = 1024
 ) -> tuple[ImageItem | VideoItem, float]:
     if isinstance(item, ImageItem):
         raw = await fetch_media(client, item.image_url.url, 30 * 1024 * 1024)
-        url = await asyncio.to_thread(prepare_image, raw)
+        url = await asyncio.to_thread(prepare_image, raw, image_max_side)
         return item.model_copy(update={"image_url": MediaURL(url=url)}), 0.0
     raw = await fetch_media(client, item.video_url.url, 50 * 1024 * 1024)
     duration = await asyncio.to_thread(inspect_video, raw, limits)
@@ -152,11 +156,13 @@ async def prepare_audio(client: httpx.AsyncClient, item: AudioItem) -> tuple[Aud
 
 async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> ContextIRRequest:
     limits = CAUSYN_VIDEO_LIMITS if spec.model == AUTH_MODEL else BASE_VIDEO_LIMITS
+    image_count = sum(isinstance(item, ImageItem) for item in spec.content)
+    image_max_side = MANY_IMAGES_MAX_SIDE if image_count > MANY_IMAGES_THRESHOLD else 1024
     try:
         async with asyncio.timeout(60):
             prepared = tuple(
                 [
-                    await prepare_reference(client, item, limits)
+                    await prepare_reference(client, item, limits, image_max_side)
                     if isinstance(item, (ImageItem, VideoItem))
                     else await prepare_audio(client, item)
                     if isinstance(item, AudioItem)

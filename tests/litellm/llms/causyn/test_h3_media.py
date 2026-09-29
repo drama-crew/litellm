@@ -372,3 +372,33 @@ async def test_causyn_1_1_total_reference_video_is_capped_at_five_seconds():
         with pytest.raises(RewriteError, match="Combined reference video duration exceeds 5 seconds"):
             await prepare_media(client, causyn_request([video_item(3), video_item(3)]))
         await prepare_media(client, request([video_item(3), video_item(3)]))
+
+
+def _image_ref(color):
+    raw = io.BytesIO()
+    Image.new("RGB", (1600, 1200), color).save(raw, format="PNG")
+    url = "data:image/png;base64," + base64.b64encode(raw.getvalue()).decode()
+    return {"type": "image_url", "image_url": {"url": url}, "role": "reference_image"}
+
+
+def _decoded_size(data_url):
+    return Image.open(io.BytesIO(base64.b64decode(data_url.split(",", 1)[1]))).size
+
+
+@pytest.mark.asyncio
+async def test_many_reference_images_are_downscaled_harder_and_keep_canvas_order():
+    colors = ("red", "green", "blue", "yellow", "white", "black", "orange", "purple", "pink")
+    async with httpx.AsyncClient(trust_env=False) as client:
+        prepared = await prepare_media(client, request([_image_ref(c) for c in colors]))
+        few = await prepare_media(client, request([_image_ref(c) for c in colors[:4]]))
+    sizes = [_decoded_size(item.image_url.url) for item in prepared.ordered_media]
+    assert len(sizes) == 9 and all(max(size) == 768 for size in sizes)
+    assert all(max(_decoded_size(item.image_url.url)) == 1024 for item in few.ordered_media)
+    texts = [
+        part["text"]
+        for part in prepared.user_content()
+        if part["type"] == "text" and part["text"].endswith("reference image:\n")
+    ]
+    assert texts == [f"<Picture {n}> reference image:\n" for n in range(1, 10)]
+    reds = [Image.open(io.BytesIO(base64.b64decode(i.image_url.url.split(",", 1)[1]))).getpixel((0, 0)) for i in prepared.ordered_media]
+    assert reds[0][0] > 200 and reds[1][1] > 100 and reds[2][2] > 200

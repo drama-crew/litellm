@@ -176,6 +176,16 @@ class TestConfiguration:
         monkeypatch.delenv("DRAMA_CONTEXT_IR_BASE_URL", raising=False)
         assert client.service_base_url() is None
 
+    def test_service_switch_defaults_off_and_accepts_truthy_values(self, monkeypatch):
+        monkeypatch.delenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", raising=False)
+        assert client.service_enabled() is False
+        for value in ("", "0", "false", "off", "no"):
+            monkeypatch.setenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", value)
+            assert client.service_enabled() is False
+        for value in ("1", "true", "TRUE", " on ", "yes"):
+            monkeypatch.setenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", value)
+            assert client.service_enabled() is True
+
     def test_configured_base_url_is_normalised(self, monkeypatch):
         monkeypatch.setenv("DRAMA_CONTEXT_IR_BASE_URL", "http://drama-context-ir:8030/")
         assert client.service_base_url() == "http://drama-context-ir:8030"
@@ -283,6 +293,69 @@ class TestRewriteAdapter:
         assert posts == ["video-same", "video-same"]
 
 
+class TestRef2vaSimpleRewriteSwitch:
+    @staticmethod
+    def _patch(monkeypatch):
+        from litellm.llms.causyn import h3_prompt
+        from litellm.llms.causyn.h3_prompt import RewriteResult, RewriteUsage
+
+        calls = {"single_shot": 0, "service": 0}
+
+        async def fake_single_shot(spec):
+            calls["single_shot"] += 1
+            return RewriteResult(prompt="single", usage=RewriteUsage(), system_sha256="a" * 64)
+
+        async def fake_service(spec, **kwargs):
+            calls["service"] += 1
+            return RewriteResult(prompt="service", usage=RewriteUsage(), system_sha256="b" * 64)
+
+        monkeypatch.setattr(h3_prompt, "_rewrite_single_shot", fake_single_shot)
+        monkeypatch.setattr(client, "rewrite_via_service", fake_service)
+        return h3_prompt, calls
+
+    @pytest.mark.asyncio
+    async def test_image_only_ref2va_uses_single_shot_when_switch_is_off_even_with_service_configured(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("DRAMA_CONTEXT_IR_BASE_URL", "http://ctx:8030")
+        monkeypatch.delenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", raising=False)
+        h3_prompt, calls = self._patch(monkeypatch)
+        got = await h3_prompt.rewrite_prompt(_spec(9))
+        assert got.prompt == "single"
+        assert calls == {"single_shot": 1, "service": 0}
+
+    @pytest.mark.asyncio
+    async def test_image_only_ref2va_uses_service_when_switch_is_on(self, monkeypatch):
+        monkeypatch.setenv("DRAMA_CONTEXT_IR_BASE_URL", "http://ctx:8030")
+        monkeypatch.setenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", "true")
+        h3_prompt, calls = self._patch(monkeypatch)
+        got = await h3_prompt.rewrite_prompt(_spec(9))
+        assert got.prompt == "service"
+        assert calls == {"single_shot": 0, "service": 1}
+
+    @pytest.mark.asyncio
+    async def test_switch_on_without_base_url_still_uses_single_shot(self, monkeypatch):
+        monkeypatch.delenv("DRAMA_CONTEXT_IR_BASE_URL", raising=False)
+        monkeypatch.setenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", "true")
+        h3_prompt, calls = self._patch(monkeypatch)
+        await h3_prompt.rewrite_prompt(_spec(2))
+        assert calls == {"single_shot": 1, "service": 0}
+
+    @pytest.mark.asyncio
+    async def test_context_ir_service_default_rewriter_is_the_switch_aware_entry_point(self, monkeypatch):
+        """Canvas and public causyn tasks both run through ContextIRService.rewrite."""
+        from litellm.llms.causyn.context_ir import ContextIRService
+        from litellm.llms.causyn.h3_prompt import rewrite_prompt
+
+        monkeypatch.setenv("DRAMA_CONTEXT_IR_BASE_URL", "http://ctx:8030")
+        monkeypatch.delenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", raising=False)
+        _, calls = self._patch(monkeypatch)
+        service = ContextIRService(store=None)  # pyright: ignore[reportArgumentType]  # store unused by rewrite
+        assert service.rewrite is rewrite_prompt
+        await service.rewrite(_spec(3))
+        assert calls == {"single_shot": 1, "service": 0}
+
+
 class TestRouting_EndToEnd:
     """rewrite_prompt 的分流：只有 ref2va 且服务已配置时才走新路径。"""
 
@@ -309,6 +382,7 @@ class TestRouting_EndToEnd:
     async def test_non_ref2va_never_uses_the_service_even_when_configured(self, monkeypatch):
         """服务只实现 Ref2VA；其余四种模式配置了也不能被误导过去。"""
         monkeypatch.setenv("DRAMA_CONTEXT_IR_BASE_URL", "http://ctx:8030")
+        monkeypatch.setenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", "true")
         called = {}
 
         async def fake_single_shot(spec):
@@ -336,6 +410,7 @@ class TestRouting_EndToEnd:
     @pytest.mark.asyncio
     async def test_ref2va_with_a_video_reference_never_uses_the_service_even_when_configured(self, monkeypatch):
         monkeypatch.setenv("DRAMA_CONTEXT_IR_BASE_URL", "http://ctx:8030")
+        monkeypatch.setenv("CAUSYN_REF2VA_CONTEXT_IR_SERVICE", "true")
         called = {}
 
         async def fake_single_shot(spec):

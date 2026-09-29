@@ -368,15 +368,15 @@ async def _rewrite_single_shot(spec: ContextIRRequest) -> RewriteResult:
 
 
 async def rewrite_prompt(spec: ContextIRRequest) -> RewriteResult:
-    """Ref2VA 在服务已配置时走多步 Context IR，其余情况保持单次改写。
+    """纯图片 Ref2VA 仅在显式开启开关且服务已配置时走多步 Context IR，其余一律单次改写。
 
-    两个条件都必须成立才分流：服务只实现了 Ref2VA 一种模式，而没有配置地址时
-    部署服务本身不应改变任何请求的走向。
+    开关 CAUSYN_REF2VA_CONTEXT_IR_SERVICE 默认关闭：服务优化完成前，生产的所有
+    Ref2VA（含纯图片）与 t2va/fl2va 一样走单次改写，即使部署里仍配着服务地址。
     """
     from litellm.llms.causyn import context_ir_client as service
 
     base_url = service.service_base_url()
-    if base_url is None or not service.should_use_service(spec):
+    if not service.service_enabled() or base_url is None or not service.should_use_service(spec):
         return await _rewrite_single_shot(spec)
     from litellm.llms.causyn.task_telemetry import current_task
 

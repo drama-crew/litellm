@@ -51,6 +51,8 @@ SUBMIT_TIMEOUT_S = 30.0
 POLL_TIMEOUT_S = 30.0
 _BASE_URL_ENV = "DRAMA_CONTEXT_IR_BASE_URL"
 _API_KEY_ENV = "DRAMA_CONTEXT_IR_API_KEY"
+_ENABLE_ENV = "CAUSYN_REF2VA_CONTEXT_IR_SERVICE"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 _RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 
 
@@ -82,6 +84,10 @@ def _failure(task: ContextIRTaskView, *, retryable: bool) -> RewriteError:
         upstream_status=task.upstream_status,
         detail=redact_provider_detail(task.error),
     )
+
+
+def service_enabled() -> bool:
+    return (os.getenv(_ENABLE_ENV) or "").strip().lower() in _TRUTHY
 
 
 def service_base_url() -> str | None:
