@@ -618,6 +618,14 @@ def _validated_seed(optional_params: dict[str, object]) -> int | None:
     return seed
 
 
+def _requested_direct_prompt(optional_params: dict[str, object], spec: _ModelSpec) -> bool:
+    if "prompt_processing" not in optional_params:
+        return False
+    if spec.model != CAUSYN_H3_MODEL or optional_params["prompt_processing"] != "direct":
+        raise _bad_request("prompt_processing must be direct and requires causyn-1.1")
+    return True
+
+
 def _request(
     model: str, prompt: object, optional_params: dict[str, object]
 ) -> tuple[dict[str, object], int, str, str, _ModelSpec]:
@@ -629,10 +637,7 @@ def _request(
     )
     if unsupported:
         raise _bad_request(f"unsupported causyn video parameter: {', '.join(unsupported)}")
-    if "prompt_processing" in optional_params and (
-        spec.model != CAUSYN_H3_MODEL or optional_params["prompt_processing"] != "direct"
-    ):
-        raise _bad_request("prompt_processing must be direct and requires causyn-1.1")
+    direct_prompt = _requested_direct_prompt(optional_params, spec)
     requested_resolution = _resolution(optional_params, spec)
     references = (
         _h3_references(optional_params) if spec.model == CAUSYN_H3_MODEL else _legacy_references(optional_params)
@@ -679,7 +684,7 @@ def _request(
     }
     if seed is not None:
         request["seed"] = seed
-    if optional_params.get("prompt_processing") == "direct" or _requires_direct_prompt_processing(references):
+    if direct_prompt or _requires_direct_prompt_processing(references):
         request["prompt_processing"] = "direct"
     return request, duration, requested_resolution, source_resolution, spec
 
