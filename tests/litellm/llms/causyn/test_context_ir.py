@@ -1343,14 +1343,14 @@ def test_queue_wait_does_not_consume_the_rewrite_window():
 
 def test_task_expires_when_a_render_no_longer_fits_even_before_the_first_attempt():
     task = _causyn_task()
-    assert ContextIRService.expired(task, now=task.created_at + 3600 - 1799)
-    assert not ContextIRService.expired(task, now=task.created_at + 3600 - 1801)
+    assert ContextIRService.expired(task, now=task.created_at + 5400 - 2699)
+    assert not ContextIRService.expired(task, now=task.created_at + 5400 - 2701)
 
 
 def test_render_reserve_covers_a_heavy_render():
     from litellm.llms.causyn.context_ir import RENDER_RESERVE_S
 
-    assert RENDER_RESERVE_S == 1800.0
+    assert RENDER_RESERVE_S == 2700.0
 
 
 @pytest.mark.asyncio

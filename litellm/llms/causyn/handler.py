@@ -90,9 +90,11 @@ CAUSYN_BILLING_METADATA_VERSION_V3 = "causyn-video-billing-v3"
 CAUSYN_BILLING_METADATA_VERSION_V4 = "causyn-video-billing-v4"
 CAUSYN_RATIO = "3:2"
 CAUSYN_DEADLINE_SECONDS = 1800.0
-# Heaviest supported ref2va (10 s + 1 image + 3x5 s video) measured ~26 min on the
-# 2-GPU lane; the deadline counts from queue entry, so leave room to wait.
-CAUSYN_H3_DEADLINE_SECONDS = 3600.0
+# Heaviest supported ref2va (15 s reference videos) takes 36-43 min (up to ~2580 s)
+# natively on the 2-GPU lane, plus rewrite, download and delivery; the deadline counts
+# from queue entry, so leave room to wait behind another job. The ARK per-request cap
+# (3300 s) and the app-side causyn-1.1 timeout (5700 s) are sized around this value.
+CAUSYN_H3_DEADLINE_SECONDS = 5400.0
 _INTERNAL_VIDEO_FLAG = "DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_FLAG_ALIAS = "OH_DRAMA_INTERNAL_VIDEO_ENABLED"
 _CAUSYN_H3_FLAG = "DRAMA_CAUSYN_1_1_ENABLED"
@@ -173,7 +175,7 @@ _MODEL_SPECS: Mapping[str, _ModelSpec] = MappingProxyType(
             duration_min=5,
             duration_max=15,
             # The deadline starts at queue entry, so it covers waiting behind
-            # prior jobs plus the run itself (heaviest ref2va ~26 min, H3
+            # prior jobs plus the run itself (heaviest ref2va up to ~43 min, H3
             # execution cap 600s for a plain 15s request). Keep it independent
             # from the historical 1.0 pipeline and the downstream call cap.
             deadline_seconds=CAUSYN_H3_DEADLINE_SECONDS,

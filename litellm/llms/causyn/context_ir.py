@@ -56,8 +56,9 @@ ATTEMPT_TIMEOUT_S = 155.0
 EXPIRY_MARGIN_S = 85.0
 LEGACY_EXPIRY_S = 600.0
 REWRITE_BACKOFF_CAP_S = 60.0
-RENDER_RESERVE_S = 1800.0
-DEFAULT_TASK_DEADLINE_S = 3600.0
+# A render (15 s reference videos: up to ~43 min natively) must still fit before the deadline.
+RENDER_RESERVE_S = 2700.0
+DEFAULT_TASK_DEADLINE_S = 5400.0
 
 
 @dataclass(frozen=True)

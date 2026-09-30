@@ -104,7 +104,7 @@ async def test_h3_enqueues_text_to_video_with_v4_metadata(enqueued: _Recorder) -
     )
     payload = enqueued.payloads[0]
     assert payload["model"] == "causyn-1.1"
-    assert payload["deadline_ts"] == 2_000_003_600.0
+    assert payload["deadline_ts"] == 2_000_005_400.0
     assert payload["request"] == {
         "prompt": "structured: a cat crosses the room",
         "duration_seconds": 5,
@@ -1019,11 +1019,11 @@ async def test_h3_long_duration_text_to_video_persists_the_fixed_hyperflow_canva
 
 
 def test_causyn_h3_deadline_covers_heaviest_ref2va_run_plus_queue_wait():
-    """Heaviest supported ref2va measured ~26 min on the 2-GPU lane; the deadline counts from queue entry."""
+    """15 s ref2va runs 36-43 min natively; the deadline counts from queue entry."""
     import litellm.llms.causyn.handler as mod
 
-    assert mod.CAUSYN_H3_DEADLINE_SECONDS == 3600.0
-    assert mod._MODEL_SPECS[mod.CAUSYN_H3_MODEL].deadline_seconds == 3600.0
+    assert mod.CAUSYN_H3_DEADLINE_SECONDS == 5400.0
+    assert mod._MODEL_SPECS[mod.CAUSYN_H3_MODEL].deadline_seconds == 5400.0
     assert mod._MODEL_SPECS[mod.CAUSYN_MODEL].deadline_seconds == 1800.0
 
 
