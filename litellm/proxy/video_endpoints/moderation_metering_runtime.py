@@ -169,7 +169,9 @@ async def handoff(logging_obj: Logging, result: object, start_time: datetime, en
                 **result._hidden_params,
                 "_moderation_metering_pending": True,
             }
-        logging.getLogger(__name__).warning("moderation metering result retains unknown financial phase")
+        logging.getLogger(__name__).warning(
+            "moderation metering result retains unknown financial phase", exc_info=outcome[0]
+        )
     if cancelled is not None:
         raise cancelled
 
@@ -205,9 +207,16 @@ async def _handoff(logging_obj: Logging, result: object, start_time: datetime, e
         hidden.get("billing_pricing_snapshot") or metadata.get("model_info") or params.get("model_info") or {}
     )
     submission = scope.submission
+    anchored = scope.phase != "submit" and submission is not None and bool(submission.native_id)
+    if anchored and submission is not None:
+        # Status ids may be re-encoded without the model segment; anchor to the submit identity,
+        # but only for the very provider task that was submitted.
+        if decoded.get("video_id") != submission.provider_task_id:
+            raise ValueError("moderation completion status does not match the submitted provider task")
+        provider = submission.provider
     deployment = TypeAdapter(str).validate_python(
         submission.deployment_id
-        if submission is not None and submission.native_id == result.id
+        if submission is not None and (anchored or submission.native_id == result.id)
         else model_info.get("id") or decoded.get("model_id") or ""
     )
     from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
@@ -254,8 +263,10 @@ async def _handoff(logging_obj: Logging, result: object, start_time: datetime, e
         phase=scope.phase,
         provider=provider,
         deployment_id=deployment,
-        native_id=result.id,
-        provider_task_id=TypeAdapter(str).validate_python(decoded.get("video_id") or result.id),
+        native_id=submission.native_id if anchored and submission is not None else result.id,
+        provider_task_id=submission.provider_task_id
+        if anchored and submission is not None
+        else TypeAdapter(str).validate_python(decoded.get("video_id") or result.id),
         amount=scope.previous.amount
         if scope.previous is not None and scope.previous.finalized
         else actual_debit(raw_cost)

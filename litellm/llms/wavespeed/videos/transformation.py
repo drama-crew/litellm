@@ -20,6 +20,7 @@ from litellm.secret_managers.main import get_secret_str
 from litellm.types.router import GenericLiteLLMParams
 from litellm.types.videos.main import VideoCreateOptionalRequestParams, VideoObject
 from litellm.types.videos.utils import (
+    decode_video_id_with_provider,
     encode_video_id_with_provider,
     extract_original_video_id,
 )
@@ -278,8 +279,17 @@ class WaveSpeedVideoConfig(BaseVideoConfig):
         if status == "failed":
             video.error = self._error(payload)
         if custom_llm_provider and video.id:
-            video.id = encode_video_id_with_provider(video.id, custom_llm_provider, None)
+            video.id = encode_video_id_with_provider(video.id, custom_llm_provider, self._caller_model_id(logging_obj))
         return video
+
+    @staticmethod
+    def _caller_model_id(logging_obj: Any) -> Optional[str]:
+        """Model segment of the id the caller polled with, so the status id matches the create id."""
+        params = getattr(logging_obj, "optional_params", None)
+        caller_id = params.get("video_id") if isinstance(params, dict) else None
+        if not isinstance(caller_id, str) or not caller_id:
+            return None
+        return decode_video_id_with_provider(caller_id).get("model_id") or None
 
     def transform_video_content_request(
         self,
