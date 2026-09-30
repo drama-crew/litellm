@@ -79,7 +79,7 @@ def platform_rejection(status: int, detail: object, path: str) -> HTTPException:
             return HTTPException(409, IDEMPOTENCY_CONFLICT)
         if path.endswith("/cancel"):
             return HTTPException(409, CANCEL_PENDING if "unknown" in text.lower() else CANCEL_TOO_LATE)
-        return HTTPException(409, text[:200] or "Request conflicts with the current state of the task")
+        return HTTPException(409, "Request conflicts with the current state of the task")
     return HTTPException(status, "Moderation control request was rejected")
 
 
@@ -426,6 +426,8 @@ async def enforce_public_media(payload: dict[str, JsonValue]) -> None:
         await public_media_policy.validate_public_payload(payload)
     except public_media_policy.MediaPolicyError as error:
         raise HTTPException(400, str(error)) from None
+    except public_media_policy.MediaBusyError as error:
+        raise HTTPException(503, str(error), headers={"Retry-After": "2"}) from None
 
 
 async def capture(request: Request, result: object) -> None:

@@ -437,3 +437,126 @@ async def test_first_failure_in_request_order_wins_and_indexes_are_one_based():
 async def test_unsupported_url_scheme_is_rejected():
     with pytest.raises(MediaPolicyError, match="public HTTP"):
         await check(image("ftp://cdn.example.com/a.png"))
+
+
+# ---------------------------------------------------------------- review round 1
+
+
+def mpo_bytes(size=(512, 512)) -> bytes:
+    out = io.BytesIO()
+    first = Image.new("RGB", size, (200, 30, 30))
+    first.save(out, format="MPO", save_all=True, append_images=[Image.new("RGB", size, (30, 200, 30))])
+    return out.getvalue()
+
+
+async def test_multi_picture_jpeg_is_accepted_as_jpeg():
+    raw = mpo_bytes()
+    with Image.open(io.BytesIO(raw)) as source:
+        assert source.format == "MPO"  # a real MPO fixture, not a plain JPEG
+    assert policy.sniff_image(raw) == "JPEG"
+    await check(image(data_url(raw, "image/jpeg")))
+    with pytest.raises(MediaPolicyError, match="dimensions"):
+        await check(image(data_url(mpo_bytes((100, 100)), "image/jpeg")))
+
+
+async def test_audio_shorter_than_two_seconds_is_rejected(monkeypatch):
+    def audio() -> MediaRef:
+        return MediaRef(kind="audio", url=data_url(wav_bytes(), "audio/wav"), role="reference", label="reference audio 1")
+
+    monkeypatch.setattr(policy, "inspect_audio", lambda raw: 0.5)
+    with pytest.raises(MediaPolicyError) as exc:
+        await check(audio())
+    assert str(exc.value) == "reference audio 1: each reference audio clip must last 2-15 seconds"
+    monkeypatch.setattr(policy, "inspect_audio", lambda raw: 2.0)
+    await check(audio())
+
+
+async def test_video_minimum_duration_is_enforced_by_the_shared_limits():
+    assert policy.CAUSYN_VIDEO_LIMITS.min_each == 2.0
+
+
+async def test_non_409_text_is_never_forwarded():
+    from litellm.proxy.video_endpoints import moderation_bridge as bridge
+
+    error = bridge.platform_rejection(409, "internal table foo is locked", "/intents")
+    assert "foo" not in str(error.detail)
+
+
+async def test_dns_that_never_answers_times_out_without_blocking_the_default_executor(monkeypatch):
+    import asyncio
+    import threading
+    import time
+
+    monkeypatch.undo()  # real resolve_host, real dedicated executor
+    release = threading.Event()
+    monkeypatch.setattr(policy.socket, "getaddrinfo", lambda *a, **k: release.wait(5) or [])
+    monkeypatch.setattr(policy, "DNS_TIMEOUT_S", 0.1)
+    started = time.monotonic()
+    try:
+        results = await asyncio.gather(
+            *(check(image(f"https://h{i}.example.com/a.png")) for i in range(40)), return_exceptions=True
+        )
+        assert time.monotonic() - started < 2
+        assert all(isinstance(r, (MediaPolicyError, policy.MediaBusyError)) for r in results)
+        assert any(isinstance(r, MediaPolicyError) and "could not be resolved" in str(r) for r in results)
+        assert any(isinstance(r, policy.MediaBusyError) for r in results), "saturation must fail fast, not queue"
+        # The shared default executor is untouched by the stuck lookups.
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: 42), 1) == 42
+    finally:
+        release.set()
+
+
+async def test_decode_concurrency_limit_holds_and_overflow_fails_fast(monkeypatch):
+    import asyncio
+    import threading
+    import time
+
+    active = {"now": 0, "max": 0}
+    lock = threading.Lock()
+    gate = threading.Event()
+
+    def slow(raw: bytes) -> None:
+        with lock:
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+        gate.wait(2)
+        with lock:
+            active["now"] -= 1
+
+    monkeypatch.setattr(policy, "_image_bytes", slow)
+    refs = [image(data_url(encoded("PNG"))) for _ in range(60)]
+    task = asyncio.ensure_future(asyncio.gather(*(check(r) for r in refs), return_exceptions=True))
+    await asyncio.sleep(0.3)
+    gate.set()
+    results = await task
+    assert active["max"] <= 2
+    assert any(isinstance(r, policy.MediaBusyError) for r in results)
+    assert any(r is None for r in results)
+
+
+async def test_decode_timeout_frees_the_request(monkeypatch):
+    import threading
+    import time
+
+    release = threading.Event()
+    monkeypatch.setattr(policy, "_image_bytes", lambda raw: release.wait(3))
+    monkeypatch.setattr(policy, "DECODE_TIMEOUT_S", 0.1)
+    started = time.monotonic()
+    try:
+        with pytest.raises(MediaPolicyError, match="reference image 1: .*in time"):
+            await check(image(data_url(encoded("PNG"))))
+        assert time.monotonic() - started < 1.5
+    finally:
+        release.set()
+
+
+async def test_site_local_ipv6_is_not_global(public_dns):
+    public_dns["cdn.example.com"] = ["fec0::1"]
+    with pytest.raises(MediaPolicyError, match="public internet host"):
+        await check(image("https://cdn.example.com/a.png"))
+
+
+async def test_too_many_references_are_rejected():
+    refs = [image("https://cdn.example.com/a.png") for _ in range(17)]
+    with pytest.raises(MediaPolicyError, match="too many"):
+        await policy.validate_public_media(refs)
