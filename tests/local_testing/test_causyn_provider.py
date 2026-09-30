@@ -1676,7 +1676,23 @@ async def test_unknown_task_is_not_misclassified_as_worker_failure() -> None:
         await handler(redis).avideo_status(VIDEO_ID, None, None, {}, None)
 
     assert exc_info.value.status_code == 404
+    assert type(exc_info.value).__name__ == "ProviderTaskNotFound"
     assert str(exc_info.value) == "causyn video was not found"
+
+
+@pytest.mark.asyncio
+async def test_status_404_without_unknown_task_code_is_a_plain_error(monkeypatch) -> None:
+    from litellm.llms.causyn import handler as causyn_handler
+
+    async def fetch(task_id, *, redis):
+        return {"ok": False, "task_id": task_id, "error": {"code": "something_else", "message": "x"}}
+
+    monkeypatch.setattr(causyn_handler, "fetch_video_generate_status", fetch)
+    with pytest.raises(CustomLLMError) as exc_info:
+        await handler(FakeRedis()).avideo_status(VIDEO_ID, None, None, {}, None)
+
+    assert exc_info.value.status_code == 404
+    assert type(exc_info.value) is CustomLLMError
 
 
 @pytest.mark.asyncio

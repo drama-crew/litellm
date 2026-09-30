@@ -413,11 +413,19 @@ def _is_provider_task_not_found(exc: BaseException) -> bool:
     return False
 
 
+DEAD_UPSTREAM_TTL_MARGIN_S = 3600
+
+
 def _dead_upstream_min_age_s() -> float:
     try:
-        return float(os.environ.get("LITELLM_DEAD_UPSTREAM_MIN_AGE_S", "1800"))
+        configured = float(os.environ.get("LITELLM_DEAD_UPSTREAM_MIN_AGE_S", "21600"))
     except ValueError:
-        return 1800.0
+        configured = 21600.0
+    from litellm.llms.libtv.transfer import STATUS_TTL_SECONDS
+
+    # A missing status key only proves "gone" once the key would have expired on its own (Redis flush,
+    # failover or a wrong URL also make it vanish), so never trust it before TTL + margin.
+    return max(configured, STATUS_TTL_SECONDS + DEAD_UPSTREAM_TTL_MARGIN_S)
 
 
 async def _close_dead_upstream(store: MeteringStore, intent_id: str, native_id: str, exc: BaseException) -> str | None:
@@ -444,9 +452,15 @@ async def _close_dead_upstream(store: MeteringStore, intent_id: str, native_id: 
     if completion is not None and completion.finalized:
         return "finalized"
     binding = await store.binding(intent_id)
+    if "completion" not in binding.expected_phases:
+        return None
     await _persist_undelivered(store, binding, submit)
-    logging.getLogger(__name__).warning(
-        "provider no longer knows task %s (intent %s); completion closed undelivered", native_id, intent_id
+    logging.getLogger(__name__).error(
+        "dead upstream: provider no longer knows task; completion closed undelivered at amount 0 "
+        "intent_id=%s native_id=%s age_s=%.0f",
+        intent_id,
+        native_id,
+        (datetime.now(timezone.utc) - since).total_seconds(),
     )
     return "closed"
 

@@ -387,6 +387,12 @@ def _bad_request(message: str) -> CustomLLMError:
 _DURATION_RECONCILE_TOLERANCE_SECONDS = 0.5
 
 
+def _not_found(unknown_task: bool) -> CustomLLMError:
+    if unknown_task:
+        return ProviderTaskNotFound("causyn video was not found")
+    return CustomLLMError(status_code=404, message="causyn video was not found")
+
+
 def _service_error(message: str = "causyn video service unavailable") -> CustomLLMError:
     return CustomLLMError(status_code=503, message=message)
 
@@ -1501,12 +1507,15 @@ class CausynVideoHandler(CustomLLM):
             )
             raise _service_error() from None
         if body.status is None:
+            # Only the worker's explicit unknown_task answer is a typed "task gone"; even that just means the
+            # status key is absent, so collect additionally requires the task to be older than the key TTL.
+            unknown = body.error is not None and body.error.code == "unknown_task"
             if spec.model == CAUSYN_H3_MODEL:
-                return await self._rewrite_status(task_id)
-            raise ProviderTaskNotFound("causyn video was not found")
+                return await self._rewrite_status(task_id, unknown_task=unknown)
+            raise _not_found(unknown)
         return body
 
-    async def _rewrite_status(self, task_id: str) -> _StatusEnvelope:
+    async def _rewrite_status(self, task_id: str, *, unknown_task: bool = False) -> _StatusEnvelope:
         try:
             raw = await self._redis_factory().get(task_key(CONTEXT_IR_PREFIX + task_id))
             if raw is not None:
@@ -1520,7 +1529,7 @@ class CausynVideoHandler(CustomLLM):
                     )
         except Exception as exc:
             raise _service_error() from exc
-        raise ProviderTaskNotFound("causyn video was not found")
+        raise _not_found(unknown_task)
 
     async def avideo_status(
         self,

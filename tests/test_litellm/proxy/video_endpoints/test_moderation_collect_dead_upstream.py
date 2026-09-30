@@ -16,6 +16,7 @@ from litellm.types.videos.utils import encode_video_id_with_provider
 
 SECRET = "synthetic-collect-secret-long-enough-32-bytes"
 NOW = datetime.now(timezone.utc)
+OLD_S = 26 * 3600
 NATIVE = encode_video_id_with_provider("task-1", "causyn", "dep-1")
 
 
@@ -38,7 +39,7 @@ def ticket():
     )
 
 
-def submit_phase(native_id=NATIVE, finalized=True, age_s=0):
+def submit_phase(native_id=NATIVE, finalized=True, age_s=OLD_S):
     bound = BillingBinding(
         intent_id="intent",
         request_digest="a" * 64,
@@ -132,11 +133,6 @@ def not_found():
     return error
 
 
-@pytest.fixture(autouse=True)
-def no_min_age(monkeypatch):
-    monkeypatch.setenv("LITELLM_DEAD_UPSTREAM_MIN_AGE_S", "0")
-
-
 @pytest.mark.asyncio
 async def test_typed_not_found_terminalizes_and_closes_completion_at_zero(monkeypatch):
     response, posts = await run_collect(monkeypatch, not_found(), submit_phase())
@@ -168,13 +164,44 @@ async def test_untyped_404s_never_terminalize(monkeypatch, error):
 
 
 @pytest.mark.asyncio
-async def test_typed_not_found_on_young_task_does_not_terminalize(monkeypatch):
-    monkeypatch.delenv("LITELLM_DEAD_UPSTREAM_MIN_AGE_S")
-    response, posts = await run_collect(monkeypatch, not_found(), submit_phase(age_s=60))
+async def test_missing_status_key_on_task_younger_than_ttl_plus_margin_does_not_terminalize(monkeypatch):
+    # env can lower the configured floor but never below the status-key TTL (24h) + margin
+    monkeypatch.setenv("LITELLM_DEAD_UPSTREAM_MIN_AGE_S", "0")
+    for age in (60, 6 * 3600, 24 * 3600 + 60):
+        response, posts = await run_collect(monkeypatch, not_found(), submit_phase(age_s=age))
+        assert response.status_code != 200
+        assert not any(path.endswith("/output") for path, _ in posts) and run_collect.meter.persisted == []
+    response, posts = await run_collect(monkeypatch, not_found(), submit_phase(age_s=26 * 3600))
+    assert response.status_code == 200 and posts[-1][1]["facts"]["status"] == "failed"
+
+
+def test_default_min_age_is_six_hours_but_never_below_ttl_plus_margin(monkeypatch):
+    monkeypatch.delenv("LITELLM_DEAD_UPSTREAM_MIN_AGE_S", raising=False)
+    assert execution._dead_upstream_min_age_s() == 25 * 3600
+    monkeypatch.setenv("LITELLM_DEAD_UPSTREAM_MIN_AGE_S", str(48 * 3600))
+    assert execution._dead_upstream_min_age_s() == 48 * 3600
+
+
+@pytest.mark.asyncio
+async def test_no_completion_in_expected_phases_is_a_plain_reraise(monkeypatch):
+    submit = submit_phase()
+    submit = submit.model_copy(update={"binding": submit.binding.model_copy(update={"expected_phases": ("submit",)})})
+    response, posts = await run_collect(monkeypatch, not_found(), submit)
     assert response.status_code != 200
     assert not any(path.endswith("/output") for path, _ in posts) and run_collect.meter.persisted == []
-    response, posts = await run_collect(monkeypatch, not_found(), submit_phase(age_s=3600))
-    assert response.status_code == 200 and posts[-1][1]["facts"]["status"] == "failed"
+
+
+def test_real_custom_video_error_path_keeps_the_typed_cause():
+    from litellm.videos.main import _raise_custom_video_error
+
+    with pytest.raises(litellm.NotFoundError) as caught:
+        _raise_custom_video_error(
+            ProviderTaskNotFound("causyn video was not found"), model="m", custom_llm_provider="causyn"
+        )
+    assert execution._is_provider_task_not_found(caught.value)
+    with pytest.raises(litellm.NotFoundError) as plain:
+        _raise_custom_video_error(CustomLLMError(404, "x"), model="m", custom_llm_provider="causyn")
+    assert not execution._is_provider_task_not_found(plain.value)
 
 
 @pytest.mark.asyncio
