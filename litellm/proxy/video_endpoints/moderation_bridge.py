@@ -113,7 +113,9 @@ def admission_unavailable(reason: str) -> HTTPException:
 
 def provider_not_sent() -> HTTPException:
     """Contract §9: every attempted deployment proved the generation was never created."""
-    return HTTPException(
+    from litellm.router_utils import attempt_outcomes
+
+    error = HTTPException(
         503,
         detail={
             "error": {
@@ -123,6 +125,8 @@ def provider_not_sent() -> HTTPException:
         },
         headers={"x-drama-submission": "not_sent"},
     )
+    attempt_outcomes.mark_verdict(error, True)
+    return error
 
 
 async def platform(

@@ -8,10 +8,10 @@ import httpx
 import pytest
 
 import litellm.llms.causyn  # noqa: F401  (pre-existing import cycle, see test_ref2va_enqueue_stream)
-from litellm.exceptions import BadGatewayError, RateLimitError
+from litellm.exceptions import BadGatewayError
 from litellm.llms.libtv.client import LibTVClient
 from litellm.llms.libtv.common import LibTVError
-from litellm.llms.libtv.handler import _raise_normalized_libtv_error, _video_usage
+from litellm.llms.libtv.handler import _video_usage
 from litellm.proxy.video_endpoints import moderation_execution as execution
 from litellm.router_utils import attempt_outcomes
 
@@ -65,89 +65,143 @@ def test_pre_create_http_failure_is_marked():
     assert _check("project/create", _Resp(status_code=503, text="x")).submission == "not_sent"
 
 
-def test_normalized_exception_carries_marker_and_unmarked_stays_unmarked():
-    marked = LibTVError(429, "refused")
-    marked.submission = "not_sent"
-    with pytest.raises(RateLimitError) as caught:
-        _raise_normalized_libtv_error(marked, "seedance")
-    assert caught.value.drama_submission == "not_sent"
-    with pytest.raises(BadGatewayError) as caught:
-        _raise_normalized_libtv_error(LibTVError(502, "boom"), "seedance")
-    assert getattr(caught.value, "drama_submission", None) is None
+def test_create_body_with_task_id_and_nonzero_code_is_not_marked():
+    body = {"code": 1200000136, "msg": "x", "data": {"taskId": "t1"}}
+    assert _check("generation/create", _Resp(body=body)).submission is None
 
 
-def _marked(exc_type=BadGatewayError):
-    marked = LibTVError(502, "no login")
-    marked.submission = "not_sent"
-    with pytest.raises(exc_type) as caught:
-        _raise_normalized_libtv_error(marked, "seedance")
-    return caught.value
+def _boundary(exc):
+    """A LibTV provider call that fails with ``exc`` at the real provider boundary."""
+    from litellm.llms.libtv.handler import normalize_libtv_errors
+
+    @normalize_libtv_errors
+    async def call(*args, **kwargs):
+        raise exc
+
+    return call
 
 
-def _unmarked():
-    with pytest.raises(BadGatewayError) as caught:
-        _raise_normalized_libtv_error(LibTVError(502, "boom"), "seedance")
-    return caught.value
+def _not_sent():
+    error = LibTVError(502, "libtv getUserInfo code=401 msg=No login")
+    error.submission = "not_sent"
+    return error
 
 
-def test_failure_outcome_not_sent_when_every_attempt_is_marked():
-    token = attempt_outcomes.start()
+async def _attempt(router, exc):
+    """One router attempt through make_call; ``exc`` None means a non-LibTV failure."""
     try:
-        first, second = _marked(), _marked(RateLimitError if False else BadGatewayError)
-        attempt_outcomes.record(first)
-        attempt_outcomes.record(second)
-        assert execution.failure_outcome(second) == "not_sent"
-    finally:
-        attempt_outcomes.stop(token)
+        if exc is None:
+
+            async def plain(**_):
+                raise RuntimeError("routing failure")
+
+            await router.make_call(plain, model="m")
+        else:
+            await router.make_call(_boundary(exc), model="m")
+    except Exception:  # noqa: BLE001
+        pass
 
 
-def test_failure_outcome_ambiguous_when_any_attempt_is_unmarked():
-    token = attempt_outcomes.start()
-    try:
-        first, last = _marked(), _marked()
-        attempt_outcomes.record(first)
-        attempt_outcomes.record(httpx.ReadTimeout("slow"))
-        attempt_outcomes.record(last)
-        assert execution.failure_outcome(last) == "ambiguous"
-    finally:
-        attempt_outcomes.stop(token)
+def _router():
+    from litellm import Router
 
-
-def test_failure_outcome_ambiguous_when_final_error_is_unmarked_even_if_attempts_marked():
-    token = attempt_outcomes.start()
-    try:
-        attempt_outcomes.record(_marked())
-        assert execution.failure_outcome(_unmarked()) == "ambiguous"
-    finally:
-        attempt_outcomes.stop(token)
-
-
-def test_unmarked_error_stays_ambiguous_without_attempt_tracking():
-    assert execution.failure_outcome(_unmarked()) == "ambiguous"
-
-
-def test_record_is_a_noop_without_a_tracking_scope():
-    attempt_outcomes.record(_marked())  # must not raise
+    return Router(model_list=[{"model_name": "m", "litellm_params": {"model": "openai/x", "api_key": "k"}}])
 
 
 @pytest.mark.asyncio
-async def test_router_make_call_records_each_attempt():
-    from litellm import Router
-
-    router = Router(model_list=[{"model_name": "m", "litellm_params": {"model": "openai/x", "api_key": "k"}}])
+@pytest.mark.parametrize(
+    "exceptions, expected",
+    [
+        ([_not_sent, _not_sent], True),
+        ([_not_sent, lambda: httpx.ReadTimeout("slow")], False),
+        ([lambda: httpx.ReadTimeout("slow"), _not_sent], False),
+        ([_not_sent, lambda: LibTVError(502, "5xx after create")], False),
+        ([_not_sent, lambda: None], False),  # non-LibTV attempt raised through the router
+    ],
+)
+async def test_ledger_is_all_not_sent_only_when_every_attempt_is_marked(exceptions, expected):
+    router = _router()
     token = attempt_outcomes.start()
     try:
-        first, second = _marked(), httpx.ReadTimeout("slow")
-
-        async def fail(exc):
-            raise exc
-
-        for exc in (first, second):
-            with pytest.raises(type(exc)):
-                await router.make_call(lambda **_: fail(exc), model="m")
-        assert attempt_outcomes.snapshot() == [True, False]
+        for factory in exceptions:
+            await _attempt(router, factory())
+        assert attempt_outcomes.all_not_sent() is expected
     finally:
         attempt_outcomes.stop(token)
+
+
+@pytest.mark.asyncio
+async def test_ledger_ignores_exception_context_chains():
+    """The 2nd attempt raised inside the 1st attempt's except block has it as __context__."""
+    router = _router()
+    token = attempt_outcomes.start()
+    try:
+        try:
+            await router.make_call(_boundary(_not_sent()), model="m")
+        except Exception:  # noqa: BLE001
+            await router.make_call(_boundary(httpx.ReadTimeout("slow")), model="m")
+    except Exception:  # noqa: BLE001
+        pass
+    else:
+        raise AssertionError("expected failure")
+    try:
+        assert attempt_outcomes.all_not_sent() is False
+    finally:
+        attempt_outcomes.stop(token)
+
+
+@pytest.mark.asyncio
+async def test_success_then_failure_inside_one_attempt_is_unknown(monkeypatch):
+    router = _router()
+
+    async def ok(**_):
+        return object()
+
+    async def boom(**_):
+        raise RuntimeError("after provider success")
+
+    monkeypatch.setattr(router, "set_response_headers", boom)
+    token = attempt_outcomes.start()
+    try:
+        await _attempt_plain(router, ok)
+        assert attempt_outcomes.all_not_sent() is False
+    finally:
+        attempt_outcomes.stop(token)
+
+
+async def _attempt_plain(router, function):
+    try:
+        await router.make_call(function, model="m")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def test_boundary_and_record_are_noops_without_a_ledger():
+    attempt_outcomes.note(attempt_outcomes.NOT_SENT)
+    attempt_outcomes.fail_attempt(attempt_outcomes.begin_attempt())
+    assert attempt_outcomes.all_not_sent() is False
+
+
+def test_empty_ledger_is_not_not_sent():
+    token = attempt_outcomes.start()
+    try:
+        assert attempt_outcomes.all_not_sent() is False
+    finally:
+        attempt_outcomes.stop(token)
+
+
+def test_failure_outcome_ignores_cause_chain_and_needs_explicit_verdict():
+    marked_looking = LibTVError(502, "x")
+    marked_looking.submission = "not_sent"
+    try:
+        raise marked_looking
+    except LibTVError as error:
+        wrapped = RuntimeError("wrapped")
+        wrapped.__cause__ = error
+    assert execution.failure_outcome(wrapped) == "ambiguous"
+    verdict = BadGatewayError(message="m", model="m", llm_provider="libtv")
+    attempt_outcomes.mark_verdict(verdict, True)
+    assert execution.failure_outcome(verdict) == "not_sent"
 
 
 def test_recreate_failure_after_a_first_create_is_not_marked():

@@ -180,6 +180,13 @@ def parse_project(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"project_uuid": str(uuid_val), "team_id": team_id if isinstance(team_id, int) else None}
 
 
+def _create_body_has_task_id(payload: Dict[str, Any]) -> bool:
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    return bool(data.get("taskId") or data.get("task_id"))
+
+
 def parse_task_id(payload: Dict[str, Any]) -> str:
     data = payload.get("data") or {}
     task_id = data.get("taskId") or data.get("task_id") or ""
@@ -773,7 +780,7 @@ class LibTVClient:
             )
             # HTTP 200 + non-success business code is a definitive refusal in the
             # create response body itself: no taskId was issued (contract §9).
-            if pre_create or step == "generation/create":
+            if pre_create or (step == "generation/create" and not _create_body_has_task_id(payload)):
                 error.submission = "not_sent"
             raise error
         return payload

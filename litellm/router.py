@@ -6601,14 +6601,14 @@ class Router:
         Handler for making a call to the .completion()/.embeddings()/etc. functions.
         """
         model_group = kwargs.get("model")
+        attempt_mark = attempt_outcomes.begin_attempt()
         try:
             response = original_function(*args, **kwargs)
             if coroutine_checker.is_async_callable(response) or inspect.isawaitable(response):
                 response = await response
-        except Exception as attempt_error:
-            # No-op unless a caller opened an attempt-tracking scope (drama
-            # contract §9): lets the proxy see every deployment attempt's outcome.
-            attempt_outcomes.record(attempt_error)
+        except Exception:
+            # No-op unless a caller opened an attempt ledger (drama contract §9).
+            attempt_outcomes.fail_attempt(attempt_mark)
             raise
         ## PROCESS RESPONSE HEADERS
         response = await self.set_response_headers(response=response, model_group=model_group, request_kwargs=kwargs)

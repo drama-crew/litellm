@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 import httpx
 
+from litellm.router_utils import attempt_outcomes
+
 from litellm.exceptions import (
     APIError,
     AuthenticationError,
@@ -130,11 +132,13 @@ def _raise_normalized_libtv_error(error: LibTVError, model: str) -> None:
         "model": _public_provider_text(model, "video-provider"),
         "llm_provider": LIBTV_PROVIDER,
     }
-    normalized = _normalized_libtv_exception(error, common, response)
-    if getattr(error, "submission", None) == "not_sent":
-        # Contract §9: survives normalization so the proxy can classify the call.
-        setattr(normalized, "drama_submission", "not_sent")
-    raise normalized from error
+    raise _normalized_libtv_exception(error, common, response) from error
+
+
+def _note_attempt(error: BaseException) -> None:
+    """Contract §9 ledger: one entry per provider attempt, decided where it is raised."""
+    marked = isinstance(error, LibTVError) and error.submission == "not_sent"
+    attempt_outcomes.note(attempt_outcomes.NOT_SENT if marked else attempt_outcomes.UNKNOWN)
 
 
 def _normalized_libtv_exception(error: LibTVError, common: dict, response: httpx.Response) -> Exception:
@@ -179,7 +183,11 @@ def normalize_libtv_errors(func):
             try:
                 return await func(*args, **kwargs)
             except LibTVError as error:
+                _note_attempt(error)
                 _raise_normalized_libtv_error(error, _model(args, kwargs))
+            except Exception as error:
+                _note_attempt(error)
+                raise
 
         return _async
 
@@ -188,7 +196,11 @@ def normalize_libtv_errors(func):
         try:
             return func(*args, **kwargs)
         except LibTVError as error:
+            _note_attempt(error)
             _raise_normalized_libtv_error(error, _model(args, kwargs))
+        except Exception as error:
+            _note_attempt(error)
+            raise
 
     return _sync
 

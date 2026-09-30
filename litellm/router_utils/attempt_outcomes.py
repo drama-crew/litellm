@@ -1,44 +1,73 @@
-"""Per-request record of whether each router deployment attempt failed with a
-provider-proven "not sent" error (drama contract §9).
+"""Request-scoped ledger of provider attempt outcomes (drama contract §9).
 
-Opt-in: nothing is recorded unless a caller opened a tracking scope with
-``start()``, so behaviour for every other caller is unchanged. The scope holds a
-mutable list, so attempts made in child tasks (retries, fallbacks) are seen.
+The only source of truth for "provably not sent". Each provider attempt adds
+exactly one entry: ``not_sent`` when the LibTV provider boundary marked the
+failure at the point it was raised, ``unknown`` for everything else (timeouts,
+5xx, success-then-failure, routing errors, non-LibTV deployments). Exception
+chains (``__cause__`` / ``__context__``) are never consulted.
+
+Opt-in: nothing is recorded unless a caller opened a ledger with ``start()``.
+The ledger is a mutable list, so attempts made in child tasks are seen.
 """
 
 from contextvars import ContextVar, Token
 from typing import List, Optional
 
-MARKER_ATTR = "drama_submission"
 NOT_SENT = "not_sent"
+UNKNOWN = "unknown"
+VERDICT_ATTR = "drama_all_attempts_not_sent"
 
-_ATTEMPTS: ContextVar[Optional[List[bool]]] = ContextVar("drama_router_attempts", default=None)
-
-
-def marked_not_sent(error: Optional[BaseException], depth: int = 0) -> bool:
-    """True when ``error`` (or its cause chain) carries the not-sent marker."""
-    while error is not None and depth < 16:
-        if getattr(error, MARKER_ATTR, None) == NOT_SENT:
-            return True
-        error = error.__cause__ or error.__context__
-        depth += 1
-    return False
+_LEDGER: ContextVar[Optional[List[str]]] = ContextVar("drama_attempt_ledger", default=None)
 
 
 def start() -> Token:
-    return _ATTEMPTS.set([])
+    return _LEDGER.set([])
 
 
 def stop(token: Token) -> None:
-    _ATTEMPTS.reset(token)
+    _LEDGER.reset(token)
 
 
-def record(error: BaseException) -> None:
-    attempts = _ATTEMPTS.get()
-    if attempts is not None:
-        attempts.append(marked_not_sent(error))
+def note(entry: str) -> None:
+    """Provider boundary: record this attempt's outcome."""
+    ledger = _LEDGER.get()
+    if ledger is not None:
+        ledger.append(entry)
 
 
-def snapshot() -> Optional[List[bool]]:
-    attempts = _ATTEMPTS.get()
-    return None if attempts is None else list(attempts)
+def begin_attempt() -> Optional[int]:
+    ledger = _LEDGER.get()
+    return None if ledger is None else len(ledger)
+
+
+def fail_attempt(mark: Optional[int]) -> None:
+    """Router: an attempt raised. Leave exactly one entry for it.
+
+    Kept only when the boundary recorded exactly one ``not_sent`` entry during
+    the attempt; anything else (no boundary passed, several entries) is unknown.
+    """
+    ledger = _LEDGER.get()
+    if ledger is None or mark is None:
+        return
+    entries = ledger[mark:]
+    del ledger[mark:]
+    ledger.append(NOT_SENT if entries == [NOT_SENT] else UNKNOWN)
+
+
+def all_not_sent() -> bool:
+    ledger = _LEDGER.get()
+    return bool(ledger) and all(entry == NOT_SENT for entry in ledger)
+
+
+def mark_verdict(error: BaseException, verdict: bool) -> None:
+    try:
+        setattr(error, VERDICT_ATTR, verdict)
+    except Exception:  # noqa: BLE001  # immutable exception: the verdict stays fail-closed
+        pass
+
+
+def verdict_of(error: BaseException) -> bool:
+    """True only for an explicit verdict set by the metered entry, or a live all-not-sent ledger."""
+    if getattr(error, VERDICT_ATTR, False) is True:
+        return True
+    return all_not_sent()

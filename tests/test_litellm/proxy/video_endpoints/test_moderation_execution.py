@@ -546,51 +546,97 @@ def test_provider_status_proof_ignores_the_implicit_context_chain():
         assert execution.provider_status_proof(outer) is None
 
 
-def _libtv_error(marked: bool):
+def _boundary_failure(exc):
+    from litellm.llms.libtv.handler import normalize_libtv_errors
+
+    @normalize_libtv_errors
+    async def call(*args, **kwargs):
+        raise exc
+
+    return call
+
+
+def _no_login():
     from litellm.llms.libtv.common import LibTVError
-    from litellm.llms.libtv.handler import _raise_normalized_libtv_error
 
     error = LibTVError(502, "libtv getUserInfo code=401 msg=No login")
-    error.submission = "not_sent" if marked else None
-    try:
-        _raise_normalized_libtv_error(error, "seedance")
-    except Exception as normalized:  # noqa: BLE001
-        return normalized
+    error.submission = "not_sent"
+    return error
+
+
+def _timeout():
+    return httpx.ReadTimeout("slow")
+
+
+def _metered_request(method="POST"):
+    from fastapi import Request
+
+    return Request({"type": "http", "method": method, "path": "/v1/videos", "headers": [], "app": FastAPI()})
+
+
+async def _run_execute(monkeypatch, sequence, route="avideo_generation", scoped=True, method="POST"):
+    """Drive ``execute`` with a router that attempts one deployment per factory in ``sequence``."""
+    from unittest.mock import MagicMock
+
+    from litellm import Router
+    from litellm.proxy.spend_tracking import budget_reservation
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+
+    scope = MagicMock()
+    scope.store.void_unsent = AsyncMock()
+    monkeypatch.setattr(entry, "scope_for", AsyncMock(return_value=scope if scoped else None))
+    monkeypatch.setattr(budget_reservation, "release_budget_reservation", AsyncMock())
+    router = Router(model_list=[{"model_name": "m", "litellm_params": {"model": "openai/x", "api_key": "k"}}])
+    final = []
+
+    async def attempts():
+        error = None
+        for factory in sequence:
+            try:
+                await router.make_call(_boundary_failure(factory()), model="m")
+            except Exception as caught:  # noqa: BLE001  # the router moves to the next attempt
+                error = caught
+        final.append(error)
+        raise error
+
+    auth = UserAPIKeyAuth(api_key="k", user_id="u", team_id="t")
+    with pytest.raises(Exception) as caught:
+        await entry.execute(_metered_request(method), auth, route, attempts())
+    return caught.value, final[0], scope
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("second_marked, expected_status", [(True, 503), (False, 502)])
-async def test_execute_answers_503_not_sent_only_when_every_attempt_is_marked(
-    monkeypatch, second_marked, expected_status
-):
-    from fastapi import HTTPException, Request
+async def test_execute_503_not_sent_when_every_attempt_is_not_sent(monkeypatch):
+    from fastapi import HTTPException
 
-    from litellm import Router
-    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+    error, _, scope = await _run_execute(monkeypatch, [_no_login, _no_login])
+    assert isinstance(error, HTTPException) and error.status_code == 503
+    assert error.headers == {"x-drama-submission": "not_sent"}
+    scope.store.void_unsent.assert_awaited_once()
+    # the public submit path classifies the same exception after execute has returned
+    assert execution.failure_outcome(error) == "not_sent"
 
-    monkeypatch.setattr(entry, "scope_for", AsyncMock(return_value=None))
-    router = Router(model_list=[{"model_name": "m", "litellm_params": {"model": "openai/x", "api_key": "k"}}])
-    first, last = _libtv_error(True), _libtv_error(second_marked)
 
-    async def attempts():
-        for error in (first, last):
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sequence", [[_no_login, _timeout], [_timeout, _no_login]])
+async def test_execute_and_public_path_agree_ambiguous_when_any_attempt_is_unknown(monkeypatch, sequence):
+    error, final, scope = await _run_execute(monkeypatch, sequence)
+    assert error is final  # no rewrite
+    assert execution.failure_outcome(error) == "ambiguous"
+    scope.store.void_unsent.assert_not_awaited()
 
-            async def fail(error=error):
-                raise error
 
-            try:
-                await router.make_call(lambda **_: fail(), model="m")
-            except Exception:  # noqa: BLE001  # the router keeps trying the next deployment
-                pass
-        raise last
+@pytest.mark.asyncio
+async def test_same_deployment_retry_not_sent_then_timeout_is_ambiguous(monkeypatch):
+    error, final, _ = await _run_execute(monkeypatch, [_no_login, _timeout])
+    assert error is final and execution.failure_outcome(error) == "ambiguous"
 
-    request = Request({"type": "http", "method": "POST", "path": "/v1/videos", "headers": [], "app": FastAPI()})
-    auth = UserAPIKeyAuth(api_key="k", user_id="u", team_id="t")
-    with pytest.raises(Exception) as caught:
-        await entry.execute(request, auth, "avideo_generation", attempts())
-    if expected_status == 503:
-        assert isinstance(caught.value, HTTPException)
-        assert caught.value.status_code == 503
-        assert caught.value.headers == {"x-drama-submission": "not_sent"}
-    else:
-        assert caught.value is last
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "route, scoped, method",
+    [("aimage_generation", True, "POST"), ("avideo_generation", False, "POST"), ("avideo_status", True, "GET")],
+)
+async def test_execute_leaves_non_metered_image_and_status_errors_unchanged(monkeypatch, route, scoped, method):
+    error, final, _ = await _run_execute(monkeypatch, [_no_login, _no_login], route, scoped, method)
+    assert error is final
