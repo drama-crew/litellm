@@ -2,21 +2,33 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
+import re
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from starlette.routing import Match
 from pydantic import TypeAdapter, ValidationError
 
 from litellm._logging import verbose_proxy_logger
 from litellm.llms.causyn.context_ir import ContextIRService, get_context_ir_service
 from litellm.llms.causyn.h3_prompt import AUTH_MODEL, ContextIRRequest, RewriteError, causyn_reference_limit_violation
 from litellm.proxy._types import ProxyException, UserAPIKeyAuth
-from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+from litellm.proxy.auth.user_api_key_auth import (
+    anthropic_api_key_header,
+    api_key_header,
+    azure_api_key_header,
+    azure_apim_header,
+    custom_litellm_key_header,
+    google_ai_studio_api_key_header,
+    user_api_key_auth,
+)
 from litellm.proxy.common_utils.http_parsing_utils import _safe_set_request_parsed_body
+from litellm.proxy.spend_tracking.budget_reservation import release_budget_reservation
 from litellm.proxy.video_endpoints import endpoints, moderation_bridge
 from litellm.proxy.video_endpoints.minimax_h3_models import AudioItem, MiniMaxH3Create
 from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, INTERNAL_MODEL, IR_PREFIX, namespace
@@ -29,10 +41,16 @@ ERROR_TYPES = {
     402: "insufficient_balance_error",
     403: "authorized_error",
     404: "not_found_error",
+    405: "method_not_allowed_error",
+    409: "conflict_error",
     422: "unprocessable_entity_error",
     429: "rate_limit_error",
     500: "server_error",
+    503: "service_unavailable_error",
 }
+INVALID_KEY_MESSAGE = "Invalid or missing API key"
+# Key material that an upstream auth message may carry: virtual keys and 64-hex key hashes.
+_KEY_MATERIAL = re.compile(r"sk-[A-Za-z0-9_\-.]+|\b[a-f0-9]{64}\b")
 STATUS_NAMES = {
     "queued": "queued",
     "in_progress": "running",
@@ -64,6 +82,42 @@ def task_owner(auth: UserAPIKeyAuth) -> str:
     if not identity:
         raise H3Error(401, "API key authentication is required")
     return hashlib.sha256(("minimax-h3-owner\0" + identity).encode()).hexdigest()
+
+
+def public_auth_message(code: int, message: str) -> str:
+    """401 is one fixed sentence (no key hash/prefix or table names); other auth text is scrubbed of key material."""
+    return INVALID_KEY_MESSAGE if code == 401 else _KEY_MATERIAL.sub("[redacted]", message)
+
+
+async def preauthenticate(request: Request) -> None:
+    """Verify the API key BEFORE the body is streamed, parsed or validated.
+
+    The auth dependency still runs afterwards with the real parsed body (model-level authorization
+    is unchanged); this is only the cheap, body-free identity gate. Every route on these prefixes
+    authorizes exactly one model (``causyn-1.1``), so a placeholder body carries the same authorization
+    decision without touching the stream. Any budget reservation the gate makes is released at once:
+    the post-parse dependency makes the one that counts.
+    """
+    _safe_set_request_parsed_body(request, {"model": AUTH_MODEL if request.url.path == IR_PREFIX + "/v2/h3_context_ir" else INTERNAL_MODEL})
+    override = request.app.dependency_overrides.get(user_api_key_auth)
+    if override is not None:
+        # Test/embedding overrides are arbitrary callables: hand them the request only when they ask for it.
+        outcome = override(request) if inspect.signature(override).parameters else override()
+        auth = await outcome if inspect.isawaitable(outcome) else outcome
+    else:
+        auth = await user_api_key_auth(
+            request,
+            api_key=await api_key_header(request),  # type: ignore[arg-type]
+            azure_api_key_header=await azure_api_key_header(request),  # type: ignore[arg-type]
+            anthropic_api_key_header=await anthropic_api_key_header(request),
+            google_ai_studio_api_key_header=await google_ai_studio_api_key_header(request),
+            azure_apim_header=await azure_apim_header(request),
+            custom_litellm_key_header=await custom_litellm_key_header(request),
+        )
+    reservation = getattr(auth, "budget_reservation", None)
+    if reservation:
+        await release_budget_reservation(reservation)
+        auth.budget_reservation = None
 
 
 async def read_json_body(request: Request) -> bytearray:
@@ -138,6 +192,7 @@ class MiniMaxH3Route(APIRoute):
 
         async def handle(request: Request) -> Response:
             try:
+                await preauthenticate(request)
                 await prepare_request(request)
                 return await original(request)
             except RewriteError as exc:
@@ -157,8 +212,12 @@ class MiniMaxH3Route(APIRoute):
                     code = 500
                 if not 400 <= code <= 599:
                     code = 500
+                if code in (401, 403):
+                    return error_response(code, public_auth_message(code, str(exc.message)))
                 return error_response(code, exc.message if code < 500 else "Video provider request failed")
             except HTTPException as exc:
+                if exc.status_code in (401, 403):
+                    return error_response(exc.status_code, public_auth_message(exc.status_code, str(exc.detail)))
                 return error_response(exc.status_code, str(exc.detail))
             except RuntimeError:
                 verbose_proxy_logger.exception("MiniMax H3 request failed")
@@ -172,6 +231,8 @@ async def context_ir_service_for_request(request: Request) -> ContextIRService |
 
 
 router = APIRouter(route_class=MiniMaxH3Route)
+# Must be included AFTER every router that serves these prefixes: it only answers what nothing else matched.
+fallback_router = APIRouter()
 
 
 @router.post(DIRECT_PREFIX + "/v2/video_generation", tags=["MiniMax H3"])
@@ -222,3 +283,28 @@ async def query_context_ir_task(video_id: str, owner: str, service: ContextIRSer
     if task is None or not task.listed or not hmac.compare_digest(task.owner, owner):
         raise H3Error(404, "Task not found")
     return {"task": task.public()}
+
+
+@fallback_router.api_route(
+    IR_PREFIX + "/{unmatched:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
+@fallback_router.api_route(
+    IR_PREFIX,
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
+async def unmatched(request: Request) -> Response:
+    """Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes."""
+    allowed: set[str] = set()
+    for route in request.app.router.routes:
+        if isinstance(route, APIRoute) and route.endpoint is not unmatched:
+            match, _ = route.matches(request.scope)
+            if match == Match.PARTIAL:
+                allowed |= set(route.methods or ())
+    if allowed:
+        response = error_response(405, "Method not allowed for this endpoint")
+        response.headers["Allow"] = ", ".join(sorted(allowed))
+        return response
+    return error_response(404, "Endpoint not found")

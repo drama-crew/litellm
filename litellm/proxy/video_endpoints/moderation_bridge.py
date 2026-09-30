@@ -51,6 +51,36 @@ class View(BaseModel):
     output: dict[str, JsonValue] | None = None
     parameters: dict[str, JsonValue] = {}
     usage: dict[str, JsonValue] | None = None
+    # Public, non-leaking reason the platform attaches when it ends a task itself (e.g. rejected input media).
+    # Optional so a platform that predates the field still parses.
+    error_message: str | None = None
+
+
+IDEMPOTENCY_CONFLICT = "Idempotency-Key was already used for a different request"
+CANCEL_TOO_LATE = "Task can no longer be cancelled; generation has already started"
+CANCEL_PENDING = "Task cancellation is pending; the submission outcome is not yet known. Query the task for its final state"
+
+
+def platform_rejection(status: int, detail: object, path: str) -> HTTPException:
+    """Map a moderation-platform error to the public status.
+
+    5xx is a genuine platform failure (503). A 409 is a client conflict and must never look retryable:
+    a reused Idempotency-Key is reported as such (the platform signals it with detail code
+    ``idempotency_conflict``; a plain-text detail that names the idempotency key is accepted too), and a
+    cancel that arrives after submission started says so. Everything else keeps its 4xx status.
+    """
+    if status >= 500:
+        return HTTPException(503, "Moderation control request was rejected")
+    code = detail.get("code") if isinstance(detail, dict) else None
+    text = detail.get("message") if isinstance(detail, dict) else detail
+    text = text if isinstance(text, str) else ""
+    if status == 409:
+        if code == "idempotency_conflict" or "idempotency" in text.lower():
+            return HTTPException(409, IDEMPOTENCY_CONFLICT)
+        if path.endswith("/cancel"):
+            return HTTPException(409, CANCEL_PENDING if "unknown" in text.lower() else CANCEL_TOO_LATE)
+        return HTTPException(409, text[:200] or "Request conflicts with the current state of the task")
+    return HTTPException(status, "Moderation control request was rejected")
 
 
 def configured(auth: UserAPIKeyAuth) -> bool:
@@ -147,9 +177,12 @@ async def platform(
             method, "/internal/moderation" + path, json=payload, headers={"Authorization": "Bearer " + secret}
         )
     if response.is_error:
-        raise HTTPException(
-            response.status_code if response.status_code < 500 else 503, "Moderation control request was rejected"
-        )
+        try:
+            body = response.json()
+            detail = body.get("detail") if isinstance(body, dict) else None
+        except ValueError:
+            detail = None
+        raise platform_rejection(response.status_code, detail, path)
     return JSON_OBJECT.validate_python(response.json())
 
 
@@ -171,6 +204,7 @@ def video(view: View) -> VideoObject:
         else "queued",
         moderation_status=view.moderation_status,
         generation_status=view.state,
+        error={"code": "input_media_rejected", "message": view.error_message} if view.error_message else None,
     )
     result._hidden_params = {"moderation_public_parameters": view.parameters, "moderation_public_usage": view.usage}
     if view.state == "completed" and isinstance(output.get("url"), str):
@@ -204,6 +238,8 @@ def v2_task(result: VideoObject, *, h3: bool = False) -> dict[str, JsonValue]:
         "task_type": "generation",
         **params,
     }
+    if result.error and result.status == "failed":
+        public["error"] = result.error
     if h3:
         public["model"] = "minimax-h3"
         if "resolution" in public:

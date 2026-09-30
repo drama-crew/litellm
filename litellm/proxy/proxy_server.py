@@ -520,6 +520,7 @@ from litellm.proxy.utils import (
     update_spend,
 )
 from litellm.proxy.video_endpoints.endpoints import router as video_router
+from litellm.proxy.video_endpoints.minimax_h3_endpoints import fallback_router as minimax_h3_fallback_router
 from litellm.proxy.video_endpoints.minimax_h3_endpoints import router as minimax_h3_router
 from litellm.proxy.video_endpoints.openapi_log_query import router as openapi_log_router
 from litellm.proxy.video_endpoints.monitor import router as video_monitor_router
@@ -15964,6 +15965,7 @@ app.include_router(openapi_log_router)
 app.include_router(video_monitor_router)
 app.include_router(context_ir_router)
 app.include_router(moderation_execution_router)
+app.include_router(minimax_h3_fallback_router)
 app.include_router(container_router)
 app.include_router(search_router)
 app.include_router(image_router)
