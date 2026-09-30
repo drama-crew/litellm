@@ -181,7 +181,9 @@ def normalize_libtv_errors(func):
         @wraps(func)
         async def _async(*args, **kwargs):
             try:
-                return await func(*args, **kwargs)
+                result = await func(*args, **kwargs)
+                attempt_outcomes.note(attempt_outcomes.SENT)
+                return result
             except LibTVError as error:
                 _note_attempt(error)
                 _raise_normalized_libtv_error(error, _model(args, kwargs))

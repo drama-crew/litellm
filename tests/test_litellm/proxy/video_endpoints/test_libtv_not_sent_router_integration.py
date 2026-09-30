@@ -224,10 +224,24 @@ async def test_same_deployment_retry_no_login_then_timeout_is_ambiguous(monkeypa
             libtv.test_persistence.cached_account = account_key("tok-1")
         return response
 
-    libtv_handler.AsyncHTTPHandler.post = flip_after_first_login_failure
-    try:
-        error, scope = await _submit(monkeypatch, router)
-    finally:
-        libtv_handler.AsyncHTTPHandler.post = original_post
+    monkeypatch.setattr(libtv_handler.AsyncHTTPHandler, "post", flip_after_first_login_failure)
+    error, scope = await _submit(monkeypatch, router)
     assert any(url.endswith("/generation/create") for url in script.calls), "retry must reach create"
+    _assert_ambiguous(error, scope)
+
+
+@pytest.mark.asyncio
+async def test_failure_after_a_successful_create_is_ambiguous_not_a_false_not_sent(monkeypatch, libtv):
+    """Account 1: No login. Account 2: create succeeds (the generation exists). A later
+    post-success step then raises. That must never be answered as 503 not_sent."""
+    SCRIPTS["tok-1"] = _Script(get_user_info=NO_LOGIN)
+    SCRIPTS["tok-2"] = _Script()  # create succeeds with a task id
+
+    async def post_success_failure(self, response, model_group, request_kwargs):
+        raise RuntimeError("post-success processing failed")
+
+    monkeypatch.setattr(Router, "set_response_headers", post_success_failure)
+    error, scope = await _submit(monkeypatch, _router(["tok-1", "tok-2"]))
+    assert any(url.endswith("/generation/create") for url in SCRIPTS["tok-2"].calls), "create must have been sent"
+    assert SCRIPTS["tok-1"].calls, "the failing account must have been attempted first"
     _assert_ambiguous(error, scope)

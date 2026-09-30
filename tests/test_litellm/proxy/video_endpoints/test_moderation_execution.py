@@ -640,3 +640,33 @@ async def test_same_deployment_retry_not_sent_then_timeout_is_ambiguous(monkeypa
 async def test_execute_leaves_non_metered_image_and_status_errors_unchanged(monkeypatch, route, scoped, method):
     error, final, _ = await _run_execute(monkeypatch, [_no_login, _no_login], route, scoped, method)
     assert error is final
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entries", [["not_sent", "sent"], ["sent"]])
+async def test_execute_never_answers_not_sent_once_a_provider_attempt_succeeded(monkeypatch, entries):
+    """Hard short-circuit: even a ledger that (wrongly) still reads all-not-sent cannot win."""
+    from litellm.router_utils import attempt_outcomes
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+    from litellm.proxy.spend_tracking import budget_reservation
+    from unittest.mock import MagicMock
+
+    scope = MagicMock()
+    scope.store.void_unsent = AsyncMock()
+    monkeypatch.setattr(entry, "scope_for", AsyncMock(return_value=scope))
+    monkeypatch.setattr(budget_reservation, "release_budget_reservation", AsyncMock())
+    failure = RuntimeError("after provider success")
+
+    async def call():
+        for value in entries:
+            attempt_outcomes.note(value)
+        raise failure
+
+    # simulate a ledger predicate that would say not_sent: the short-circuit must still hold
+    monkeypatch.setattr(attempt_outcomes, "all_not_sent", lambda: True)
+    auth = UserAPIKeyAuth(api_key="k", user_id="u", team_id="t")
+    with pytest.raises(RuntimeError) as caught:
+        await entry.execute(_metered_request(), auth, "avideo_generation", call())
+    assert caught.value is failure
+    assert execution.failure_outcome(failure) == "ambiguous"
+    scope.store.void_unsent.assert_not_awaited()

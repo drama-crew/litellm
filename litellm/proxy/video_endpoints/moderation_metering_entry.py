@@ -183,14 +183,16 @@ async def execute(
             record_submission_failure,
         )
 
-        if not accepted:
-            # Contract §9: settle the ledger verdict once, on the exception itself, so
-            # callers outside this scope (public submit path) classify identically.
-            attempt_outcomes.mark_verdict(exc, attempt_outcomes.all_not_sent())
+        # Hard short-circuit: once any provider attempt returned a result, nothing
+        # raised afterwards can be classified not_sent, whatever the ledger says.
+        sent = accepted or attempt_outcomes.provider_succeeded()
+        # Contract §9: settle the ledger verdict once, on the exception itself, so
+        # callers outside this scope (public submit path) classify identically.
+        attempt_outcomes.mark_verdict(exc, not sent and attempt_outcomes.all_not_sent())
         producer = request.scope.get("moderation_producer_attempt")
         if producer is not None and not accepted and failure_outcome(exc) == "ambiguous":
             await record_submission_failure(producer[0], producer[1], exc)
-        if scope is not None and not accepted and failure_outcome(exc) in {"not_sent", "rejected"}:
+        if scope is not None and not sent and failure_outcome(exc) in {"not_sent", "rejected"}:
             from litellm.proxy.spend_tracking import budget_reservation
             from litellm.proxy.video_endpoints.openapi_log_capture import raw_method
 
@@ -202,7 +204,7 @@ async def execute(
             except Exception:  # noqa: BLE001  # voiding is best effort and must never mask the provider failure
                 logging.getLogger(__name__).warning("unsent metering placeholders not voided", exc_info=True)
         if (
-            not accepted
+            not sent
             and scope is not None
             and request.method == "POST"
             and route in NOT_SENT_REWRITE_ROUTES

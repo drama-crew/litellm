@@ -14,6 +14,7 @@ from contextvars import ContextVar, Token
 from typing import List, Optional
 
 NOT_SENT = "not_sent"
+SENT = "sent"  # the provider returned a result: success is never evidence of not-sent
 UNKNOWN = "unknown"
 VERDICT_ATTR = "drama_all_attempts_not_sent"
 
@@ -40,18 +41,36 @@ def begin_attempt() -> Optional[int]:
     return None if ledger is None else len(ledger)
 
 
+def succeed_attempt(mark: Optional[int]) -> None:
+    """Router: an attempt returned a provider result. Leave exactly one ``sent`` entry."""
+    ledger = _LEDGER.get()
+    if ledger is None or mark is None:
+        return
+    del ledger[mark:]
+    ledger.append(SENT)
+
+
 def fail_attempt(mark: Optional[int]) -> None:
     """Router: an attempt raised. Leave exactly one entry for it.
 
-    Kept only when the boundary recorded exactly one ``not_sent`` entry during
-    the attempt; anything else (no boundary passed, several entries) is unknown.
+    ``sent`` when the provider had already returned a result inside the attempt,
+    ``not_sent`` only when the boundary recorded exactly one ``not_sent`` entry,
+    otherwise ``unknown`` (no boundary passed, several entries).
     """
     ledger = _LEDGER.get()
     if ledger is None or mark is None:
         return
     entries = ledger[mark:]
     del ledger[mark:]
-    ledger.append(NOT_SENT if entries == [NOT_SENT] else UNKNOWN)
+    if SENT in entries:
+        ledger.append(SENT)
+    else:
+        ledger.append(NOT_SENT if entries == [NOT_SENT] else UNKNOWN)
+
+
+def provider_succeeded() -> bool:
+    ledger = _LEDGER.get()
+    return bool(ledger) and SENT in ledger
 
 
 def all_not_sent() -> bool:
@@ -68,6 +87,7 @@ def mark_verdict(error: BaseException, verdict: bool) -> None:
 
 def verdict_of(error: BaseException) -> bool:
     """True only for an explicit verdict set by the metered entry, or a live all-not-sent ledger."""
-    if getattr(error, VERDICT_ATTR, False) is True:
-        return True
-    return all_not_sent()
+    verdict = getattr(error, VERDICT_ATTR, None)
+    if isinstance(verdict, bool):
+        return verdict
+    return all_not_sent() and not provider_succeeded()

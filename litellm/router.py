@@ -6606,8 +6606,11 @@ class Router:
             response = original_function(*args, **kwargs)
             if coroutine_checker.is_async_callable(response) or inspect.isawaitable(response):
                 response = await response
+            # Success is never evidence of not-sent: anything failing after this
+            # point must not read as "provably not sent" (drama contract §9).
+            attempt_outcomes.succeed_attempt(attempt_mark)
         except Exception:
-            # No-op unless a caller opened an attempt ledger (drama contract §9).
+            # No-op unless a caller opened an attempt ledger.
             attempt_outcomes.fail_attempt(attempt_mark)
             raise
         ## PROCESS RESPONSE HEADERS
