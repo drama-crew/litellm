@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import logging
 import re
 from collections.abc import Awaitable
 from datetime import datetime
@@ -181,6 +182,10 @@ async def execute(
             await raw_method(budget_reservation, "release_budget_reservation")(
                 budget_reservation=auth.budget_reservation
             )
+            try:
+                await scope.store.void_unsent(scope.binding.intent_id)
+            except Exception:  # noqa: BLE001  # voiding is best effort and must never mask the provider failure
+                logging.getLogger(__name__).warning("unsent metering placeholders not voided", exc_info=True)
         raise
     finally:
         runtime.CONTEXT.reset(token)

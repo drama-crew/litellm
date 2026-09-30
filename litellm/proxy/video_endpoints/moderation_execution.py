@@ -545,6 +545,11 @@ async def settlement(body: SettlementTicket, request: Request, authorization: An
             events.append(event)
     failure = None if events else await store.submission_failure(binding.intent_id)
     if failure is not None:
+        if failure[0] == "provider_not_submitted":
+            try:
+                await store.void_unsent(binding.intent_id)
+            except Exception:  # noqa: BLE001  # voiding is best effort; the 409 answer stands regardless
+                logging.getLogger(__name__).warning("unsent metering placeholders not voided", exc_info=True)
         return JSONResponse(
             status_code=409,
             content={

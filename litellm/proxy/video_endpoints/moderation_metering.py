@@ -24,6 +24,9 @@ from litellm.proxy.video_endpoints.openapi_log_capture import RawDatabase, raw_m
 from litellm.proxy.video_endpoints.openapi_logs import Database
 
 
+VOID = "void"
+
+
 class BillingWindow(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
     kind: Literal["key", "team"]
@@ -501,10 +504,10 @@ class MeteringStore:
                         "provider_task_id": event.provider_task_id,
                         "facts": event.facts,
                     }
-                if previous.status != "unknown" or previous.payload.model_copy(update=updates) != event:
+                if previous.status not in ("unknown", VOID) or previous.payload.model_copy(update=updates) != event:
                     raise ValueError("moderation billing payload replay conflict")
                 await tx.execute_raw(
-                    'UPDATE "LiteLLM_ModerationMeteringPhase" SET payload=$2::jsonb,payload_hash=$3,status=$4 WHERE request_id=$1',
+                    'UPDATE "LiteLLM_ModerationMeteringPhase" SET payload=$2::jsonb,payload_hash=$3,status=$4,failure_reason=NULL WHERE request_id=$1',
                     event.request_id,
                     event.model_dump_json(),
                     event.digest(),
@@ -685,7 +688,9 @@ class MeteringStore:
             )
         )
         receipts = tuple(row.receipt for row in rows if row.status == "settled" and row.receipt is not None)
-        complete = set(receipt.phase for receipt in receipts) == set(binding.expected_phases)
+        # void phases are terminal placeholders for a submission proven never sent; they neither settle nor block.
+        live = set(binding.expected_phases) - {row.payload.phase for row in rows if row.status == VOID}
+        complete = bool(live) and set(receipt.phase for receipt in receipts) == live
         return SettlementEnvelope(
             binding=binding,
             receipts=receipts,
@@ -719,6 +724,21 @@ class MeteringStore:
             attempt,
         )
         return changed == 1
+
+    async def void_unsent(self, intent_id: str) -> int:
+        """Void the placeholder phases of an intent proven never sent (contract section 10).
+
+        No-op unless no phase of the intent has a native id; only untouched `unknown` placeholders are voided.
+        """
+        return await self.db.execute_raw(
+            'UPDATE "LiteLLM_ModerationMeteringPhase" SET status=$2,failure_reason=$3 '
+            "WHERE intent_id=$1 AND status='unknown' AND COALESCE(payload->>'native_id','')='' "
+            'AND NOT EXISTS (SELECT 1 FROM "LiteLLM_ModerationMeteringPhase" '
+            "WHERE intent_id=$1 AND COALESCE(payload->>'native_id','')<>'')",
+            intent_id,
+            VOID,
+            "not_sent",
+        )
 
     async def clear_submission_failure(self, intent_id: str) -> None:
         await self.db.execute_raw(
