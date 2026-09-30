@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -584,17 +585,33 @@ class RecoveryConsumer:
         self.stopped = asyncio.Event()
         self.task: asyncio.Task[None] | None = None
         self.last_operation = ""
+        self.last_error: tuple[str, str] | None = None
+        self.last_error_at = 0.0
 
     async def tick(self) -> None:
         async with asyncio.timeout(15):
             self.last_operation = await self.authority.recover_pending(self.last_operation)
             await self.authority.run_once()
 
+    def report(self, error: BaseException) -> None:
+        # Rate-limited per (type, message) so a permanently failing tick stays visible without flooding the log.
+        signature = (type(error).__name__, str(error))
+        now = time.monotonic()
+        if signature == self.last_error and now - self.last_error_at < 60:
+            return
+        self.last_error, self.last_error_at = signature, now
+        logging.getLogger(__name__).warning(
+            "moderation metering durable recovery pending: %s: %s",
+            type(error).__name__,
+            error,
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
     async def run(self) -> None:
         while not self.stopped.is_set():
             outcome = await asyncio.gather(self.tick(), return_exceptions=True)
             if isinstance(outcome[0], BaseException):
-                logging.getLogger(__name__).warning("moderation metering durable recovery pending")
+                self.report(outcome[0])
             try:
                 await asyncio.wait_for(self.stopped.wait(), timeout=self.interval)
             except TimeoutError:

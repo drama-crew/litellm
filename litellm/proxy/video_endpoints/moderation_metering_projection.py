@@ -189,9 +189,13 @@ async def project(
             )
             if count not in (0, 1):
                 raise ValueError("financial membership identity ambiguous")
-    inserted = await tx.execute_raw(
-        'INSERT INTO "LiteLLM_SpendLogs" (request_id,call_type,api_key,spend,"startTime","endTime",model,model_id,model_group,custom_llm_provider,"user",team_id,organization_id,end_user,metadata,request_tags,prompt_tokens,completion_tokens,total_tokens) '
-        "VALUES ($1,$2,$3,$4,$5::timestamptz,$6::timestamptz,$7,$8,$7,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb,$16,$17,$18) ON CONFLICT(request_id) DO NOTHING",
+    metadata = {
+        "moderation_intent_id": value.intent_id,
+        "provider_task_id": value.provider_task_id,
+        "billing_facts": value.facts.model_dump(mode="json"),
+        **(value.legacy_metadata.model_dump(exclude_none=True) if value.legacy_metadata else {}),
+    }
+    row = (
         value.request_id,
         value.facts.route,
         value.fingerprint or "",
@@ -205,21 +209,23 @@ async def project(
         value.team_id,
         value.organization_id,
         value.end_user_id,
-        json.dumps(
-            {
-                "moderation_intent_id": value.intent_id,
-                "provider_task_id": value.provider_task_id,
-                "billing_facts": value.facts.model_dump(mode="json"),
-                **(value.legacy_metadata.model_dump(exclude_none=True) if value.legacy_metadata else {}),
-            }
-        ),
+        json.dumps(metadata),
         json.dumps(value.tag_ids),
         value.facts.prompt_tokens or 0,
         value.facts.completion_tokens or 0,
         (value.facts.prompt_tokens or 0) + (value.facts.completion_tokens or 0),
     )
+    inserted = await tx.execute_raw(
+        'INSERT INTO "LiteLLM_SpendLogs" (request_id,call_type,api_key,spend,"startTime","endTime",model,model_id,model_group,custom_llm_provider,"user",team_id,organization_id,end_user,metadata,request_tags,prompt_tokens,completion_tokens,total_tokens) '
+        "VALUES ($1,$2,$3,$4,$5::timestamptz,$6::timestamptz,$7,$8,$7,$9,$10,$11,$12,$13,$14::jsonb,$15::jsonb,$16,$17,$18) ON CONFLICT(request_id) DO NOTHING",
+        *row,
+    )
+    # A fresh projection is one request in the daily tables. An adopted row was already counted as a request by
+    # LiteLLM's regular logging of the same (spend-0) call, so adoption adds spend/tokens but no extra request.
+    request_count = 1
     if inserted != 1:
-        raise ValueError("financial projection request identity already exists outside its receipt")
+        await _adopt_zero_spend_log(tx, value, metadata, row)
+        request_count = 0
     daily = (
         ("LiteLLM_DailyUserSpend", "user_id", value.user_id),
         ("LiteLLM_DailyTeamSpend", "team_id", value.team_id),
@@ -236,9 +242,9 @@ async def project(
             continue
         await tx.execute_raw(
             f'INSERT INTO "{table}" (id,{dimension},date,api_key,model,model_group,custom_llm_provider,mcp_namespaced_tool_name,endpoint,spend,api_requests,successful_requests,prompt_tokens,completion_tokens,updated_at) '
-            "VALUES ($1,$2,$3,$4,$5,$5,$6,'',$7,$8,1,1,$9,$10,NOW()) "
+            "VALUES ($1,$2,$3,$4,$5,$5,$6,'',$7,$8,$11,$11,$9,$10,NOW()) "
             f"ON CONFLICT({dimension},date,api_key,model,custom_llm_provider,mcp_namespaced_tool_name,endpoint) DO UPDATE "
-            f'SET spend="{table}".spend+EXCLUDED.spend,api_requests="{table}".api_requests+1,successful_requests="{table}".successful_requests+1,prompt_tokens="{table}".prompt_tokens+EXCLUDED.prompt_tokens,completion_tokens="{table}".completion_tokens+EXCLUDED.completion_tokens,updated_at=NOW()',
+            f'SET spend="{table}".spend+EXCLUDED.spend,api_requests="{table}".api_requests+EXCLUDED.api_requests,successful_requests="{table}".successful_requests+EXCLUDED.successful_requests,prompt_tokens="{table}".prompt_tokens+EXCLUDED.prompt_tokens,completion_tokens="{table}".completion_tokens+EXCLUDED.completion_tokens,updated_at=NOW()',
             uuid4().hex,
             identity,
             value.facts.started_at.date().isoformat(),
@@ -249,4 +255,38 @@ async def project(
             float(value.amount),
             value.facts.prompt_tokens or 0,
             value.facts.completion_tokens or 0,
+            request_count,
         )
+
+
+async def _adopt_zero_spend_log(tx: Database, value: FinancialProjection, metadata: dict[str, object], row: tuple[object, ...]) -> None:
+    """Replace a debit-free row that LiteLLM's regular spend logging left under this phase's request id.
+
+    Money-safe: the row is locked, and is only replaced when it carries no debit (spend = 0) and no moderation
+    projection of its own. A row that already holds spend, or that looks like any projection (including this
+    one, whose replay would otherwise double-debit the counters above), keeps the double-billing guard.
+    """
+    rows = await tx.query_raw(
+        'SELECT spend,metadata FROM "LiteLLM_SpendLogs" WHERE request_id=$1 FOR UPDATE', value.request_id
+    )
+    if len(rows) != 1:
+        raise ValueError("financial projection request identity already exists outside its receipt")
+    existing_metadata = rows[0]["metadata"]
+    if isinstance(existing_metadata, str):
+        existing_metadata = json.loads(existing_metadata)
+    existing_metadata = existing_metadata if isinstance(existing_metadata, dict) else {}
+    if float(rows[0]["spend"] or 0) != 0:
+        raise ValueError("financial projection request identity already exists outside its receipt")
+    if "moderation_intent_id" in existing_metadata or "billing_facts" in existing_metadata:
+        # Only an exact, zero-amount replay of this same projection is idempotent; anything else is a
+        # different or amount-conflicting projection.
+        if value.amount != 0 or existing_metadata != json.loads(json.dumps(metadata)):
+            raise ValueError("financial projection request identity already exists outside its receipt")
+    updated = await tx.execute_raw(
+        'UPDATE "LiteLLM_SpendLogs" SET call_type=$2,api_key=$3,spend=$4,"startTime"=$5::timestamptz,"endTime"=$6::timestamptz,'
+        'model=$7,model_id=$8,model_group=$7,custom_llm_provider=$9,"user"=$10,team_id=$11,organization_id=$12,end_user=$13,'
+        "metadata=$14::jsonb,request_tags=$15::jsonb,prompt_tokens=$16,completion_tokens=$17,total_tokens=$18 WHERE request_id=$1",
+        *row,
+    )
+    if updated != 1:
+        raise ValueError("financial projection request identity already exists outside its receipt")

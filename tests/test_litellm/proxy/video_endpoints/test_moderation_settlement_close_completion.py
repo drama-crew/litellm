@@ -244,7 +244,9 @@ async def test_delivered_reads_completion_status_once_under_completion_scope(mon
     assert video_id == NATIVE
     admission = scope["moderation_metering_admission"]
     assert (admission.intent_id, admission.phase, admission.actor_user_id) == ("intent", "completion", "actor")
-    assert (b"x-litellm-call-id", b"public-video:intent:completion") in scope["headers"]
+    (call_id,) = [value for name, value in scope["headers"] if name == b"x-litellm-call-id"]
+    # a poll id, never the phase request id (that one belongs to the phase's financial projection row)
+    assert call_id.startswith(b"public-video:intent:completion:poll:")
     assert meter.persisted == []
 
 

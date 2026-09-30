@@ -7,7 +7,10 @@ import os
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal
+from uuid import uuid4
 from typing import TYPE_CHECKING, Annotated, Literal
+
+from uuid import uuid4
 
 import httpx
 import jwt
@@ -391,7 +394,9 @@ async def completion_status_read(
         execution.scope["moderation_financial_read_ticket"] = read_ticket
     execution.scope["headers"] = [
         *execution.scope["headers"],
-        (b"x-litellm-call-id", ("public-video:" + intent_id + ":completion").encode()),
+        # Never the phase request id itself: that id belongs to the phase's financial projection row, and a
+        # regular spend-log row written for a status poll (even a failed one) would collide with it forever.
+        (b"x-litellm-call-id", ("public-video:" + intent_id + ":completion:poll:" + uuid4().hex).encode()),
     ]
     context_token = BILLING_CONTEXT.set(context)
     try:
