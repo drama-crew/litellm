@@ -705,6 +705,14 @@ class MeteringStore:
             total_actual=sum((receipt.amount or Decimal(0) for receipt in receipts), Decimal(0)) if complete else None,
         )
 
+    async def phase_status(self, request_id: str) -> str | None:
+        rows = TypeAdapter(tuple[dict[str, str | None], ...]).validate_python(
+            await self.db.query_raw(
+                'SELECT status FROM "LiteLLM_ModerationMeteringPhase" WHERE request_id=$1', request_id
+            )
+        )
+        return rows[0]["status"] if rows else None
+
     async def manual_settlement_reason(self, intent_id: str) -> str | None:
         rows = TypeAdapter(tuple[dict[str, str | None], ...]).validate_python(
             await self.db.query_raw(

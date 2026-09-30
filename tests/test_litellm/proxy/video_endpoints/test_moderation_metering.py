@@ -22,6 +22,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture(autouse=True)
+def immediate_outbox_retry(monkeypatch):
+    # these tests re-run the reconciler right after a transient failure; production waits 60s before reclaiming
+    monkeypatch.setenv("LITELLM_BILLING_OUTBOX_RETRY_IDLE_MS", "0")
+
+
 @pytest_asyncio.fixture(loop_scope="function")
 async def store():
     schema = "meter_" + uuid4().hex

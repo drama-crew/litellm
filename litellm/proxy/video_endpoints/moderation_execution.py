@@ -400,6 +400,25 @@ async def completion_status_read(
         BILLING_CONTEXT.reset(context_token)
 
 
+def _is_definitive_not_found(exc: BaseException) -> bool:
+    """A provider answer that the task does not exist (HTTP 404), never a transient failure."""
+    for attr in ("status_code", "code"):
+        try:
+            if int(getattr(exc, attr, None)) == 404:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+async def _submit_settled_for(intent_id: str, native_id: str) -> bool:
+    """True only when the intent's submit phase is settled with exactly this native id."""
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+
+    submit = await runtime.store().phase(intent_id, "submit")
+    return submit is not None and submit.finalized and bool(submit.native_id) and submit.native_id == native_id
+
+
 @router.post("/collect", include_in_schema=False)
 async def collect(body: Ticket, request: Request, authorization: Annotated[str | None, Header()] = None):
     claims = authorize(body.ticket, authorization, "collect")
@@ -443,20 +462,32 @@ async def collect(body: Ticket, request: Request, authorization: Annotated[str |
             ),
         }
     else:
-        result = await completion_status_read(
-            request,
-            auth,
-            native_id=native_id,
-            intent_id=claims.intent_id,
-            metering=task["metering"],
-            read_ticket=body.ticket,
-            context=BillingContext(
+        try:
+            result = await completion_status_read(
+                request,
+                auth,
+                native_id=native_id,
                 intent_id=claims.intent_id,
-                model=claims.model,
-                principal=principal,
-                billing=bridge.JSON_OBJECT.validate_python(task["billing"]),
-            ),
-        )
+                metering=task["metering"],
+                read_ticket=body.ticket,
+                context=BillingContext(
+                    intent_id=claims.intent_id,
+                    model=claims.model,
+                    principal=principal,
+                    billing=bridge.JSON_OBJECT.validate_python(task["billing"]),
+                ),
+            )
+        except Exception as exc:
+            if not (_is_definitive_not_found(exc) and await _submit_settled_for(claims.intent_id, native_id)):
+                raise
+            logging.getLogger(__name__).warning(
+                "moderation collect: provider no longer knows task %s (intent %s); terminalizing as failed",
+                native_id,
+                claims.intent_id,
+            )
+            # Same shape as a provider-reported `failed` status, so the app terminalizes the task and
+            # the completion closes at amount 0 through the normal failed branch.
+            result = VideoObject(id=native_id, object="video", status="failed")
         if not isinstance(result, VideoObject) or result.status not in {"completed", "failed", "cancelled"}:
             return {"accepted": False}
         stored = bridge.JSON_OBJECT.validate_python(result.object_store_result or {})

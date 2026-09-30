@@ -3,14 +3,22 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 
-from litellm.llms.libtv.billing_outbox import BudgetAuthorityDependencyPending, CausynBillingEvent, ImageBillingEvent
+from litellm.llms.libtv.billing_outbox import (
+    BudgetAuthorityDependencyPending,
+    CausynBillingEvent,
+    ImageBillingEvent,
+    PermanentBillingFailure,
+)
 from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
-from litellm.proxy.video_endpoints.moderation_metering import PhaseEvent
+from litellm.proxy.video_endpoints.moderation_metering import MANUAL_SETTLEMENT, VOID, PhaseEvent
 from litellm.proxy.video_endpoints.moderation_metering_projection import (
     BillingFacts,
     FinancialProjection,
     LegacyMetadata,
 )
+
+
+TERMINAL_NON_SETTLING = frozenset({MANUAL_SETTLEMENT, "waived", VOID})
 
 
 async def settle_outbox(event: ImageBillingEvent | CausynBillingEvent) -> bool:
@@ -35,12 +43,15 @@ async def settle_outbox(event: ImageBillingEvent | CausynBillingEvent) -> bool:
             event.provider,
             event.deployment_id,
         ):
-            raise ValueError("outbox financial phase identity mismatch")
+            raise PermanentBillingFailure("outbox financial phase identity mismatch")
         authority = runtime.store()
         await authority.persist(phase)
         await authority.run_once()
         receipt = await authority.settlement(phase.binding)
         if phase not in receipt.receipts:
+            status = await authority.phase_status(phase.request_id)
+            if status in TERMINAL_NON_SETTLING:
+                raise PermanentBillingFailure(f"phase {phase.request_id} is {status}; it will never settle")
             raise BudgetAuthorityDependencyPending("actual phase receipt pending")
         return True
     if isinstance(event, CausynBillingEvent) and event.moderation_intent_id:

@@ -215,6 +215,33 @@ class BudgetAuthorityDependencyPending(ValueError):
     pass
 
 
+class PermanentBillingFailure(ValueError):
+    """Retrying can never succeed (identity mismatch, or the phase is parked/waived/void)."""
+
+
+RETRY_IDLE_ENV = "LITELLM_BILLING_OUTBOX_RETRY_IDLE_MS"
+DEFAULT_RETRY_IDLE_MS = 60_000
+DEAD_STREAM_SUFFIX = ":dead"
+_LOG_LIMIT = 300
+
+
+def _retry_idle_ms() -> int:
+    try:
+        return max(0, int(os.environ.get(RETRY_IDLE_ENV, DEFAULT_RETRY_IDLE_MS)))
+    except ValueError:
+        return DEFAULT_RETRY_IDLE_MS
+
+
+def _describe(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"[:_LOG_LIMIT]
+
+
+def _is_permanent(error: BaseException) -> bool:
+    from litellm.proxy.video_endpoints.moderation_metering import KeyIdentityMismatch
+
+    return isinstance(error, (PermanentBillingFailure, KeyIdentityMismatch))
+
+
 class LibTVBillingReconciler:
     def __init__(
         self,
@@ -226,6 +253,7 @@ class LibTVBillingReconciler:
         consumer: str | None = None,
         poll_interval: float = 1.0,
         batch_size: int = 100,
+        retry_idle_ms: int | None = None,
     ) -> None:
         self.redis = redis_client
         self.prisma_client = prisma_client
@@ -234,6 +262,7 @@ class LibTVBillingReconciler:
         self.consumer = consumer or f"{uuid.uuid4()}"
         self.poll_interval = poll_interval
         self.batch_size = batch_size
+        self.retry_idle_ms = _retry_idle_ms() if retry_idle_ms is None else retry_idle_ms
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._group_ready = False
@@ -260,7 +289,7 @@ class LibTVBillingReconciler:
                 self.stream_key,
                 self.consumer_group,
                 self.consumer,
-                min_idle_time=0,
+                min_idle_time=self.retry_idle_ms,
                 start_id="0-0",
                 count=self.batch_size,
             )
@@ -293,16 +322,46 @@ class LibTVBillingReconciler:
         for event_id, fields in events:
             try:
                 event = _event_from_stream(fields)
-            except (ValueError, TypeError, KeyError):
-                logger.warning("billing outbox event awaits durable reconciliation")
+            except (ValueError, TypeError, KeyError) as error:
+                if await self._dead_letter(event_id, fields, "unparseable event: " + _describe(error)):
+                    processed += 1
                 continue
-            outcome = await asyncio.gather(self._reconcile_event(event), return_exceptions=True)
-            if isinstance(outcome[0], BaseException):
-                logger.warning("billing outbox event awaits durable reconciliation")
+            outcome = (await asyncio.gather(self._reconcile_event(event), return_exceptions=True))[0]
+            if isinstance(outcome, BaseException):
+                if isinstance(outcome, asyncio.CancelledError):
+                    raise outcome
+                if _is_permanent(outcome):
+                    await self._dead_letter(event_id, fields, "permanent failure: " + _describe(outcome))
+                else:
+                    logger.warning(
+                        "billing outbox event %s awaits durable reconciliation: %s", event_id, _describe(outcome)
+                    )
                 continue
             await self.redis.xack(self.stream_key, self.consumer_group, event_id)
             processed += 1
         return processed
+
+    async def _dead_letter(self, event_id: str, fields: Mapping[Any, Any], reason: str) -> bool:
+        """Park an event that can never succeed on `<stream>:dead`, then ack it. Ack only after the XADD lands."""
+        payload = fields.get(BILLING_EVENT_FIELD, fields.get(BILLING_EVENT_FIELD.encode(), ""))
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8", "replace")
+        try:
+            await self.redis.xadd(
+                self.stream_key + DEAD_STREAM_SUFFIX,
+                {
+                    BILLING_EVENT_FIELD: str(payload),
+                    "source_event_id": str(event_id),
+                    "consumer_group": self.consumer_group,
+                    "reason": reason,
+                },
+            )
+            await self.redis.xack(self.stream_key, self.consumer_group, event_id)
+        except Exception as error:
+            logger.warning("billing outbox event %s could not be dead-lettered: %s", event_id, _describe(error))
+            return False
+        logger.error("billing outbox event %s dead-lettered: %s", event_id, reason)
+        return True
 
     async def _reconcile_event(self, event: ImageBillingEvent | CausynBillingEvent) -> None:
         if isinstance(event, CausynBillingEvent):
