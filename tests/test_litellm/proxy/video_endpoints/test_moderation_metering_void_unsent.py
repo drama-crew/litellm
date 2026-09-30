@@ -120,3 +120,39 @@ async def test_settlement_provider_not_submitted_voids(monkeypatch, code, voided
     response = await cc.settle(monkeypatch, meter)
     assert response.status_code == 409
     assert meter.void_unsent.await_count == (1 if voided else 0)
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_persist_revives_void_siblings_so_retry_is_not_complete_early(store):  # noqa: F811
+    meter, bound = store[0], cc.db_binding()
+    await prepare_meter(meter, bound, {})
+    await meter.void_unsent("intent")
+    await meter.persist(cc.submit_event(bound))
+    assert await statuses(meter) == {"submit": ("pending", None), "completion": ("unknown", None)}
+    await meter.db.execute_raw(
+        "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET status='settled',receipt=payload WHERE phase='submit'"
+    )
+    assert (await meter.settlement(bound)).complete is False
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_void_unsent_waits_for_the_task_lock_and_then_sees_the_native_id(store):  # noqa: F811
+    import asyncio
+
+    meter, bound = store[0], cc.db_binding()
+    await prepare_meter(meter, bound, {})
+    async with meter.transactions() as tx:
+        await tx.query_raw(
+            'SELECT intent_id FROM "LiteLLM_ModerationMeteringTask" WHERE intent_id=$1 FOR UPDATE', "intent"
+        )
+        voiding = asyncio.ensure_future(meter.void_unsent("intent"))
+        await asyncio.sleep(0.5)
+        assert not voiding.done()  # blocked on the same lock persist takes
+        await tx.execute_raw(
+            "UPDATE \"LiteLLM_ModerationMeteringPhase\" SET payload=jsonb_set(payload,'{native_id}','\"n\"') "
+            "WHERE phase='submit'"
+        )
+    await asyncio.wait_for(voiding, 10)
+    assert {v[0] for v in (await statuses(meter)).values()} == {"unknown"}

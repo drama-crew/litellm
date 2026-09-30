@@ -464,6 +464,13 @@ class MeteringStore:
                 if sibling.payload.native_id
             ):
                 raise ValueError("moderation billing provider binding changed")
+            # a native id proves the intent was sent: earlier "not sent" voids no longer apply
+            await tx.execute_raw(
+                'UPDATE "LiteLLM_ModerationMeteringPhase" SET status=\'unknown\',failure_reason=NULL '
+                "WHERE intent_id=$1 AND status=$2",
+                event.binding.intent_id,
+                VOID,
+            )
             old = TypeAdapter(list[PhaseRow]).validate_python(
                 await tx.query_raw(
                     'SELECT * FROM "LiteLLM_ModerationMeteringPhase" WHERE intent_id=$1 AND phase=$2 FOR UPDATE',
@@ -730,15 +737,20 @@ class MeteringStore:
 
         No-op unless no phase of the intent has a native id; only untouched `unknown` placeholders are voided.
         """
-        return await self.db.execute_raw(
-            'UPDATE "LiteLLM_ModerationMeteringPhase" SET status=$2,failure_reason=$3 '
-            "WHERE intent_id=$1 AND status='unknown' AND COALESCE(payload->>'native_id','')='' "
-            'AND NOT EXISTS (SELECT 1 FROM "LiteLLM_ModerationMeteringPhase" '
-            "WHERE intent_id=$1 AND COALESCE(payload->>'native_id','')<>'')",
-            intent_id,
-            VOID,
-            "not_sent",
-        )
+        async with self.transactions() as tx:
+            # same lock persist() takes, so the "no native id" check cannot race a concurrent persist
+            await tx.query_raw(
+                'SELECT intent_id FROM "LiteLLM_ModerationMeteringTask" WHERE intent_id=$1 FOR UPDATE', intent_id
+            )
+            return await tx.execute_raw(
+                'UPDATE "LiteLLM_ModerationMeteringPhase" SET status=$2,failure_reason=$3 '
+                "WHERE intent_id=$1 AND status='unknown' AND COALESCE(payload->>'native_id','')='' "
+                'AND NOT EXISTS (SELECT 1 FROM "LiteLLM_ModerationMeteringPhase" '
+                "WHERE intent_id=$1 AND COALESCE(payload->>'native_id','')<>'')",
+                intent_id,
+                VOID,
+                "not_sent",
+            )
 
     async def clear_submission_failure(self, intent_id: str) -> None:
         await self.db.execute_raw(
