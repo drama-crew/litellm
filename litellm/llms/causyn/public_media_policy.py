@@ -74,6 +74,7 @@ _EXTRA_BLOCKED = tuple(
     for net in (
         "100.64.0.0/10",  # carrier-grade NAT, includes the Aliyun metadata address 100.100.100.200
         "168.63.129.16/32",  # Azure wire server
+        "::/96",  # IPv4-compatible (::127.0.0.1)
         "64:ff9b::/96",
         "64:ff9b:1::/48",
         "2002::/16",
@@ -335,8 +336,22 @@ def _non_global(address: str) -> bool:
     return not ip.is_global or any(ip in net for net in _EXTRA_BLOCKED if ip.version == net.version)
 
 
+_NUMERIC_LABEL = re.compile(r"0x[0-9a-f]*|[0-9]+", re.IGNORECASE)
+
+
+def _is_numeric_ipv4(labels: list[str]) -> bool:
+    """inet_aton semantics: 1-4 dot-separated labels that are ALL numeric (decimal, octal or 0x hex).
+
+    A domain that merely consists of hex letters ("bad.cafe", "face.be") has a non-numeric label and is not matched.
+    """
+    return 1 <= len(labels) <= 4 and all(_NUMERIC_LABEL.fullmatch(label) for label in labels)
+
+
 def _check_url_syntax(url: str) -> tuple[str, int]:
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        raise MediaPolicyError(PUBLIC_HOST_MESSAGE) from None
     if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
         raise MediaPolicyError("media must be a public HTTP(S) URL or Base64 data URL")
     try:
@@ -348,11 +363,14 @@ def _check_url_syntax(url: str) -> tuple[str, int]:
     labels = host.split(".")
     if (
         not host
+        or not host.isascii()  # fullwidth digits / ideographic dots normalise to IPv4 in some resolvers
+        or "%" in host  # IPv6 zone ids and percent-encoding tricks
         or ":" in host  # IPv6 literal in any spelling
-        or len(labels) < 2  # single label: internal service names and decimal IPv4
+        or "" in labels  # empty label ("a..b")
+        or len(labels) < 2  # single label: internal service names
         or host == "localhost"
         or host.endswith(_BLOCKED_SUFFIXES)
-        or re.fullmatch(r"0x[0-9a-f]*|[0-9]+", labels[-1])  # dotted/hex/octal/short IPv4 spellings
+        or _is_numeric_ipv4(labels)
         or not (port in (80, 443) or port >= 1024)
     ):
         raise MediaPolicyError(PUBLIC_HOST_MESSAGE)

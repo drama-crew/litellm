@@ -271,6 +271,8 @@ async def test_audio_is_wav_or_mp3_and_size_limited(monkeypatch):
         "http://[::ffff:127.0.0.1]/a.png",
         "http://[::ffff:7f00:1]/a.png",
         "http://[fe80::1]/a.png",
+        "http://[::127.0.0.1]/a.png",
+        "http://[64:ff9b::7f00:1]/a.png",
         "http://[2606:4700:4700::1111]/a.png",
         "http://8.8.8.8/a.png",
         "http://0.0.0.0/a.png",
@@ -279,6 +281,17 @@ async def test_audio_is_wav_or_mp3_and_size_limited(monkeypatch):
         "http://0x7f.0.0.1/a.png",
         "http://0177.0.0.1/a.png",
         "http://127.1/a.png",
+        "http://0X7F.0.0.1/a.png",
+        "http://0x7f.1/a.png",
+        "http://0xff.0xff.0xff.0xff/a.png",
+        "http://127.0.0.1./a.png",
+        "http://127.0.0.1../a.png",
+        "http://\uff11\uff12\uff17\uff0e\uff10\uff0e\uff10\uff0e\uff11/a.png",
+        "http://127\u30020\u30020\u30021/a.png",
+        "http://ex\u00e4mple.com/a.png",
+        "http://[::1%25lo0]/a.png",
+        "http://cdn.example.com%25lo0/a.png",
+        "http://cdn..example.com/a.png",
         "http://drama-litellm:4000/a.png",
         "http://drama-platform:3000/a.png",
         "http://localhost/a.png",
@@ -311,12 +324,17 @@ async def test_ssrf_message_is_the_documented_one(url):
 @pytest.mark.parametrize(
     "answers",
     [["10.1.2.3"], ["93.184.216.34", "10.1.2.3"], ["100.64.0.1"], ["100.100.100.200"], ["169.254.169.254"],
-     ["::1"], ["::ffff:10.0.0.1"], ["fd00::1"], ["64:ff9b::7f00:1"], ["198.18.0.1"], ["0.0.0.0"], ["168.63.129.16"]],
+     ["::1"], ["::ffff:10.0.0.1"], ["fd00::1"], ["64:ff9b::7f00:1"], ["::127.0.0.1"], ["::10.0.0.1"], ["2002:7f00:1::1"], ["198.18.0.1"], ["0.0.0.0"], ["168.63.129.16"]],
 )
 async def test_hostnames_resolving_to_non_global_addresses_are_rejected(public_dns, answers):
     public_dns["cdn.example.com"] = answers
     with pytest.raises(MediaPolicyError, match="media URL must point to a public internet host"):
         await check(image("https://cdn.example.com/a.png"))
+
+
+@pytest.mark.parametrize("host", ["bad.cafe", "cafe.de", "abc.de", "face.be", "deadbeef.io", "0xdead.example.com", "xn--bcher-kva.example"])
+async def test_legitimate_hex_letter_and_idna_domains_are_not_mistaken_for_ip_literals(host):
+    await check(image(f"https://{host}/a.png"))
 
 
 async def test_public_hosts_and_allowed_ports_pass(public_dns):

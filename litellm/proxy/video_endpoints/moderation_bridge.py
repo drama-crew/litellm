@@ -380,6 +380,8 @@ async def submit(
     model = policy_model or await resolved_model(auth, payload.get("model"))
     if model and not policy_model:
         payload = {**payload, "model": model}
+    if model == "causyn-1.1":
+        await enforce_public_media(payload)
     source = await source_descriptor(request, auth, payload)
     normalized = await inline_media(request, owner, payload)
     prepared = {
@@ -414,6 +416,16 @@ async def submit(
     history_id = await openapi_log_capture.start(request, auth, prepared)
     await openapi_log_capture.submitted(history_id, projected)
     return projected
+
+
+async def enforce_public_media(payload: dict[str, JsonValue]) -> None:
+    """Submit-time media admission for public causyn-1.1 traffic (never reached by ticketed producer traffic)."""
+    from litellm.llms.causyn import public_media_policy
+
+    try:
+        await public_media_policy.validate_public_payload(payload)
+    except public_media_policy.MediaPolicyError as error:
+        raise HTTPException(400, str(error)) from None
 
 
 async def capture(request: Request, result: object) -> None:
