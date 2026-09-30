@@ -218,7 +218,10 @@ class MiniMaxH3Route(APIRoute):
             except HTTPException as exc:
                 if exc.status_code in (401, 403):
                     return error_response(exc.status_code, public_auth_message(exc.status_code, str(exc.detail)))
-                return error_response(exc.status_code, str(exc.detail))
+                response = error_response(exc.status_code, str(exc.detail))
+                if exc.headers and "Retry-After" in exc.headers:
+                    response.headers["Retry-After"] = exc.headers["Retry-After"]
+                return response
             except RuntimeError:
                 verbose_proxy_logger.exception("MiniMax H3 request failed")
                 return error_response(500, "Video request failed")

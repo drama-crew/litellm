@@ -56,6 +56,8 @@ class View(BaseModel):
     error_message: str | None = None
 
 
+# Seconds a client should wait after a saturated media-validation 503 (Retry-After).
+MEDIA_BUSY_RETRY_AFTER_S = 10
 IDEMPOTENCY_CONFLICT = "Idempotency-Key was already used for a different request"
 CANCEL_TOO_LATE = "Task can no longer be cancelled; generation has already started"
 CANCEL_PENDING = "Task cancellation is pending; the submission outcome is not yet known. Query the task for its final state"
@@ -427,7 +429,7 @@ async def enforce_public_media(payload: dict[str, JsonValue]) -> None:
     except public_media_policy.MediaPolicyError as error:
         raise HTTPException(400, str(error)) from None
     except public_media_policy.MediaBusyError as error:
-        raise HTTPException(503, str(error), headers={"Retry-After": "2"}) from None
+        raise HTTPException(503, str(error), headers={"Retry-After": str(MEDIA_BUSY_RETRY_AFTER_S)}) from None
 
 
 async def capture(request: Request, result: object) -> None:

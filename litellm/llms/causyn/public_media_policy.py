@@ -53,8 +53,12 @@ AUDIO_TOTAL_MAX_SECONDS = 15.0 + 1e-6
 MAX_REFERENCES = 16
 DNS_TIMEOUT_S = 3.0
 DECODE_TIMEOUT_S = 10.0
-DECODE_SLOTS, DECODE_MAX_WAITING = 2, 16
-DNS_SLOTS, DNS_MAX_WAITING = 8, 16
+DECODE_SLOTS = 2
+DNS_SLOTS = 8
+# Requests queued behind a saturated pool hold no decode memory (their bytes are already in the request),
+# so a deep queue is cheap; beyond it validation fails fast with a retryable 503 instead of queueing unboundedly.
+DECODE_MAX_WAITING = 64
+DNS_MAX_WAITING = 64
 IMAGE_FORMATS = "JPEG, PNG, WEBP, HEIC, HEIF"
 PUBLIC_HOST_MESSAGE = "media URL must point to a public internet host"
 

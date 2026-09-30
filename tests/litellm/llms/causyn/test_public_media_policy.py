@@ -494,7 +494,7 @@ async def test_dns_that_never_answers_times_out_without_blocking_the_default_exe
     started = time.monotonic()
     try:
         results = await asyncio.gather(
-            *(check(image(f"https://h{i}.example.com/a.png")) for i in range(40)), return_exceptions=True
+            *(check(image(f"https://h{i}.example.com/a.png")) for i in range(policy.DNS_SLOTS + policy.DNS_MAX_WAITING + 30)), return_exceptions=True
         )
         assert time.monotonic() - started < 2
         assert all(isinstance(r, (MediaPolicyError, policy.MediaBusyError)) for r in results)
@@ -524,7 +524,7 @@ async def test_decode_concurrency_limit_holds_and_overflow_fails_fast(monkeypatc
             active["now"] -= 1
 
     monkeypatch.setattr(policy, "_image_bytes", slow)
-    refs = [image(data_url(encoded("PNG"))) for _ in range(60)]
+    refs = [image(data_url(encoded("PNG"))) for _ in range(policy.DECODE_SLOTS + policy.DECODE_MAX_WAITING + 20)]
     task = asyncio.ensure_future(asyncio.gather(*(check(r) for r in refs), return_exceptions=True))
     await asyncio.sleep(0.3)
     gate.set()
