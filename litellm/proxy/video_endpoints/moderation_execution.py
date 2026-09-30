@@ -5,7 +5,9 @@ import json
 import logging
 import os
 from contextvars import ContextVar
-from typing import Annotated, Literal
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Annotated, Any, Literal
 
 import httpx
 import jwt
@@ -21,6 +23,10 @@ from litellm.types.videos.main import CharacterObject, VideoObject
 class Ticket(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     ticket: str
+
+
+class SettlementTicket(Ticket):
+    close_completion: Literal["undelivered", "delivered"] | None = None
 
 
 class Claims(BaseModel):
@@ -349,6 +355,35 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
     return {"accepted": True, "state": "submitted"}
 
 
+async def completion_status_read(
+    request: Request,
+    auth: UserAPIKeyAuth,
+    *,
+    native_id: str,
+    intent_id: str,
+    metering: object,
+    read_ticket: str | None,
+    context: BillingContext | None,
+) -> object:
+    """One provider status read under the completion metering scope (shared by collect and settlement)."""
+    from litellm.proxy.video_endpoints.endpoints import video_status
+    from litellm.proxy.video_endpoints.moderation_metering_entry import attest
+
+    execution = execution_request(request, {}, "/v1/videos/" + native_id, "GET")
+    attest(execution, metering, phase="completion")
+    if read_ticket is not None:
+        execution.scope["moderation_financial_read_ticket"] = read_ticket
+    execution.scope["headers"] = [
+        *execution.scope["headers"],
+        (b"x-litellm-call-id", ("public-video:" + intent_id + ":completion").encode()),
+    ]
+    context_token = BILLING_CONTEXT.set(context)
+    try:
+        return await video_status(native_id, execution, Response(), auth)
+    finally:
+        BILLING_CONTEXT.reset(context_token)
+
+
 @router.post("/collect", include_in_schema=False)
 async def collect(body: Ticket, request: Request, authorization: Annotated[str | None, Header()] = None):
     claims = authorize(body.ticket, authorization, "collect")
@@ -392,29 +427,20 @@ async def collect(body: Ticket, request: Request, authorization: Annotated[str |
             ),
         }
     else:
-        from litellm.proxy.video_endpoints.endpoints import video_status
-
-        execution = execution_request(request, {}, "/v1/videos/" + native_id, "GET")
-        from litellm.proxy.video_endpoints.moderation_metering_entry import attest
-
-        attest(execution, task["metering"], phase="completion")
-        execution.scope["moderation_financial_read_ticket"] = body.ticket
-        execution.scope["headers"] = [
-            *execution.scope["headers"],
-            (b"x-litellm-call-id", ("public-video:" + claims.intent_id + ":completion").encode()),
-        ]
-        context_token = BILLING_CONTEXT.set(
-            BillingContext(
+        result = await completion_status_read(
+            request,
+            auth,
+            native_id=native_id,
+            intent_id=claims.intent_id,
+            metering=task["metering"],
+            read_ticket=body.ticket,
+            context=BillingContext(
                 intent_id=claims.intent_id,
                 model=claims.model,
                 principal=principal,
                 billing=bridge.JSON_OBJECT.validate_python(task["billing"]),
-            )
+            ),
         )
-        try:
-            result = await video_status(native_id, execution, Response(), auth)
-        finally:
-            BILLING_CONTEXT.reset(context_token)
         if not isinstance(result, VideoObject) or result.status not in {"completed", "failed", "cancelled"}:
             return {"accepted": False}
         stored = bridge.JSON_OBJECT.validate_python(result.object_store_result or {})
@@ -477,7 +503,7 @@ async def cancel(body: Ticket, request: Request, authorization: Annotated[str | 
 
 
 @router.post("/settlement", include_in_schema=False)
-async def settlement(body: Ticket, request: Request, authorization: Annotated[str | None, Header()] = None):
+async def settlement(body: SettlementTicket, request: Request, authorization: Annotated[str | None, Header()] = None):
     from litellm.proxy.video_endpoints import moderation_metering_runtime as metering
     from litellm.proxy.video_endpoints.moderation_metering import AdmissionMissing, BillingBinding, PhaseEvent
 
@@ -504,6 +530,8 @@ async def settlement(body: Ticket, request: Request, authorization: Annotated[st
         if event.binding != binding or event.native_id != authority["native_id"]:
             raise HTTPException(403, "Settlement provider binding mismatch")
         await store.persist(event)
+    if body.close_completion is not None:
+        await close_completion(request, store, binding, body.close_completion)
     manual = await store.manual_settlement_reason(binding.intent_id)
     if manual is not None:
         return JSONResponse(status_code=409, content={"error": {"code": "key_identity_mismatch", "message": manual}})
@@ -526,3 +554,58 @@ async def settlement(body: Ticket, request: Request, authorization: Annotated[st
             },
         )
     return (await store.settlement(binding)).model_copy(update={"events": tuple(events)}).model_dump(mode="json")
+
+
+async def close_completion(request: Request, store: Any, binding: Any, mode: str) -> None:
+    """Contract section 8: close a completion phase nobody polls. Ignored unless provably closable."""
+    submit = await store.phase(binding.intent_id, "submit")
+    completion = await store.phase(binding.intent_id, "completion")
+    if (
+        "completion" not in binding.expected_phases
+        or "submit" not in binding.expected_phases
+        or submit is None
+        or not submit.native_id
+        or (completion is not None and completion.finalized)
+    ):
+        return
+    if mode == "undelivered":
+        from litellm.proxy.video_endpoints.moderation_metering import PhaseEvent, request_id
+        from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts, actual_debit
+
+        now = datetime.now(timezone.utc)
+        raw = Decimal(0)
+        # BillingFacts forbids extra keys, so the audit marker is logged rather than stored.
+        logging.getLogger(__name__).info("closed_by=app_undelivered intent_id=%s", binding.intent_id)
+        await store.persist(
+            PhaseEvent(
+                binding=binding,
+                request_id=request_id(binding, "completion"),
+                phase="completion",
+                provider=submit.provider,
+                deployment_id=submit.deployment_id,
+                native_id=submit.native_id,
+                provider_task_id=submit.provider_task_id,
+                amount=actual_debit(raw),
+                finalized=True,
+                facts=BillingFacts(started_at=now, ended_at=now, route="avideo_status", raw_cost_credit=raw),
+            )
+        )
+        return
+    if binding.actor_user_id is None:
+        return
+    auth = UserAPIKeyAuth(api_key=binding.fingerprint, user_id=binding.user_id, team_id=binding.team_id)
+    await completion_status_read(
+        request,
+        auth,
+        native_id=submit.native_id,
+        intent_id=binding.intent_id,
+        metering={
+            "intent_id": binding.intent_id,
+            "request_digest": binding.request_digest,
+            "actor_user_id": binding.actor_user_id,
+            "model": binding.model,
+            "generation_id": binding.generation_id,
+        },
+        read_ticket=None,
+        context=None,
+    )
