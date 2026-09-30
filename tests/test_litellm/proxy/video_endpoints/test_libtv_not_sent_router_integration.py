@@ -15,7 +15,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, Request
 
 import litellm
-import litellm.llms.causyn  # noqa: F401  (pre-existing import cycle)
+import litellm.llms.causyn  # (pre-existing import cycle)
 from litellm import Router
 from litellm.llms.libtv import handler as libtv_handler
 from litellm.llms.libtv.client import LibTVClient
