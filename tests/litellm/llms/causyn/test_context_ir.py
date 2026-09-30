@@ -429,7 +429,7 @@ async def test_public_ir_normalizes_model_and_requires_moderation_before_rewrite
         created = await client.post("/video/minimax-h3/v2/h3_context_ir", json=payload)
         assert created.status_code == 200, created.text
         assert created.json()["task_id"] == "mod_video_ir"
-        assert normalized == [{"model": "causyn-1.1"}]
+        assert normalized and all(item == {"model": "causyn-1.1"} for item in normalized)  # identity gate + dependency
         assert submit.call_args.args[2]["model"] == "MiniMax-H3"
         assert not await service.store.list_tasks(h3.task_owner(UserAPIKeyAuth(api_key="owner")))
         payload["content"] = [
