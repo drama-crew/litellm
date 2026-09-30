@@ -1413,6 +1413,10 @@ model LiteLLM_WorkflowMessage {
 
 // Task history is independent from accounting and never participates in billing.
 model LiteLLM_OpenApiLog {
+  call_source String @default("unknown")
+  project_id String?
+  generation_id String?
+  artifact_id String?
   id String @id
   owner String
   user_id String

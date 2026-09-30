@@ -56,6 +56,27 @@ async def persist(operation: Awaitable[None]) -> None:
         verbose_proxy_logger.warning("Open API history write failed: %s", type(exc).__name__)
 
 
+def request_attribution(request: Request, auth: UserAPIKeyAuth) -> logs.RequestAttribution:
+    metadata = logs.JSON_OBJECT.validate_python(auth.metadata or {})
+    project = metadata.get("project_id")
+    project_id = project if isinstance(project, str) and 0 < len(project) <= 200 else None
+    default = logs.RequestAttribution(call_source="open_api", project_id=project_id)
+    header = request.headers.get("x-litellm-spend-logs-metadata", "")
+    if not project_id or not auth.user_id or not header or len(header) > 8192:
+        return default
+    try:
+        context = logs.JSON_OBJECT.validate_json(header)
+        if context.get("project_id") != project_id or context.get("call_source") not in (None, "studio"):
+            return default
+        if not context.get("generation_id") or not context.get("artifact_id"):
+            return default
+        return logs.RequestAttribution.model_validate(
+            {**{k: context.get(k) for k in ("project_id", "generation_id", "artifact_id")}, "call_source": "studio"}
+        )
+    except ValueError:
+        return default
+
+
 async def start(request: Request, auth: UserAPIKeyAuth, body: object) -> str | None:
     log_id = str(uuid.uuid4())
     request.scope["openapi_log_id"] = log_id
@@ -76,6 +97,7 @@ async def start(request: Request, auth: UserAPIKeyAuth, body: object) -> str | N
             model=str(data.get("model") or ""),
             payload=payload if auth.user_id else {},
             started_at=datetime.now(timezone.utc),
+            attribution=request_attribution(request, auth),
         )
 
     await persist(operation())

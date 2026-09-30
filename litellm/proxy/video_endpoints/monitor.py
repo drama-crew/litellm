@@ -37,6 +37,11 @@ class MonitorRow(BaseModel):
     trace_id: str | None = None
     provider_task_id: str | None = None
     observation_error: str | None = None
+    call_source: str = "unknown"
+    project_id: str | None = None
+    generation_id: str | None = None
+    artifact_id: str | None = None
+    user_id: str | None = None
 
 
 ROWS = TypeAdapter(list[MonitorRow])
@@ -69,7 +74,7 @@ class Credentials(BaseModel):
     model: str = ""
 
 
-COLUMNS = """id,task_id,public_task_id,model,
+COLUMNS = """id,task_id,public_task_id,model,call_source,project_id,generation_id,artifact_id,user_id,
     CASE WHEN result->'error'->>'code'='cancelled' THEN 'cancelled' ELSE status END AS status,
     started_at,observed_at,finished_at,
     coalesce(error,result->'error'->>'message',result->>'error') AS error,result->>'trace_id' AS trace_id"""
