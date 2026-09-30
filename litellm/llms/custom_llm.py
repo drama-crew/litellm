@@ -43,6 +43,17 @@ class CustomLLMError(Exception):  # use this for all your exceptions
         super().__init__(self.message)  # Call the base class constructor with the parameters it needs
 
 
+class ProviderTaskNotFound(CustomLLMError):
+    """The provider authoritatively answered that this specific task id does not exist upstream.
+
+    Still a 404 CustomLLMError for every other caller; only raise it from an adapter that has an explicit
+    "task not found" answer, never for routing, base-URL or access failures.
+    """
+
+    def __init__(self, message):
+        super().__init__(status_code=404, message=message)
+
+
 class CustomLLM(BaseLLM):
     def __init__(self) -> None:
         super().__init__()

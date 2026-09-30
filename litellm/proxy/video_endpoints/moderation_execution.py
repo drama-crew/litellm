@@ -262,7 +262,7 @@ async def record_submission_failure(intent_id: str, attempt: str, error: BaseExc
 
 
 if TYPE_CHECKING:
-    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, MeteringStore
+    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, MeteringStore, PhaseEvent
 
 router = APIRouter(prefix="/internal/moderation")
 
@@ -400,23 +400,55 @@ async def completion_status_read(
         BILLING_CONTEXT.reset(context_token)
 
 
-def _is_definitive_not_found(exc: BaseException) -> bool:
-    """A provider answer that the task does not exist (HTTP 404), never a transient failure."""
-    for attr in ("status_code", "code"):
-        try:
-            if int(getattr(exc, attr, None)) == 404:
-                return True
-        except (TypeError, ValueError):
-            continue
+def _is_provider_task_not_found(exc: BaseException) -> bool:
+    """True only for the typed adapter answer "this task id does not exist upstream", anywhere in the chain."""
+    from litellm.llms.custom_llm import ProviderTaskNotFound
+
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        if isinstance(exc, ProviderTaskNotFound):
+            return True
+        seen.add(id(exc))
+        exc = exc.__cause__ or exc.__context__
     return False
 
 
-async def _submit_settled_for(intent_id: str, native_id: str) -> bool:
-    """True only when the intent's submit phase is settled with exactly this native id."""
-    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+def _dead_upstream_min_age_s() -> float:
+    try:
+        return float(os.environ.get("LITELLM_DEAD_UPSTREAM_MIN_AGE_S", "1800"))
+    except ValueError:
+        return 1800.0
 
-    submit = await runtime.store().phase(intent_id, "submit")
-    return submit is not None and submit.finalized and bool(submit.native_id) and submit.native_id == native_id
+
+async def _close_dead_upstream(store: MeteringStore, intent_id: str, native_id: str, exc: BaseException) -> str | None:
+    """Close the completion as undelivered when the provider authoritatively lost the task.
+
+    Returns "closed", "finalized" (completion already settled, nothing to do) or None (not a dead upstream:
+    caller re-raises). Requires: typed not-found, submit settled with this exact native id and at least the
+    minimum age, so a just-created task is never judged gone.
+    """
+    if not _is_provider_task_not_found(exc):
+        return None
+    submit = await store.phase(intent_id, "submit")
+    if submit is None or not submit.finalized or not submit.native_id or submit.native_id != native_id:
+        return None
+    facts = submit.facts
+    since = None if facts is None else (facts.ended_at or facts.started_at)
+    if since is None:
+        return None
+    if since.tzinfo is None:
+        since = since.replace(tzinfo=timezone.utc)
+    if (datetime.now(timezone.utc) - since).total_seconds() < _dead_upstream_min_age_s():
+        return None
+    completion = await store.phase(intent_id, "completion")
+    if completion is not None and completion.finalized:
+        return "finalized"
+    binding = await store.binding(intent_id)
+    await _persist_undelivered(store, binding, submit)
+    logging.getLogger(__name__).warning(
+        "provider no longer knows task %s (intent %s); completion closed undelivered", native_id, intent_id
+    )
+    return "closed"
 
 
 @router.post("/collect", include_in_schema=False)
@@ -478,15 +510,14 @@ async def collect(body: Ticket, request: Request, authorization: Annotated[str |
                 ),
             )
         except Exception as exc:
-            if not (_is_definitive_not_found(exc) and await _submit_settled_for(claims.intent_id, native_id)):
+            from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+
+            closed = await _close_dead_upstream(runtime.store(), claims.intent_id, native_id, exc)
+            if closed is None:
                 raise
-            logging.getLogger(__name__).warning(
-                "moderation collect: provider no longer knows task %s (intent %s); terminalizing as failed",
-                native_id,
-                claims.intent_id,
-            )
-            # Same shape as a provider-reported `failed` status, so the app terminalizes the task and
-            # the completion closes at amount 0 through the normal failed branch.
+            if closed == "finalized":
+                return {"accepted": False}
+            # Same shape as a provider-reported `failed` status, so the app terminalizes the task.
             result = VideoObject(id=native_id, object="video", status="failed")
         if not isinstance(result, VideoObject) or result.status not in {"completed", "failed", "cancelled"}:
             return {"accepted": False}
@@ -608,6 +639,37 @@ async def settlement(body: SettlementTicket, request: Request, authorization: An
     return (await store.settlement(binding)).model_copy(update={"events": tuple(events)}).model_dump(mode="json")
 
 
+async def _persist_undelivered(store: MeteringStore, binding: BillingBinding, submit: PhaseEvent) -> None:
+    """Persist a finalized amount-0 completion under the submit identity (idempotent, deterministic payload)."""
+    from litellm.proxy.video_endpoints.moderation_metering import PhaseEvent, request_id
+    from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts, actual_debit
+
+    # Deterministic: duplicate or concurrent closes must yield byte-identical payloads.
+    stamp = submit.facts.ended_at if submit.facts is not None else datetime.fromtimestamp(0, timezone.utc)
+    started = submit.facts.started_at if submit.facts is not None else stamp
+    raw = Decimal(0)
+    # BillingFacts forbids extra keys, so the audit marker is logged rather than stored.
+    logging.getLogger(__name__).info("closed_by=app_undelivered intent_id=%s", binding.intent_id)
+    event = PhaseEvent(
+        binding=binding,
+        request_id=request_id(binding, "completion"),
+        phase="completion",
+        provider=submit.provider,
+        deployment_id=submit.deployment_id,
+        native_id=submit.native_id,
+        provider_task_id=submit.provider_task_id,
+        amount=actual_debit(raw),
+        finalized=True,
+        facts=BillingFacts(started_at=started, ended_at=stamp, route="avideo_status", raw_cost_credit=raw),
+    )
+    try:
+        await store.persist(event)
+    except ValueError:
+        current = await store.phase(binding.intent_id, "completion")
+        if current is None or not current.finalized:
+            raise
+
+
 async def close_completion(
     request: Request,
     store: MeteringStore,
@@ -629,30 +691,7 @@ async def close_completion(
         from litellm.proxy.video_endpoints.moderation_metering import PhaseEvent, request_id
         from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts, actual_debit
 
-        # Deterministic: duplicate or concurrent closes must yield byte-identical payloads.
-        stamp = submit.facts.ended_at if submit.facts is not None else datetime.fromtimestamp(0, timezone.utc)
-        started = submit.facts.started_at if submit.facts is not None else stamp
-        raw = Decimal(0)
-        # BillingFacts forbids extra keys, so the audit marker is logged rather than stored.
-        logging.getLogger(__name__).info("closed_by=app_undelivered intent_id=%s", binding.intent_id)
-        event = PhaseEvent(
-            binding=binding,
-            request_id=request_id(binding, "completion"),
-            phase="completion",
-            provider=submit.provider,
-            deployment_id=submit.deployment_id,
-            native_id=submit.native_id,
-            provider_task_id=submit.provider_task_id,
-            amount=actual_debit(raw),
-            finalized=True,
-            facts=BillingFacts(started_at=started, ended_at=stamp, route="avideo_status", raw_cost_credit=raw),
-        )
-        try:
-            await store.persist(event)
-        except ValueError:
-            current = await store.phase(binding.intent_id, "completion")
-            if current is None or not current.finalized:
-                raise
+        await _persist_undelivered(store, binding, submit)
         return
     if binding.actor_user_id is None:
         return
@@ -673,7 +712,9 @@ async def close_completion(
             read_ticket=None,
             context=None,
         )
-    except Exception:
+    except Exception as exc:
+        if await _close_dead_upstream(store, binding.intent_id, submit.native_id, exc) is not None:
+            return
         logging.getLogger(__name__).warning(
             "completion close status read failed intent_id=%s", binding.intent_id, exc_info=True
         )

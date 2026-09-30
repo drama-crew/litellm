@@ -22,9 +22,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 def immediate_outbox_retry(monkeypatch):
-    # these tests re-run the reconciler right after a transient failure; production waits 60s before reclaiming
+    # tests that re-run the reconciler right after a transient failure; production waits 60s before reclaiming
     monkeypatch.setenv("LITELLM_BILLING_OUTBOX_RETRY_IDLE_MS", "0")
 
 
@@ -2069,7 +2069,7 @@ async def test_context_ir_internal_execution_rewrite_outbox_production_schema_on
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_kind", ["image", "causyn", "context_ir"])
 @pytest.mark.parametrize("global_state", ["ready", "born", "unregistered"])
-async def test_entry_fix1_actual_outbox_freezes_global_identity(store, monkeypatch, event_kind, global_state):
+async def test_entry_fix1_actual_outbox_freezes_global_identity(store, immediate_outbox_retry, monkeypatch, event_kind, global_state):
     import json
     from datetime import datetime, timezone
     from types import SimpleNamespace

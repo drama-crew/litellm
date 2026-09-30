@@ -56,7 +56,7 @@ from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, Top
 from litellm.llms.causyn.vdn_geometry import GEOMETRIES, LEGACY, pixel_budget, resolve_geometry
 from litellm.llms.causyn.video_prompt import VideoPromptInput, VideoSubmission, submit_video_prompt
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
-from litellm.llms.custom_llm import CustomLLM, CustomLLMError
+from litellm.llms.custom_llm import CustomLLM, CustomLLMError, ProviderTaskNotFound
 from litellm.llms.libtv.billing_outbox import CausynBillingEvent, enqueue_causyn_billing
 from litellm.llms.libtv.persistence import get_persistence
 from litellm.llms.libtv.transfer import get_transfer_redis
@@ -1503,7 +1503,7 @@ class CausynVideoHandler(CustomLLM):
         if body.status is None:
             if spec.model == CAUSYN_H3_MODEL:
                 return await self._rewrite_status(task_id)
-            raise CustomLLMError(status_code=404, message="causyn video was not found")
+            raise ProviderTaskNotFound("causyn video was not found")
         return body
 
     async def _rewrite_status(self, task_id: str) -> _StatusEnvelope:
@@ -1520,7 +1520,7 @@ class CausynVideoHandler(CustomLLM):
                     )
         except Exception as exc:
             raise _service_error() from exc
-        raise CustomLLMError(status_code=404, message="causyn video was not found")
+        raise ProviderTaskNotFound("causyn video was not found")
 
     async def avideo_status(
         self,
