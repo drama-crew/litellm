@@ -278,7 +278,7 @@ async def test_h3_completed_status_restores_model_and_billing(
                 "etag": "etag-1",
                 "bytes": 100,
                 "content_type": "video/mp4",
-                "duration_seconds": 5.0 + 1 / 24,
+                "duration_seconds": 124 / 24,  # 5 s snaps up to 124 frames (17n+5 grid)
                 "width": width,
                 "height": height,
                 "sha256": "a" * 64,

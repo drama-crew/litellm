@@ -580,6 +580,27 @@ def _frames_for_duration(duration: int) -> int:
     return duration * 24 + (5 - duration * 24) % 17
 
 
+_H3_FPS = 24
+# The H3 pipeline never renders more than this many frames, so every ordered
+# duration from 14 s up comes back as 345 / 24 = 14.375 s.
+_H3_MAX_RENDERED_FRAMES = 345
+# One frame of slack (plus float epsilon) on top of the exact frame count.
+_H3_DURATION_EPSILON_SECONDS = 1 / _H3_FPS + 1e-6
+
+
+def _h3_rendered_frames(duration: int) -> int:
+    """Frames the H3 pipeline renders for an ordered whole-second duration."""
+    return min(_H3_MAX_RENDERED_FRAMES, _frames_for_duration(duration))
+
+
+def _expected_rendered_seconds(duration: float) -> float:
+    return _h3_rendered_frames(round(duration)) / _H3_FPS
+
+
+def _duration_reconciles(ordered: float, rendered: float) -> bool:
+    return abs(_expected_rendered_seconds(ordered) - rendered) <= _H3_DURATION_EPSILON_SECONDS
+
+
 _ADAPTIVE_DURATIONS: tuple[int, ...] = tuple(range(4, 16))
 _ADAPTIVE_EDGE_KEYFRAME_SIZES: tuple[tuple[int, int], ...] = ((400, 1000), (1000, 400))
 
@@ -1231,8 +1252,23 @@ class CausynVideoHandler(CustomLLM):
             # platform treats as terminal, each one became a "生成失败" for a video
             # that was already sitting in the object store. 45 of them before this
             # was found.
-            if abs(durable.duration_seconds - result.duration_seconds) > _DURATION_RECONCILE_TOLERANCE_SECONDS:
-                logger.warning("causyn video billing: task metadata duration does not match worker result")
+            if spec.model == CAUSYN_H3_MODEL:
+                # H3 renders a deterministic frame count per ordered duration
+                # (17n+5 grid, capped at 345 frames), so 15 s comes back as
+                # 14.375 s: reconcile against that, not a flat tolerance.
+                duration_ok = _duration_reconciles(durable.duration_seconds, result.duration_seconds)
+            else:
+                duration_ok = (
+                    abs(durable.duration_seconds - result.duration_seconds) <= _DURATION_RECONCILE_TOLERANCE_SECONDS
+                )
+            if not duration_ok:
+                logger.warning(
+                    "causyn video billing: task metadata duration does not match worker result "
+                    "(ordered=%s rendered=%s task_id=%s)",
+                    durable.duration_seconds,
+                    result.duration_seconds,
+                    task_id,
+                )
                 raise _service_error()
             if not _result_geometry_matches(durable, result):
                 logger.warning("causyn video billing: task metadata resolution does not match worker result")
