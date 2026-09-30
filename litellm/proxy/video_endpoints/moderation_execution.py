@@ -19,6 +19,9 @@ from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.video_endpoints import moderation_bridge as bridge
 from litellm.types.videos.main import CharacterObject, VideoObject
 
+if TYPE_CHECKING:
+    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, MeteringStore, PhaseEvent
+
 
 class Ticket(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -260,9 +263,6 @@ async def record_submission_failure(intent_id: str, attempt: str, error: BaseExc
     except Exception:  # noqa: BLE001  # the marker is best effort and must never mask the provider failure
         logging.getLogger(__name__).warning("provider submission failure marker not recorded", exc_info=True)
 
-
-if TYPE_CHECKING:
-    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, MeteringStore, PhaseEvent
 
 router = APIRouter(prefix="/internal/moderation")
 
@@ -658,24 +658,36 @@ async def _persist_undelivered(store: MeteringStore, binding: BillingBinding, su
     from litellm.proxy.video_endpoints.moderation_metering import PhaseEvent, request_id
     from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts, actual_debit
 
-    # Deterministic: duplicate or concurrent closes must yield byte-identical payloads.
-    stamp = submit.facts.ended_at if submit.facts is not None else datetime.fromtimestamp(0, timezone.utc)
-    started = submit.facts.started_at if submit.facts is not None else stamp
-    raw = Decimal(0)
     # BillingFacts forbids extra keys, so the audit marker is logged rather than stored.
     logging.getLogger(__name__).info("closed_by=app_undelivered intent_id=%s", binding.intent_id)
-    event = PhaseEvent(
-        binding=binding,
-        request_id=request_id(binding, "completion"),
-        phase="completion",
-        provider=submit.provider,
-        deployment_id=submit.deployment_id,
-        native_id=submit.native_id,
-        provider_task_id=submit.provider_task_id,
-        amount=actual_debit(raw),
-        finalized=True,
-        facts=BillingFacts(started_at=started, ended_at=stamp, route="avideo_status", raw_cost_credit=raw),
-    )
+    current = await store.phase(binding.intent_id, "completion")
+    if current is not None and current.native_id and not current.finalized:
+        # A running poll already persisted this row. persist() only accepts amount, finalized and the
+        # raw_cost_credit fill on top of it, so derive the close from the stored row (deterministic).
+        facts = current.facts
+        if facts is not None and facts.raw_cost_credit is None:
+            facts = facts.model_copy(update={"raw_cost_credit": Decimal(0)})
+        if facts is None:
+            stamp = submit.facts.ended_at if submit.facts is not None else datetime.fromtimestamp(0, timezone.utc)
+            facts = BillingFacts(started_at=stamp, ended_at=stamp, route="avideo_status", raw_cost_credit=Decimal(0))
+        event = current.model_copy(update={"amount": actual_debit(Decimal(0)), "finalized": True, "facts": facts})
+    else:
+        # Deterministic: duplicate or concurrent closes must yield byte-identical payloads.
+        stamp = submit.facts.ended_at if submit.facts is not None else datetime.fromtimestamp(0, timezone.utc)
+        started = submit.facts.started_at if submit.facts is not None else stamp
+        raw = Decimal(0)
+        event = PhaseEvent(
+            binding=binding,
+            request_id=request_id(binding, "completion"),
+            phase="completion",
+            provider=submit.provider,
+            deployment_id=submit.deployment_id,
+            native_id=submit.native_id,
+            provider_task_id=submit.provider_task_id,
+            amount=actual_debit(raw),
+            finalized=True,
+            facts=BillingFacts(started_at=started, ended_at=stamp, route="avideo_status", raw_cost_credit=raw),
+        )
     try:
         await store.persist(event)
     except ValueError:
@@ -702,9 +714,6 @@ async def close_completion(
     ):
         return
     if mode == "undelivered":
-        from litellm.proxy.video_endpoints.moderation_metering import PhaseEvent, request_id
-        from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts, actual_debit
-
         await _persist_undelivered(store, binding, submit)
         return
     if binding.actor_user_id is None:

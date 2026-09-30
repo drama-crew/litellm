@@ -12,8 +12,6 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 import httpx
 
-from litellm.router_utils import attempt_outcomes
-
 from litellm.exceptions import (
     APIError,
     AuthenticationError,
@@ -29,6 +27,7 @@ from litellm.exceptions import (
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM
 from litellm.proxy.common_utils.public_surface_sanitization import sanitize_public_provider_text
+from litellm.router_utils import attempt_outcomes
 from litellm.types.utils import ImageObject, ImageResponse
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import (

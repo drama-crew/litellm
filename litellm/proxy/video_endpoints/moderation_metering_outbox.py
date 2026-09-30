@@ -45,7 +45,19 @@ async def settle_outbox(event: ImageBillingEvent | CausynBillingEvent) -> bool:
         ):
             raise PermanentBillingFailure("outbox financial phase identity mismatch")
         authority = runtime.store()
-        await authority.persist(phase)
+        try:
+            await authority.persist(phase)
+        except PermanentBillingFailure:
+            raise
+        except ValueError as error:
+            # A finalized phase (e.g. closed undelivered at 0) with a different payload can never accept this charge.
+            if "replay conflict" in str(error):
+                current = await authority.phase(phase.binding.intent_id, phase.phase)
+                if current is not None and current.finalized and current != phase:
+                    raise PermanentBillingFailure(
+                        f"phase {phase.request_id} is already finalized with a different payload"
+                    ) from error
+            raise
         await authority.run_once()
         receipt = await authority.settlement(phase.binding)
         if phase not in receipt.receipts:

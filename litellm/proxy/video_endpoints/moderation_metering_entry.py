@@ -13,9 +13,9 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 import litellm
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.router_utils import attempt_outcomes
 from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
 from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, BillingWindow
+from litellm.router_utils import attempt_outcomes
 
 ENTRY_KEY = "moderation_metering_admission"
 T = TypeVar("T")
