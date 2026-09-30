@@ -7,7 +7,7 @@ import os
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Annotated, Any, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import httpx
 import jwt
@@ -247,6 +247,9 @@ async def record_submission_failure(intent_id: str, attempt: str, error: BaseExc
     except Exception:  # noqa: BLE001  # the marker is best effort and must never mask the provider failure
         logging.getLogger(__name__).warning("provider submission failure marker not recorded", exc_info=True)
 
+
+if TYPE_CHECKING:
+    from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, MeteringStore
 
 router = APIRouter(prefix="/internal/moderation")
 
@@ -530,11 +533,11 @@ async def settlement(body: SettlementTicket, request: Request, authorization: An
         if event.binding != binding or event.native_id != authority["native_id"]:
             raise HTTPException(403, "Settlement provider binding mismatch")
         await store.persist(event)
-    if body.close_completion is not None:
-        await close_completion(request, store, binding, body.close_completion)
     manual = await store.manual_settlement_reason(binding.intent_id)
     if manual is not None:
         return JSONResponse(status_code=409, content={"error": {"code": "key_identity_mismatch", "message": manual}})
+    if body.close_completion is not None:
+        await close_completion(request, store, binding, body.close_completion)
     events: list[PhaseEvent] = []
     for phase in binding.expected_phases:
         event = await store.phase(binding.intent_id, phase)
@@ -556,7 +559,12 @@ async def settlement(body: SettlementTicket, request: Request, authorization: An
     return (await store.settlement(binding)).model_copy(update={"events": tuple(events)}).model_dump(mode="json")
 
 
-async def close_completion(request: Request, store: Any, binding: Any, mode: str) -> None:
+async def close_completion(
+    request: Request,
+    store: MeteringStore,
+    binding: BillingBinding,
+    mode: Literal["undelivered", "delivered"],
+) -> None:
     """Contract section 8: close a completion phase nobody polls. Ignored unless provably closable."""
     submit = await store.phase(binding.intent_id, "submit")
     completion = await store.phase(binding.intent_id, "completion")
@@ -572,40 +580,51 @@ async def close_completion(request: Request, store: Any, binding: Any, mode: str
         from litellm.proxy.video_endpoints.moderation_metering import PhaseEvent, request_id
         from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts, actual_debit
 
-        now = datetime.now(timezone.utc)
+        # Deterministic: duplicate or concurrent closes must yield byte-identical payloads.
+        stamp = submit.facts.ended_at if submit.facts is not None else datetime.fromtimestamp(0, timezone.utc)
+        started = submit.facts.started_at if submit.facts is not None else stamp
         raw = Decimal(0)
         # BillingFacts forbids extra keys, so the audit marker is logged rather than stored.
         logging.getLogger(__name__).info("closed_by=app_undelivered intent_id=%s", binding.intent_id)
-        await store.persist(
-            PhaseEvent(
-                binding=binding,
-                request_id=request_id(binding, "completion"),
-                phase="completion",
-                provider=submit.provider,
-                deployment_id=submit.deployment_id,
-                native_id=submit.native_id,
-                provider_task_id=submit.provider_task_id,
-                amount=actual_debit(raw),
-                finalized=True,
-                facts=BillingFacts(started_at=now, ended_at=now, route="avideo_status", raw_cost_credit=raw),
-            )
+        event = PhaseEvent(
+            binding=binding,
+            request_id=request_id(binding, "completion"),
+            phase="completion",
+            provider=submit.provider,
+            deployment_id=submit.deployment_id,
+            native_id=submit.native_id,
+            provider_task_id=submit.provider_task_id,
+            amount=actual_debit(raw),
+            finalized=True,
+            facts=BillingFacts(started_at=started, ended_at=stamp, route="avideo_status", raw_cost_credit=raw),
         )
+        try:
+            await store.persist(event)
+        except ValueError:
+            current = await store.phase(binding.intent_id, "completion")
+            if current is None or not current.finalized:
+                raise
         return
     if binding.actor_user_id is None:
         return
     auth = UserAPIKeyAuth(api_key=binding.fingerprint, user_id=binding.user_id, team_id=binding.team_id)
-    await completion_status_read(
-        request,
-        auth,
-        native_id=submit.native_id,
-        intent_id=binding.intent_id,
-        metering={
-            "intent_id": binding.intent_id,
-            "request_digest": binding.request_digest,
-            "actor_user_id": binding.actor_user_id,
-            "model": binding.model,
-            "generation_id": binding.generation_id,
-        },
-        read_ticket=None,
-        context=None,
-    )
+    try:
+        await completion_status_read(
+            request,
+            auth,
+            native_id=submit.native_id,
+            intent_id=binding.intent_id,
+            metering={
+                "intent_id": binding.intent_id,
+                "request_digest": binding.request_digest,
+                "actor_user_id": binding.actor_user_id,
+                "model": binding.model,
+                "generation_id": binding.generation_id,
+            },
+            read_ticket=None,
+            context=None,
+        )
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "completion close status read failed intent_id=%s", binding.intent_id, exc_info=True
+        )

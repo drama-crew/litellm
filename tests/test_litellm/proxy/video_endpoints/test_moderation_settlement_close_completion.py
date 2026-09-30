@@ -257,6 +257,135 @@ async def test_delivered_skipped_when_completion_already_finalized(monkeypatch):
     assert calls == []
 
 
+@pytest.mark.asyncio
+async def test_undelivered_payload_is_deterministic(monkeypatch):
+    first, second = libtv_meter(), libtv_meter()
+    await settle(monkeypatch, first, "undelivered")
+    await settle(monkeypatch, second, "undelivered")
+    assert first.persisted[0].model_dump_json() == second.persisted[0].model_dump_json()
+    assert first.persisted[0].facts.started_at == first.phases["submit"].facts.started_at
+
+
+@pytest.mark.asyncio
+async def test_undelivered_lost_race_is_a_noop(monkeypatch):
+    meter = libtv_meter()
+    real = finalized_completion(meter.bound, "25")
+
+    async def persist(event):
+        meter.phases["completion"] = real
+        raise ValueError("moderation billing payload replay conflict")
+
+    meter.persist = persist
+    response = await settle(monkeypatch, meter, "undelivered")
+    assert response.status_code == 200
+    assert meter.phases["completion"] == real
+
+
+@pytest.mark.asyncio
+async def test_undelivered_conflict_without_finalized_completion_still_raises(monkeypatch):
+    meter = libtv_meter()
+
+    async def persist(event):
+        raise ValueError("boom")
+
+    meter.persist = persist
+    with pytest.raises(ValueError):
+        await settle(monkeypatch, meter, "undelivered")
+
+
+@pytest.mark.asyncio
+async def test_no_close_when_parked_for_manual_settlement(monkeypatch):
+    meter = libtv_meter()
+
+    async def manual(intent_id):
+        return "key_identity_mismatch: x"
+
+    meter.manual_settlement_reason = manual
+    response = await settle(monkeypatch, meter, "undelivered")
+    assert response.status_code == 409
+    assert meter.persisted == []
+
+
+@pytest.mark.asyncio
+async def test_delivered_read_failure_returns_envelope(monkeypatch):
+    from litellm.proxy.video_endpoints import endpoints
+
+    async def boom(*a, **k):
+        raise RuntimeError("provider down")
+
+    monkeypatch.setattr(endpoints, "video_status", boom)
+    meter = libtv_meter()
+    response = await settle(monkeypatch, meter, "delivered")
+    assert response.status_code == 200
+    assert response.json()["complete"] is False
+
+
+def libtv_scope(authority):
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+
+    bound = binding()
+    facts = BillingFacts(
+        started_at=NOW,
+        ended_at=NOW,
+        route="avideo_generation",
+        duration_seconds=Decimal(5),
+        resolution="720p",
+        pricing=(("output_cost_per_second_720p", Decimal("2")),),
+        raw_cost_credit=Decimal(0),
+    )
+    submit = submit_event(bound).model_copy(update={"facts": facts})
+    return runtime.Scope(bound, "completion", authority, placeholder(bound), submit)
+
+
+@pytest.mark.asyncio
+async def test_delivered_libtv_completed_persists_provider_correct_amount(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from litellm.llms.libtv import billing_outbox
+    from litellm.llms.libtv.handler import LibTVLLM
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+
+    authority = AsyncMock()
+    scope = libtv_scope(authority)
+    sent = []
+    monkeypatch.setattr(billing_outbox, "enqueue_causyn_billing", AsyncMock(side_effect=lambda r, e: sent.append(e)))
+    monkeypatch.setattr("litellm.llms.causyn.handler._default_redis_factory", lambda: None)
+    vo = VideoObject(id=NATIVE, object="video", status="completed")
+    token = runtime.CONTEXT.set(scope)
+    try:
+        await LibTVLLM()._bill_protected_video(vo, "task-1", scope)
+        logging_obj = MagicMock()
+        setattr(logging_obj, runtime.SCOPE_KEY, scope)
+        setattr(logging_obj, runtime.CALL_TYPE_KEY, "avideo_status")
+        logging_obj.model_call_details = {}
+        await runtime._handoff(logging_obj, vo, NOW, NOW)
+    finally:
+        runtime.CONTEXT.reset(token)
+    (event,) = [c.args[0] for c in authority.persist.await_args_list]
+    assert event.phase == "completion" and event.finalized is True
+    assert event.native_id == NATIVE and event.amount > 0
+    assert event.facts.raw_cost_credit == Decimal("10")  # 5s x rate 2
+    assert len(sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_libtv_failed_completion_persists_zero():
+    from unittest.mock import AsyncMock, MagicMock
+
+    from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
+
+    authority = AsyncMock()
+    scope = libtv_scope(authority)
+    logging_obj = MagicMock()
+    setattr(logging_obj, runtime.SCOPE_KEY, scope)
+    setattr(logging_obj, runtime.CALL_TYPE_KEY, "avideo_status")
+    logging_obj.model_call_details = {}
+    logging_obj.custom_llm_provider = "libtv"
+    await runtime._handoff(logging_obj, VideoObject(id=NATIVE, object="video", status="failed"), NOW, NOW)
+    (event,) = [c.args[0] for c in authority.persist.await_args_list]
+    assert event.amount == Decimal(0) and event.finalized is True
+
+
 # --- real MeteringStore (needs the throwaway PostgreSQL/Redis from test-env.sh) ---
 import os  # noqa: E402
 
