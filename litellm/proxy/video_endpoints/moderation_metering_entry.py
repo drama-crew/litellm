@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter
 
 import litellm
 from litellm.proxy._types import UserAPIKeyAuth
+from litellm.router_utils import attempt_outcomes
 from litellm.proxy.video_endpoints import moderation_metering_runtime as runtime
 from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, BillingWindow
 
@@ -163,6 +164,7 @@ async def execute(
     if scope is not None and request_data is not None:
         request_data[runtime.SCOPE_KEY] = runtime.Ownership.PROTECTED
     token = runtime.CONTEXT.set(scope)
+    attempts = attempt_outcomes.start()
     accepted = False
     try:
         result = await call
@@ -170,7 +172,11 @@ async def execute(
         await moderation_bridge.capture(request, result)
         return result
     except Exception as exc:
-        from litellm.proxy.video_endpoints.moderation_execution import failure_outcome, record_submission_failure
+        from litellm.proxy.video_endpoints.moderation_execution import (
+            failure_outcome,
+            provider_proved_not_sent,
+            record_submission_failure,
+        )
 
         producer = request.scope.get("moderation_producer_attempt")
         if producer is not None and not accepted and failure_outcome(exc) == "ambiguous":
@@ -186,6 +192,9 @@ async def execute(
                 await scope.store.void_unsent(scope.binding.intent_id)
             except Exception:  # noqa: BLE001  # voiding is best effort and must never mask the provider failure
                 logging.getLogger(__name__).warning("unsent metering placeholders not voided", exc_info=True)
+        if not accepted and request.method == "POST" and provider_proved_not_sent(exc):
+            raise moderation_bridge.provider_not_sent() from exc
         raise
     finally:
+        attempt_outcomes.stop(attempts)
         runtime.CONTEXT.reset(token)

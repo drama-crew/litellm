@@ -436,6 +436,24 @@ def select_image_upscale_providers(
     return ((deployment_id, provider, token),)
 
 
+# Steps that run strictly before ``generation/create`` (account resolution,
+# project/canvas setup, asset upload and verification). Any failure of these is
+# provably pre-creation (contract §9).
+_PRE_CREATE_STEPS = frozenset(
+    {
+        "getUserInfo",
+        "tool_spec/list",
+        "project/create",
+        "nodes/batch",
+        "init",
+        "complete",
+        "third_asset/create",
+        "third_asset/check",
+        "image/verify",
+    }
+)
+
+
 class LibTVClient:
     def __init__(
         self,
@@ -732,20 +750,32 @@ class LibTVClient:
 
     def _check(self, response: Any, step: str) -> Dict[str, Any]:
         headers = dict(getattr(response, "headers", {}) or {})
+        pre_create = step in _PRE_CREATE_STEPS
         if response.status_code != 200:
-            raise LibTVError(
+            error = LibTVError(
                 status_code=response.status_code,
                 message=f"libtv {step} HTTP {response.status_code}: {response.text[:300]}",
                 headers=headers,
             )
+            # Only a step that runs strictly before generation/create proves
+            # anything from a failure. A generation/create HTTP error (5xx or
+            # otherwise) never proves the provider did not register the task.
+            if pre_create:
+                error.submission = "not_sent"
+            raise error
         payload = response.json()
         if payload.get("code") not in (0, None):
             status_code = 429 if _is_rate_limit_code(payload.get("code")) else 502
-            raise LibTVError(
+            error = LibTVError(
                 status_code=status_code,
                 message=f"libtv {step} code={payload.get('code')} msg={payload.get('msg')}",
                 headers=headers,
             )
+            # HTTP 200 + non-success business code is a definitive refusal in the
+            # create response body itself: no taskId was issued (contract §9).
+            if pre_create or step == "generation/create":
+                error.submission = "not_sent"
+            raise error
         return payload
 
     # ---------- sync ----------

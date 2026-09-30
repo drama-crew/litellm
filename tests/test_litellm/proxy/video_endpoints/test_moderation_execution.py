@@ -544,3 +544,53 @@ def test_provider_status_proof_ignores_the_implicit_context_chain():
     except RuntimeError as outer:
         assert outer.__context__ is not None and outer.__cause__ is None
         assert execution.provider_status_proof(outer) is None
+
+
+def _libtv_error(marked: bool):
+    from litellm.llms.libtv.common import LibTVError
+    from litellm.llms.libtv.handler import _raise_normalized_libtv_error
+
+    error = LibTVError(502, "libtv getUserInfo code=401 msg=No login")
+    error.submission = "not_sent" if marked else None
+    try:
+        _raise_normalized_libtv_error(error, "seedance")
+    except Exception as normalized:  # noqa: BLE001
+        return normalized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_marked, expected_status", [(True, 503), (False, 502)])
+async def test_execute_answers_503_not_sent_only_when_every_attempt_is_marked(
+    monkeypatch, second_marked, expected_status
+):
+    from fastapi import HTTPException, Request
+
+    from litellm import Router
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+
+    monkeypatch.setattr(entry, "scope_for", AsyncMock(return_value=None))
+    router = Router(model_list=[{"model_name": "m", "litellm_params": {"model": "openai/x", "api_key": "k"}}])
+    first, last = _libtv_error(True), _libtv_error(second_marked)
+
+    async def attempts():
+        for error in (first, last):
+
+            async def fail(error=error):
+                raise error
+
+            try:
+                await router.make_call(lambda **_: fail(), model="m")
+            except Exception:  # noqa: BLE001  # the router keeps trying the next deployment
+                pass
+        raise last
+
+    request = Request({"type": "http", "method": "POST", "path": "/v1/videos", "headers": [], "app": FastAPI()})
+    auth = UserAPIKeyAuth(api_key="k", user_id="u", team_id="t")
+    with pytest.raises(Exception) as caught:
+        await entry.execute(request, auth, "avideo_generation", attempts())
+    if expected_status == 503:
+        assert isinstance(caught.value, HTTPException)
+        assert caught.value.status_code == 503
+        assert caught.value.headers == {"x-drama-submission": "not_sent"}
+    else:
+        assert caught.value is last

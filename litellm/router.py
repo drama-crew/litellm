@@ -86,6 +86,7 @@ from litellm.router_strategy.lowest_tpm_rpm import LowestTPMLoggingHandler
 from litellm.router_strategy.lowest_tpm_rpm_v2 import LowestTPMLoggingHandler_v2
 from litellm.router_strategy.simple_shuffle import simple_shuffle
 from litellm.router_strategy.tag_based_routing import get_deployments_for_tag
+from litellm.router_utils import attempt_outcomes
 from litellm.router_utils.add_retry_fallback_headers import (
     _HiddenParamsHost,
     add_fallback_headers_to_response,
@@ -6600,9 +6601,15 @@ class Router:
         Handler for making a call to the .completion()/.embeddings()/etc. functions.
         """
         model_group = kwargs.get("model")
-        response = original_function(*args, **kwargs)
-        if coroutine_checker.is_async_callable(response) or inspect.isawaitable(response):
-            response = await response
+        try:
+            response = original_function(*args, **kwargs)
+            if coroutine_checker.is_async_callable(response) or inspect.isawaitable(response):
+                response = await response
+        except Exception as attempt_error:
+            # No-op unless a caller opened an attempt-tracking scope (drama
+            # contract §9): lets the proxy see every deployment attempt's outcome.
+            attempt_outcomes.record(attempt_error)
+            raise
         ## PROCESS RESPONSE HEADERS
         response = await self.set_response_headers(response=response, model_group=model_group, request_kwargs=kwargs)
 

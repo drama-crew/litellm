@@ -25,6 +25,9 @@ class LibTVError(Exception):
         self.status_code = status_code
         self.message = message
         self.headers = dict(headers or {})
+        # Provable submission outcome (contract §9): "not_sent" only when this
+        # failure proves no provider generation exists. Set by LibTVClient._check.
+        self.submission: Optional[str] = None
         super().__init__(message)
 
 

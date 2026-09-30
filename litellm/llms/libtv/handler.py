@@ -130,29 +130,37 @@ def _raise_normalized_libtv_error(error: LibTVError, model: str) -> None:
         "model": _public_provider_text(model, "video-provider"),
         "llm_provider": LIBTV_PROVIDER,
     }
+    normalized = _normalized_libtv_exception(error, common, response)
+    if getattr(error, "submission", None) == "not_sent":
+        # Contract §9: survives normalization so the proxy can classify the call.
+        setattr(normalized, "drama_submission", "not_sent")
+    raise normalized from error
+
+
+def _normalized_libtv_exception(error: LibTVError, common: dict, response: httpx.Response) -> Exception:
     if isinstance(error, LibTVContentPolicyError):
-        raise ContentPolicyViolationError(**common, response=response) from error
+        return ContentPolicyViolationError(**common, response=response)
     if error.status_code == 400:
-        raise BadRequestError(**common, response=response) from error
+        return BadRequestError(**common, response=response)
     if error.status_code == 401:
-        raise AuthenticationError(**common, response=response) from error
+        return AuthenticationError(**common, response=response)
     if error.status_code == 403:
-        raise PermissionDeniedError(**common, response=response) from error
+        return PermissionDeniedError(**common, response=response)
     if error.status_code in (408, 504):
-        raise Timeout(
+        return Timeout(
             **common,
             headers=error.headers,
             exception_status_code=error.status_code,
-        ) from error
+        )
     if error.status_code == 429:
-        raise RateLimitError(**common, response=response) from error
+        return RateLimitError(**common, response=response)
     if error.status_code == 502:
-        raise BadGatewayError(**common, response=response) from error
+        return BadGatewayError(**common, response=response)
     if error.status_code == 503:
-        raise ServiceUnavailableError(**common, response=response) from error
+        return ServiceUnavailableError(**common, response=response)
     if error.status_code >= 500:
-        raise InternalServerError(**common, response=response) from error
-    raise APIError(status_code=error.status_code, **common) from error
+        return InternalServerError(**common, response=response)
+    return APIError(status_code=error.status_code, **common)
 
 
 def normalize_libtv_errors(func):
@@ -216,6 +224,26 @@ def _project_name(model: str) -> str:
     if override:
         return override
     return random.choice(_PROJECT_NAME_POOL)
+
+
+def _usage_params(optional_params: dict, generation_params: Optional[dict] = None) -> dict:
+    """optional_params merged with the resolved generation params, so create-time
+    usage (video object) and the persisted task usage are derived identically."""
+    merged = dict(optional_params)
+    gp = generation_params or {}
+    if merged.get("seconds") is None and merged.get("duration") is None:
+        merged["duration"] = gp.get("duration")
+    # build_generation_params' output buckets duration/resolution/quality under
+    # per-mode vendor spellings (e.g. kling's quality_4k, singleImage2video's
+    # resolution_480; see transform._candidate_value), never a bare "resolution"
+    # or "quality" key -- so these fallbacks must prefix-match the same way
+    # _candidate_value does, or every mode using a bucketed key silently drops
+    # the tier (the root cause of the 15-day kling-v3-omni billing gap).
+    if merged.get("resolution") is None and merged.get("size") is None:
+        merged["resolution"] = next((v for k, v in gp.items() if k.startswith("resolution")), None)
+    if merged.get("quality") is None:
+        merged["quality"] = next((v for k, v in gp.items() if k.startswith("quality")), None)
+    return merged
 
 
 def _video_usage(optional_params: dict) -> Optional[dict]:
@@ -791,7 +819,13 @@ class LibTVLLM(CustomLLM):
             redis_client=optional_params.get("media_transfer_redis"),
         )
 
-    def _build_video_object(self, model: str, created: dict, optional_params: Optional[dict] = None) -> VideoObject:
+    def _build_video_object(
+        self,
+        model: str,
+        created: dict,
+        optional_params: Optional[dict] = None,
+        generation_params: Optional[dict] = None,
+    ) -> VideoObject:
         op = optional_params or {}
         # Encode the libtv task id + this deployment's status model into the video
         # id so the proxy routes subsequent /v1/videos/{id} status and /content
@@ -803,7 +837,7 @@ class LibTVLLM(CustomLLM):
         forwarded_prompt_chars = created.get("forwarded_prompt_chars")
         if type(forwarded_prompt_chars) is int:
             vo.forwarded_prompt_chars = forwarded_prompt_chars
-        vo.usage = _video_usage(op)
+        vo.usage = _video_usage(_usage_params(op, generation_params))
         vo._hidden_params = {"project_uuid": created.get("project_uuid"), "billing_pricing_snapshot": model_info}
         return vo
 
@@ -868,7 +902,13 @@ class LibTVLLM(CustomLLM):
                 self.fresh_asset_retry_wait,
             )
             await asyncio.sleep(self.fresh_asset_retry_wait)
-            created = await self._acreate_after_wait(lt, model, vendor, params, project_name)
+            try:
+                created = await self._acreate_after_wait(lt, model, vendor, params, project_name)
+            except LibTVError as error:
+                # An earlier create already issued a task id, so this refusal no
+                # longer proves that no generation exists (contract §9).
+                error.submission = None
+                raise
         return created
 
     async def _acreate_after_wait(
@@ -935,20 +975,7 @@ class LibTVLLM(CustomLLM):
         and only avideo_status bills; the sync video_generation/video_status paths
         are unused by the production proxy and stay billing-free.
         """
-        merged = dict(optional_params)
-        gp = generation_params or {}
-        if merged.get("seconds") is None and merged.get("duration") is None:
-            merged["duration"] = gp.get("duration")
-        # build_generation_params' output buckets duration/resolution/quality under
-        # per-mode vendor spellings (e.g. kling's quality_4k, singleImage2video's
-        # resolution_480; see transform._candidate_value), never a bare "resolution"
-        # or "quality" key -- so these fallbacks must prefix-match the same way
-        # _candidate_value does, or every mode using a bucketed key silently drops
-        # the tier (the root cause of the 15-day kling-v3-omni billing gap).
-        if merged.get("resolution") is None and merged.get("size") is None:
-            merged["resolution"] = next((v for k, v in gp.items() if k.startswith("resolution")), None)
-        if merged.get("quality") is None:
-            merged["quality"] = next((v for k, v in gp.items() if k.startswith("quality")), None)
+        merged = _usage_params(optional_params, generation_params)
         usage = _video_usage(merged)
         if usage is None:
             logger.warning(
@@ -1483,7 +1510,9 @@ class LibTVLLM(CustomLLM):
                 task_id=created.get("task_id"),
                 prompt=prompt,
             )
-            return self._build_video_object(model, created, {**optional_params, "resolution": params["resolution"]})
+            return self._build_video_object(
+                model, created, {**optional_params, "resolution": params["resolution"]}, params
+            )
         images, videos, audios = _collect_reference_groups(optional_params)
         _guard_reference_intent(model, optional_params, images, videos, audios)
         auto_compliance = _auto_compliance_enabled(spec)
@@ -1586,7 +1615,7 @@ class LibTVLLM(CustomLLM):
             task_id=created.get("task_id"),
             prompt=prompt,
         )
-        return self._build_video_object(model, created, optional_params)
+        return self._build_video_object(model, created, optional_params, params)
 
     @normalize_libtv_errors
     async def avideo_generation(
@@ -1627,7 +1656,7 @@ class LibTVLLM(CustomLLM):
                 prompt=prompt,
             )
             op = {**optional_params, "resolution": params["resolution"]}
-            vo = self._build_video_object(model, created, op)
+            vo = self._build_video_object(model, created, op, params)
             await self._record_video_task_usage(created["task_id"], op, params)
             return vo
         images, videos, audios = _collect_reference_groups(optional_params)
@@ -1732,6 +1761,6 @@ class LibTVLLM(CustomLLM):
             task_id=created.get("task_id"),
             prompt=prompt,
         )
-        vo = self._build_video_object(model, created, optional_params)
+        vo = self._build_video_object(model, created, optional_params, params)
         await self._record_video_task_usage(created["task_id"], optional_params, params)
         return vo

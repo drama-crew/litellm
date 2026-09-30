@@ -111,6 +111,20 @@ def admission_unavailable(reason: str) -> HTTPException:
     )
 
 
+def provider_not_sent() -> HTTPException:
+    """Contract §9: every attempted deployment proved the generation was never created."""
+    return HTTPException(
+        503,
+        detail={
+            "error": {
+                "code": "provider_not_sent",
+                "message": "The provider did not create the generation; no submission was sent",
+            }
+        },
+        headers={"x-drama-submission": "not_sent"},
+    )
+
+
 async def platform(
     request: Request,
     method: str,

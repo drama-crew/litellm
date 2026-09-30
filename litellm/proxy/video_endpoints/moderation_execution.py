@@ -176,10 +176,27 @@ def transport_outcome(error: BaseException, depth: int = 0) -> str | None:
     return None
 
 
+def provider_proved_not_sent(error: BaseException) -> bool:
+    """Contract §9: the final error is marked AND every router attempt was marked.
+
+    A single unmarked attempt (timeout, 5xx after create was sent, unknown error)
+    makes the whole call ambiguous. Without attempt tracking there is exactly one
+    attempt: the error itself.
+    """
+    from litellm.router_utils import attempt_outcomes
+
+    if not attempt_outcomes.marked_not_sent(error):
+        return False
+    attempts = attempt_outcomes.snapshot()
+    return all(attempts) if attempts else True
+
+
 def failure_outcome(error: BaseException) -> str:
     evidence = transport_outcome(error)
     if evidence is not None:
         return evidence
+    if provider_proved_not_sent(error):
+        return "not_sent"
     rejected = {400, 401, 402, 403, 404, 422, 429}
     if isinstance(error, HTTPException) and error.status_code in rejected:
         return "rejected"
