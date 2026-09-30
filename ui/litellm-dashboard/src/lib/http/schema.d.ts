@@ -27930,10 +27930,19 @@ export interface components {
         };
         /** MonitorRow */
         MonitorRow: {
+            /** Artifact Id */
+            artifact_id?: string | null;
+            /**
+             * Call Source
+             * @default unknown
+             */
+            call_source: string;
             /** Error */
             error?: string | null;
             /** Finished At */
             finished_at?: string | null;
+            /** Generation Id */
+            generation_id?: string | null;
             /** Id */
             id: string;
             /** Model */
@@ -27945,6 +27954,8 @@ export interface components {
              * Format: date-time
              */
             observed_at: string;
+            /** Project Id */
+            project_id?: string | null;
             /** Provider Task Id */
             provider_task_id?: string | null;
             /** Public Task Id */
@@ -27960,6 +27971,8 @@ export interface components {
             task_id?: string | null;
             /** Trace Id */
             trace_id?: string | null;
+            /** User Id */
+            user_id?: string | null;
         };
         /**
          * MutualTLSSecurityScheme

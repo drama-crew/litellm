@@ -8,7 +8,7 @@ import re
 from datetime import datetime
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from litellm.types.videos.utils import decode_video_id_with_provider
 
@@ -39,6 +39,14 @@ class VideoSnapshot(BaseModel):
     status: str = "unknown"
     completed_at: int | None = None
     error: JsonValue = None
+
+
+class RequestAttribution(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    call_source: Literal["studio", "open_api", "unknown"] = "unknown"
+    project_id: str | None = Field(default=None, max_length=200)
+    generation_id: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    artifact_id: str | None = Field(default=None, max_length=200)
 
 
 def completion_time(snapshot: VideoSnapshot) -> int | None:
@@ -100,17 +108,25 @@ async def create_log(
     model: str,
     payload: JsonValue,
     started_at: datetime,
+    attribution: RequestAttribution | None = None,
 ) -> None:
+    context = attribution or RequestAttribution()
     await db.execute_raw(
         """INSERT INTO "LiteLLM_OpenApiLog"
-        (id, owner, user_id, endpoint, model, status, started_at, observed_at, input, historical, elapsed_estimated)
-        VALUES ($1,$2,$3,$4,$5,'queued',$6::timestamptz,$6::timestamptz,$7::jsonb,false,false) ON CONFLICT (id) DO NOTHING""",
+        (id, owner, user_id, endpoint, model, status, started_at, observed_at,
+        call_source,project_id,generation_id,artifact_id,input,historical,elapsed_estimated)
+        VALUES ($1,$2,$3,$4,$5,'queued',$6::timestamptz,$6::timestamptz,$7,$8,$9,$10,$11::jsonb,false,false)
+        ON CONFLICT (id) DO NOTHING""",
         log_id,
         owner,
         user_id,
         endpoint,
         model,
         started_at,
+        context.call_source,
+        context.project_id,
+        context.generation_id,
+        context.artifact_id,
         encode_payload(payload),
     )
 

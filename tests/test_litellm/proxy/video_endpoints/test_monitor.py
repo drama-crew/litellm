@@ -1,4 +1,8 @@
 from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -9,6 +13,98 @@ from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
 from litellm.proxy.video_endpoints import monitor
 
 NOW = datetime.now(timezone.utc)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not os.getenv("OPEN_VIDEO_MONITOR_TEST_DSN"), reason="isolated PostgreSQL required")
+async def test_attribution_migration_and_submission_failure_roundtrip():
+    import asyncpg
+    from litellm.proxy.video_endpoints.openapi_logs import RequestAttribution, create_log, failed
+
+    conn = await asyncpg.connect(os.environ["OPEN_VIDEO_MONITOR_TEST_DSN"])
+    schema = "video_origin_" + uuid.uuid4().hex
+    await conn.execute(f'CREATE SCHEMA "{schema}"')
+
+    class DB:
+        async def execute_raw(self, sql, *args):
+            await conn.execute(sql, *args)
+            return 1
+
+        async def query_raw(self, sql, *args):
+            return [dict(row) for row in await conn.fetch(sql, *args)]
+
+    try:
+        await conn.execute(f'SET search_path TO "{schema}"')
+        migrations = Path(__file__).resolve().parents[4] / "litellm-proxy-extras/litellm_proxy_extras/migrations"
+        await conn.execute((migrations / "20260909094200_openapi_task_history/migration.sql").read_text())
+        upgrade = (migrations / "20260930050000_video_request_attribution/migration.sql").read_text()
+        await conn.execute(upgrade)
+        await conn.execute(upgrade)
+        await create_log(
+            DB(),
+            log_id="attempt-1",
+            owner="key",
+            user_id="owner",
+            endpoint="videos",
+            model="seedance-2.5",
+            payload={},
+            started_at=NOW,
+            attribution=RequestAttribution(
+                call_source="studio", project_id="project-1", generation_id="generation-1", artifact_id="shot-1"
+            ),
+        )
+        await failed(DB(), "attempt-1", "upstream rejected before creating task")
+        row = (await monitor.list_pending(DB(), NOW, "")).items[0]
+        assert row.status == "failed" and row.task_id is None
+        assert row.call_source == "studio" and row.generation_id == "generation-1"
+        assert row.project_id == "project-1" and row.artifact_id == "shot-1" and row.user_id == "owner"
+    finally:
+        await conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_submit_failure_preserves_attribution_without_provider_task_id(monkeypatch):
+    from starlette.requests import Request
+    from litellm.proxy.video_endpoints import openapi_log_capture as capture
+
+    db = SimpleNamespace(execute_raw=AsyncMock(), query_raw=AsyncMock())
+    monkeypatch.setattr(capture, "database", lambda: db)
+    context = {
+        "call_source": "studio",
+        "project_id": "project-1",
+        "generation_id": "generation-1",
+        "artifact_id": "shot-1",
+    }
+    request = Request({"type": "http", "headers": [(b"x-litellm-spend-logs-metadata", json.dumps(context).encode())]})
+    auth = UserAPIKeyAuth(api_key="test-key", user_id="owner-1", metadata={"project_id": "project-1"})
+    log_id = await capture.start(request, auth, {"model": "seedance-2.5", "prompt": "汉" * 100000})
+    await capture.failed(log_id, RuntimeError("provider refused submission"))
+    args = db.execute_raw.call_args_list[0].args
+    assert args[7:11] == ("studio", "project-1", "generation-1", "shot-1")
+    assert db.execute_raw.call_args_list[1].args[1] == log_id
+    db.query_raw.return_value = [record(id=log_id, task_id=None, status="failed", user_id="owner-1", **context)]
+    row = (await monitor.list_pending(db, NOW, "")).items[0]
+    assert row.generation_id == "generation-1" and row.project_id == "project-1"
+    assert row.call_source == "studio" and row.task_id is None
+
+
+@pytest.mark.parametrize(
+    "header,project",
+    [
+        ('{"call_source":"studio","project_id":"other","generation_id":"g","artifact_id":"a"}', "project-1"),
+        ('{"call_source":"studio","project_id":"project-1","generation_id":"g","artifact_id":"a"}', None),
+        ("invalid json", "project-1"),
+        ("x" * 9000, "project-1"),
+    ],
+)
+def test_unverified_attribution_cannot_classify_external_request_as_studio(header, project):
+    from starlette.requests import Request
+    from litellm.proxy.video_endpoints.openapi_log_capture import request_attribution
+
+    request = Request({"type": "http", "headers": [(b"x-litellm-spend-logs-metadata", header.encode())]})
+    result = request_attribution(request, UserAPIKeyAuth(user_id="owner-1", metadata={"project_id": project}))
+    assert result.call_source == "open_api" and result.generation_id is None
 
 
 def record(**updates):
