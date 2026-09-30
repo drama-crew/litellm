@@ -7,9 +7,7 @@ import os
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from decimal import Decimal
-from uuid import uuid4
 from typing import TYPE_CHECKING, Annotated, Literal
-
 from uuid import uuid4
 
 import httpx

@@ -595,7 +595,7 @@ class RecoveryConsumer:
 
     def report(self, error: BaseException) -> None:
         # Rate-limited per (type, message) so a permanently failing tick stays visible without flooding the log.
-        signature = (type(error).__name__, str(error))
+        signature = (type(error).__name__, str(error)[:500])
         now = time.monotonic()
         if signature == self.last_error and now - self.last_error_at < 60:
             return
@@ -603,7 +603,7 @@ class RecoveryConsumer:
         logging.getLogger(__name__).warning(
             "moderation metering durable recovery pending: %s: %s",
             type(error).__name__,
-            error,
+            signature[1],
             exc_info=(type(error), error, error.__traceback__),
         )
 
