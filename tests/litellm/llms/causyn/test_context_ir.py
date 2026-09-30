@@ -768,6 +768,31 @@ async def test_permanent_provider_errors_never_retry_or_deliver(redis, failure):
         assert calls == {"upstream": 1}
 
 
+@pytest.mark.asyncio
+async def test_terminal_rewrite_error_log_includes_the_error_message(caplog):
+    import logging
+    from unittest.mock import AsyncMock, MagicMock
+
+    from litellm.llms.causyn.context_ir_store import ContextIRTask
+
+    message = "reference video measured 15.2s; each must be 2-15 seconds"
+
+    async def failing_rewrite(request):
+        raise RewriteError(message, 400)
+
+    service = ContextIRService(MagicMock(save=AsyncMock()), rewrite=failing_rewrite, settle=no_settle, deliver=AsyncMock())
+    service.fail = AsyncMock()
+    running = ContextIRTask(
+        id="t1", owner="o", request=spec(), created_at=1, updated_at=1, billing=BillingIdentity(), price=1.0
+    )
+    with caplog.at_level(logging.WARNING):
+        await service.rewrite_and_complete(running, "token")
+    service.fail.assert_awaited_once()
+    assert service.fail.await_args.args[2] == message  # user-facing behaviour unchanged
+    logged = [r.getMessage() for r in caplog.records if "Context IR rewrite failed" in r.getMessage()]
+    assert logged and message in logged[0]
+
+
 def test_retry_after_is_bounded_and_jittered():
     import time
     from email.utils import formatdate

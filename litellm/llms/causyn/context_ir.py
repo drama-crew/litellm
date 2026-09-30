@@ -406,11 +406,12 @@ class ContextIRService:
                 await self.store.retry(task_id, token, delay)
                 return
             logger.warning(
-                "Context IR rewrite failed for %s attempt=%s upstream_status=%s detail=%s",
+                "Context IR rewrite failed for %s attempt=%s upstream_status=%s detail=%s message=%s",
                 task_id,
                 attempted.attempts,
                 exc.upstream_status,
                 exc.detail,
+                str(exc),
             )
             await self.fail(attempted, token, str(exc), detail=exc.describe_upstream())
             return

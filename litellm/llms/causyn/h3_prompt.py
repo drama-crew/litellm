@@ -30,9 +30,10 @@ from litellm.proxy.video_endpoints.minimax_h3_models import (
 MODEL = "qwen/qwen3.8-flash"
 PUBLIC_MODEL = "causyn-h3-context-ir"
 AUTH_MODEL = "causyn-1.1"
-# causyn-1.1 limits measured on the 2-GPU Ref2VA lane (larger combinations OOM).
-CAUSYN_VIDEO_REF_MAX_SECONDS = 5.0
-CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS = 5.0
+# causyn-1.1 reference-video limits. The Ref2VA engine enforces an exact memory/row admission
+# guard (--max-ref-video-total-seconds 15) and returns its own 400 for over-budget combinations.
+CAUSYN_VIDEO_REF_MAX_SECONDS = 15.0
+CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS = 15.0
 CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO = 4
 PRICE_CREDITS = 4.0
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})

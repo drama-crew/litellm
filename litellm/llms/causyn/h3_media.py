@@ -88,7 +88,7 @@ class VideoLimits(NamedTuple):
 
 
 BASE_VIDEO_LIMITS = VideoLimits(2.0, 15.0, 15.0, 1e-6)
-# causyn-1.1 runs on the 2-GPU Ref2VA lane; 0.1 s tolerance is shared with ARK and the platform backend.
+# causyn-1.1 runs on the Ref2VA lane; 0.1 s tolerance is shared with ARK and the platform backend.
 CAUSYN_VIDEO_LIMITS = VideoLimits(2.0, CAUSYN_VIDEO_REF_MAX_SECONDS, CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS, 0.1)
 
 

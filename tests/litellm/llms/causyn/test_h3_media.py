@@ -324,9 +324,10 @@ def test_inspect_video_limits_are_required_and_tolerance_is_per_model():
     from litellm.llms.causyn.h3_media import BASE_VIDEO_LIMITS, CAUSYN_VIDEO_LIMITS
 
     assert inspect_video(clip(seconds=6), BASE_VIDEO_LIMITS) == 6
-    with pytest.raises(RewriteError, match=r"measured 6.0s; each must be 2-5 seconds"):
-        inspect_video(clip(seconds=6), CAUSYN_VIDEO_LIMITS)
-    assert inspect_video(clip(seconds=5), CAUSYN_VIDEO_LIMITS) == 5
+    assert inspect_video(clip(seconds=6), CAUSYN_VIDEO_LIMITS) == 6
+    assert inspect_video(clip(seconds=15), CAUSYN_VIDEO_LIMITS) == 15
+    with pytest.raises(RewriteError, match=r"measured 16.0s; each must be 2-15 seconds"):
+        inspect_video(clip(seconds=16), CAUSYN_VIDEO_LIMITS)
 
 
 def _fractional_clip(seconds, fps=25):
@@ -350,28 +351,51 @@ def clip_frames(frames, fps):
 def test_causyn_video_tolerance_is_point_one_second_and_base_keeps_epsilon():
     from litellm.llms.causyn.h3_media import BASE_VIDEO_LIMITS, CAUSYN_VIDEO_LIMITS
 
-    assert inspect_video(_fractional_clip(5.04), CAUSYN_VIDEO_LIMITS) == pytest.approx(5.04, abs=0.02)
-    with pytest.raises(RewriteError, match=r"measured 5\.2s; each must be 2-5 seconds"):
-        inspect_video(_fractional_clip(5.2), CAUSYN_VIDEO_LIMITS)
-    assert inspect_video(_fractional_clip(5.2), BASE_VIDEO_LIMITS) == pytest.approx(5.2, abs=0.02)
+    assert inspect_video(_fractional_clip(15.04), CAUSYN_VIDEO_LIMITS) == pytest.approx(15.04, abs=0.02)
+    with pytest.raises(RewriteError, match=r"measured 15\.2s; each must be 2-15 seconds"):
+        inspect_video(_fractional_clip(15.2), CAUSYN_VIDEO_LIMITS)
+    with pytest.raises(RewriteError, match=r"measured 15\.0s; each must be 2-15 seconds"):
+        inspect_video(_fractional_clip(15.04), BASE_VIDEO_LIMITS)
+    assert inspect_video(_fractional_clip(5.2), CAUSYN_VIDEO_LIMITS) == pytest.approx(5.2, abs=0.02)
+
+
+def _fractional_video_item(seconds):
+    url = "data:video/mp4;base64," + base64.b64encode(_fractional_clip(seconds)).decode()
+    return {"type": "video_url", "video_url": {"url": url}}
 
 
 @pytest.mark.asyncio
-async def test_causyn_1_1_rejects_a_reference_video_longer_than_five_seconds():
+async def test_causyn_1_1_accepts_a_single_fifteen_second_reference_video():
     async with httpx.AsyncClient(trust_env=False) as client:
-        await prepare_media(client, causyn_request([video_item(5)]))
-        with pytest.raises(RewriteError, match="each must be 2-5 seconds"):
-            await prepare_media(client, causyn_request([video_item(6)]))
+        await prepare_media(client, causyn_request([video_item(15)]))
+        await prepare_media(client, causyn_request([_fractional_video_item(15.04)]))
+
+
+@pytest.mark.asyncio
+async def test_causyn_1_1_rejects_a_reference_video_over_fifteen_seconds_plus_tolerance():
+    async with httpx.AsyncClient(trust_env=False) as client:
+        with pytest.raises(RewriteError, match="each must be 2-15 seconds"):
+            await prepare_media(client, causyn_request([_fractional_video_item(15.2)]))
+
+
+@pytest.mark.asyncio
+async def test_causyn_1_1_accepts_three_five_second_reference_videos():
+    async with httpx.AsyncClient(trust_env=False) as client:
+        await prepare_media(client, causyn_request([video_item(5), video_item(5), video_item(5)]))
+
+
+@pytest.mark.asyncio
+async def test_causyn_1_1_total_reference_video_is_capped_at_fifteen_seconds():
+    async with httpx.AsyncClient(trust_env=False) as client:
+        with pytest.raises(RewriteError, match="Combined reference video duration exceeds 15 seconds"):
+            await prepare_media(
+                client,
+                causyn_request([_fractional_video_item(7.6), _fractional_video_item(7.6)]),
+            )
+        with pytest.raises(RewriteError, match="Combined reference video duration exceeds 15 seconds"):
+            await prepare_media(client, causyn_request([video_item(8), video_item(8)]))
         # the public MiniMax-H3 / LibTV path keeps the 2-15 s window
-        await prepare_media(client, request([video_item(6)]))
-
-
-@pytest.mark.asyncio
-async def test_causyn_1_1_total_reference_video_is_capped_at_five_seconds():
-    async with httpx.AsyncClient(trust_env=False) as client:
-        with pytest.raises(RewriteError, match="Combined reference video duration exceeds 5 seconds"):
-            await prepare_media(client, causyn_request([video_item(3), video_item(3)]))
-        await prepare_media(client, request([video_item(3), video_item(3)]))
+        await prepare_media(client, request([video_item(6), video_item(6)]))
 
 
 def _image_ref(color):
