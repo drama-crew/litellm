@@ -135,26 +135,37 @@ def inspect_audio(raw: bytes) -> float:
         return duration
 
 
+class PreparedRaw(NamedTuple):
+    """Raw bytes of the reference videos and audios, in content order, kept for perception."""
+
+    videos: tuple[bytes, ...]
+    audios: tuple[bytes, ...]
+
+
 async def prepare_reference(
     client: httpx.AsyncClient, item: ImageItem | VideoItem, limits: VideoLimits, image_max_side: int = 1024
-) -> tuple[ImageItem | VideoItem, float]:
+) -> tuple[ImageItem | VideoItem, float, bytes]:
     if isinstance(item, ImageItem):
         raw = await fetch_media(client, item.image_url.url, 30 * 1024 * 1024)
         url = await asyncio.to_thread(prepare_image, raw, image_max_side)
-        return item.model_copy(update={"image_url": MediaURL(url=url)}), 0.0
+        return item.model_copy(update={"image_url": MediaURL(url=url)}), 0.0, b""
     raw = await fetch_media(client, item.video_url.url, 50 * 1024 * 1024)
     duration = await asyncio.to_thread(inspect_video, raw, limits)
     url = "data:video/mp4;base64," + base64.b64encode(raw).decode("ascii")
-    return item.model_copy(update={"video_url": MediaURL(url=url)}), duration
+    return item.model_copy(update={"video_url": MediaURL(url=url)}), duration, raw
 
 
-async def prepare_audio(client: httpx.AsyncClient, item: AudioItem) -> tuple[AudioItem, float]:
+async def prepare_audio(client: httpx.AsyncClient, item: AudioItem) -> tuple[AudioItem, float, bytes]:
     raw = await fetch_media(client, item.audio_url.url, 20 * 1024 * 1024)
     duration = await asyncio.to_thread(inspect_audio, raw)
-    return item, duration
+    return item, duration, raw
 
 
 async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> ContextIRRequest:
+    return (await prepare_media_with_raw(client, spec))[0]
+
+
+async def prepare_media_with_raw(client: httpx.AsyncClient, spec: ContextIRRequest) -> tuple[ContextIRRequest, PreparedRaw]:
     limits = CAUSYN_VIDEO_LIMITS if spec.model == AUTH_MODEL else BASE_VIDEO_LIMITS
     image_count = sum(isinstance(item, ImageItem) for item in spec.content)
     image_max_side = MANY_IMAGES_MAX_SIDE if image_count > MANY_IMAGES_THRESHOLD else 1024
@@ -166,18 +177,22 @@ async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> Co
                     if isinstance(item, (ImageItem, VideoItem))
                     else await prepare_audio(client, item)
                     if isinstance(item, AudioItem)
-                    else (item, 0.0)
+                    else (item, 0.0, b"")
                     for item in spec.content
                 ]
             )
         if (
-            sum(duration for item, duration in prepared if isinstance(item, VideoItem))
+            sum(duration for item, duration, _ in prepared if isinstance(item, VideoItem))
             > limits.max_total + limits.tolerance
         ):
             raise RewriteError(f"Combined reference video duration exceeds {limits.max_total:g} seconds", 400)
-        if sum(duration for item, duration in prepared if isinstance(item, AudioItem)) > 15.000001:
+        if sum(duration for item, duration, _ in prepared if isinstance(item, AudioItem)) > 15.000001:
             raise RewriteError("Combined reference audio duration exceeds 15 seconds", 400)
-        return spec.model_copy(update={"content": tuple(item for item, _ in prepared)})
+        raw = PreparedRaw(
+            videos=tuple(data for item, _, data in prepared if isinstance(item, VideoItem)),
+            audios=tuple(data for item, _, data in prepared if isinstance(item, AudioItem)),
+        )
+        return spec.model_copy(update={"content": tuple(item for item, _, _ in prepared)}), raw
     except RewriteError:
         raise
     except (httpx.TransportError, TimeoutError) as exc:

@@ -1,0 +1,22 @@
+{
+ "t2va": {
+  "mode": "t2va",
+  "sha256": "4bf32c92e10404f8a69d718fead23d6921e2ad81bac9b6f136f4fdde4f50af92",
+  "bytes": 49453
+ },
+ "i2va": {
+  "mode": "i2va",
+  "sha256": "bb797bad9d6b95f1127f029e66e0d26413d594fe2f9e898fb21f9729653a28b7",
+  "bytes": 49720
+ },
+ "fl2va": {
+  "mode": "fl2va",
+  "sha256": "6c394c99c0585266a868c84a5e1acec5ac6182e527a0d042417e854cf16875b8",
+  "bytes": 50001
+ },
+ "l2va": {
+  "mode": "l2va",
+  "sha256": "8878f44bb5d02bf43ca4451bcf95ab4b1ad7bf52cc007662170c46abaab82e96",
+  "bytes": 49737
+ }
+}
