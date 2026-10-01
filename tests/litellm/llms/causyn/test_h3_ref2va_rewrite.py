@@ -1261,16 +1261,23 @@ ZH_PROMPT = "把视频里跑酷的人换成图1里的女人，动作、镜头和
 RULE_PHRASE = "entire visible appearance"
 
 
+OBSERVED_SUBJECT = (
+    "<Subject 1> is the female parkour athlete, whose facial features and long black hair are derived from "
+    "<Picture 1>, but who wears a light grey hooded sweatshirt, dark trousers, and sneakers to match the original "
+    "video's attire."
+)
+OBSERVED_VIDEO = (
+    "<Video 1>: weak_reference - Provides the structural timeline, camera motion, and physical action path, but the "
+    "primary subject is visually replaced."
+)
+
+
 def bad_replacement_prompt() -> str:
-    """Gold R1 with the observed regression: source attire transferred and the edit source marked weak_reference."""
-    text = mutate("R1", "<Subject 1> is the woman whose appearance comes from <Picture 1>", "<Subject 1> is the woman from <Picture 1>")
-    text = text.replace(
-        "The short blade she holds in <Picture 1> is not carried in the target video.",
-        "She wears a light grey hooded sweatshirt, dark trousers, and sneakers to match the original video's attire.",
-        1,
-    )
-    video_line = next(l for l in text.splitlines() if l.startswith("<Video 1> (camera"))
-    return text.replace(video_line, "<Video 1>: weak_reference - only the motion is used.")
+    """Gold R1 with the exact observed regression: source attire on the new subject and a weak_reference source."""
+    text = GOLD["R1"]
+    subject = next(l for l in text.splitlines() if l.startswith("<Subject 1> is the woman"))
+    video = next(l for l in text.splitlines() if l.startswith("<Video 1> (camera"))
+    return text.replace(subject, OBSERVED_SUBJECT).replace(video, OBSERVED_VIDEO)
 
 
 def replacement_findings(prompt, spec, facts):
@@ -1303,6 +1310,9 @@ def test_soft_check_flags_the_observed_bad_text():
     # each trigger alone is enough
     only_attire = mutate("R1", "The short blade she holds", "She wears it to match the original video's attire. The short blade she holds")
     assert replacement_findings(only_attire, spec, facts)
+    subject = next(l for l in bad_replacement_prompt().splitlines() if l.startswith("<Subject 1> is the female"))
+    attire_only = bad_replacement_prompt().replace(OBSERVED_VIDEO, next(l for l in GOLD["R1"].splitlines() if l.startswith("<Video 1> (camera")))
+    assert subject in attire_only and replacement_findings(attire_only, spec, facts)
     video_line = next(l for l in GOLD["R1"].splitlines() if l.startswith("<Video 1> (camera"))
     assert replacement_findings(GOLD["R1"].replace(video_line, "<Video 1>: weak_reference - motion."), spec, facts)
     # it is soft: validate_prompt with a sink accepts it, without a sink it raises with this phrase first
@@ -1331,3 +1341,66 @@ def test_observed_chinese_request_with_the_bad_rewrite_is_flagged():
     assert spec.prompt == ZH_PROMPT
     assert replacement_findings(bad_replacement_prompt(), spec, facts)
     assert replacement_findings(GOLD["R1"], spec, facts) == []
+
+
+def with_user_text(text):
+    base, facts = case("R1")
+    return base.model_copy(update={"content": (base.content[0].model_copy(update={"text": text}), *base.content[1:])}), facts
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Replace the runner with the woman from picture 1 but keep the original runner's clothing.",
+        "Swap the person and retain the source outfit unchanged.",
+        "把跑酷的人换成图1的女人，保持原来的衣服不变。",
+        "换成图1的女人，服装保留。",
+    ],
+)
+def test_user_who_keeps_the_source_clothing_never_triggers_the_check(text):
+    spec, facts = with_user_text(text)
+    assert replacement_findings(bad_replacement_prompt(), spec, facts) == []
+
+
+def test_environment_subject_matching_the_original_does_not_trigger():
+    spec, facts = case("R1")
+    env = "<Subject 2> is the sunlit plaza rebuilt to match the original video's park: granite ledges and trees."
+    line = next(l for l in GOLD["R1"].splitlines() if l.startswith("<Subject 2> is the sunlit"))
+    assert replacement_findings(GOLD["R1"].replace(line, env), spec, facts) == []
+
+
+def test_reference_generation_summary_with_replace_wording_does_not_trigger():
+    spec, facts = case("R1")
+    text = bad_replacement_prompt().replace("[video editing + reference generation]", "[reference generation]")
+    assert replacement_findings(text, spec, facts) == []
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "but who does not wear the original video's attire",
+        "instead of the original video's outfit",
+        "unlike the source clothing",
+    ],
+)
+def test_negated_attire_mentions_do_not_trigger(phrase):
+    spec, facts = case("R1")
+    line = next(l for l in GOLD["R1"].splitlines() if l.startswith("<Subject 1> is the woman"))
+    assert replacement_findings(GOLD["R1"].replace(line, line + " She " + phrase + "."), spec, facts) == []
+
+
+def test_attire_alternatives_need_a_clothing_word():
+    assert not h3_prompt._source_attire_mentioned("rebuilt to match the original video's park")
+    assert h3_prompt._source_attire_mentioned("wears a grey hoodie to match the original video's attire")
+    assert h3_prompt._source_attire_mentioned("她穿着和原视频的衣服一样")
+
+
+@pytest.mark.asyncio
+async def test_one_repair_resolves_the_observed_regression(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(bad_replacement_prompt(), GOLD["R1"])
+    result = await run(provider, spec)
+    assert len(provider.bodies) == 2
+    assert h3_prompt._V_REPLACE in provider.bodies[1]["messages"][3]["content"]
+    assert result.prompt == GOLD["R1"].strip() and result.soft_violations == ()

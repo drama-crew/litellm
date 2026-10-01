@@ -559,9 +559,20 @@ _V_REPLACE = (
     "The rewritten H3 prompt replacement subject must take its appearance from the reference image, "
     "not the source performer"
 )
+_CLOTHING = r"(?:attire|clothing|clothes|outfit|wardrobe|costume|hoodie|sweatshirt|jacket)"
+# Every alternative is anchored on a clothing word (or 衣/服/装 after 原视频/源视频).
 _SOURCE_ATTIRE = re.compile(
-    r"(?:original|source)(?: video)?(?:'s|’s)? (?:attire|clothing|clothes|outfit)|to match the original|"
-    r"same (?:attire|clothing|clothes|outfit) as the (?:original|source)",
+    rf"(?:original|source)(?: video)?(?:'s|’s)? {_CLOTHING}|"
+    rf"to match the (?:original|source)(?: video)?(?:'s|’s)? {_CLOTHING}|"
+    rf"same {_CLOTHING} as the (?:original|source)|"
+    r"(?:原视频|源视频|原片)[^。，,.]{0,6}[衣服装]",
+    re.IGNORECASE,
+)
+_NEGATION = re.compile(r"\b(?:not|never|without|unlike|instead of|rather than)\b|n't|不|而非", re.IGNORECASE)
+_KEEP_SOURCE_CLOTHING = re.compile(
+    rf"\b(?:keep|retain|preserve|maintain)\b[^.。]{{0,40}}?\b(?:original|source)\b[^.。]{{0,25}}?\b{_CLOTHING}\b|"
+    rf"\b(?:original|source)\b[^.。]{{0,25}}?\b{_CLOTHING}\b[^.。]{{0,25}}?\b(?:kept|retained|preserved|unchanged)\b|"
+    r"(?:保持|保留|不变)[^。，,.]{0,6}[衣服装穿]|[衣服装穿][^。，,.]{0,6}(?:保持|保留|不变)",
     re.IGNORECASE,
 )
 _V_CUTS = "The rewritten H3 prompt does not mirror the source video's shot cuts"
@@ -645,8 +656,34 @@ def ref2va_violations(
     return hard, soft
 
 
+def _replacement_subject_text(subject_definitions: str) -> str:
+    """Heuristic scope: the first `<Subject N>` definition (with its wrapped lines) that is derived from a `<Picture N>`.
+
+    The replacement is the subject built from the reference image; environment and other subjects are not checked.
+    """
+    block: list[str] | None = None
+    for line in subject_definitions.splitlines():
+        if re.match(r"^<Subject \d+>", line):
+            if block and re.search(r"<Picture \d+>", " ".join(block)):
+                break
+            block = [line]
+        elif block is not None and not line.lstrip().startswith("<"):
+            block.append(line)
+    return " ".join(block) if block and re.search(r"<Picture \d+>", " ".join(block)) else ""
+
+
+def _source_attire_mentioned(text: str) -> bool:
+    return any(
+        not _NEGATION.search(text[max(0, match.start() - 40) : match.start()]) for match in _SOURCE_ATTIRE.finditer(text)
+    )
+
+
 def _replacement_violations(spec: ContextIRRequest, sections: dict[str, str]) -> list[str]:
-    """Conservative phrase checks for a person swap in a video edit; no semantics, soft only."""
+    """Conservative phrase checks for a person swap in a video edit; no semantics, soft only.
+
+    Skipped when the request is not a video edit with a replacement, or when the user explicitly asks to keep the
+    source clothing (English or Chinese).
+    """
     if not (
         any(isinstance(item, VideoItem) for item in spec.content)
         and any(isinstance(item, ImageItem) for item in spec.content)
@@ -655,11 +692,13 @@ def _replacement_violations(spec: ContextIRRequest, sections: dict[str, str]) ->
     summary = sections["summary"].lower()
     if "video editing" not in summary or not re.search(r"replac|swap", summary):
         return []
+    if _KEEP_SOURCE_CLOTHING.search(spec.prompt):
+        return []
     weak = any(
         re.match(r"<Video \d+>", line.strip()) and "weak_reference" in line
         for line in sections["retention_analysis"].splitlines()
     )
-    attire = _SOURCE_ATTIRE.search(sections["subject_definitions"])
+    attire = _source_attire_mentioned(_replacement_subject_text(sections["subject_definitions"]))
     if not weak and not attire:
         return []
     detail = "source <Video N> must be fully_preserved" if weak else "do not match the source performer's attire"
