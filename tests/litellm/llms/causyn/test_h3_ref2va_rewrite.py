@@ -516,8 +516,8 @@ async def test_model_env_selects_allow_listed_models_and_ref2va_only(patched, mo
 @pytest.mark.parametrize(
     "model,reasoning,max_tokens",
     [
-        ("qwen/qwen3.8-flash", {"enabled": False}, 4096),
-        ("qwen/qwen3.8-omni-flash", {"enabled": False}, 4096),
+        ("qwen/qwen3.8-flash", {"enabled": False}, 8192),
+        ("qwen/qwen3.8-omni-flash", {"enabled": False}, 8192),
         ("qwen/qwen3.8-max-0902", {"enabled": True, "effort": "low"}, 12000),
     ],
 )
@@ -1065,3 +1065,74 @@ async def test_unparseable_reply_has_a_detail_too(patched):
         with pytest.raises(RewriteError) as caught:
             await H3PromptRewriter(client, "k").rewrite(spec)
     assert caught.value.detail == "unreadable reply, 7 bytes"
+
+
+# ----------------------------------------------------------------------------- truncated answers
+
+
+def scripted(plan):
+    """Handler replaying `plan`: a str is a stop answer, 'length' a truncated one (looping text)."""
+    bodies: list[dict] = []
+    steps = iter(plan)
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        step = next(steps)
+        if step == "length":
+            message = {"content": "The runner sprints. " * 50}
+            finish = "length"
+        else:
+            message, finish = {"content": step}, "stop"
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen/qwen3.8-flash",
+                "choices": [{"message": message, "finish_reason": finish}],
+                "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+            },
+        )
+
+    return handler, bodies
+
+
+@pytest.mark.asyncio
+async def test_truncated_first_answer_is_repaired_once_without_echoing_it(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    handler, bodies = scripted(["length", GOLD["R1"]])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await H3PromptRewriter(client, "k").rewrite(spec)
+    assert result.prompt == GOLD["R1"].strip()
+    assert len(bodies) == 2
+    messages = bodies[1]["messages"]
+    assert [m["role"] for m in messages] == ["system", "user", "user"]
+    assert messages[2]["content"] == h3_prompt.TRUNCATION_REPAIR_MESSAGE
+    assert "The runner sprints" not in json.dumps(messages)
+    assert "350–500 words" in messages[2]["content"] and "do not repeat sentences" in messages[2]["content"]
+
+
+@pytest.mark.asyncio
+async def test_truncated_twice_raises_the_permanent_error(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    handler, bodies = scripted(["length", "length", GOLD["R1"]])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "k").rewrite(spec)
+    assert len(bodies) == 2
+    assert str(caught.value) == "H3 prompt rewrite provider returned an invalid response"
+    assert caught.value.status_code == 502 and caught.value.retryable is False
+    assert "finish_reason=length" in caught.value.detail
+
+
+@pytest.mark.asyncio
+async def test_non_ref2va_truncation_is_still_permanent_without_repair():
+    spec = ContextIRRequest.model_validate(
+        {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat."}], "duration": 5, "ratio": "16:9"}
+    )
+    handler, bodies = scripted(["length", "x"])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "k").rewrite(spec)
+    assert len(bodies) == 1 and caught.value.retryable is False
+    assert bodies[0]["max_tokens"] == 4096 and bodies[0]["reasoning"] == {"enabled": False}

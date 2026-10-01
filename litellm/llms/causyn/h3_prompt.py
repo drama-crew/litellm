@@ -50,8 +50,8 @@ REF2VA_MODEL_CAPS: dict[str, frozenset[str]] = {
 }
 # Per-model reasoning request and completion budget. max-0902 rejects `reasoning.enabled=false`.
 REF2VA_MODEL_REASONING: dict[str, tuple[dict[str, JsonValue], int]] = {
-    "qwen/qwen3.8-flash": ({"enabled": False}, 4096),
-    "qwen/qwen3.8-omni-flash": ({"enabled": False}, 4096),
+    "qwen/qwen3.8-flash": ({"enabled": False}, 8192),
+    "qwen/qwen3.8-omni-flash": ({"enabled": False}, 8192),
     "qwen/qwen3.8-max-0902": ({"enabled": True, "effort": "low"}, 12000),
 }
 MAX_RAW_VIDEO_BYTES = 20 * 1024 * 1024
@@ -174,6 +174,10 @@ class RewriteError(Exception):
             except (ValueError, TypeError, OverflowError):
                 return backoff
         return max(backoff, min(retry_after_cap, seconds))
+
+
+class TruncatedRewriteError(RewriteError):
+    """The provider cut the answer off at max_tokens. Permanent unless the one repair call can still produce it."""
 
 
 @dataclass(frozen=True)
@@ -676,6 +680,12 @@ def ref2va_addendum(has_video: bool, has_audio: bool) -> str:
     return "\n" + " ".join(parts)
 
 
+TRUNCATION_REPAIR_MESSAGE = (
+    "Your previous answer was cut off before it finished. Rewrite the complete answer from the beginning, "
+    "concisely: keep detailed_description within 350–500 words and do not repeat sentences."
+)
+
+
 def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...]) -> str:
     listed = "\n".join(f"- {violation}" for violation in violations)
     return (
@@ -716,8 +726,11 @@ class H3PromptRewriter:
         self.client = client
         self.api_key = api_key
 
-    async def _complete(self, model: str, messages: list[dict[str, JsonValue]], budget: float) -> _Completion:
-        reasoning, max_tokens = REF2VA_MODEL_REASONING.get(model, REF2VA_MODEL_REASONING[MODEL])
+    async def _complete(
+        self, model: str, messages: list[dict[str, JsonValue]], budget: float, ref2va: bool = False
+    ) -> _Completion:
+        # Non-ref2va keeps today's payload exactly; the per-model table applies to ref2va only.
+        reasoning, max_tokens = REF2VA_MODEL_REASONING[model] if ref2va else ({"enabled": False}, 4096)
         payload = {
             "model": model,
             "messages": messages,
@@ -761,7 +774,8 @@ class H3PromptRewriter:
             # A wrong/unlisted model id is a provider routing glitch (retry); a truncated or malformed answer
             # (e.g. finish_reason=length) is permanent, as before.
             routing = any(error["loc"][:1] == ("model",) for error in exc.errors())
-            raise RewriteError(
+            truncated = any(error["loc"][:3] == ("choices", 0, "finish_reason") for error in exc.errors())
+            raise (TruncatedRewriteError if truncated else RewriteError)(
                 "H3 prompt rewrite provider returned an invalid response",
                 502,
                 retryable=routing,
@@ -798,19 +812,26 @@ class H3PromptRewriter:
         # A retry after a retryable failure of the repair call reuses the first answer instead of paying for it again.
         answer_key = media_key(spec, raw.videos, raw.audios) + model if ref2va else ""
         cached_answer = _FIRST_ANSWERS.get(answer_key) if ref2va else None
+        truncated = False
         if cached_answer is not None:
             prompt, usage = cached_answer, RewriteUsage()
         else:
-            completed = await self._complete(model, messages, ATTEMPT_BUDGET_S)
-            prompt = completed.choices[0].message.content.strip()
-            usage = completed.usage
+            try:
+                completed = await self._complete(model, messages, ATTEMPT_BUDGET_S, ref2va)
+                prompt = completed.choices[0].message.content.strip()
+                usage = completed.usage
+            except TruncatedRewriteError:
+                if not ref2va:
+                    raise
+                prompt, usage, truncated = "", RewriteUsage(), True
         keep_first_answer = False
         soft: list[str] = []
         hard_failure: RewriteError | None = None
-        try:
-            validate_prompt(prompt, spec, facts, soft=soft if ref2va else None)
-        except RewriteError as failure:
-            hard_failure = failure
+        if not truncated:
+            try:
+                validate_prompt(prompt, spec, facts, soft=soft if ref2va else None)
+            except RewriteError as failure:
+                hard_failure = failure
 
         def result(text: str, used: RewriteUsage, leftover: list[str]) -> RewriteResult:
             if leftover:
@@ -824,6 +845,22 @@ class H3PromptRewriter:
             )
 
         try:
+            if truncated:
+                # The cut-off text is not echoed back (it may be huge or looping): ask again, concisely.
+                remaining = ATTEMPT_BUDGET_S - (time.monotonic() - started)
+                deadline = ATTEMPT_DEADLINE.get()
+                if deadline is not None:
+                    remaining = min(remaining, deadline - time.monotonic())
+                if remaining < MIN_REPAIR_BUDGET_S:
+                    raise TruncatedRewriteError(
+                        "H3 prompt rewrite provider returned an invalid response", 502, retryable=False
+                    )
+                messages.append({"role": "user", "content": TRUNCATION_REPAIR_MESSAGE})
+                again = await self._complete(model, messages, remaining, ref2va)  # a second truncation raises
+                again_soft: list[str] = []
+                again_prompt = again.choices[0].message.content.strip()
+                validate_prompt(again_prompt, spec, facts, soft=again_soft)
+                return result(again_prompt, again.usage, again_soft)
             if not ref2va or (hard_failure is None and not soft):
                 if hard_failure is not None:
                     raise hard_failure
@@ -843,7 +880,7 @@ class H3PromptRewriter:
                 {"role": "user", "content": _repair_message(listed, _provided_labels(spec))},
             ]
             try:
-                repaired = await self._complete(model, messages, remaining)
+                repaired = await self._complete(model, messages, remaining, ref2va)
             except RewriteError as call_failure:
                 if hard_failure is None:  # a usable first answer beats a failed improvement
                     return result(prompt, usage, soft)
