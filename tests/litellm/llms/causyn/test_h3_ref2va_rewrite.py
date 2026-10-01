@@ -830,7 +830,7 @@ async def test_perception_is_memoised_across_retries(monkeypatch):
     clip = two_shot_clip()
     first = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(clip,), audios=()))
     second = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(bytes(clip),), audios=()))
-    assert first is second and len(calls) == 1
+    assert first.videos == second.videos and len(calls) == 1
     other = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"different",), audios=()))
     assert other is not first and len(calls) == 2
 
@@ -872,3 +872,58 @@ async def test_retry_after_a_failed_repair_call_reuses_the_first_answer(patched)
     assert len(calls) == 3  # first, failed repair, retried repair: the first answer was not paid for twice
     assert calls[2]["messages"][2] == {"role": "assistant", "content": OLD["R1"].strip()}
     assert result.prompt == GOLD["R1"].strip()
+
+
+@pytest.mark.asyncio
+async def test_cached_facts_hold_no_audio_bytes_and_reattach_current_ones():
+    spec = ref_spec("image", "video", "audio", duration=5)
+    audio = b"RIFFxxxxWAVE" + b"0" * 5000
+    first = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"v",), audios=(audio,)))
+    assert first.audio_raw == (audio,)
+    assert all(entry.audio_raw == () for entry in h3_prompt._FACTS_MEMO.values())
+    again = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"v",), audios=(audio,)))
+    assert again.audio_raw == (audio,)
+
+
+@pytest.mark.asyncio
+async def test_facts_memo_is_bounded_by_total_keyframe_bytes(monkeypatch):
+    monkeypatch.setattr(h3_prompt, "FACTS_MEMO_MAX_BYTES", 2500)
+
+    def fat(raw, **kwargs):
+        return VideoFacts(5.0, 24.0, 64, 64, (2.0,), (Keyframe(0.15, 1, b"j" * 1000),))
+
+    monkeypatch.setattr(h3_prompt, "analyze_video", fat)
+    spec = ref_spec("image", "video", duration=5)
+    for n in range(5):
+        await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"v%d" % n,), audios=()))
+    assert len(h3_prompt._FACTS_MEMO) == 2  # 3 x 1000 B would exceed 2500 B
+    kept = {h3_prompt.media_key(spec, (b"v%d" % n,), ()) for n in (3, 4)}
+    assert set(h3_prompt._FACTS_MEMO) == kept
+
+
+def test_media_key_covers_text_duration_ratio_roles_and_fetched_bytes():
+    base = ref_spec("image", "video", duration=5)
+    key = h3_prompt.media_key(base, (b"v",), ())
+    assert key == h3_prompt.media_key(ref_spec("image", "video", duration=5), (b"v",), ())
+    assert key != h3_prompt.media_key(base, (b"w",), ())
+    assert key != h3_prompt.media_key(ref_spec("image", "video", duration=6), (b"v",), ())
+    assert key != h3_prompt.media_key(base.model_copy(update={"ratio": "9:16"}), (b"v",), ())
+    changed = base.model_copy(update={"content": (base.content[0].model_copy(update={"text": "Other"}), *base.content[1:])})
+    assert key != h3_prompt.media_key(changed, (b"v",), ())
+    assert key != h3_prompt.media_key(ref_spec("video", "image", duration=5), (b"v",), ())
+    # the video URL itself is not part of the key; only its fetched bytes are
+    other_url = base.model_copy(update={"content": (*base.content[:2], base.content[2].model_copy(update={"video_url": {"url": "https://x.example/v.mp4"}}))})
+    assert key == h3_prompt.media_key(other_url, (b"v",), ())
+
+
+@pytest.mark.asyncio
+async def test_permanent_repair_failure_leaves_no_cached_first_answer(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(OLD["R1"], OLD["R1"])
+    with pytest.raises(RewriteError):
+        await run(provider, spec)
+    assert len(h3_prompt._FIRST_ANSWERS) == 0
+    provider2 = Provider(GOLD["R1"])
+    await run(provider2, spec)
+    assert len(provider2.bodies) == 1  # the next identical request does not replay a stale answer

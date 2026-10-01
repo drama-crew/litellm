@@ -11,7 +11,7 @@ import re
 import time
 from contextvars import ContextVar
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from importlib.resources import files
@@ -218,6 +218,7 @@ def _audio_format(raw: bytes) -> Literal["wav", "mp3"] | None:
 
 
 _MEMO_SIZE = 32
+FACTS_MEMO_MAX_BYTES = 64 * 1024 * 1024
 _FACTS_MEMO: OrderedDict[str, RefFacts] = OrderedDict()
 _FIRST_ANSWERS: OrderedDict[str, str] = OrderedDict()
 
@@ -229,30 +230,60 @@ def _remember(store: OrderedDict, key: str, value: object) -> None:
         store.popitem(last=False)
 
 
+def _facts_bytes(facts: RefFacts) -> int:
+    return sum(len(frame.jpeg) for video in facts.videos if video is not None for frame in video.keyframes)
+
+
+def _remember_facts(key: str, facts: RefFacts) -> None:
+    """Keep the facts (never the audio bytes) bounded by entry count and by total keyframe bytes."""
+    _remember(_FACTS_MEMO, key, facts)
+    while len(_FACTS_MEMO) > 1 and sum(_facts_bytes(f) for f in _FACTS_MEMO.values()) > FACTS_MEMO_MAX_BYTES:
+        _FACTS_MEMO.popitem(last=False)
+
+
 def media_key(spec: ContextIRRequest, videos: tuple[bytes, ...], audios: tuple[bytes, ...]) -> str:
-    """Stable per-request key: the submitted media URLs plus the digest of every fetched video/audio byte string."""
-    digest = hashlib.sha256(spec.model_dump_json().encode())
-    for data in (*videos, b"|", *audios):
-        digest.update(hashlib.sha256(data).digest())
+    """Per-request key: text, duration, ratio, each item's type/role in order, image URLs and fetched media digests."""
+    digest = hashlib.sha256()
+
+    def feed(*parts: str | bytes) -> None:
+        for part in parts:
+            data = part.encode() if isinstance(part, str) else part
+            digest.update(len(data).to_bytes(8, "big") + data)
+
+    feed(spec.model, spec.prompt, str(spec.duration), spec.ratio)
+    video_index = audio_index = 0
+    for item in spec.content:
+        if isinstance(item, TextItem):
+            continue
+        feed(type(item).__name__, item.role)
+        if isinstance(item, ImageItem):
+            feed(item.image_url.url)
+        elif isinstance(item, VideoItem):
+            feed(hashlib.sha256(videos[video_index]).digest() if video_index < len(videos) else b"")
+            video_index += 1
+        else:
+            feed(hashlib.sha256(audios[audio_index]).digest() if audio_index < len(audios) else b"")
+            audio_index += 1
     return digest.hexdigest()
 
 
 async def perceive_media(spec: ContextIRRequest, raw: object) -> RefFacts:
-    """Perception for one request, memoised across durable-task retries (in-process LRU of 32).
+    """Perception for one request, memoised across durable-task retries (LRU of 32 entries and 64 MB of keyframes).
 
-    A retry still re-fetches the media (the bytes are not cached) but skips the up to 20 s of CPU work. Any failure
-    degrades to missing facts, never to an error.
+    A retry still re-fetches the media (the bytes are not cached) but skips the up to 20 s of CPU work. The cache never
+    holds audio bytes: they are re-attached from the current request. Any failure degrades to missing facts.
     """
     videos_raw: tuple[bytes, ...] = getattr(raw, "videos", ())
     audios_raw: tuple[bytes, ...] = getattr(raw, "audios", ())
     key = media_key(spec, videos_raw, audios_raw)
     cached = _FACTS_MEMO.get(key)
-    if cached is not None:
+    if cached is None:
+        facts = await _perceive(videos_raw, audios_raw)
+        _remember_facts(key, replace(facts, audio_raw=()))
+    else:
         _FACTS_MEMO.move_to_end(key)
-        return cached
-    facts = await _perceive(videos_raw, audios_raw)
-    _remember(_FACTS_MEMO, key, facts)
-    return facts
+        facts = cached
+    return replace(facts, audio_raw=audios_raw)
 
 
 async def _perceive(videos_raw: tuple[bytes, ...], audios_raw: tuple[bytes, ...]) -> RefFacts:
@@ -734,29 +765,36 @@ class H3PromptRewriter:
             completed = await self._complete(model, messages, ATTEMPT_BUDGET_S)
             prompt = completed.choices[0].message.content.strip()
             usage = completed.usage
+        keep_first_answer = False
         try:
-            validate_prompt(prompt, spec, facts)
-        except RewriteError as failure:
-            remaining = ATTEMPT_BUDGET_S - (time.monotonic() - started)
-            deadline = ATTEMPT_DEADLINE.get()
-            if deadline is not None:
-                remaining = min(remaining, deadline - time.monotonic())
-            if not ref2va or remaining < MIN_REPAIR_BUDGET_S:
-                raise
-            _remember(_FIRST_ANSWERS, answer_key, prompt)
-            messages += [
-                {"role": "assistant", "content": prompt},
-                {
-                    "role": "user",
-                    "content": _repair_message(failure.violations or (str(failure),), _provided_labels(spec)),
-                },
-            ]
-            repaired = await self._complete(model, messages, remaining)  # a failure here keeps the cached first answer
-            _FIRST_ANSWERS.pop(answer_key, None)
-            prompt = repaired.choices[0].message.content.strip()
-            usage = _sum_usage(usage, repaired.usage)
-            validate_prompt(prompt, spec, facts)
-        _FIRST_ANSWERS.pop(answer_key, None)
+            try:
+                validate_prompt(prompt, spec, facts)
+            except RewriteError as failure:
+                remaining = ATTEMPT_BUDGET_S - (time.monotonic() - started)
+                deadline = ATTEMPT_DEADLINE.get()
+                if deadline is not None:
+                    remaining = min(remaining, deadline - time.monotonic())
+                if not ref2va or remaining < MIN_REPAIR_BUDGET_S:
+                    raise
+                _remember(_FIRST_ANSWERS, answer_key, prompt)
+                messages += [
+                    {"role": "assistant", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": _repair_message(failure.violations or (str(failure),), _provided_labels(spec)),
+                    },
+                ]
+                try:
+                    repaired = await self._complete(model, messages, remaining)
+                except RewriteError as call_failure:
+                    keep_first_answer = call_failure.retryable  # a retried attempt reuses the first answer
+                    raise
+                prompt = repaired.choices[0].message.content.strip()
+                usage = _sum_usage(usage, repaired.usage)
+                validate_prompt(prompt, spec, facts)
+        finally:
+            if not keep_first_answer:
+                _FIRST_ANSWERS.pop(answer_key, None)
         return RewriteResult(
             prompt=prompt, usage=usage, model=model, system_sha256=hashlib.sha256(system.encode()).hexdigest()
         )
