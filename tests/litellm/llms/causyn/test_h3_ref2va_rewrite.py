@@ -30,6 +30,15 @@ AUD = "https://media.example/a.wav"
 CUT_MSG = "The rewritten H3 prompt does not mirror the source video's shot cuts"
 
 
+@pytest.fixture(autouse=True)
+def clean_state(monkeypatch):
+    h3_prompt._FACTS_MEMO.clear()
+    h3_prompt._FIRST_ANSWERS.clear()
+    h3_prompt._warned_models.clear()
+    monkeypatch.delenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", raising=False)
+    monkeypatch.delenv("CAUSYN_H3_REWRITE_SEND_VIDEO", raising=False)
+
+
 def item(kind: str, url: str | None = None) -> dict:
     if kind == "image":
         return {"type": "image_url", "image_url": {"url": url or IMG}, "role": "reference_image"}
@@ -254,7 +263,8 @@ def test_image_only_ref2va_keeps_working_without_facts():
     prompt = (
         "subject_definitions:\n<Subject 1> is the woman from <Picture 1> in the coat of <Picture 2>.\n\n"
         "summary:\n[reference generation] A woman walks.\n\n"
-        "retention_analysis:\n<Subject 1> (appears in [Shot 1]): fully_preserved - face and coat.\n"
+        "retention_analysis:\n<Subject 1> (appears in [Shot 1]): fully_preserved - face from <Picture 1>\n"
+        "and the coat of <Picture 2>.\n"
         "<Picture 2>: fully_preserved - the coat.\n\n"
         f"detailed_description:\nA calm look.\n[Shot 1] {desc}\n\n"
         "overall_soundscape:\nSoft footsteps.\n\nnon_diegetic_music:\nN/A"
@@ -423,15 +433,32 @@ async def test_send_video_env_keeps_raw_video_part(patched, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_video_without_keyframes_degrades_to_the_raw_video(patched, monkeypatch):
-    monkeypatch.delenv("CAUSYN_H3_REWRITE_SEND_VIDEO", raising=False)
+async def test_video_without_keyframes_sends_facts_only_never_the_raw_video(patched, monkeypatch):
     spec = ref_spec("image", "video", duration=5)
     facts = RefFacts(videos=(vfacts(None, with_frames=False),))
     patched(spec, facts)
     provider = Provider(OLD["R1"], OLD["R1"])
     with pytest.raises(RewriteError):
         await run(provider, spec)
-    assert "video_url" in [p["type"] for p in parts(provider.bodies[0])]
+    content = parts(provider.bodies[0])
+    assert "video_url" not in [p["type"] for p in content]
+    assert any(p.get("text", "").startswith("<Video 1>: ") for p in content)
+
+
+def test_raw_video_needs_the_env_and_a_size_under_20_mb():
+    from types import SimpleNamespace
+
+    def video(n):
+        return SimpleNamespace(video_url=SimpleNamespace(url="data:video/mp4;base64," + "A" * n))
+
+    send = ContextIRRequest._perceived_video_parts
+    facts = RefFacts(videos=(vfacts(3.0),))
+    assert "video_url" in [p["type"] for p in send(video(1000), 1, facts, True)]
+    assert "video_url" not in [p["type"] for p in send(video(1000), 1, facts, False)]
+    assert "video_url" not in [p["type"] for p in send(video(28 * 1024 * 1024), 1, facts, True)]
+    assert "video_url" in [p["type"] for p in send(video(26 * 1024 * 1024), 1, facts, True)]
+    nokey = RefFacts(videos=(vfacts(None, with_frames=False),))
+    assert "video_url" not in [p["type"] for p in send(video(1000), 1, nokey, False)]
 
 
 @pytest.mark.asyncio
@@ -453,18 +480,30 @@ async def test_audio_part_is_sent_only_to_the_omni_model(patched, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_model_env_is_allow_listed_and_ref2va_only(patched, monkeypatch):
+async def test_unknown_model_env_fails_closed_for_ref2va_with_a_warning(patched, monkeypatch, caplog):
     spec, facts = case("R1")
     patched(spec, facts)
-    monkeypatch.setenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", "evil/other-model")
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", "qwen/qwen3.8-omni")
     provider = Provider(GOLD["R1"])
-    await run(provider, spec)
-    assert provider.bodies[0]["model"] == "qwen/qwen3.8-flash"
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            with pytest.raises(RewriteError) as caught:
+                await run(provider, spec)
+    assert str(caught.value) == "H3 prompt rewrite model is not configured"
+    assert caught.value.status_code == 503 and caught.value.retryable is False
+    assert provider.bodies == []
+    assert sum("not an allow-listed" in r.message for r in caplog.records) == 1  # warned once
+
+
+@pytest.mark.asyncio
+async def test_model_env_selects_allow_listed_models_and_ref2va_only(patched, monkeypatch):
+    spec, facts = case("R1")
+    patched(spec, facts)
     monkeypatch.setenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", "qwen/qwen3.8-max-0902")
     provider = Provider(GOLD["R1"], model="qwen/qwen3.8-max-0902")
     await run(provider, spec)
     assert provider.bodies[0]["model"] == "qwen/qwen3.8-max-0902"
-    # a non-ref2va request keeps flash even when the env is set
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", "typo/model")
     t2va = ContextIRRequest.model_validate(
         {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat."}], "duration": 5, "ratio": "16:9"}
     )
@@ -475,21 +514,88 @@ async def test_model_env_is_allow_listed_and_ref2va_only(patched, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model,reasoning,max_tokens",
+    [
+        ("qwen/qwen3.8-flash", {"enabled": False}, 4096),
+        ("qwen/qwen3.8-omni-flash", {"enabled": False}, 4096),
+        ("qwen/qwen3.8-max-0902", {"enabled": True, "effort": "low"}, 12000),
+    ],
+)
+async def test_reasoning_and_token_budget_are_per_model(patched, monkeypatch, model, reasoning, max_tokens):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", model)
+    provider = Provider(GOLD["R1"], model=model)
+    await run(provider, spec)
+    body = provider.bodies[0]
+    assert body["reasoning"] == reasoning and body["max_tokens"] == max_tokens
+    assert list(body) == ["model", "messages", "max_tokens", "stream", "temperature", "reasoning", "provider"]
+
+
+@pytest.mark.asyncio
+async def test_answer_with_reasoning_fields_is_accepted(patched, monkeypatch):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", "qwen/qwen3.8-max-0902")
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen/qwen3.8-max-0902",
+                "choices": [
+                    {
+                        "message": {"content": GOLD["R1"], "reasoning": "thinking...", "reasoning_details": []},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await H3PromptRewriter(client, "k").rewrite(spec)
+    assert result.prompt == GOLD["R1"].strip()
+
+
+VIDEO_ONLY = ("one `[Shot N]` per detected source shot", "At MM:SS.mmm", "its own `<Subject N>`", "350–500 words")
+COMMON = ("(appears in [Shot", "Every provided media label appears in `subject_definitions`")
+
+
+@pytest.mark.asyncio
 async def test_ref2va_system_prompt_carries_the_perception_rules(patched):
     spec, facts = case("R1")
     patched(spec, facts)
     provider = Provider(GOLD["R1"])
     await run(provider, spec)
     system = provider.bodies[0]["messages"][0]["content"]
-    for phrase in (
-        "one `[Shot N]` per detected source shot",
-        "At MM:SS.mmm",
-        "its own `<Subject N>`",
-        "(appears in [Shot",
-        "350–500 words",
-        "Every provided media label appears in `subject_definitions`",
-    ):
+    for phrase in (*VIDEO_ONLY, *COMMON):
         assert phrase in system
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kinds", [("image", "image"), ("image", "audio")])
+async def test_video_only_rules_are_absent_without_a_reference_video(patched, kinds):
+    spec = ref_spec(*kinds, duration=8)
+    facts = RefFacts(audios=(afacts(),), audio_raw=(b"RIFFxxxxWAVE",)) if kinds[-1] == "audio" else RefFacts()
+    patched(spec, facts)
+    provider = Provider("not valid", "not valid")
+    with pytest.raises(RewriteError):
+        await run(provider, spec)
+    system = provider.bodies[0]["messages"][0]["content"]
+    added = system[len(h3_prompt.system_prompt()) :]  # the official skill text itself mentions timestamps
+    for phrase in VIDEO_ONLY:
+        assert phrase not in added
+    for phrase in (*COMMON, "`[Shot N]` markers numbered from 1", "200–750 words"):
+        assert phrase in added
+    assert "official six-section reference format" in system
+
+
+def test_repair_message_names_the_exact_missing_items():
+    message = h3_prompt._repair_message(("A: missing <Audio 1>", "B: 12 words"), ("<Picture 1>", "<Audio 1>"))
+    assert "- A: missing <Audio 1>" in message and "- B: 12 words" in message
+    assert "<Picture 1>, <Audio 1>" in message
 
 
 def test_completion_model_is_an_allow_list_check():
@@ -605,3 +711,164 @@ def _png() -> bytes:
     out = io.BytesIO()
     Image.new("RGB", (512, 512), "red").save(out, format="PNG")
     return out.getvalue()
+
+
+def test_completion_accepts_suffixed_ids_of_the_requested_model_and_rejects_mismatch():
+    from litellm.llms.causyn.h3_prompt import _Completion
+
+    base = {"choices": [{"message": {"content": "x"}, "finish_reason": "stop"}], "usage": {}}
+    ctx = {"requested": "qwen/qwen3.8-omni-flash"}
+    assert _Completion.model_validate({**base, "model": "qwen/qwen3.8-omni-flash:20261001"}, context=ctx)
+    with pytest.raises(ValidationError):
+        _Completion.model_validate({**base, "model": "qwen/qwen3.8-flash"}, context=ctx)
+
+
+@pytest.mark.asyncio
+async def test_returned_model_mismatch_is_a_retryable_fixed_phrase_error(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(GOLD["R1"], model="qwen/qwen3.8-max-0902")  # requested flash
+    with pytest.raises(RewriteError) as caught:
+        await run(provider, spec)
+    assert caught.value.status_code == 502 and caught.value.retryable is True
+    assert str(caught.value) == "H3 prompt rewrite provider returned an invalid response"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (b"RIFFxxxxWAVE", "wav"),
+        (b"ID3\x04\x00", "mp3"),
+        (b"\xff\xfb\x90\x00", "mp3"),  # MPEG-1 Layer III
+        (b"\xff\xf3\x90\x00", "mp3"),  # MPEG-2 Layer III
+        (b"\xff\xf1\x50\x80", None),  # AAC ADTS
+        (b"\xff\xf9\x50\x80", None),  # AAC ADTS
+        (b"\xff\xfd\x90\x00", None),  # Layer II
+        (b"OggS", None),
+    ],
+)
+def test_audio_format_detection(raw, expected):
+    assert h3_prompt._audio_format(raw) == expected
+
+
+def test_audio_over_the_budget_is_dropped_but_facts_remain():
+    spec = ref_spec("image", "audio", duration=8)
+    big = RefFacts(audios=(afacts(),), audio_raw=(b"RIFFxxxxWAVE" + b"0" * (12 * 1024 * 1024),))
+    content = spec.user_content(big, "qwen/qwen3.8-omni-flash")
+    assert "input_audio" not in [p["type"] for p in content]
+    assert any(p.get("text", "").startswith("<Audio 1>: ") for p in content)
+    small = RefFacts(audios=(afacts(),), audio_raw=(b"RIFFxxxxWAVE" + b"0" * 1000,))
+    assert "input_audio" in [p["type"] for p in spec.user_content(small, "qwen/qwen3.8-omni-flash")]
+
+
+# ----------------------------------------------------------------------------- cut / retention rules
+
+
+def test_cut_rule_matches_lowercase_at_and_second_precision():
+    spec, facts = case("R1")
+    for variant in ("at 00:03.583, the", "at 00:03.700, the"):
+        assert not cut_findings(mutate("R1", "At 00:03.583, the", variant), spec, facts), variant
+    assert cut_findings(mutate("R1", "At 00:03.583, the", "at 00:05, the"), spec, facts)
+    whole = RefFacts(videos=(vfacts(3.0),))  # cut at a whole second: MM:SS is enough
+    assert not cut_findings(mutate("R1", "At 00:03.583, the", "At 00:03, the"), spec, whole)
+    assert cut_findings(mutate("R1", "At 00:03.583, the", "At 00:04, the"), spec, whole)
+
+
+def test_retention_allows_wrapped_lines_but_needs_every_label():
+    spec, facts = case("R1")
+    validate_prompt(mutate("R1", "are retained; the blade", "are retained;\nthe blade"), spec, facts)
+    subject2 = next(line for line in GOLD["R1"].splitlines() if line.startswith("<Subject 2> (appears in"))
+    dropped = GOLD["R1"].replace(subject2 + "\n", "")
+    assert dropped != GOLD["R1"]
+    assert any(v.startswith(h3_prompt._V_RETENTION) and "<Subject 2>" in v for v in violations(dropped, spec, facts))
+    stray = GOLD["R1"].replace("retention_analysis:\n", "retention_analysis:\nstray text\n")
+    assert any(v.startswith(h3_prompt._V_RETENTION) for v in violations(stray, spec, facts))
+
+
+# ----------------------------------------------------------------------------- perception robustness
+
+
+@pytest.mark.asyncio
+async def test_perceive_degrades_on_corrupt_media_without_mocks():
+    raw = h3_media.PreparedRaw(videos=(b"not a video",), audios=(b"not audio",))
+    facts = await h3_prompt.perceive_media(ref_spec("image", "video", "audio"), raw)
+    assert facts.videos[0].cuts is None and facts.videos[0].keyframes == ()
+    assert facts.audios == (None,)
+    assert facts.audio_raw == (b"not audio",)
+
+
+@pytest.mark.asyncio
+async def test_perceive_degrades_when_the_inner_analysis_raises(monkeypatch):
+    def boom(*args, **kwargs):
+        raise RuntimeError("decoder crash")
+
+    monkeypatch.setattr(h3_prompt, "analyze_video", boom)
+    raw = h3_media.PreparedRaw(videos=(b"x", b"y"), audios=(b"z",))
+    facts = await h3_prompt.perceive_media(ref_spec("image", "video", "video", "audio"), raw)
+    assert facts.videos == (None, None) and facts.audios == (None,)
+
+
+@pytest.mark.asyncio
+async def test_perceive_with_an_exhausted_budget_returns_facts_without_cuts(monkeypatch):
+    monkeypatch.setattr(h3_prompt, "PERCEPTION_BUDGET_S", -1.0)
+    raw = h3_media.PreparedRaw(videos=(two_shot_clip(),), audios=())
+    facts = await h3_prompt.perceive_media(ref_spec("image", "video", duration=5), raw)
+    assert facts.videos[0] is not None and facts.videos[0].cuts is None and facts.videos[0].keyframes == ()
+
+
+@pytest.mark.asyncio
+async def test_perception_is_memoised_across_retries(monkeypatch):
+    calls = []
+    real = h3_prompt.analyze_video
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(h3_prompt, "analyze_video", counting)
+    spec = ref_spec("image", "video", duration=5)
+    clip = two_shot_clip()
+    first = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(clip,), audios=()))
+    second = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(bytes(clip),), audios=()))
+    assert first is second and len(calls) == 1
+    other = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"different",), audios=()))
+    assert other is not first and len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_memo_is_bounded_to_32_entries():
+    spec = ref_spec("image", "video", duration=5)
+    for n in range(40):
+        await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"v%d" % n,), audios=()))
+    assert len(h3_prompt._FACTS_MEMO) == 32
+
+
+@pytest.mark.asyncio
+async def test_retry_after_a_failed_repair_call_reuses_the_first_answer(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    calls: list[dict] = []
+    plan = iter([OLD["R1"], 503, GOLD["R1"]])
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        step = next(plan)
+        if step == 503:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen/qwen3.8-flash",
+                "choices": [{"message": {"content": step}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "k").rewrite(spec)
+        assert caught.value.retryable
+        result = await H3PromptRewriter(client, "k").rewrite(spec)
+    assert len(calls) == 3  # first, failed repair, retried repair: the first answer was not paid for twice
+    assert calls[2]["messages"][2] == {"role": "assistant", "content": OLD["R1"].strip()}
+    assert result.prompt == GOLD["R1"].strip()
