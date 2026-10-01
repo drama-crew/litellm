@@ -43,6 +43,9 @@ from litellm.proxy.video_endpoints.minimax_h3_models import (
 )
 
 MODEL = "qwen/qwen3.8-flash"
+# Default Ref2VA rewrite model (evaluated: omni needs fewer repairs, writes fuller descriptions and is the only one
+# that accepts audio at the same cost). Non-ref2va modes always use MODEL.
+REF2VA_DEFAULT_MODEL = "qwen/qwen3.8-omni-flash"
 # Ref2VA rewrite model allow-list with each model's input modalities. Audio is sent only to `omni`.
 REF2VA_MODEL_CAPS: dict[str, frozenset[str]] = {
     "qwen/qwen3.8-flash": frozenset({"text", "image", "video"}),
@@ -200,7 +203,7 @@ def ref2va_model() -> str:
     """Selected Ref2VA rewrite model. An env value outside the allow-list fails closed (never a silent fallback)."""
     chosen = os.getenv(REF2VA_MODEL_ENV, "").strip()
     if not chosen:
-        return MODEL
+        return REF2VA_DEFAULT_MODEL
     if chosen not in REF2VA_MODEL_CAPS:
         if chosen not in _warned_models:
             _warned_models.add(chosen)

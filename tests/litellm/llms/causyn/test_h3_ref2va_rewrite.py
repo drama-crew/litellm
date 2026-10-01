@@ -289,7 +289,7 @@ def test_non_ref2va_validation_is_unchanged():
 
 
 class Provider:
-    def __init__(self, *answers: str, model: str = "qwen/qwen3.8-flash") -> None:
+    def __init__(self, *answers: str, model: str | None = None) -> None:
         self.answers = list(answers)
         self.model = model
         self.bodies: list[dict] = []
@@ -301,7 +301,7 @@ class Provider:
         return httpx.Response(
             200,
             json={
-                "model": self.model,
+                "model": self.model or body["model"],
                 "choices": [{"message": {"content": answer}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110, "cost": 0.001},
             },
@@ -420,7 +420,7 @@ async def test_ref2va_user_content_has_facts_and_labelled_keyframes_without_raw_
     for label in labels:
         assert content[index[label] + 1]["type"] == "image_url"
     assert index[labels[0]] < index[labels[1]]
-    assert provider.bodies[0]["model"] == "qwen/qwen3.8-flash"
+    assert provider.bodies[0]["model"] == "qwen/qwen3.8-omni-flash"  # the ref2va default
 
 
 @pytest.mark.asyncio
@@ -465,13 +465,13 @@ def test_raw_video_needs_the_env_and_a_size_under_20_mb():
 async def test_audio_part_is_sent_only_to_the_omni_model(patched, monkeypatch):
     spec, facts = case("R4")
     patched(spec, facts)
-    monkeypatch.delenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", raising=False)
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", "qwen/qwen3.8-flash")
     flash = Provider(GOLD["R4"])
     await run(flash, spec)
     assert "input_audio" not in [p["type"] for p in parts(flash.bodies[0])]
     assert any("<Audio 1>: 15.00 s" in p.get("text", "") for p in parts(flash.bodies[0]))
 
-    monkeypatch.setenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", "qwen/qwen3.8-omni-flash")
+    monkeypatch.delenv("CAUSYN_H3_REF2VA_REWRITE_MODEL")  # unset: omni is the default and receives the audio
     omni = Provider(GOLD["R4"], model="qwen/qwen3.8-omni-flash")
     result = await run(omni, spec)
     assert omni.bodies[0]["model"] == "qwen/qwen3.8-omni-flash" and result.model == "qwen/qwen3.8-omni-flash"
@@ -852,13 +852,14 @@ async def test_retry_after_a_failed_repair_call_reuses_the_first_answer(patched)
 
     def handler(request):
         calls.append(json.loads(request.content))
+        body_model = calls[-1]["model"]
         step = next(plan)
         if step == 503:
             return httpx.Response(503)
         return httpx.Response(
             200,
             json={
-                "model": "qwen/qwen3.8-flash",
+                "model": body_model,
                 "choices": [{"message": {"content": step}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
             },
@@ -1016,6 +1017,7 @@ async def test_failed_repair_call_keeps_a_soft_only_first_answer(patched):
     answers = iter([soft_only_prompt()])
 
     def handler(request):
+        body_model = json.loads(request.content)["model"]
         try:
             text = next(answers)
         except StopIteration:
@@ -1023,7 +1025,7 @@ async def test_failed_repair_call_keeps_a_soft_only_first_answer(patched):
         return httpx.Response(
             200,
             json={
-                "model": "qwen/qwen3.8-flash",
+                "model": body_model,
                 "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
                 "usage": {},
             },
@@ -1079,6 +1081,7 @@ def scripted(plan):
 
     def handler(request):
         bodies.append(json.loads(request.content))
+        body_model = bodies[-1]["model"]
         step = next(steps)
         if step == "length":
             message = {"content": "The runner sprints. " * 50}
@@ -1088,7 +1091,7 @@ def scripted(plan):
         return httpx.Response(
             200,
             json={
-                "model": "qwen/qwen3.8-flash",
+                "model": body_model,
                 "choices": [{"message": message, "finish_reason": finish}],
                 "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
             },
