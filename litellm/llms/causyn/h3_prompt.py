@@ -9,6 +9,7 @@ import random
 import logging
 import re
 import time
+import weakref
 from contextvars import ContextVar
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -179,6 +180,8 @@ class RewriteError(Exception):
 class TruncatedRewriteError(RewriteError):
     """The provider cut the answer off at max_tokens. Permanent unless the one repair call can still produce it."""
 
+    usage: "RewriteUsage"
+
 
 @dataclass(frozen=True)
 class RefFacts:
@@ -224,7 +227,7 @@ def _audio_format(raw: bytes) -> Literal["wav", "mp3"] | None:
 _MEMO_SIZE = 32
 FACTS_MEMO_MAX_BYTES = 64 * 1024 * 1024
 _FACTS_MEMO: OrderedDict[str, RefFacts] = OrderedDict()
-_FIRST_ANSWERS: OrderedDict[str, str] = OrderedDict()
+_FIRST_ANSWERS: OrderedDict[str, tuple[str, RewriteUsage]] = OrderedDict()
 
 
 def _remember(store: OrderedDict, key: str, value: object) -> None:
@@ -271,19 +274,41 @@ def media_key(spec: ContextIRRequest, videos: tuple[bytes, ...], audios: tuple[b
     return digest.hexdigest()
 
 
-async def perceive_media(spec: ContextIRRequest, raw: object) -> RefFacts:
+_PERCEPTION_SLOTS = 2
+_semaphores: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore]" = weakref.WeakKeyDictionary()
+_warned_import = False
+
+
+def _perception_semaphore() -> asyncio.Semaphore:
+    """Process-wide cap on concurrent perception, created lazily per event loop (tests use one loop each)."""
+    loop = asyncio.get_running_loop()
+    semaphore = _semaphores.get(loop)
+    if semaphore is None:
+        semaphore = _semaphores[loop] = asyncio.Semaphore(_PERCEPTION_SLOTS)
+    return semaphore
+
+
+async def perceive_media(spec: ContextIRRequest, raw: object, key: str | None = None) -> RefFacts:
     """Perception for one request, memoised across durable-task retries (LRU of 32 entries and 64 MB of keyframes).
 
     A retry still re-fetches the media (the bytes are not cached) but skips the up to 20 s of CPU work. The cache never
-    holds audio bytes: they are re-attached from the current request. Any failure degrades to missing facts.
+    holds audio bytes: they are re-attached from the current request. Any failure degrades to missing facts. The work
+    runs as a shielded task, so if the attempt is cancelled mid-way the finished facts still land in the memo.
     """
     videos_raw: tuple[bytes, ...] = getattr(raw, "videos", ())
     audios_raw: tuple[bytes, ...] = getattr(raw, "audios", ())
-    key = media_key(spec, videos_raw, audios_raw)
+    if key is None:
+        key = await asyncio.to_thread(media_key, spec, videos_raw, audios_raw)
     cached = _FACTS_MEMO.get(key)
     if cached is None:
-        facts = await _perceive(videos_raw, audios_raw)
-        _remember_facts(key, replace(facts, audio_raw=()))
+
+        async def run() -> RefFacts:
+            async with _perception_semaphore():
+                facts = await _perceive(videos_raw, audios_raw)
+            _remember_facts(key, replace(facts, audio_raw=()))
+            return facts
+
+        facts = await asyncio.shield(asyncio.ensure_future(run()))
     else:
         _FACTS_MEMO.move_to_end(key)
         facts = cached
@@ -291,11 +316,22 @@ async def perceive_media(spec: ContextIRRequest, raw: object) -> RefFacts:
 
 
 async def _perceive(videos_raw: tuple[bytes, ...], audios_raw: tuple[bytes, ...]) -> RefFacts:
-
     def work() -> RefFacts:
+        global _warned_import
+        try:
+            import av  # noqa: F401
+            import numpy  # noqa: F401
+            from PIL import Image  # noqa: F401
+        except ImportError:
+            if not _warned_import:
+                _warned_import = True
+                _log.warning("Ref2VA perception is unavailable: a required imaging library is missing")
+            return RefFacts(videos=(None,) * len(videos_raw), audios=(None,) * len(audios_raw), audio_raw=audios_raw)
         deadline = time.monotonic() + PERCEPTION_BUDGET_S
         budget = keyframe_budget(len(videos_raw))
         videos = tuple(analyze_video(data, max_keyframes=budget, deadline=deadline) for data in videos_raw)
+        if any(video.cuts is None and not video.keyframes for video in videos):
+            _log.warning("Ref2VA perception produced no shot cuts and no keyframes for a reference video")
         audios: list[AudioFacts | None] = []
         for data in audios_raw:
             try:
@@ -307,9 +343,8 @@ async def _perceive(videos_raw: tuple[bytes, ...], audios_raw: tuple[bytes, ...]
     try:
         return await asyncio.to_thread(work)
     except Exception:  # noqa: BLE001
-        return RefFacts(
-            videos=(None,) * len(videos_raw), audios=(None,) * len(audios_raw), audio_raw=audios_raw
-        )
+        _log.warning("Ref2VA perception failed and was skipped")
+        return RefFacts(videos=(None,) * len(videos_raw), audios=(None,) * len(audios_raw), audio_raw=audios_raw)
 
 
 class ContextIRRequest(BaseModel):
@@ -562,7 +597,8 @@ def ref2va_violations(
         hard.append(f"{_V_SHOTS}: number [Shot N] sequentially from 1 in detailed_description")
     times = tuple(_seconds(*match.groups()) for match in _TIMESTAMP.finditer(description))
     if any(later <= earlier for earlier, later in zip(times, times[1:])) or any(t >= spec.duration for t in times):
-        hard.append(f"{_V_TIMES}: 'At MM:SS.mmm' must strictly increase and stay below {spec.duration}.000")
+        # Without a reference video there are no source timings to protect, so this is only a quality finding.
+        (hard if any(isinstance(item, VideoItem) for item in spec.content) else soft).append(f"{_V_TIMES}: 'At MM:SS.mmm' must strictly increase and stay below {spec.duration}.000")
     words = len(description.split())
     if not DESCRIPTION_WORDS[0] <= words <= DESCRIPTION_WORDS[1]:
         soft.append(f"{_V_WORDS}: it has {words}, aim for 350-500")
@@ -696,6 +732,13 @@ def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...]) -> str
     )
 
 
+def _remaining(started: float) -> float:
+    """Seconds left for provider calls: the attempt budget since `started`, capped by the attempt deadline."""
+    remaining = ATTEMPT_BUDGET_S - (time.monotonic() - started)
+    deadline = ATTEMPT_DEADLINE.get()
+    return remaining if deadline is None else min(remaining, deadline - time.monotonic())
+
+
 def _sum_usage(first: RewriteUsage, second: RewriteUsage) -> RewriteUsage:
     cost = None if first.cost is None and second.cost is None else (first.cost or 0.0) + (second.cost or 0.0)
     return RewriteUsage(
@@ -704,6 +747,13 @@ def _sum_usage(first: RewriteUsage, second: RewriteUsage) -> RewriteUsage:
         total_tokens=first.total_tokens + second.total_tokens,
         cost=cost,
     )
+
+
+def _reply_usage(response: httpx.Response) -> RewriteUsage:
+    try:
+        return RewriteUsage.model_validate(response.json().get("usage") or {})
+    except Exception:  # noqa: BLE001
+        return RewriteUsage()
 
 
 def _response_detail(response: httpx.Response) -> str:
@@ -775,23 +825,29 @@ class H3PromptRewriter:
             # (e.g. finish_reason=length) is permanent, as before.
             routing = any(error["loc"][:1] == ("model",) for error in exc.errors())
             truncated = any(error["loc"][:3] == ("choices", 0, "finish_reason") for error in exc.errors())
-            raise (TruncatedRewriteError if truncated else RewriteError)(
+            failure = (TruncatedRewriteError if truncated else RewriteError)(
                 "H3 prompt rewrite provider returned an invalid response",
                 502,
                 retryable=routing,
                 detail=_response_detail(response),
-            ) from exc
+            )
+            if truncated:
+                failure.usage = _reply_usage(response)  # type: ignore[attr-defined]
+            raise failure from exc
 
     async def rewrite(self, spec: ContextIRRequest) -> RewriteResult:
         if not self.api_key:
             raise RewriteError("H3 prompt rewrite is not configured", 503)
         from litellm.llms.causyn import h3_media
 
-        started = time.monotonic()
         ref2va = spec.mode == "ref2va"
         model = ref2va_model() if ref2va else MODEL  # a misconfigured model fails before any media is fetched
         prepared, raw = await h3_media.prepare_media_with_raw(self.client, spec)
-        facts = await perceive_media(prepared, raw) if ref2va else None
+        # One key per request (hashed off the event loop) serves both the facts memo and the first-answer cache.
+        key = await asyncio.to_thread(media_key, spec, raw.videos, raw.audios) if ref2va else ""
+        facts = await perceive_media(prepared, raw, key) if ref2va else None
+        # The provider clock starts once fetch and perception are done; the attempt deadline still bounds it.
+        started = time.monotonic()
         system = system_prompt() + (
             "\nFor the current Ref2VA request, the official six-section reference format replaces the application's three-field format. "
             "Use subject_definitions, summary, retention_analysis, detailed_description, overall_soundscape, non_diegetic_music. "
@@ -810,20 +866,20 @@ class H3PromptRewriter:
             {"role": "user", "content": user},
         ]
         # A retry after a retryable failure of the repair call reuses the first answer instead of paying for it again.
-        answer_key = media_key(spec, raw.videos, raw.audios) + model if ref2va else ""
+        answer_key = key + model if ref2va else ""
         cached_answer = _FIRST_ANSWERS.get(answer_key) if ref2va else None
         truncated = False
         if cached_answer is not None:
-            prompt, usage = cached_answer, RewriteUsage()
+            prompt, usage = cached_answer
         else:
             try:
-                completed = await self._complete(model, messages, ATTEMPT_BUDGET_S, ref2va)
+                completed = await self._complete(model, messages, max(5.0, _remaining(started)), ref2va)
                 prompt = completed.choices[0].message.content.strip()
                 usage = completed.usage
-            except TruncatedRewriteError:
+            except TruncatedRewriteError as cut:
                 if not ref2va:
                     raise
-                prompt, usage, truncated = "", RewriteUsage(), True
+                prompt, usage, truncated = "", cut.usage, True
         keep_first_answer = False
         soft: list[str] = []
         hard_failure: RewriteError | None = None
@@ -847,10 +903,7 @@ class H3PromptRewriter:
         try:
             if truncated:
                 # The cut-off text is not echoed back (it may be huge or looping): ask again, concisely.
-                remaining = ATTEMPT_BUDGET_S - (time.monotonic() - started)
-                deadline = ATTEMPT_DEADLINE.get()
-                if deadline is not None:
-                    remaining = min(remaining, deadline - time.monotonic())
+                remaining = _remaining(started)
                 if remaining < MIN_REPAIR_BUDGET_S:
                     raise TruncatedRewriteError(
                         "H3 prompt rewrite provider returned an invalid response", 502, retryable=False
@@ -860,21 +913,18 @@ class H3PromptRewriter:
                 again_soft: list[str] = []
                 again_prompt = again.choices[0].message.content.strip()
                 validate_prompt(again_prompt, spec, facts, soft=again_soft)
-                return result(again_prompt, again.usage, again_soft)
+                return result(again_prompt, _sum_usage(usage, again.usage), again_soft)
             if not ref2va or (hard_failure is None and not soft):
                 if hard_failure is not None:
                     raise hard_failure
                 return result(prompt, usage, [])
-            remaining = ATTEMPT_BUDGET_S - (time.monotonic() - started)
-            deadline = ATTEMPT_DEADLINE.get()
-            if deadline is not None:
-                remaining = min(remaining, deadline - time.monotonic())
+            remaining = _remaining(started)
             if remaining < MIN_REPAIR_BUDGET_S:
                 if hard_failure is not None:
                     raise hard_failure
                 return result(prompt, usage, soft)  # soft-only first answer is acceptable as is
             listed = (hard_failure.violations or (str(hard_failure),)) if hard_failure is not None else tuple(soft)
-            _remember(_FIRST_ANSWERS, answer_key, prompt)
+            _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
             messages += [
                 {"role": "assistant", "content": prompt},
                 {"role": "user", "content": _repair_message(listed, _provided_labels(spec))},

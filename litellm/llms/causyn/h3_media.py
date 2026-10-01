@@ -17,6 +17,7 @@ from litellm.llms.causyn.h3_prompt import (
     RETRYABLE_STATUS_CODES,
     ContextIRRequest,
     RewriteError,
+    send_video_enabled,
 )
 from litellm.proxy.video_endpoints.minimax_h3_models import AudioItem, ImageItem, MediaURL, VideoItem
 
@@ -143,7 +144,11 @@ class PreparedRaw(NamedTuple):
 
 
 async def prepare_reference(
-    client: httpx.AsyncClient, item: ImageItem | VideoItem, limits: VideoLimits, image_max_side: int = 1024
+    client: httpx.AsyncClient,
+    item: ImageItem | VideoItem,
+    limits: VideoLimits,
+    image_max_side: int = 1024,
+    build_video_url: bool = True,
 ) -> tuple[ImageItem | VideoItem, float, bytes]:
     if isinstance(item, ImageItem):
         raw = await fetch_media(client, item.image_url.url, 30 * 1024 * 1024)
@@ -151,6 +156,8 @@ async def prepare_reference(
         return item.model_copy(update={"image_url": MediaURL(url=url)}), 0.0, b""
     raw = await fetch_media(client, item.video_url.url, 50 * 1024 * 1024)
     duration = await asyncio.to_thread(inspect_video, raw, limits)
+    if not build_video_url:  # Ref2VA sends the raw video only when opted in; keep the bytes for perception alone
+        return item, duration, raw
     url = "data:video/mp4;base64," + base64.b64encode(raw).decode("ascii")
     return item.model_copy(update={"video_url": MediaURL(url=url)}), duration, raw
 
@@ -167,13 +174,14 @@ async def prepare_media(client: httpx.AsyncClient, spec: ContextIRRequest) -> Co
 
 async def prepare_media_with_raw(client: httpx.AsyncClient, spec: ContextIRRequest) -> tuple[ContextIRRequest, PreparedRaw]:
     limits = CAUSYN_VIDEO_LIMITS if spec.model == AUTH_MODEL else BASE_VIDEO_LIMITS
+    build_video_url = spec.mode != "ref2va" or send_video_enabled()
     image_count = sum(isinstance(item, ImageItem) for item in spec.content)
     image_max_side = MANY_IMAGES_MAX_SIDE if image_count > MANY_IMAGES_THRESHOLD else 1024
     try:
         async with asyncio.timeout(60):
             prepared = tuple(
                 [
-                    await prepare_reference(client, item, limits, image_max_side)
+                    await prepare_reference(client, item, limits, image_max_side, build_video_url)
                     if isinstance(item, (ImageItem, VideoItem))
                     else await prepare_audio(client, item)
                     if isinstance(item, AudioItem)

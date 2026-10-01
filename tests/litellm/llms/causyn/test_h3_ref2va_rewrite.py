@@ -17,6 +17,7 @@ from litellm.llms.causyn.h3_prompt import (
     RewriteError,
     validate_prompt,
 )
+from litellm.proxy.video_endpoints.minimax_h3_models import MediaURL
 from litellm.llms.causyn.ref_media_facts import AudioFacts, Keyframe, VideoFacts
 
 DATA = Path(__file__).parent / "data"
@@ -313,7 +314,7 @@ def patched(monkeypatch):
         async def prepare(client, request):
             return request, h3_media.PreparedRaw(videos=(b"v",) * len(facts.videos), audios=tuple(facts.audio_raw))
 
-        async def perceive(request, raw):
+        async def perceive(request, raw, key=None):
             return facts
 
         monkeypatch.setattr(h3_media, "prepare_media_with_raw", prepare)
@@ -869,6 +870,7 @@ async def test_retry_after_a_failed_repair_call_reuses_the_first_answer(patched)
         assert caught.value.retryable
         result = await H3PromptRewriter(client, "k").rewrite(spec)
     assert len(calls) == 3  # first, failed repair, retried repair: the first answer was not paid for twice
+    assert result.usage.prompt_tokens == 10  # the first answer's 5 tokens are still reported on the retry
     assert calls[2]["messages"][2] == {"role": "assistant", "content": OLD["R1"].strip()}
     assert result.prompt == GOLD["R1"].strip()
 
@@ -1136,3 +1138,114 @@ async def test_non_ref2va_truncation_is_still_permanent_without_repair():
             await H3PromptRewriter(client, "k").rewrite(spec)
     assert len(bodies) == 1 and caught.value.retryable is False
     assert bodies[0]["max_tokens"] == 4096 and bodies[0]["reasoning"] == {"enabled": False}
+
+
+# ----------------------------------------------------------------------------- final-review fixes
+
+
+@pytest.mark.asyncio
+async def test_missing_imaging_library_logs_one_warning_per_process(monkeypatch, caplog):
+    monkeypatch.setattr(h3_prompt, "_warned_import", False)
+    monkeypatch.setitem(__import__("sys").modules, "numpy", None)  # `import numpy` now raises ImportError
+    spec = ref_spec("image", "video", duration=5)
+    with caplog.at_level("WARNING"):
+        for n in range(3):
+            facts = await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"v%d" % n,), audios=()))
+            assert facts.videos == (None,)
+    assert sum("imaging library is missing" in r.message for r in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_empty_perception_of_a_fetched_video_logs_a_warning(caplog):
+    spec = ref_spec("image", "video", duration=5)
+    with caplog.at_level("WARNING"):
+        await h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"corrupt",), audios=()))
+    assert any("no shot cuts and no keyframes" in r.message for r in caplog.records)
+    assert all("corrupt" not in r.message and "http" not in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_perception_concurrency_is_capped_at_two(monkeypatch):
+    import asyncio
+
+    running = peak = 0
+
+    async def slow(videos, audios):
+        nonlocal running, peak
+        running += 1
+        peak = max(peak, running)
+        await asyncio.sleep(0.05)
+        running -= 1
+        return RefFacts(videos=(None,) * len(videos))
+
+    monkeypatch.setattr(h3_prompt, "_perceive", slow)
+    spec = ref_spec("image", "video", duration=5)
+    await asyncio.gather(
+        *[h3_prompt.perceive_media(spec, h3_media.PreparedRaw(videos=(b"c%d" % n,), audios=())) for n in range(6)]
+    )
+    assert peak == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_attempt_still_fills_the_memo(monkeypatch):
+    import asyncio
+
+    async def slow(videos, audios):
+        await asyncio.sleep(0.1)
+        return RefFacts(videos=(vfacts(2.0),))
+
+    monkeypatch.setattr(h3_prompt, "_perceive", slow)
+    spec = ref_spec("image", "video", duration=5)
+    raw = h3_media.PreparedRaw(videos=(b"late",), audios=())
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.02):
+            await h3_prompt.perceive_media(spec, raw)
+    await asyncio.sleep(0.2)
+    assert len(h3_prompt._FACTS_MEMO) == 1
+
+
+@pytest.mark.asyncio
+async def test_ref2va_does_not_build_a_video_data_url_unless_send_video(monkeypatch):
+    import asyncio
+
+    clip = base64.b64encode(two_shot_clip()).decode()
+    original = "data:video/quicktime;base64," + clip  # a rebuilt URL would say video/mp4
+    spec = ref_spec("image", "video", duration=5)
+    image = spec.content[1].model_copy(update={"image_url": MediaURL(url="data:image/png;base64," + base64.b64encode(_png()).decode())})
+    video = spec.content[2].model_copy(update={"video_url": MediaURL(url=original)})
+    spec = spec.model_copy(update={"content": (spec.content[0], image, video)})
+    async with httpx.AsyncClient() as client:
+        prepared, raw = await h3_media.prepare_media_with_raw(client, spec)
+        assert prepared.content[2].video_url.url == original and raw.videos[0]
+        monkeypatch.setenv("CAUSYN_H3_REWRITE_SEND_VIDEO", "1")
+        prepared, _ = await h3_media.prepare_media_with_raw(client, spec)
+        assert prepared.content[2].video_url.url.startswith("data:video/mp4;base64,")
+
+
+def test_timestamp_rule_is_hard_only_with_a_reference_video():
+    bad = "[Shot 1] A. At 00:04.000 x At 00:02.000 y"
+    desc = " ".join(["She walks along the quiet street while the camera follows."] * 25)
+    prompt = (
+        "subject_definitions:\n<Subject 1> is the woman from <Picture 1>.\n\n"
+        "summary:\n[reference generation] A woman walks.\n\n"
+        "retention_analysis:\n<Subject 1> (appears in [Shot 1]): kept from <Picture 1>.\n\n"
+        f"detailed_description:\n[Shot 1] {desc} At 00:04.000 then At 00:02.000.\n\n"
+        "overall_soundscape:\nSteps.\n\nnon_diegetic_music:\nN/A"
+    )
+    image_only = ref_spec("image", duration=8)
+    hard, soft = h3_prompt.ref2va_violations(prompt, image_only, None)
+    assert hard == [] and any(v.startswith(h3_prompt._V_TIMES) for v in soft)
+    validate_prompt(prompt, image_only, None, soft=[])
+    with_video = ref_spec("image", "video", duration=8)
+    hard, _ = h3_prompt.ref2va_violations(prompt, with_video, RefFacts(videos=(vfacts(None),)))
+    assert any(v.startswith(h3_prompt._V_TIMES) for v in hard)
+
+
+@pytest.mark.asyncio
+async def test_usage_of_truncated_and_reused_first_answers_is_reported(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    handler, bodies = scripted(["length", GOLD["R1"]])  # each call reports 7 prompt / 3 completion tokens
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await H3PromptRewriter(client, "k").rewrite(spec)
+    assert result.usage.prompt_tokens == 14 and result.usage.completion_tokens == 6

@@ -131,7 +131,7 @@ def test_ir_endpoint_applies_the_direct_limits(stack, kinds, extra, message):
     assert not state["platform"]
 
 
-def test_ir_endpoint_accepts_video_and_audio_without_direct_prompt_processing(stack, monkeypatch):
+def test_ir_endpoint_forwards_video_and_audio_to_moderation_as_a_non_direct_request(stack, monkeypatch):
     client, _, state = stack
     seen = []
 
@@ -143,7 +143,8 @@ def test_ir_endpoint_accepts_video_and_audio_without_direct_prompt_processing(st
     assert response.status_code == 200, response.text
     assert [r["media_type"] for r in seen[0]["references"]] == ["image", "video", "audio"]
     sent = state["platform"][-1][1]["payload"]
-    assert "prompt_processing" not in sent, "the IR prefix must be rewritten, not direct"
+    # What moderation sees is non-direct; the render request still gets prompt_processing=direct after the rewrite.
+    assert "prompt_processing" not in sent
     assert [r["media_type"] for r in sent["references"]] == ["image", "video", "audio"]
 
 
@@ -180,4 +181,14 @@ def test_submit_policy_rejects_short_inline_video(stack, monkeypatch):
     response = client.post(DIRECT, json=data, headers=HEADERS)
     assert response.status_code == 400, response.text
     assert "reference video 1" in response.json()["error"]["message"]
+    assert not state["platform"]
+
+
+def test_standalone_context_ir_still_rejects_reference_audio(stack):
+    client, _, state = stack
+    data = payload("image", "audio")
+    data.pop("resolution")  # the standalone contract has no resolution field
+    response = client.post("/video/minimax-h3/v2/h3_context_ir", json=data, headers=HEADERS)
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["message"] == "Reference audio is not supported by this Context IR service"
     assert not state["platform"]
