@@ -48,22 +48,35 @@ def test_direct_accepts(kinds):
     assert MiniMaxH3DirectCreate.model_validate(payload(*kinds))
 
 
+REJECTS = [
+    (("audio",), {}, "reference audio requires at least one reference image or video"),
+    (("audio",) * 3, {}, "reference audio requires at least one reference image or video"),
+    (("video",) * 4, {}, "reference count exceeds 9 images, 3 videos or 3 audio clips"),
+    (("video", "audio") + ("audio",) * 3, {}, "reference count exceeds 9 images, 3 videos or 3 audio clips"),
+    (("image",) * 10, {}, "reference count exceeds 9 images, 3 videos or 3 audio clips"),
+    (("image",) * 9 + ("video",) * 3 + ("audio",), {}, "at most 12 reference items are allowed"),
+    (("video",), {"ratio": "adaptive"}, "reference media requires an explicit ratio"),
+    (("audio", "image"), {"ratio": "adaptive"}, "reference media requires an explicit ratio"),
+]
+
+
+@pytest.mark.parametrize("kinds,extra,message", REJECTS)
+def test_direct_rejects(kinds, extra, message):
+    with pytest.raises(ValueError) as caught:
+        MiniMaxH3DirectCreate.model_validate(payload(*kinds, **extra))
+    assert caught.value.errors()[0]["msg"] == "Value error, " + message
+
+
 @pytest.mark.parametrize(
     "kinds,extra,message",
-    [
-        (("audio",), {}, "audio"),
-        (("audio",) * 3, {}, "audio"),
-        (("video",) * 4, {}, "reference count"),
-        (("video", "audio") + ("audio",) * 3, {}, "reference count"),
-        (("image",) * 10, {}, "reference count"),
-        (("image",) * 9 + ("video",) * 3 + ("audio",), {}, "12"),
-        (("video",), {"ratio": "adaptive"}, "explicit"),
-        (("audio", "image"), {"ratio": "adaptive"}, "explicit"),
-    ],
+    [r for r in REJECTS if r[0] in (("audio",), ("video",) * 4) or r[1]],
 )
-def test_direct_rejects(kinds, extra, message):
-    with pytest.raises(ValueError, match=message):
-        MiniMaxH3DirectCreate.model_validate(payload(*kinds, **extra))
+def test_direct_endpoint_rejections(stack, kinds, extra, message):
+    client, _, state = stack
+    response = client.post(DIRECT, json=payload(*kinds, **extra), headers=HEADERS)
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Value error, " + message
+    assert not state["platform"]
 
 
 def test_direct_rejects_video_mixed_with_first_frame():
@@ -71,8 +84,9 @@ def test_direct_rejects_video_mixed_with_first_frame():
     data["content"].append(
         {"type": "image_url", "image_url": {"url": "https://media.example/f.png"}, "role": "first_frame"}
     )
-    with pytest.raises(ValueError, match="cannot be mixed"):
+    with pytest.raises(ValueError) as caught:
         MiniMaxH3DirectCreate.model_validate(data)
+    assert caught.value.errors()[0]["msg"] == "Value error, first/last frames and reference media cannot be mixed"
 
 
 @pytest.mark.parametrize("kinds", [("video",), ("audio", "image"), ("image", "video", "audio")])
@@ -100,9 +114,24 @@ def test_image_only_body_unchanged_on_direct():
     assert [r["media_type"] for r in body["references"]] == ["image", "image"]
 
 
-def test_ir_prefix_rejects_video_with_400_and_exact_message(stack):
+def _ir_cases():
+    keyframe = {"type": "image_url", "image_url": {"url": "https://media.example/f.png"}, "role": "first_frame"}
+    with_frame = payload("video")
+    with_frame["content"].append(keyframe)
+    return [
+        payload("image", "video"),
+        payload("audio", "image"),
+        payload(*("video",) * 4),
+        payload(*("audio",) * 4),
+        with_frame,
+        payload("video", ratio="adaptive"),
+    ]
+
+
+@pytest.mark.parametrize("data", _ir_cases())
+def test_ir_prefix_rejects_video_with_400_and_exact_message(stack, data):
     client, _, state = stack
-    response = client.post(IR, json=payload("image", "video"), headers=HEADERS)
+    response = client.post(IR, json=data, headers=HEADERS)
     assert response.status_code == 400
     assert response.json()["error"]["message"] == IR_MESSAGE
     assert not state["platform"]
@@ -127,9 +156,6 @@ def test_direct_prefix_routes_video_audio_with_direct_prompt_processing(stack, m
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required")
 def test_submit_policy_rejects_short_inline_video(stack, monkeypatch):
     client, _, state = stack
-
-    async def no_upload(*args, **kwargs):
-        return "private://x"
 
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "short.mp4"

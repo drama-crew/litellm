@@ -175,6 +175,14 @@ async def prepare_request(request: Request) -> None:
             _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
         else:
             is_direct = request.url.path == DIRECT_PREFIX + "/v2/video_generation"
+            if not is_direct:
+                # Structural gate, ahead of every other rule: any video/audio item on the IR prefix gets this one message.
+                parsed = json.loads(raw)
+                items = parsed.get("content") if isinstance(parsed, dict) else None
+                if isinstance(items, list) and any(
+                    isinstance(item, dict) and item.get("type") in ("video_url", "audio_url") for item in items
+                ):
+                    raise H3Error(400, IR_PREFIX_MEDIA_MESSAGE)
             spec = (MiniMaxH3DirectCreate if is_direct else MiniMaxH3Create).model_validate_json(raw)
             request.scope["minimax_h3_spec"] = spec
             body = spec.internal_body()
@@ -210,11 +218,7 @@ class MiniMaxH3Route(APIRoute):
             except ValidationError as exc:
                 return error_response(
                     400,
-                    "; ".join(
-                        # The IR-prefix restriction is a documented, exact message: no pydantic "Value error, " prefix.
-                        IR_PREFIX_MEDIA_MESSAGE if item["msg"].endswith(IR_PREFIX_MEDIA_MESSAGE) else item["msg"]
-                        for item in exc.errors(include_input=False, include_url=False)
-                    ),
+                    "; ".join(item["msg"] for item in exc.errors(include_input=False, include_url=False)),
                 )
             except ProxyException as exc:
                 try:
