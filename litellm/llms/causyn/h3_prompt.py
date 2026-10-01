@@ -555,6 +555,15 @@ _V_SHOTS = "The rewritten H3 prompt has invalid shot numbering"
 _V_TIMES = "The rewritten H3 prompt has invalid shot timestamps"
 _V_WORDS = "The rewritten H3 prompt detailed_description must have 200 to 750 words"
 _V_RETENTION = "The rewritten H3 prompt retention_analysis lines must start with a defined label"
+_V_REPLACE = (
+    "The rewritten H3 prompt replacement subject must take its appearance from the reference image, "
+    "not the source performer"
+)
+_SOURCE_ATTIRE = re.compile(
+    r"(?:original|source)(?: video)?(?:'s|’s)? (?:attire|clothing|clothes|outfit)|to match the original|"
+    r"same (?:attire|clothing|clothes|outfit) as the (?:original|source)",
+    re.IGNORECASE,
+)
 _V_CUTS = "The rewritten H3 prompt does not mirror the source video's shot cuts"
 
 
@@ -632,7 +641,29 @@ def ref2va_violations(
     elif unmentioned:
         soft.append(f"{_V_RETENTION}: add a retention line for {', '.join(unmentioned)}")
     hard.extend(_cut_violations(spec, facts, sections, description))
+    soft.extend(_replacement_violations(spec, sections))
     return hard, soft
+
+
+def _replacement_violations(spec: ContextIRRequest, sections: dict[str, str]) -> list[str]:
+    """Conservative phrase checks for a person swap in a video edit; no semantics, soft only."""
+    if not (
+        any(isinstance(item, VideoItem) for item in spec.content)
+        and any(isinstance(item, ImageItem) for item in spec.content)
+    ):
+        return []
+    summary = sections["summary"].lower()
+    if "video editing" not in summary or not re.search(r"replac|swap", summary):
+        return []
+    weak = any(
+        re.match(r"<Video \d+>", line.strip()) and "weak_reference" in line
+        for line in sections["retention_analysis"].splitlines()
+    )
+    attire = _SOURCE_ATTIRE.search(sections["subject_definitions"])
+    if not weak and not attire:
+        return []
+    detail = "source <Video N> must be fully_preserved" if weak else "do not match the source performer's attire"
+    return [f"{_V_REPLACE}: {detail}"]
 
 
 def _cut_violations(
@@ -694,7 +725,17 @@ def validate_prompt(
             raise RewriteError(found_soft[0].split(": ", 1)[0], violations=tuple(found_soft))
 
 
-def ref2va_addendum(has_video: bool, has_audio: bool) -> str:
+REPLACEMENT_APPEARANCE_RULE = (
+    "When the request replaces a person or subject in a source video with a subject from a reference image, the "
+    "replacement's entire visible appearance — face, hair, body, clothing, footwear and accessories — comes from the "
+    "reference image. Keep the source performer's clothing only if the user explicitly asks for it. Never describe the "
+    "replaced performer's clothing, colours or accessories on the new subject. The source video supplies only motion, "
+    "timing, camera and environment. In a [video editing] task the source `<Video N>` keeps its structural role: mark "
+    "it fully_preserved (or partially_preserved when the user changes the structure), never weak_reference."
+)
+
+
+def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False) -> str:
     """Perception rules appended to the Ref2VA system text; the video-only parts apply only with a reference video."""
     parts = []
     if has_video or has_audio:
@@ -710,6 +751,8 @@ def ref2va_addendum(has_video: bool, has_audio: bool) -> str:
             "Define the environment as its own `<Subject N>`. "
             "`detailed_description` should be 350–500 words."
         )
+        if has_image:
+            parts.append(REPLACEMENT_APPEARANCE_RULE)
     else:
         parts.append("`detailed_description` uses `[Shot N]` markers numbered from 1 and has 200–750 words.")
     parts.append(
@@ -859,6 +902,7 @@ class H3PromptRewriter:
             + ref2va_addendum(
                 any(isinstance(item, VideoItem) for item in spec.content),
                 any(isinstance(item, AudioItem) for item in spec.content),
+                any(isinstance(item, ImageItem) for item in spec.content),
             )
             if ref2va
             else ""

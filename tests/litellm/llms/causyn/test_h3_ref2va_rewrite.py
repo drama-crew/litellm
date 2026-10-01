@@ -1252,3 +1252,82 @@ async def test_usage_of_truncated_and_reused_first_answers_is_reported(patched):
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await H3PromptRewriter(client, "k").rewrite(spec)
     assert result.usage.prompt_tokens == 14 and result.usage.completion_tokens == 6
+
+
+# ----------------------------------------------------------------------------- replacement appearance
+
+
+ZH_PROMPT = "把视频里跑酷的人换成图1里的女人，动作、镜头和场景都保持不变，她不拿武器。"
+RULE_PHRASE = "entire visible appearance"
+
+
+def bad_replacement_prompt() -> str:
+    """Gold R1 with the observed regression: source attire transferred and the edit source marked weak_reference."""
+    text = mutate("R1", "<Subject 1> is the woman whose appearance comes from <Picture 1>", "<Subject 1> is the woman from <Picture 1>")
+    text = text.replace(
+        "The short blade she holds in <Picture 1> is not carried in the target video.",
+        "She wears a light grey hooded sweatshirt, dark trousers, and sneakers to match the original video's attire.",
+        1,
+    )
+    video_line = next(l for l in text.splitlines() if l.startswith("<Video 1> (camera"))
+    return text.replace(video_line, "<Video 1>: weak_reference - only the motion is used.")
+
+
+def replacement_findings(prompt, spec, facts):
+    hard, soft = h3_prompt.ref2va_violations(prompt, spec, facts)
+    return [v for v in soft if v.startswith(h3_prompt._V_REPLACE)]
+
+
+def test_addendum_has_the_replacement_rule_only_with_video_and_image():
+    add = h3_prompt.ref2va_addendum
+    assert RULE_PHRASE in add(True, False, True) and "never weak_reference" in add(True, False, True)
+    assert RULE_PHRASE not in add(True, False, False)  # video only
+    assert RULE_PHRASE not in add(False, False, True)  # image only
+    assert RULE_PHRASE not in add(False, True, True)  # image + audio
+    assert RULE_PHRASE not in add(True, True)
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_carries_the_rule_for_a_video_edit_request(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(GOLD["R1"])
+    await run(provider, spec)
+    assert RULE_PHRASE in provider.bodies[0]["messages"][0]["content"]
+
+
+def test_soft_check_flags_the_observed_bad_text():
+    spec, facts = case("R1")
+    found = replacement_findings(bad_replacement_prompt(), spec, facts)
+    assert len(found) == 1 and "reference image" in found[0]
+    # each trigger alone is enough
+    only_attire = mutate("R1", "The short blade she holds", "She wears it to match the original video's attire. The short blade she holds")
+    assert replacement_findings(only_attire, spec, facts)
+    video_line = next(l for l in GOLD["R1"].splitlines() if l.startswith("<Video 1> (camera"))
+    assert replacement_findings(GOLD["R1"].replace(video_line, "<Video 1>: weak_reference - motion."), spec, facts)
+    # it is soft: validate_prompt with a sink accepts it, without a sink it raises with this phrase first
+    sink: list[str] = []
+    h3_prompt.validate_prompt(bad_replacement_prompt(), spec, facts, soft=sink)
+    assert any(v.startswith(h3_prompt._V_REPLACE) for v in sink)
+
+
+@pytest.mark.parametrize("name", ["R1", "R2", "R3", "R4"])
+def test_soft_check_does_not_fire_on_the_gold_prompts(name):
+    spec, facts = case(name)
+    assert replacement_findings(GOLD[name], spec, facts) == []
+
+
+def test_soft_check_ignores_non_edit_or_non_replacement_summaries():
+    spec, facts = case("R1")
+    no_edit = bad_replacement_prompt().replace("[video editing + reference generation]", "[reference generation]")
+    assert replacement_findings(no_edit, spec, facts) == []
+    image_only = ref_spec("image", duration=8)
+    assert replacement_findings(bad_replacement_prompt(), image_only, None) == []
+
+
+def test_observed_chinese_request_with_the_bad_rewrite_is_flagged():
+    base, facts = case("R1")
+    spec = base.model_copy(update={"content": (base.content[0].model_copy(update={"text": ZH_PROMPT}), *base.content[1:])})
+    assert spec.prompt == ZH_PROMPT
+    assert replacement_findings(bad_replacement_prompt(), spec, facts)
+    assert replacement_findings(GOLD["R1"], spec, facts) == []
