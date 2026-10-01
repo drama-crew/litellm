@@ -214,3 +214,58 @@ def test_real_reference_video() -> None:
     assert f.cuts is not None and len(f.cuts) == 1
     assert abs(f.cuts[0] - 3.583) <= 0.1
     assert 0 < len(f.keyframes) <= 8
+
+
+def test_audio_capped_at_16s_but_reports_metadata_duration() -> None:
+    sr = 8000
+    t = np.arange(sr * 40) / sr
+    f = rmf.analyze_audio(_wav_like(0.5 * np.sin(2 * np.pi * 440 * t), sr))
+    assert len(f.loudness_db) == 32  # 16 s of 0.5 s buckets
+    assert abs(f.duration - 40.0) < 0.1
+
+
+def test_audio_error_message_is_fixed() -> None:
+    with pytest.raises(rmf.MediaFactsError) as ei:
+        rmf.analyze_audio(b"garbage" * 100)
+    assert str(ei.value) == "cannot decode audio"
+
+
+def test_audio_deadline_exceeded_raises() -> None:
+    sr = 8000
+    raw = _wav_like(np.zeros(sr * 4), sr)
+    with pytest.raises(rmf.MediaFactsError):
+        rmf.analyze_audio(raw, deadline=time.monotonic() - 1)
+
+
+def test_default_budget_expires_during_decode(monkeypatch: pytest.MonkeyPatch) -> None:
+    raw = _two_shot(seconds=4.0)
+    real = time.monotonic
+    state = {"calls": 0}
+
+    def fake() -> float:
+        state["calls"] += 1
+        return real() + (0 if state["calls"] < 30 else 1000)  # budget set at call 1, blown mid-decode
+
+    monkeypatch.setattr(rmf.time, "monotonic", fake)
+    f = rmf.analyze_video(raw)
+    assert f.cuts is None and f.keyframes == ()
+    assert f.duration > 0
+
+
+def test_large_frames_are_sampled_sparsely(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict = {}
+    real = rmf._detect_cuts
+
+    def spy(raw, fps, duration, deadline, sample_fps=48.0, threaded=True):
+        seen.update(sample_fps=sample_fps, threaded=threaded)
+        return real(raw, fps, duration, deadline, sample_fps, threaded)
+
+    monkeypatch.setattr(rmf, "_detect_cuts", spy)
+    f = rmf.analyze_video(_two_shot())
+    assert seen == {"sample_fps": 48.0, "threaded": True}
+    monkeypatch.setattr(rmf, "LARGE_FRAME_PIXELS", 1000)
+    monkeypatch.setattr(rmf, "LARGE_SAMPLE_FPS", 6.0)
+    f = rmf.analyze_video(_two_shot())
+    assert seen == {"sample_fps": 6.0, "threaded": False}
+    assert f.cuts is not None and len(f.cuts) == 1 and abs(f.cuts[0] - 2.0) <= 0.25
+    assert f.keyframes and {k.shot for k in f.keyframes} == {1, 2}

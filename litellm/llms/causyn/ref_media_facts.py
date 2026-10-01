@@ -15,6 +15,10 @@ from dataclasses import dataclass
 from statistics import median
 
 MAX_SAMPLE_FPS = 48.0
+LARGE_FRAME_PIXELS = 8_294_400  # 4K; larger frames are sampled sparsely and decoded single-threaded
+LARGE_SAMPLE_FPS = 12.0
+DEFAULT_BUDGET_SECONDS = 20.0
+AUDIO_MAX_SECONDS = 16.0
 PROXY_SIZE = (64, 36)
 CUT_MIN_SCORE = 0.12
 CUT_MEDIAN_FACTOR = 4.0
@@ -89,17 +93,20 @@ def _open_video(raw: bytes):
     return av.open(io.BytesIO(raw), mode="r", format="mov", options={"enable_drefs": "0"})
 
 
-def _detect_cuts(raw: bytes, fps: float, duration: float, deadline: float | None) -> tuple[float, ...] | None:
+def _detect_cuts(
+    raw: bytes, fps: float, duration: float, deadline: float | None, sample_fps: float = MAX_SAMPLE_FPS, threaded: bool = True
+) -> tuple[float, ...] | None:
     import numpy as np
 
     times: list[float] = []
     scores: list[float] = []
     prev = None
     last_t = -1e9
-    min_dt = 1.0 / MAX_SAMPLE_FPS - 1e-4
+    min_dt = 1.0 / sample_fps - 1e-4
     with _open_video(raw) as c:
         stream = c.streams.video[0]
-        stream.thread_type = "AUTO"
+        if threaded:
+            stream.thread_type = "AUTO"
         for i, frame in enumerate(c.decode(stream)):
             if _expired(deadline):
                 return None
@@ -149,7 +156,7 @@ def _pick_keyframe_times(cuts: tuple[float, ...], duration: float, cap: int) -> 
 
 
 def _extract_keyframes(
-    raw: bytes, targets: list[float], cuts: tuple[float, ...], fps: float, deadline: float | None
+    raw: bytes, targets: list[float], cuts: tuple[float, ...], fps: float, deadline: float | None, threaded: bool = True
 ) -> tuple[Keyframe, ...]:
     from PIL import Image
 
@@ -158,7 +165,8 @@ def _extract_keyframes(
     last = None
     with _open_video(raw) as c:
         stream = c.streams.video[0]
-        stream.thread_type = "AUTO"
+        if threaded:
+            stream.thread_type = "AUTO"
         for i, frame in enumerate(c.decode(stream)):
             if _expired(deadline):
                 break
@@ -176,6 +184,9 @@ def _extract_keyframes(
 
 
 def _encode_keyframe(t: float, frame, cuts: tuple[float, ...], image_mod) -> Keyframe:
+    if frame.width * frame.height > LARGE_FRAME_PIXELS:  # downscale in swscale first: avoid a 100 MB RGB copy
+        sc = KEYFRAME_SHORT_SIDE / min(frame.width, frame.height)
+        frame = frame.reformat(width=max(2, round(frame.width * sc)), height=max(2, round(frame.height * sc)), format="rgb24")
     img = frame.to_image()
     short = min(img.size)
     if short > KEYFRAME_SHORT_SIDE:
@@ -183,11 +194,13 @@ def _encode_keyframe(t: float, frame, cuts: tuple[float, ...], image_mod) -> Key
         img = img.resize((max(1, round(img.width * scale)), max(1, round(img.height * scale))), image_mod.LANCZOS)
     buf = io.BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=KEYFRAME_QUALITY)
-    return Keyframe(t=round(t, 4), shot=bisect.bisect_right(cuts, t - 1e-6) + 1, jpeg=buf.getvalue())
+    return Keyframe(t=round(t, 4), shot=bisect.bisect_right(cuts, t + 1e-6) + 1, jpeg=buf.getvalue())
 
 
 def analyze_video(raw: bytes, *, max_keyframes: int = 8, deadline: float | None = None) -> VideoFacts:
     """Never raises. cuts=None means detection failed or the deadline was exceeded."""
+    if deadline is None:
+        deadline = time.monotonic() + DEFAULT_BUDGET_SECONDS
     duration, fps, width, height = 0.0, 0.0, 0, 0
     try:
         import av
@@ -204,8 +217,10 @@ def analyze_video(raw: bytes, *, max_keyframes: int = 8, deadline: float | None 
         return VideoFacts(duration, fps, width, height, None, ())
     if not math.isfinite(duration):
         duration = 0.0
+    large = width * height > LARGE_FRAME_PIXELS
+    sample_fps = LARGE_SAMPLE_FPS if large else MAX_SAMPLE_FPS
     try:
-        cuts = _detect_cuts(raw, fps or 24.0, duration, deadline)
+        cuts = _detect_cuts(raw, fps or 24.0, duration, deadline, sample_fps, not large)
     except Exception:
         cuts = None
     if cuts is None and _expired(deadline):
@@ -215,7 +230,7 @@ def analyze_video(raw: bytes, *, max_keyframes: int = 8, deadline: float | None 
             return VideoFacts(duration, fps, width, height, cuts, ())
         shots = cuts or ()
         targets = _pick_keyframe_times(shots, duration, max_keyframes)
-        frames = _extract_keyframes(raw, targets, shots, fps or 24.0, deadline)
+        frames = _extract_keyframes(raw, targets, shots, fps or 24.0, deadline, not large)
     except Exception:
         frames = ()
     return VideoFacts(duration, fps, width, height, cuts, frames)
@@ -235,7 +250,7 @@ def render_video_facts(label: str, f: VideoFacts) -> str:
 # ---------------------------------------------------------------- audio
 
 
-def _decode_mono(raw: bytes):
+def _decode_mono(raw: bytes, deadline: float | None = None):
     import av
     import numpy as np
 
@@ -248,18 +263,28 @@ def _decode_mono(raw: bytes):
             channels = int(stream.codec_context.channels)
             resampler = av.AudioResampler(format="flt", layout="mono", rate=sr)
             chunks = []
+            total, limit = 0, int(sr * AUDIO_MAX_SECONDS)
+            meta = float(c.duration) / av.time_base if c.duration else 0.0
             for frame in c.decode(stream):
+                if _expired(deadline):
+                    raise MediaFactsError("audio analysis budget exceeded")
                 for r in resampler.resample(frame):
+                    a = r.to_ndarray().reshape(-1)
+                    chunks.append(a)
+                    total += len(a)
+                if total >= limit:
+                    break
+            else:
+                for r in resampler.resample(None) or []:
                     chunks.append(r.to_ndarray().reshape(-1))
-            for r in resampler.resample(None) or []:
-                chunks.append(r.to_ndarray().reshape(-1))
     except MediaFactsError:
         raise
     except Exception as exc:
-        raise MediaFactsError(f"cannot decode audio: {exc}") from exc
+        raise MediaFactsError("cannot decode audio") from exc
     if not chunks or sr <= 0:
         raise MediaFactsError("audio contains no samples")
-    return np.concatenate(chunks).astype(np.float32), sr, channels
+    x = np.concatenate(chunks).astype(np.float32)[:limit]
+    return x, sr, channels, meta
 
 
 def _spectral_stats(x, sr: int) -> tuple[float, float]:
@@ -315,11 +340,17 @@ def _character(mean_db: float, db_std: float, onset_rate: float, flatness: float
     return "tonal/music"
 
 
-def analyze_audio(raw: bytes) -> AudioFacts:
-    """Raises MediaFactsError when the audio cannot be decoded."""
+def analyze_audio(raw: bytes, *, deadline: float | None = None) -> AudioFacts:
+    """Raises MediaFactsError (fixed message) when the audio cannot be decoded or the budget is exceeded.
+
+    Only the first 16 s of samples are analysed (bounds CPU/memory when a header lies about its length);
+    ``duration`` is the container's metadata duration when available.
+    """
+    if deadline is None:
+        deadline = time.monotonic() + DEFAULT_BUDGET_SECONDS
     import numpy as np
 
-    x, sr, channels = _decode_mono(raw)
+    x, sr, channels, meta = _decode_mono(raw, deadline)
     step = int(sr * RMS_STEP)
     nbuckets = max(1, math.ceil(len(x) / step))
     db: list[float] = []
@@ -332,7 +363,7 @@ def analyze_audio(raw: bytes) -> AudioFacts:
     mean_db = float(np.mean(db))
     std_db = float(np.std(db))
     return AudioFacts(
-        duration=len(x) / sr,
+        duration=meta if meta > 0 else len(x) / sr,
         sample_rate=sr,
         channels=channels,
         loudness_db=tuple(db),
