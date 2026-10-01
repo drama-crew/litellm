@@ -31,7 +31,6 @@ from litellm.proxy.common_utils.http_parsing_utils import _safe_set_request_pars
 from litellm.proxy.spend_tracking.budget_reservation import release_budget_reservation
 from litellm.proxy.video_endpoints import endpoints, moderation_bridge
 from litellm.proxy.video_endpoints.minimax_h3_models import (
-    IR_PREFIX_MEDIA_MESSAGE,
     AudioItem,
     MiniMaxH3Create,
     MiniMaxH3DirectCreate,
@@ -175,14 +174,6 @@ async def prepare_request(request: Request) -> None:
             _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
         else:
             is_direct = request.url.path == DIRECT_PREFIX + "/v2/video_generation"
-            if not is_direct:
-                # Structural gate, ahead of every other rule: any video/audio item on the IR prefix gets this one message.
-                parsed = json.loads(raw)
-                items = parsed.get("content") if isinstance(parsed, dict) else None
-                if isinstance(items, list) and any(
-                    isinstance(item, dict) and item.get("type") in ("video_url", "audio_url") for item in items
-                ):
-                    raise H3Error(400, IR_PREFIX_MEDIA_MESSAGE)
             spec = (MiniMaxH3DirectCreate if is_direct else MiniMaxH3Create).model_validate_json(raw)
             request.scope["minimax_h3_spec"] = spec
             body = spec.internal_body()

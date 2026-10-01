@@ -14,7 +14,6 @@ from litellm.proxy.video_endpoints.minimax_h3_models import MiniMaxH3Create, Min
 
 from .test_minimax_h3_public_media import HEADERS, png, data_url, stack  # noqa: F401
 
-IR_MESSAGE = "reference video and audio are supported on /video/minimax-h3/direct only"
 DIRECT = "/video/minimax-h3/direct/v2/video_generation"
 IR = "/video/minimax-h3/v2/video_generation"
 
@@ -89,10 +88,16 @@ def test_direct_rejects_video_mixed_with_first_frame():
     assert caught.value.errors()[0]["msg"] == "Value error, first/last frames and reference media cannot be mixed"
 
 
-@pytest.mark.parametrize("kinds", [("video",), ("audio", "image"), ("image", "video", "audio")])
-def test_plain_model_rejects_video_audio_with_exact_message(kinds):
-    with pytest.raises(ValueError, match=IR_MESSAGE):
-        MiniMaxH3Create.model_validate(payload(*kinds))
+@pytest.mark.parametrize("kinds", [("video",), ("audio", "image"), ("image", "video", "audio"), ("video",) * 3])
+def test_ir_model_accepts_video_audio_with_the_same_limits_as_direct(kinds):
+    assert MiniMaxH3Create.model_validate(payload(*kinds))
+
+
+@pytest.mark.parametrize("kinds,extra,message", REJECTS)
+def test_ir_model_rejects_with_the_same_messages_as_direct(kinds, extra, message):
+    with pytest.raises(ValueError) as caught:
+        MiniMaxH3Create.model_validate(payload(*kinds, **extra))
+    assert caught.value.errors()[0]["msg"] == "Value error, " + message
 
 
 def test_internal_body_order_and_shape():
@@ -114,27 +119,32 @@ def test_image_only_body_unchanged_on_direct():
     assert [r["media_type"] for r in body["references"]] == ["image", "image"]
 
 
-def _ir_cases():
-    keyframe = {"type": "image_url", "image_url": {"url": "https://media.example/f.png"}, "role": "first_frame"}
-    with_frame = payload("video")
-    with_frame["content"].append(keyframe)
-    return [
-        payload("image", "video"),
-        payload("audio", "image"),
-        payload(*("video",) * 4),
-        payload(*("audio",) * 4),
-        with_frame,
-        payload("video", ratio="adaptive"),
-    ]
-
-
-@pytest.mark.parametrize("data", _ir_cases())
-def test_ir_prefix_rejects_video_with_400_and_exact_message(stack, data):
+@pytest.mark.parametrize(
+    "kinds,extra,message",
+    [r for r in REJECTS if r[0] in (("audio",), ("video",) * 4) or r[1]],
+)
+def test_ir_endpoint_applies_the_direct_limits(stack, kinds, extra, message):
     client, _, state = stack
-    response = client.post(IR, json=data, headers=HEADERS)
+    response = client.post(IR, json=payload(*kinds, **extra), headers=HEADERS)
     assert response.status_code == 400
-    assert response.json()["error"]["message"] == IR_MESSAGE
+    assert response.json()["error"]["message"] == "Value error, " + message
     assert not state["platform"]
+
+
+def test_ir_endpoint_accepts_video_and_audio_without_direct_prompt_processing(stack, monkeypatch):
+    client, _, state = stack
+    seen = []
+
+    async def spy(data):
+        seen.append(data)
+
+    monkeypatch.setattr(policy, "validate_public_payload", spy)
+    response = client.post(IR, json=payload("image", "video", "audio"), headers=HEADERS)
+    assert response.status_code == 200, response.text
+    assert [r["media_type"] for r in seen[0]["references"]] == ["image", "video", "audio"]
+    sent = state["platform"][-1][1]["payload"]
+    assert "prompt_processing" not in sent, "the IR prefix must be rewritten, not direct"
+    assert [r["media_type"] for r in sent["references"]] == ["image", "video", "audio"]
 
 
 def test_direct_prefix_routes_video_audio_with_direct_prompt_processing(stack, monkeypatch):

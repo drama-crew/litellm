@@ -34,9 +34,9 @@ Use a normal Causyn API key. The public model is normalized before authorization
 
 For reference mode, use 1–9 images with `role: reference_image` and an explicit ratio. Text-only requests also require an explicit ratio: `21:9`, `16:9`, `4:3`, `1:1`, `3:4`, or `9:16`. First-frame or first/last-frame requests use adaptive canvas sizing. Exactly one non-empty text item is required. Duration is an integer from 4 through 15 seconds. Current deployment supports 768P with generated audio; callbacks, last-frame-only requests, mixed keyframe/reference input, silent output and extra fields are rejected before submission.
 
-### Reference video and audio (direct endpoint only)
+### Reference video and audio
 
-`/video/minimax-h3/direct/v2/video_generation` also accepts these content items, in addition to `text` and `image_url`:
+Both `/video/minimax-h3/v2/video_generation` (built-in rewrite) and `/video/minimax-h3/direct/v2/video_generation` (prompt unchanged) accept these content items, with the same limits, in addition to `text`:
 
 | `type` | field | `role` | limits |
 |---|---|---|---|
@@ -46,7 +46,7 @@ For reference mode, use 1–9 images with `role: reference_image` and an explici
 
 At most 12 reference items in total. Reference audio needs at least one reference image or video. Reference video/audio requires an explicit, non-adaptive `ratio` and cannot be combined with `first_frame`/`last_frame`. Each URL is a public HTTP(S) URL or a Base64 data URL. Inline data is bounded by the 64 MB request body: Base64 adds about 33%, so the largest inline video is about 45 MB; use https URLs for large media. Inline media is validated at submit (HTTP 400). URL media is validated when the platform fetches it; a task whose media is rejected then ends `failed` with `error.code=input_media_rejected` and `moderation_status=not_started`, and is not charged.
 
-Because direct text is passed unchanged, bind media in your prompt with per-type tags `<Picture N>`, `<Video N>` and `<Audio N>`. Each type is numbered separately from 1, in the order the items appear in `content`.
+On the direct endpoint the text is passed unchanged, so bind media in your prompt with per-type tags `<Picture N>`, `<Video N>` and `<Audio N>`. Each type is numbered separately from 1, in the order the items appear in `content`.
 
 ```json
 {
@@ -73,7 +73,7 @@ Because direct text is passed unchanged, bind media in your prompt with per-type
 }
 ```
 
-The Context IR prefix (`/video/minimax-h3/v2/video_generation`) rejects video and audio items with `reference video and audio are supported on /video/minimax-h3/direct only`.
+On the Context IR prefix (`/video/minimax-h3/v2/video_generation`) the built-in rewrite measures each reference video (duration, shot cuts, timestamped keyframes) and audio (loudness timeline, onsets) before writing the prompt, and one repair call is made if its first answer fails validation. For a single-source video edit the rewritten prompt starts a new `[Shot N]` at each detected source cut. A reference media file the rewrite cannot read still yields a prompt, with fewer measured facts.
 
 Direct text is passed unchanged: plain language and caller-authored H3 structure are both accepted. Clients cannot send `prompt_processing`, provider routing, queue selection or moderation bypass flags. The IR path performs the existing built-in rewrite after input admission. Standalone rewriting is available only at `/video/minimax-h3/v2/h3_context_ir`; it uses `model: minimax-h3` and the existing content/duration/ratio/callback contract without a video resolution field.
 

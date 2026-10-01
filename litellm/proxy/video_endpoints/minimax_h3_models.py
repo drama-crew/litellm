@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import time
-from typing import Annotated, ClassVar, Generic, Literal, TypeVar
+from typing import Annotated, Generic, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -185,15 +185,10 @@ class MiniMaxH3Content(H3Content[ModelName]):
     pass
 
 
-IR_PREFIX_MEDIA_MESSAGE = "reference video and audio are supported on /video/minimax-h3/direct only"
 MAX_REFERENCE_ITEMS = 12
 
 
 class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
-    # The IR prefix keeps image-only references: the internal handler silently switches any request that carries
-    # video/audio to direct prompt processing, which would break that prefix's contract.
-    allow_reference_media: ClassVar[bool] = False
-
     @model_validator(mode="after")
     def validate_hyperflow(self) -> Self:
         if self.resolution != "768P":
@@ -202,8 +197,6 @@ class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
         audios = [item for item in self.content if isinstance(item, AudioItem)]
         images = [item for item in self.content if isinstance(item, ImageItem) and item.role == "reference_image"]
         if videos or audios:
-            if not self.allow_reference_media:
-                raise ValueError(IR_PREFIX_MEDIA_MESSAGE)
             if len(images) + len(videos) + len(audios) > MAX_REFERENCE_ITEMS:
                 raise ValueError(f"at most {MAX_REFERENCE_ITEMS} reference items are allowed")
             if audios and not images and not videos:
@@ -236,9 +229,7 @@ class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
 
 
 class MiniMaxH3DirectCreate(MiniMaxH3Create):
-    """Direct facade: additionally accepts reference video and reference audio."""
-
-    allow_reference_media: ClassVar[bool] = True
+    """Direct facade: same limits as the IR prefix; its prompt is passed unchanged instead of being rewritten."""
 
 
 class MiniMaxTask(StrictModel):
