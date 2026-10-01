@@ -463,6 +463,8 @@ class RewriteResult(BaseModel):
     usage: RewriteUsage
     model: str = MODEL
     system_sha256: str
+    # Soft validator findings the accepted answer still has (ref2va only); diagnostic, never public.
+    soft_violations: tuple[str, ...] = ()
 
 
 class _Message(BaseModel):
@@ -532,28 +534,34 @@ def _section(prompt: str, fields: tuple[str, ...], name: str) -> str:
     return prompt[start : min(later) if later else len(prompt)]
 
 
-def ref2va_violations(prompt: str, spec: ContextIRRequest, facts: RefFacts | None) -> list[str]:
-    """Findings beyond the section layout; each starts with a fixed phrase, details follow a colon."""
-    found: list[str] = []
+def ref2va_violations(
+    prompt: str, spec: ContextIRRequest, facts: RefFacts | None
+) -> tuple[list[str], list[str]]:
+    """(hard, soft) findings beyond the section layout; each starts with a fixed phrase, details follow a colon.
+
+    Hard: unknown labels, shot numbering, timestamps, source-cut alignment (they break generation).
+    Soft: length, label definitions, retention completeness and form (they only lower prompt quality).
+    """
+    hard: list[str] = []
+    soft: list[str] = []
     sections = {name: _section(prompt, REFERENCE_FIELDS, name) for name in REFERENCE_FIELDS}
     provided = frozenset(_provided_labels(spec))
     used = frozenset(f"<{kind} {number}>" for kind, number in _MEDIA_LABEL.findall(prompt))
-    if used != provided:
-        wrong = sorted(used ^ provided)
-        found.append(f"{_V_LABELS}: {', '.join(wrong)}")
+    if used - provided:
+        hard.append(f"{_V_LABELS}: {', '.join(sorted(used - provided))}")
     undefined = sorted(label for label in provided if label not in sections["subject_definitions"])
     if undefined:
-        found.append(f"{_V_DEFINE}: {', '.join(undefined)}")
+        soft.append(f"{_V_DEFINE}: {', '.join(undefined)}")
     description = sections["detailed_description"]
     shots = tuple(int(match.group(1)) for match in re.finditer(r"\[Shot (\d+)\]", description))
     if not shots or shots[0] != 1 or tuple(dict.fromkeys(shots)) != tuple(range(1, max(shots) + 1)):
-        found.append(f"{_V_SHOTS}: number [Shot N] sequentially from 1 in detailed_description")
+        hard.append(f"{_V_SHOTS}: number [Shot N] sequentially from 1 in detailed_description")
     times = tuple(_seconds(*match.groups()) for match in _TIMESTAMP.finditer(description))
     if any(later <= earlier for earlier, later in zip(times, times[1:])) or any(t >= spec.duration for t in times):
-        found.append(f"{_V_TIMES}: 'At MM:SS.mmm' must strictly increase and stay below {spec.duration}.000")
+        hard.append(f"{_V_TIMES}: 'At MM:SS.mmm' must strictly increase and stay below {spec.duration}.000")
     words = len(description.split())
     if not DESCRIPTION_WORDS[0] <= words <= DESCRIPTION_WORDS[1]:
-        found.append(f"{_V_WORDS}: it has {words}, aim for 350-500")
+        soft.append(f"{_V_WORDS}: it has {words}, aim for 350-500")
     subjects = frozenset(
         match.group(0)
         for line in sections["subject_definitions"].splitlines()
@@ -577,11 +585,11 @@ def ref2va_violations(prompt: str, spec: ContextIRRequest, facts: RefFacts | Non
         label for label in provided if label not in retention
     ])
     if bad:
-        found.append(f"{_V_RETENTION}: {bad[0]!r}")
+        soft.append(f"{_V_RETENTION}: {bad[0]!r}")
     elif unmentioned:
-        found.append(f"{_V_RETENTION}: add a retention line for {', '.join(unmentioned)}")
-    found.extend(_cut_violations(spec, facts, sections, description))
-    return found
+        soft.append(f"{_V_RETENTION}: add a retention line for {', '.join(unmentioned)}")
+    hard.extend(_cut_violations(spec, facts, sections, description))
+    return hard, soft
 
 
 def _cut_violations(
@@ -603,7 +611,10 @@ def _cut_violations(
     return [f"{_V_CUTS}: start a [Shot k] with 'At MM:SS.mmm' at each source cut, missing {cut_list}"]
 
 
-def validate_prompt(prompt: str, spec: ContextIRRequest, facts: RefFacts | None = None) -> None:
+def validate_prompt(
+    prompt: str, spec: ContextIRRequest, facts: RefFacts | None = None, soft: list[str] | None = None
+) -> None:
+    """Raise on any violation. With `soft` given, ref2va soft-only findings are appended to it instead of raising."""
     if not prompt or len(prompt) > 7000:
         raise RewriteError("The rewritten H3 prompt must contain 1 to 7000 characters")
     fields = REFERENCE_FIELDS if spec.mode == "ref2va" else BASE_FIELDS
@@ -631,9 +642,13 @@ def validate_prompt(prompt: str, spec: ContextIRRequest, facts: RefFacts | None 
     if prompt.count("<d>") != prompt.count("</d>") or re.search(r"<d>(?!\[[^\]\n]+\])", prompt):
         raise RewriteError("The rewritten H3 prompt has invalid dialogue tags")
     if spec.mode == "ref2va":
-        found = ref2va_violations(prompt, spec, facts)
-        if found:
-            raise RewriteError(found[0].split(": ", 1)[0], violations=tuple(found))
+        hard, found_soft = ref2va_violations(prompt, spec, facts)
+        if hard:
+            raise RewriteError(hard[0].split(": ", 1)[0], violations=tuple(hard + found_soft))
+        if soft is not None:
+            soft.extend(found_soft)
+        elif found_soft:
+            raise RewriteError(found_soft[0].split(": ", 1)[0], violations=tuple(found_soft))
 
 
 def ref2va_addendum(has_video: bool, has_audio: bool) -> str:
@@ -681,6 +696,21 @@ def _sum_usage(first: RewriteUsage, second: RewriteUsage) -> RewriteUsage:
     )
 
 
+def _response_detail(response: httpx.Response) -> str:
+    """Short diagnostic for an unusable provider reply: finish_reason, returned model id, empty content. No body text."""
+    try:
+        body = response.json()
+        choice = body["choices"][0]
+        message = choice.get("message") or {}
+        content = message.get("content")
+        return (
+            f"finish_reason={choice.get('finish_reason')} model={body.get('model')} "
+            f"content_empty={not (isinstance(content, str) and content.strip())}"
+        )
+    except Exception:  # noqa: BLE001
+        return f"unreadable reply, {len(response.content)} bytes"
+
+
 class H3PromptRewriter:
     def __init__(self, client: httpx.AsyncClient, api_key: str) -> None:
         self.client = client
@@ -722,12 +752,21 @@ class H3PromptRewriter:
         try:
             return _Completion.model_validate(response.json(), context={"requested": model})
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise RewriteError("H3 prompt rewrite provider returned an incomplete response", retryable=True) from exc
+            raise RewriteError(
+                "H3 prompt rewrite provider returned an incomplete response",
+                retryable=True,
+                detail=_response_detail(response),
+            ) from exc
         except ValidationError as exc:
             # A wrong/unlisted model id is a provider routing glitch (retry); a truncated or malformed answer
             # (e.g. finish_reason=length) is permanent, as before.
             routing = any(error["loc"][:1] == ("model",) for error in exc.errors())
-            raise RewriteError("H3 prompt rewrite provider returned an invalid response", 502, retryable=routing) from exc
+            raise RewriteError(
+                "H3 prompt rewrite provider returned an invalid response",
+                502,
+                retryable=routing,
+                detail=_response_detail(response),
+            ) from exc
 
     async def rewrite(self, spec: ContextIRRequest) -> RewriteResult:
         if not self.api_key:
@@ -766,38 +805,63 @@ class H3PromptRewriter:
             prompt = completed.choices[0].message.content.strip()
             usage = completed.usage
         keep_first_answer = False
+        soft: list[str] = []
+        hard_failure: RewriteError | None = None
         try:
+            validate_prompt(prompt, spec, facts, soft=soft if ref2va else None)
+        except RewriteError as failure:
+            hard_failure = failure
+
+        def result(text: str, used: RewriteUsage, leftover: list[str]) -> RewriteResult:
+            if leftover:
+                _log.info("Ref2VA rewrite accepted with soft violations: %s", [v.split(": ", 1)[0][-60:] for v in leftover])
+            return RewriteResult(
+                prompt=text,
+                usage=used,
+                model=model,
+                system_sha256=hashlib.sha256(system.encode()).hexdigest(),
+                soft_violations=tuple(leftover),
+            )
+
+        try:
+            if not ref2va or (hard_failure is None and not soft):
+                if hard_failure is not None:
+                    raise hard_failure
+                return result(prompt, usage, [])
+            remaining = ATTEMPT_BUDGET_S - (time.monotonic() - started)
+            deadline = ATTEMPT_DEADLINE.get()
+            if deadline is not None:
+                remaining = min(remaining, deadline - time.monotonic())
+            if remaining < MIN_REPAIR_BUDGET_S:
+                if hard_failure is not None:
+                    raise hard_failure
+                return result(prompt, usage, soft)  # soft-only first answer is acceptable as is
+            listed = (hard_failure.violations or (str(hard_failure),)) if hard_failure is not None else tuple(soft)
+            _remember(_FIRST_ANSWERS, answer_key, prompt)
+            messages += [
+                {"role": "assistant", "content": prompt},
+                {"role": "user", "content": _repair_message(listed, _provided_labels(spec))},
+            ]
             try:
-                validate_prompt(prompt, spec, facts)
-            except RewriteError as failure:
-                remaining = ATTEMPT_BUDGET_S - (time.monotonic() - started)
-                deadline = ATTEMPT_DEADLINE.get()
-                if deadline is not None:
-                    remaining = min(remaining, deadline - time.monotonic())
-                if not ref2va or remaining < MIN_REPAIR_BUDGET_S:
-                    raise
-                _remember(_FIRST_ANSWERS, answer_key, prompt)
-                messages += [
-                    {"role": "assistant", "content": prompt},
-                    {
-                        "role": "user",
-                        "content": _repair_message(failure.violations or (str(failure),), _provided_labels(spec)),
-                    },
-                ]
-                try:
-                    repaired = await self._complete(model, messages, remaining)
-                except RewriteError as call_failure:
-                    keep_first_answer = call_failure.retryable  # a retried attempt reuses the first answer
-                    raise
-                prompt = repaired.choices[0].message.content.strip()
-                usage = _sum_usage(usage, repaired.usage)
-                validate_prompt(prompt, spec, facts)
+                repaired = await self._complete(model, messages, remaining)
+            except RewriteError as call_failure:
+                if hard_failure is None:  # a usable first answer beats a failed improvement
+                    return result(prompt, usage, soft)
+                keep_first_answer = call_failure.retryable  # a retried attempt reuses the first answer
+                raise
+            repaired_prompt = repaired.choices[0].message.content.strip()
+            total = _sum_usage(usage, repaired.usage)
+            repaired_soft: list[str] = []
+            try:
+                validate_prompt(repaired_prompt, spec, facts, soft=repaired_soft)
+            except RewriteError:
+                if hard_failure is None:  # the repair made it worse: keep the first answer
+                    return result(prompt, total, soft)
+                raise
+            return result(repaired_prompt, total, repaired_soft)
         finally:
             if not keep_first_answer:
                 _FIRST_ANSWERS.pop(answer_key, None)
-        return RewriteResult(
-            prompt=prompt, usage=usage, model=model, system_sha256=hashlib.sha256(system.encode()).hexdigest()
-        )
 
 
 async def _rewrite_single_shot(spec: ContextIRRequest) -> RewriteResult:

@@ -438,8 +438,7 @@ async def test_video_without_keyframes_sends_facts_only_never_the_raw_video(patc
     facts = RefFacts(videos=(vfacts(None, with_frames=False),))
     patched(spec, facts)
     provider = Provider(OLD["R1"], OLD["R1"])
-    with pytest.raises(RewriteError):
-        await run(provider, spec)
+    await run(provider, spec)  # no detected cuts: the old prompt only has soft findings and is accepted
     content = parts(provider.bodies[0])
     assert "video_url" not in [p["type"] for p in content]
     assert any(p.get("text", "").startswith("<Video 1>: ") for p in content)
@@ -927,3 +926,142 @@ async def test_permanent_repair_failure_leaves_no_cached_first_answer(patched):
     provider2 = Provider(GOLD["R1"])
     await run(provider2, spec)
     assert len(provider2.bodies) == 1  # the next identical request does not replay a stale answer
+
+
+# ----------------------------------------------------------------------------- hard / soft classes
+
+
+def soft_only_prompt() -> str:
+    """Gold R1 with a too-short detailed_description: every hard rule holds, only the word range is broken."""
+    head, rest = GOLD["R1"].split("detailed_description:\n", 1)
+    _, tail = rest.split("\n\noverall_soundscape:", 1)
+    return head + "detailed_description:\n[Shot 1] A runner sprints.\n[Shot 2] At 00:03.583, a low shot.\n\noverall_soundscape:" + tail
+
+
+def classes(prompt, spec, facts):
+    hard, soft = h3_prompt.ref2va_violations(prompt, spec, facts)
+    return {v.split(": ", 1)[0] for v in hard}, {v.split(": ", 1)[0] for v in soft}
+
+
+def test_hard_soft_matrix():
+    spec, facts = case("R1")
+    assert classes(soft_only_prompt(), spec, facts) == (set(), {h3_prompt._V_WORDS})
+    hard, soft = classes(mutate("R1", "<Video 1> is the source", "<Video 2> is the source"), spec, facts)
+    assert h3_prompt._V_LABELS in hard
+    assert h3_prompt._V_SHOTS in classes(mutate("R1", "[Shot 2] At", "[Shot 3] At"), spec, facts)[0]
+    assert h3_prompt._V_TIMES in classes(mutate("R1", "At 00:03.583", "At 00:05.000"), spec, facts)[0]
+    assert h3_prompt._V_CUTS in classes(OLD["R1"], spec, facts)[0]
+    # a ref2va answer without [Shot 1] is hard
+    assert h3_prompt._V_SHOTS in classes(GOLD["R1"].replace("[Shot 1]", "Shot one").replace("[Shot 2]", "Shot two"), spec, facts)[0]
+    # undefined provided label, retention gaps and word range are soft only
+    spec4, facts4 = case("R4")
+    start = GOLD["R4"].index("<Audio 1> is a complete")
+    end = GOLD["R4"].index("\n", start)
+    assert classes(GOLD["R4"][:start] + GOLD["R4"][end + 1 :], spec4, facts4)[0] == set()
+    subject2 = next(l for l in GOLD["R1"].splitlines() if l.startswith("<Subject 2> (appears in"))
+    hard, soft = classes(GOLD["R1"].replace(subject2 + "\n", ""), spec, facts)
+    assert hard == set() and h3_prompt._V_RETENTION in soft
+
+
+def test_validate_with_a_soft_sink_accepts_soft_only_and_raises_hard():
+    spec, facts = case("R1")
+    sink: list[str] = []
+    validate_prompt(soft_only_prompt(), spec, facts, soft=sink)
+    assert sink and sink[0].startswith(h3_prompt._V_WORDS)
+    with pytest.raises(RewriteError):
+        validate_prompt(OLD["R1"], spec, facts, soft=[])
+
+
+@pytest.mark.asyncio
+async def test_soft_only_first_answer_is_repaired_and_a_clean_repair_wins(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(soft_only_prompt(), GOLD["R1"])
+    result = await run(provider, spec)
+    assert len(provider.bodies) == 2 and result.prompt == GOLD["R1"].strip() and result.soft_violations == ()
+
+
+@pytest.mark.asyncio
+async def test_soft_only_after_repair_is_accepted_and_recorded(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(soft_only_prompt(), soft_only_prompt())
+    result = await run(provider, spec)
+    assert len(provider.bodies) == 2
+    assert result.prompt == soft_only_prompt().strip()
+    assert result.soft_violations and result.soft_violations[0].startswith(h3_prompt._V_WORDS)
+
+
+@pytest.mark.asyncio
+async def test_hard_violation_after_repair_raises(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(soft_only_prompt(), OLD["R1"])
+    # first had only soft findings: the worse repair is dropped, the first answer returned
+    result = await run(provider, spec)
+    assert result.prompt == soft_only_prompt().strip() and result.soft_violations
+    h3_prompt._FIRST_ANSWERS.clear()
+    provider = Provider(OLD["R1"], OLD["R1"])
+    with pytest.raises(RewriteError) as caught:
+        await run(provider, spec)
+    assert str(caught.value) == CUT_MSG
+
+
+@pytest.mark.asyncio
+async def test_failed_repair_call_keeps_a_soft_only_first_answer(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    answers = iter([soft_only_prompt()])
+
+    def handler(request):
+        try:
+            text = next(answers)
+        except StopIteration:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={
+                "model": "qwen/qwen3.8-flash",
+                "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+                "usage": {},
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await H3PromptRewriter(client, "k").rewrite(spec)
+    assert result.prompt == soft_only_prompt().strip()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reply,expected",
+    [
+        ({"model": "qwen/qwen3.8-flash", "choices": [{"message": {"content": ""}, "finish_reason": "length"}], "usage": {}},
+         "finish_reason=length model=qwen/qwen3.8-flash content_empty=True"),
+        ({"model": "other/model", "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}], "usage": {}},
+         "finish_reason=stop model=other/model content_empty=False"),
+    ],
+)
+async def test_invalid_response_carries_a_redacted_detail_not_a_public_message(patched, reply, expected):
+    spec, facts = case("R1")
+    patched(spec, facts)
+
+    def handler(request):
+        return httpx.Response(200, json=reply)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "k").rewrite(spec)
+    assert str(caught.value) == "H3 prompt rewrite provider returned an invalid response"
+    assert caught.value.detail == expected
+    assert expected.split()[0] not in str(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_unparseable_reply_has_a_detail_too(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"{broken"))) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "k").rewrite(spec)
+    assert caught.value.detail == "unreadable reply, 7 bytes"
