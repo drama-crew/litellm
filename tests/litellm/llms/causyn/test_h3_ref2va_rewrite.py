@@ -545,3 +545,63 @@ async def test_non_ref2va_payload_is_byte_identical_to_the_previous_code_path(mo
             await H3PromptRewriter(client, "k").rewrite(spec)
     assert len(seen) == 1
     assert hashlib.sha256(seen[0]).hexdigest() == golden["sha256"]
+
+
+# ----------------------------------------------------------------------------- real perception, no patches
+
+
+def two_shot_clip() -> bytes:
+    import io
+
+    av = pytest.importorskip("av")
+    np = pytest.importorskip("numpy")
+    out = io.BytesIO()
+    rng = np.random.default_rng(1)
+    with av.open(out, "w", format="mp4") as container:
+        stream = container.add_stream("libx264", rate=24)
+        stream.width = stream.height = 256
+        stream.pix_fmt = "yuv420p"
+        for i in range(72):
+            base = 30 if i < 36 else 200
+            frame = np.clip(rng.integers(0, 40, (256, 256, 3)) + base, 0, 255).astype("uint8")
+            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    return out.getvalue()
+
+
+@pytest.mark.asyncio
+async def test_real_perception_reaches_the_provider_payload():
+    clip = "data:video/mp4;base64," + base64.b64encode(two_shot_clip()).decode()
+    spec = ContextIRRequest.model_validate(
+        {
+            "model": "causyn-1.1",
+            "content": [
+                {"type": "text", "text": "Replace the runner."},
+                item("image", "data:image/png;base64," + base64.b64encode(_png()).decode()),
+                item("video", clip),
+            ],
+            "duration": 5,
+            "ratio": "16:9",
+        }
+    )
+    provider = Provider("not valid", "still not valid")
+    with pytest.raises(RewriteError):
+        await run(provider, spec)
+    assert len(provider.bodies) == 2
+    content = parts(provider.bodies[0])
+    facts = next(p["text"] for p in content if p["type"] == "text" and p["text"].startswith("<Video 1>: "))
+    assert "[Shot 2] 00:01.5" in facts or "[Shot 2] 00:01.4" in facts
+    assert "video_url" not in [p["type"] for p in content]
+    assert sum(p["type"] == "image_url" for p in content) >= 3  # reference picture + keyframes
+
+
+def _png() -> bytes:
+    import io
+
+    from PIL import Image
+
+    out = io.BytesIO()
+    Image.new("RGB", (512, 512), "red").save(out, format="PNG")
+    return out.getvalue()
