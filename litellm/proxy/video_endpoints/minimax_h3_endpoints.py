@@ -30,7 +30,12 @@ from litellm.proxy.auth.user_api_key_auth import (
 from litellm.proxy.common_utils.http_parsing_utils import _safe_set_request_parsed_body
 from litellm.proxy.spend_tracking.budget_reservation import release_budget_reservation
 from litellm.proxy.video_endpoints import endpoints, moderation_bridge
-from litellm.proxy.video_endpoints.minimax_h3_models import AudioItem, MiniMaxH3Create
+from litellm.proxy.video_endpoints.minimax_h3_models import (
+    IR_PREFIX_MEDIA_MESSAGE,
+    AudioItem,
+    MiniMaxH3Create,
+    MiniMaxH3DirectCreate,
+)
 from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, INTERNAL_MODEL, IR_PREFIX, namespace
 from litellm.types.videos.main import VideoObject
 
@@ -169,10 +174,11 @@ async def prepare_request(request: Request) -> None:
             request.scope["causyn_context_ir_spec"] = spec_ir
             _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
         else:
-            spec = MiniMaxH3Create.model_validate_json(raw)
+            is_direct = request.url.path == DIRECT_PREFIX + "/v2/video_generation"
+            spec = (MiniMaxH3DirectCreate if is_direct else MiniMaxH3Create).model_validate_json(raw)
             request.scope["minimax_h3_spec"] = spec
             body = spec.internal_body()
-            if request.url.path == DIRECT_PREFIX + "/v2/video_generation":
+            if is_direct:
                 request.scope["causyn_direct_prompt"] = True
                 body["prompt_processing"] = "direct"
             _safe_set_request_parsed_body(request, body)
@@ -203,7 +209,12 @@ class MiniMaxH3Route(APIRoute):
                 return error_response(400, "Invalid JSON body")
             except ValidationError as exc:
                 return error_response(
-                    400, "; ".join(item["msg"] for item in exc.errors(include_input=False, include_url=False))
+                    400,
+                    "; ".join(
+                        # The IR-prefix restriction is a documented, exact message: no pydantic "Value error, " prefix.
+                        IR_PREFIX_MEDIA_MESSAGE if item["msg"].endswith(IR_PREFIX_MEDIA_MESSAGE) else item["msg"]
+                        for item in exc.errors(include_input=False, include_url=False)
+                    ),
                 )
             except ProxyException as exc:
                 try:

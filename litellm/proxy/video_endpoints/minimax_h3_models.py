@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import time
-from typing import Annotated, Generic, Literal, TypeVar
+from typing import Annotated, ClassVar, Generic, Literal, TypeVar
 from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -185,20 +185,45 @@ class MiniMaxH3Content(H3Content[ModelName]):
     pass
 
 
+IR_PREFIX_MEDIA_MESSAGE = "reference video and audio are supported on /video/minimax-h3/direct only"
+MAX_REFERENCE_ITEMS = 12
+
+
 class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
+    # The IR prefix keeps image-only references: the internal handler silently switches any request that carries
+    # video/audio to direct prompt processing, which would break that prefix's contract.
+    allow_reference_media: ClassVar[bool] = False
+
     @model_validator(mode="after")
     def validate_hyperflow(self) -> Self:
         if self.resolution != "768P":
             raise ValueError("minimax-h3 supports 768P resolution")
-        if any(isinstance(item, (VideoItem, AudioItem)) for item in self.content):
-            raise ValueError("minimax-h3 supports image references only")
-        if self.ratio == "adaptive" and any(
-            isinstance(item, ImageItem) and item.role == "reference_image" for item in self.content
-        ):
+        videos = [item for item in self.content if isinstance(item, VideoItem)]
+        audios = [item for item in self.content if isinstance(item, AudioItem)]
+        images = [item for item in self.content if isinstance(item, ImageItem) and item.role == "reference_image"]
+        if videos or audios:
+            if not self.allow_reference_media:
+                raise ValueError(IR_PREFIX_MEDIA_MESSAGE)
+            if len(images) + len(videos) + len(audios) > MAX_REFERENCE_ITEMS:
+                raise ValueError(f"at most {MAX_REFERENCE_ITEMS} reference items are allowed")
+            if audios and not images and not videos:
+                raise ValueError("reference audio requires at least one reference image or video")
+            if self.ratio == "adaptive":
+                raise ValueError("reference media requires an explicit ratio")
+        if self.ratio == "adaptive" and images:
             raise ValueError("reference images require an explicit ratio")
         return self
 
     def internal_body(self) -> dict[str, object]:
+        references: list[dict[str, str]] = []
+        for item in self.content:
+            if isinstance(item, ImageItem):
+                role = "reference" if item.role == "reference_image" else item.role
+                references.append({"role": role, "media_type": "image", "url": item.image_url.url})
+            elif isinstance(item, VideoItem):
+                references.append({"role": "reference", "media_type": "video", "url": item.video_url.url})
+            elif isinstance(item, AudioItem):
+                references.append({"role": "reference", "media_type": "audio", "url": item.audio_url.url})
         return {
             "model": "causyn-1.1",
             "prompt": next(item.text for item in self.content if isinstance(item, TextItem)),
@@ -206,16 +231,14 @@ class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
             "resolution": "768p",
             "aspect_ratio": self.effective_ratio,
             "generate_audio": True,
-            "references": [
-                {
-                    "role": "reference" if item.role == "reference_image" else item.role,
-                    "media_type": "image",
-                    "url": item.image_url.url,
-                }
-                for item in self.content
-                if isinstance(item, ImageItem)
-            ],
+            "references": references,
         }
+
+
+class MiniMaxH3DirectCreate(MiniMaxH3Create):
+    """Direct facade: additionally accepts reference video and reference audio."""
+
+    allow_reference_media: ClassVar[bool] = True
 
 
 class MiniMaxTask(StrictModel):
