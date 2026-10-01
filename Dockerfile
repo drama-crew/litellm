@@ -15,6 +15,17 @@
 # at symbol versions, so it happily installs a package the base cannot run.
 # 2026-09-02: bumped to a base carrying glibc 2.44 (verified: python-3.13
 # 3.13.15-r4 installs and imports math/subprocess/selectors on it).
+#
+# 2026-10-02: Wolfi is moving to OpenSSL 4.0, whose `openssl-4.0-libcrypto`
+# conflicts on files (etc/ssl/ca.cnf) with `openssl` 3.6.x, which this image
+# keeps. Two packages already depend on OpenSSL 4 in the live repository, so
+# they are pinned to their last OpenSSL-3 builds (verified with a real
+# `apk add` from the digest below, no openssl-4.0 pulled in):
+#   - nodejs-26 26.8.1-r4 (26.10.0-r3 needs OpenSSL 4; production runs 26.8.1-r4)
+#   - cyrus-sasl-heimdal-libs 2.1.28-r57 (r58 needs OpenSSL 4; builder-only,
+#     pulled in transitively)
+# Remove both pins when the base digest moves to an OpenSSL-4 world (and then
+# drop `openssl`/`openssl-dev` 3.x with it).
 ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:7e62cecd3c5712dba6e52c5260afb8f9d7a23b9bbcdd26ad7508a811e74b766d
 
 # Runtime image
@@ -63,7 +74,8 @@ RUN for attempt in 1 2 3 4 5; do \
             rust \
             openssl \
             openssl-dev \
-            nodejs \
+            "nodejs-26=26.8.1-r4" \
+            "cyrus-sasl-heimdal-libs=2.1.28-r57" \
             npm \
             libsndfile \
         && exit 0; \
@@ -189,7 +201,7 @@ USER root
 
 # node (without npm) is required by the prisma CLI at runtime
 RUN for attempt in 1 2 3 4 5; do \
-        timeout -k 30s 900s apk --timeout 60 add --no-cache bash openssl tzdata nodejs python-3.13 libsndfile && exit 0; \
+        timeout -k 30s 900s apk --timeout 60 add --no-cache bash openssl tzdata "nodejs-26=26.8.1-r4" python-3.13 libsndfile && exit 0; \
         echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
         sleep 5; \
     done; \
