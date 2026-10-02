@@ -66,6 +66,12 @@ CUT_TOLERANCE_S = 0.35
 DESCRIPTION_WORDS = (200, 750)
 AUDIO_PART_BUDGET_BYTES = 12 * 1024 * 1024
 MIN_REPAIR_BUDGET_S = 10.0
+BASE_MAX_TOKENS = 8192
+CRITIC_ENV = "CAUSYN_H3_REWRITE_CRITIC"
+CRITIC_MODEL_ENV = "CAUSYN_H3_REWRITE_CRITIC_MODEL"
+CRITIC_TIMEOUT_S = 20.0
+CRITIC_MAX_DEFECTS = 8
+CRITIC_DEFECT_CHARS = 300
 ATTEMPT_BUDGET_S = 90.0
 PUBLIC_MODEL = "causyn-h3-context-ir"
 AUTH_MODEL = "causyn-1.1"
@@ -724,6 +730,82 @@ def _cut_violations(
     return [f"{_V_CUTS}: start a [Shot k] with 'At MM:SS.mmm' at each source cut, missing {cut_list}"]
 
 
+_FROM_SHOT = re.compile(r"\(from (?:\[Shot (\d+)\]|Shot (\d+))\)")
+_V_ALIGN = "The rewritten H3 prompt has invalid last-frame alignment"
+
+
+def _base_violations(prompt: str, spec: ContextIRRequest, description: str) -> list[str]:
+    """Hard structural findings for t2va/i2va/fl2va/l2va: later-shot timestamps and last-frame alignment."""
+    found: list[str] = []
+    numbers = tuple(int(m.group(1)) for m in re.finditer(r"\[Shot (\d+)\]", description))
+    starts: dict[int, float] = {}
+    for match in _SHOT_START.finditer(description):
+        starts.setdefault(int(match.group(1)), _seconds(*match.groups()[1:]))
+    later = sorted({n for n in numbers if n >= 2})
+    times = [starts.get(n) for n in later]
+    if any(t is None for t in times):
+        found.append(f"{_V_TIMES}: every later [Shot k] needs 'At MM:SS.mmm', missing for Shot {later[times.index(None)]}")
+    elif any(b <= a for a, b in zip(times, times[1:])) or any(not 0 < t < spec.duration for t in times):
+        found.append(f"{_V_TIMES}: 'At MM:SS.mmm' must strictly increase and stay between 0 and {spec.duration}.000")
+    if spec.mode in {"fl2va", "l2va"} and numbers:
+        aligned = _FROM_SHOT.findall(prompt.splitlines()[0])
+        if aligned and int(aligned[-1][0] or aligned[-1][1]) != max(numbers):
+            found.append(f"{_V_ALIGN}: the last frame must come from the final shot, Shot {max(numbers)}")
+    return found
+
+
+_QUOTED = re.compile(r"\u201c([^\u201d]{2,300})\u201d|\"([^\"]{2,300})\"|\u300c([^\u300d]{2,300})\u300d|\u300e([^\u300f]{2,300})\u300f")
+_DOUBLE_QUOTED = re.compile(r"\u201c([^\u201d\n]{1,200})\u201d|\"([^\"\n]{1,200})\"")
+_DIALOGUE = re.compile(r"<d>(.*?)</d>", re.DOTALL)
+_DIALOGUE_MARKERS = re.compile(r"</?(?:cutoff|scenetrans)\s*/?>")
+_LANG_TAG = re.compile(r"^\s*\[[^\]\n]+\]")
+_TRAILING_PUNCT = ".!?\u3002\uff01\uff1f\u2026,\uff0c"
+_V_QUOTED = "The rewritten H3 prompt must keep the user's quoted text verbatim: "
+_V_SPEECH = "The rewritten H3 prompt must not add dialogue the user did not write: "
+_V_VISIBLE = "The rewritten H3 prompt must not add visible text the user did not write: "
+
+
+def _norm(text: str) -> str:
+    """Whitespace-collapsed text without one trailing punctuation mark."""
+    text = " ".join(text.split())
+    return text[:-1].rstrip() if text and text[-1] in _TRAILING_PUNCT else text
+
+
+def literal_violations(prompt: str, spec: ContextIRRequest) -> list[str]:
+    """Soft, deterministic fidelity findings: quoted lines kept, no invented speech or on-screen text.
+
+    Not applied to requests with a reference video (its spoken content is unknown here).
+    """
+    if any(isinstance(item, VideoItem) for item in spec.content):
+        return []
+    found: list[str] = []
+    user = " ".join(spec.prompt.split())
+    rewrite = " ".join(prompt.split())
+    spans = [_norm(next(g for g in m.groups() if g is not None)) for m in _QUOTED.finditer(spec.prompt)]
+    missing = [s for s in dict.fromkeys(spans) if s and s not in rewrite]
+    if missing:
+        found.append(_V_QUOTED + "; ".join(missing))
+    has_audio = any(isinstance(item, AudioItem) for item in spec.content)
+    if not has_audio:
+        invented: list[str] = []
+        for match in _DIALOGUE.finditer(prompt):
+            for piece in _DIALOGUE_MARKERS.split(_LANG_TAG.sub("", match.group(1), count=1)):
+                text = _norm(piece)
+                if text and text not in user:
+                    invented.append(text[:120])
+        if invented:
+            found.append(_V_SPEECH + "; ".join(dict.fromkeys(invented)))
+    if not spec.ordered_media:
+        outside = _DIALOGUE.sub(" ", prompt)
+        extra = [
+            _norm(next(g for g in m.groups() if g is not None)) for m in _DOUBLE_QUOTED.finditer(outside)
+        ]
+        extra = [s for s in dict.fromkeys(extra) if s and s not in user]
+        if extra:
+            found.append(_V_VISIBLE + "; ".join(extra))
+    return found
+
+
 def validate_prompt(
     prompt: str, spec: ContextIRRequest, facts: RefFacts | None = None, soft: list[str] | None = None
 ) -> None:
@@ -754,6 +836,10 @@ def validate_prompt(
             raise RewriteError("The rewritten H3 prompt has invalid shot numbering")
     if prompt.count("<d>") != prompt.count("</d>") or re.search(r"<d>(?!\[[^\]\n]+\])", prompt):
         raise RewriteError("The rewritten H3 prompt has invalid dialogue tags")
+    if spec.mode != "ref2va":
+        base_hard = _base_violations(prompt, spec, prompt[positions[0] : positions[1]])
+        if base_hard:
+            raise RewriteError(base_hard[0].split(": ", 1)[0], violations=tuple(base_hard))
     if spec.mode == "ref2va":
         hard, found_soft = ref2va_violations(prompt, spec, facts)
         if hard:
@@ -807,14 +893,75 @@ TRUNCATION_REPAIR_MESSAGE = (
 )
 
 
-def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...]) -> str:
+TRUNCATION_REPAIR_MESSAGE_BASE = (
+    "Your previous answer was cut off before it finished. Rewrite the complete answer from the beginning, "
+    "concisely, and do not repeat sentences."
+)
+
+
+def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...], base: bool = False) -> str:
     listed = "\n".join(f"- {violation}" for violation in violations)
+    if base:
+        return (
+            "Your previous answer has these problems:\n"
+            f"{listed}\n"
+            "Fix exactly these items and keep everything else unchanged. "
+            "Return the complete prompt again in the same three-field format."
+        )
     return (
         "Your previous answer broke these output rules:\n"
         f"{listed}\n"
         f"The provided media labels are exactly: {', '.join(labels) or 'none'}.\n"
         "Write the complete prompt again in the same six-section format and fix every point."
     )
+
+
+CRITIC_INSTRUCTION = """You audit a rewritten video-generation prompt against the user's original request.
+List ONLY concrete fidelity defects of the rewrite, each one short:
+- a subject, object, attribute (color, material, count, size, clothing), spatial relation, viewpoint, camera instruction
+  (movement type and direction), style, action or setting that the user explicitly requested but the rewrite dropped,
+  changed or contradicted;
+- a spoken line or visible text that the user wrote but the rewrite changed, translated, shortened or omitted;
+- dialogue, lyrics or visible on-screen text that the rewrite invented although the user did not ask for it;
+- a new main subject or story event that replaces or competes with what the user asked for.
+Added scenic detail, lighting, sound design, camera framing or motion that is compatible with the request is NOT a defect.
+Attached images are authoritative for appearance: details taken from them are not defects.
+Return ONLY JSON: {"defects": ["...", ...]} (empty list when the rewrite is faithful)."""
+CRITIC_AUDIO_NOTE = (
+    "Reference audio is attached to this request but not shown to you: spoken content may come from it, "
+    "so do not flag dialogue for that reason."
+)
+
+
+def critic_enabled() -> bool:
+    return os.getenv(CRITIC_ENV, "").strip() != "0"
+
+
+def critic_model() -> str | None:
+    """Allow-listed critic model; an unknown value skips the critic (it is optional) with a single warning."""
+    chosen = os.getenv(CRITIC_MODEL_ENV, "").strip() or REF2VA_DEFAULT_MODEL
+    if chosen in REF2VA_MODEL_CAPS:
+        return chosen
+    if CRITIC_MODEL_ENV + chosen not in _warned_models:
+        _warned_models.add(CRITIC_MODEL_ENV + chosen)
+        _log.warning("%s is not an allow-listed model, the fidelity critic is skipped: %r", CRITIC_MODEL_ENV, chosen[:80])
+    return None
+
+
+def parse_defects(text: str) -> tuple[str, ...] | None:
+    """Defects from the first JSON object in a critic reply; None when the reply is unusable."""
+    decoder = json.JSONDecoder()
+    for start in (m.start() for m in re.finditer(r"\{", text)):
+        try:
+            value, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        defects = value.get("defects") if isinstance(value, dict) else None
+        if isinstance(defects, list) and all(isinstance(d, str) for d in defects):
+            cleaned = (" ".join(d.split())[:CRITIC_DEFECT_CHARS] for d in defects)
+            return tuple(d for d in cleaned if d)[:CRITIC_MAX_DEFECTS]
+        return None
+    return None
 
 
 def _remaining(started: float) -> float:
@@ -862,10 +1009,17 @@ class H3PromptRewriter:
         self.api_key = api_key
 
     async def _complete(
-        self, model: str, messages: list[dict[str, JsonValue]], budget: float, ref2va: bool = False
+        self,
+        model: str,
+        messages: list[dict[str, JsonValue]],
+        budget: float,
+        ref2va: bool = False,
+        settings: tuple[dict[str, JsonValue], int] | None = None,
     ) -> _Completion:
-        # Non-ref2va keeps today's payload exactly; the per-model table applies to ref2va only.
-        reasoning, max_tokens = REF2VA_MODEL_REASONING[model] if ref2va else ({"enabled": False}, 4096)
+        # Non-ref2va uses MODEL with reasoning off; the per-model table applies to ref2va; `settings` is the critic's.
+        reasoning, max_tokens = settings or (
+            REF2VA_MODEL_REASONING[model] if ref2va else ({"enabled": False}, BASE_MAX_TOKENS)
+        )
         payload = {
             "model": model,
             "messages": messages,
@@ -920,6 +1074,39 @@ class H3PromptRewriter:
                 failure.usage = _reply_usage(response)  # type: ignore[attr-defined]
             raise failure from exc
 
+    async def fidelity_defects(
+        self, spec: ContextIRRequest, prompt: str, budget: float
+    ) -> tuple[tuple[str, ...], RewriteUsage]:
+        """Defects a cheap critic call finds in `prompt`, plus the call's usage. Strictly fail-open: any error -> none."""
+        model = critic_model()
+        if model is None:
+            return (), RewriteUsage()
+        parts: list[dict[str, JsonValue]] = [{"type": "text", "text": CRITIC_INSTRUCTION}]
+        for item in spec.ordered_media:
+            if isinstance(item, ImageItem):
+                parts.append({"type": "text", "text": f"Attached image ({item.role}):"})
+                parts.append({"type": "image_url", "image_url": {"url": item.image_url.url}})
+        if any(isinstance(item, AudioItem) for item in spec.content):
+            parts.append({"type": "text", "text": CRITIC_AUDIO_NOTE})
+        parts.append({"type": "text", "text": f"USER REQUEST:\n{spec.prompt}\n\nREWRITE:\n{prompt}"})
+        reasoning = REF2VA_MODEL_REASONING[model][0]
+        settings = (reasoning, 6000 if reasoning.get("enabled") else 1500)
+        try:
+            completed = await self._complete(
+                model, [{"role": "user", "content": parts}], min(CRITIC_TIMEOUT_S, budget), settings=settings
+            )
+        except TruncatedRewriteError as cut:
+            _log.info("H3 rewrite fidelity critic skipped: reply cut off")
+            return (), cut.usage
+        except RewriteError as failure:
+            _log.info("H3 rewrite fidelity critic skipped: %s", failure.describe_upstream() or "provider error")
+            return (), RewriteUsage()
+        defects = parse_defects(completed.choices[0].message.content)
+        if defects is None:
+            _log.info("H3 rewrite fidelity critic skipped: unusable reply")
+            return (), completed.usage
+        return defects, completed.usage
+
     async def rewrite(self, spec: ContextIRRequest) -> RewriteResult:
         if not self.api_key:
             raise RewriteError("H3 prompt rewrite is not configured", 503)
@@ -929,7 +1116,7 @@ class H3PromptRewriter:
         model = ref2va_model() if ref2va else MODEL  # a misconfigured model fails before any media is fetched
         prepared, raw = await h3_media.prepare_media_with_raw(self.client, spec)
         # One key per request (hashed off the event loop) serves both the facts memo and the first-answer cache.
-        key = await asyncio.to_thread(media_key, spec, raw.videos, raw.audios) if ref2va else ""
+        key = await asyncio.to_thread(media_key, spec, raw.videos, raw.audios)
         facts = await perceive_media(prepared, raw, key) if ref2va else None
         # The provider clock starts once fetch and perception are done; the attempt deadline still bounds it.
         started = time.monotonic()
@@ -952,8 +1139,9 @@ class H3PromptRewriter:
             {"role": "user", "content": user},
         ]
         # A retry after a retryable failure of the repair call reuses the first answer instead of paying for it again.
-        answer_key = key + model if ref2va else ""
-        cached_answer = _FIRST_ANSWERS.get(answer_key) if ref2va else None
+        answer_key = key + model
+        has_video = any(isinstance(item, VideoItem) for item in spec.content)
+        cached_answer = _FIRST_ANSWERS.get(answer_key)
         truncated = False
         if cached_answer is not None:
             prompt, usage = cached_answer
@@ -963,8 +1151,6 @@ class H3PromptRewriter:
                 prompt = completed.choices[0].message.content.strip()
                 usage = completed.usage
             except TruncatedRewriteError as cut:
-                if not ref2va:
-                    raise
                 prompt, usage, truncated = "", cut.usage, True
         keep_first_answer = False
         soft: list[str] = []
@@ -974,10 +1160,19 @@ class H3PromptRewriter:
                 validate_prompt(prompt, spec, facts, soft=soft if ref2va else None)
             except RewriteError as failure:
                 hard_failure = failure
+        # Deterministic fidelity findings (none for a request with a reference video, whose path is unchanged).
+        literal = [] if truncated or has_video else literal_violations(prompt, spec)
+        if hard_failure is None and not truncated and not has_video and critic_enabled():
+            budget = _remaining(started)
+            if budget >= MIN_REPAIR_BUDGET_S:
+                defects, critic_usage = await self.fidelity_defects(spec, prompt, budget)
+                usage = _sum_usage(usage, critic_usage)
+                soft.extend(f"Fidelity: {defect}" for defect in defects)
+        soft.extend(literal)
 
         def result(text: str, used: RewriteUsage, leftover: list[str]) -> RewriteResult:
             if leftover:
-                _log.info("Ref2VA rewrite accepted with soft violations: %s", [v.split(": ", 1)[0][-60:] for v in leftover])
+                _log.info("H3 rewrite accepted with soft violations: %s", [v.split(": ", 1)[0][-60:] for v in leftover])
             return RewriteResult(
                 prompt=text,
                 usage=used,
@@ -994,26 +1189,29 @@ class H3PromptRewriter:
                     raise TruncatedRewriteError(
                         "H3 prompt rewrite provider returned an invalid response", 502, retryable=False
                     )
-                messages.append({"role": "user", "content": TRUNCATION_REPAIR_MESSAGE})
+                messages.append(
+                    {"role": "user", "content": TRUNCATION_REPAIR_MESSAGE if ref2va else TRUNCATION_REPAIR_MESSAGE_BASE}
+                )
                 again = await self._complete(model, messages, remaining, ref2va)  # a second truncation raises
                 again_soft: list[str] = []
                 again_prompt = again.choices[0].message.content.strip()
                 validate_prompt(again_prompt, spec, facts, soft=again_soft)
+                again_soft.extend([] if has_video else literal_violations(again_prompt, spec))
                 return result(again_prompt, _sum_usage(usage, again.usage), again_soft)
-            if not ref2va or (hard_failure is None and not soft):
-                if hard_failure is not None:
-                    raise hard_failure
+            if hard_failure is None and not soft:
                 return result(prompt, usage, [])
             remaining = _remaining(started)
             if remaining < MIN_REPAIR_BUDGET_S:
                 if hard_failure is not None:
                     raise hard_failure
                 return result(prompt, usage, soft)  # soft-only first answer is acceptable as is
-            listed = (hard_failure.violations or (str(hard_failure),)) if hard_failure is not None else tuple(soft)
+            listed = (
+                (*(hard_failure.violations or (str(hard_failure),)), *literal) if hard_failure is not None else tuple(soft)
+            )
             _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
             messages += [
                 {"role": "assistant", "content": prompt},
-                {"role": "user", "content": _repair_message(listed, _provided_labels(spec))},
+                {"role": "user", "content": _repair_message(listed, _provided_labels(spec), base=not ref2va)},
             ]
             try:
                 repaired = await self._complete(model, messages, remaining, ref2va)
@@ -1027,6 +1225,7 @@ class H3PromptRewriter:
             repaired_soft: list[str] = []
             try:
                 validate_prompt(repaired_prompt, spec, facts, soft=repaired_soft)
+                repaired_soft.extend([] if has_video else literal_violations(repaired_prompt, spec))
             except RewriteError:
                 if hard_failure is None:  # the repair made it worse: keep the first answer
                     return result(prompt, total, soft)

@@ -38,6 +38,8 @@ def clean_state(monkeypatch):
     h3_prompt._warned_models.clear()
     monkeypatch.delenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", raising=False)
     monkeypatch.delenv("CAUSYN_H3_REWRITE_SEND_VIDEO", raising=False)
+    # The optional fidelity critic is covered in test_h3_rewrite_fidelity.py; here it would add provider calls.
+    monkeypatch.setenv("CAUSYN_H3_REWRITE_CRITIC", "0")
 
 
 def item(kind: str, url: str | None = None) -> dict:
@@ -368,14 +370,14 @@ async def test_two_invalid_answers_raise_the_validator_error(patched):
 
 
 @pytest.mark.asyncio
-async def test_non_ref2va_failure_is_never_repaired():
+async def test_non_ref2va_failure_gets_exactly_one_repair():
     spec = ContextIRRequest.model_validate(
         {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat."}], "duration": 5, "ratio": "16:9"}
     )
-    provider = Provider("not a valid prompt", "also invalid")
+    provider = Provider("not a valid prompt", "also invalid", "never reached")
     with pytest.raises(RewriteError):
         await run(provider, spec)
-    assert len(provider.bodies) == 1
+    assert len(provider.bodies) == 2
 
 
 @pytest.mark.asyncio
@@ -507,7 +509,7 @@ async def test_model_env_selects_allow_listed_models_and_ref2va_only(patched, mo
     t2va = ContextIRRequest.model_validate(
         {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat."}], "duration": 5, "ratio": "16:9"}
     )
-    plain = Provider("bad")
+    plain = Provider("bad", "bad")
     with pytest.raises(RewriteError):
         await run(plain, t2va)
     assert plain.bodies[0]["model"] == "qwen/qwen3.8-flash"
@@ -649,8 +651,10 @@ async def test_non_ref2va_payload_is_byte_identical_to_the_previous_code_path(mo
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(RewriteError):
             await H3PromptRewriter(client, "k").rewrite(spec)
-    assert len(seen) == 1
-    assert hashlib.sha256(seen[0]).hexdigest() == golden["sha256"]
+    assert len(seen) == 2  # the invalid answer "x" gets its one repair call
+    # Only max_tokens changed (4096 -> 8192); everything else in the payload is byte-identical.
+    assert b'"max_tokens":8192' in seen[0]
+    assert hashlib.sha256(seen[0].replace(b'"max_tokens":8192', b'"max_tokens":4096')).hexdigest() == golden["sha256"]
 
 
 # ----------------------------------------------------------------------------- real perception, no patches
@@ -1131,16 +1135,16 @@ async def test_truncated_twice_raises_the_permanent_error(patched):
 
 
 @pytest.mark.asyncio
-async def test_non_ref2va_truncation_is_still_permanent_without_repair():
+async def test_non_ref2va_double_truncation_is_permanent_after_one_repair():
     spec = ContextIRRequest.model_validate(
         {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat."}], "duration": 5, "ratio": "16:9"}
     )
-    handler, bodies = scripted(["length", "x"])
+    handler, bodies = scripted(["length", "length"])
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(RewriteError) as caught:
             await H3PromptRewriter(client, "k").rewrite(spec)
-    assert len(bodies) == 1 and caught.value.retryable is False
-    assert bodies[0]["max_tokens"] == 4096 and bodies[0]["reasoning"] == {"enabled": False}
+    assert len(bodies) == 2 and caught.value.retryable is False
+    assert bodies[0]["max_tokens"] == 8192 and bodies[0]["reasoning"] == {"enabled": False}
 
 
 # ----------------------------------------------------------------------------- final-review fixes

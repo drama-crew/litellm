@@ -23,6 +23,14 @@ from litellm.proxy.video_endpoints import minimax_h3_endpoints as h3
 PROMPT = (
     "integrated_multimodal_description: [Shot 1] A cat walks.\noverall_soundscape: Quiet.\nnon_diegetic_music: None."
 )
+
+
+@pytest.fixture(autouse=True)
+def no_fidelity_critic(monkeypatch):
+    # These tests count upstream provider calls; the optional critic call is covered in test_h3_rewrite_fidelity.py.
+    monkeypatch.setenv("CAUSYN_H3_REWRITE_CRITIC", "0")
+
+
 RESULT = RewriteResult(
     prompt=PROMPT,
     usage=RewriteUsage(prompt_tokens=30, completion_tokens=20, total_tokens=50, cost=0.001),
@@ -765,7 +773,8 @@ async def test_permanent_provider_errors_never_retry_or_deliver(redis, failure):
         await service.process(task.id)
         await service.process(task.id)
         assert (await service.store.get(task.id)).status == "failed"
-        assert calls == {"upstream": 1}
+        # A cut-off or invalid answer gets one repair call in the same attempt; HTTP errors are never repaired.
+        assert calls == {"upstream": 2 if failure in {"length", "invalid"} else 1}
 
 
 @pytest.mark.asyncio
