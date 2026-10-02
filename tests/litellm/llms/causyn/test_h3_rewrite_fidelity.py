@@ -330,3 +330,147 @@ def test_parse_defects_limits_and_shapes():
     assert parsed is not None and len(parsed) == 8 and len(parsed[0]) == 300
     assert h3_prompt.parse_defects('{"defects": [1]}') is None
     assert h3_prompt.parse_defects("nothing") is None
+
+
+# ----------------------------------------------------------------------------- fix round 1
+
+
+@pytest.mark.asyncio
+async def test_critic_never_fails_the_rewrite_on_unexpected_errors(monkeypatch):
+    good = t2va_prompt("[Shot 1] An orange vase on a table.")
+    spec = make_spec("An orange vase on a table.")
+    provider = Provider(good, critic=httpx.DecodingError("bad gzip"))
+    assert (await run(provider, spec)).prompt == good and len(provider.bodies) == 1
+
+    async def boom(self, *args, **kwargs):
+        raise RuntimeError("secret-token-123 https://x.example")
+
+    monkeypatch.setattr(H3PromptRewriter, "_complete", H3PromptRewriter._complete)
+    provider = Provider(good)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        rewriter = H3PromptRewriter(client, "k")
+        real = H3PromptRewriter._complete
+
+        async def selective(self, model, messages, budget, ref2va=False, settings=None):
+            if settings is not None:
+                raise RuntimeError("secret-token-123 https://x.example")
+            return await real(self, model, messages, budget, ref2va, settings)
+
+        monkeypatch.setattr(H3PromptRewriter, "_complete", selective)
+        result = await rewriter.rewrite(spec)
+    assert result.prompt == good and len(provider.bodies) == 1
+
+
+@pytest.mark.parametrize(
+    "user,rewrite",
+    [
+        ("He says “I don’t know”", "<d>[English] I don't know</d>"),
+        ("He says \"I don't know\"", "<d>[English] I don’t know</d>"),
+        ("a man says hello to her", "<d>[English] Hello</d>"),
+        ("她说“你好，世界”", "<d>[Chinese] 你好,世界</d>"),
+        ("He says \"wait...\"", "<d>[English] wait…</d>"),
+    ],
+)
+def test_comparison_is_normalised_on_both_sides(user, rewrite):
+    assert literal_violations(t2va_prompt("[Shot 1] " + rewrite), make_spec(user)) == []
+
+
+def test_inch_marks_and_unbalanced_quotes_trigger_nothing():
+    plain = t2va_prompt("[Shot 1] A 12 inch pizza and a 14 inch pan.")
+    assert literal_violations(plain, make_spec('a 12" pizza and a 14" pan')) == []
+    assert literal_violations(plain, make_spec('he says "hello there')) == []
+    odd = t2va_prompt('[Shot 1] A sign reading "OPEN" and "CLOSED" hangs.')
+    found = literal_violations(odd, make_spec("A sign hangs on a door."))
+    assert len(found) == 1 and "OPEN" in found[0]
+    unbalanced = t2va_prompt('[Shot 1] A 5" nail and a "sign.')
+    assert literal_violations(unbalanced, make_spec("A nail.")) == []
+
+
+def test_pasted_caption_in_dialogue_is_flagged_when_the_user_marked_lines():
+    spec = make_spec('A cop says "Drop it now." The street is empty at night.')
+    ok = t2va_prompt("[Shot 1] <d>[English] Drop it now.</d>")
+    assert literal_violations(ok, spec) == []
+    caption = t2va_prompt("[Shot 1] <d>[English] A cop says Drop it now. The street is empty at night.</d> Drop it now.")
+    found = literal_violations(caption, spec)
+    assert any("must not add dialogue" in v for v in found)
+    short = t2va_prompt("[Shot 1] <d>[English] The street is empty</d> Drop it now.")
+    assert literal_violations(short, spec) == []  # short phrase from the prompt is tolerated
+    # without quotes plain containment applies
+    assert literal_violations(t2va_prompt("[Shot 1] <d>[English] A cop says drop it</d>"), make_spec("A cop says drop it")) == []
+
+
+def test_language_tag_is_stripped_from_every_piece_and_markers_split():
+    spec = make_spec("He says hello and goodbye.")
+    prompt = t2va_prompt("[Shot 1] <d>[English] hello<cutoff>[English] goodbye</d>")
+    assert literal_violations(prompt, spec) == []
+    prompt = t2va_prompt("[Shot 1] <d>[English] hello<scenetrans>[English] never said</d>")
+    found = literal_violations(prompt, spec)
+    assert len(found) == 1 and "never said" in found[0] and "[english]" not in found[0].lower()
+
+
+@pytest.mark.asyncio
+async def test_fl2va_alignment_without_a_from_shot_marker_is_accepted():
+    head = "How the reference pictures align with the target video — the last picture aligns with the 5.00-second mark of the target video.\n"
+    prompt = head + t2va_prompt("[Shot 1] A cat walks. [Shot 2] At 00:03.000, it stops.")
+    provider = Provider(prompt, critic=[])
+    result = await run(provider, make_spec("A cat walks.", "first_frame", "last_frame"))
+    assert result.prompt == prompt and len(provider.bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_retryable_repair_failure_after_hard_failure_reuses_the_first_answer():
+    bad = t2va_prompt("[Shot 1] A cat. [Shot 2] At 00:09.000, cut.")
+    good = t2va_prompt("[Shot 1] A cat walks. [Shot 2] At 00:03.000, cut.")
+    spec = make_spec("A cat walks.", duration=5)
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        calls.append(body)
+        if len(calls) == 1:
+            return reply(body["model"], bad, 10)
+        if len(calls) == 2:
+            return httpx.Response(503)
+        return reply(body["model"], good, 10)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "k").rewrite(spec)
+        assert caught.value.retryable is True and len(calls) == 2
+        result = await H3PromptRewriter(client, "k").rewrite(spec)
+    assert result.prompt == good and len(calls) == 3  # exactly one provider call on the retry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "model,reasoning,max_tokens",
+    [
+        ("qwen/qwen3.8-omni-flash", {"enabled": False}, 8192),
+        ("qwen/qwen3.8-max-0902", {"enabled": True, "effort": "low"}, 12000),
+    ],
+)
+async def test_base_rewrite_model_is_configurable(monkeypatch, model, reasoning, max_tokens):
+    monkeypatch.setenv("CAUSYN_H3_REWRITE_MODEL", model)
+    monkeypatch.setenv("CAUSYN_H3_REWRITE_CRITIC", "0")
+    provider = Provider(t2va_prompt("[Shot 1] A cat walks."))
+    result = await run(provider, make_spec("A cat walks."))
+    body = provider.bodies[0]
+    assert body["model"] == model and body["reasoning"] == reasoning and body["max_tokens"] == max_tokens
+    assert result.model == model
+
+
+@pytest.mark.asyncio
+async def test_unknown_base_rewrite_model_fails_before_any_http_call(monkeypatch):
+    monkeypatch.setenv("CAUSYN_H3_REWRITE_MODEL", "typo/model")
+    called = []
+
+    async def prepare(client, request):
+        called.append("media")
+        raise AssertionError("media must not be fetched")
+
+    monkeypatch.setattr(h3_media, "prepare_media_with_raw", prepare)
+    provider = Provider("x")
+    with pytest.raises(RewriteError) as caught:
+        await run(provider, make_spec("A cat walks."))
+    assert caught.value.status_code == 503 and caught.value.retryable is False
+    assert provider.bodies == [] and called == []
