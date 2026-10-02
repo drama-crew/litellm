@@ -577,6 +577,7 @@ _V_LABELS = "The rewritten H3 prompt must use exactly the provided media labels"
 _V_DEFINE = "The rewritten H3 prompt must define every provided media label in subject_definitions"
 _V_SHOTS = "The rewritten H3 prompt has invalid shot numbering"
 _V_TIMES = "The rewritten H3 prompt has invalid shot timestamps"
+_V_LENGTH = "The rewritten H3 prompt must contain 1 to 7000 characters"
 _V_WORDS = "The rewritten H3 prompt detailed_description must have 200 to 750 words"
 _V_RETENTION = "The rewritten H3 prompt retention_analysis lines must start with a defined label"
 _V_REPLACE = (
@@ -852,7 +853,9 @@ def validate_prompt(
 ) -> None:
     """Raise on any violation. With `soft` given, ref2va soft-only findings are appended to it instead of raising."""
     if not prompt or len(prompt) > 7000:
-        raise RewriteError("The rewritten H3 prompt must contain 1 to 7000 characters")
+        # "it has N characters" is added only for the too-long case (the repair message then asks to shorten).
+        detail = (f"{_V_LENGTH}: it has {len(prompt)} characters",) if prompt else ()
+        raise RewriteError(_V_LENGTH, violations=detail)
     fields = REFERENCE_FIELDS if spec.mode == "ref2va" else BASE_FIELDS
     positions = tuple(prompt.find(field + ":") for field in fields)
     if any(position < 0 for position in positions) or positions != tuple(sorted(positions)):
@@ -948,22 +951,39 @@ KEEP_DETAIL_SENTENCE = (
 )
 
 
+SHORTEN_SENTENCE = (
+    "Shorten the descriptive sections so the whole prompt stays well under 7000 characters; "
+    "keep every required section, label and spoken line."
+)
+
+
+def _too_long(violation: str) -> bool:
+    """The over-7000-characters violation, or the word-count violation in its over-maximum form."""
+    if violation.startswith(_V_LENGTH):
+        return ": it has " in violation
+    if violation.startswith(_V_WORDS):
+        found = re.search(r"it has (\d+)", violation)
+        return found is not None and int(found.group(1)) > DESCRIPTION_WORDS[1]
+    return False
+
+
 def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...], base: bool = False) -> str:
     listed = "\n".join(f"- {violation}" for violation in violations)
+    closing = SHORTEN_SENTENCE if any(_too_long(v) for v in violations) else KEEP_DETAIL_SENTENCE
     if base:
         return (
             "Your previous answer has these problems:\n"
             f"{listed}\n"
             "Fix exactly these items and keep everything else unchanged. "
             "Return the complete prompt again in the same three-field format.\n"
-            f"{KEEP_DETAIL_SENTENCE}"
+            f"{closing}"
         )
     return (
         "Your previous answer broke these output rules:\n"
         f"{listed}\n"
         f"The provided media labels are exactly: {', '.join(labels) or 'none'}.\n"
         "Write the complete prompt again in the same six-section format and fix every point.\n"
-        f"{KEEP_DETAIL_SENTENCE}"
+        f"{closing}"
     )
 
 

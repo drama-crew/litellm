@@ -607,3 +607,42 @@ def test_every_repair_message_keeps_the_detail_sentence(base):
         "section; change only what is needed to fix the listed points."
     )
     assert base or "The provided media labels are exactly: <Picture 1>." in message
+
+
+# ----------------------------------------------------------------------------- length-aware repair sentence
+
+SHORTEN = (
+    "Shorten the descriptive sections so the whole prompt stays well under 7000 characters; "
+    "keep every required section, label and spoken line."
+)
+
+
+@pytest.mark.asyncio
+async def test_repair_after_an_over_7000_character_answer_asks_to_shorten():
+    too_long = t2va_prompt("[Shot 1] " + "A cat walks slowly. " * 400)
+    assert len(too_long) > 7000
+    provider = Provider(too_long, t2va_prompt("[Shot 1] A cat walks."))
+    await run(provider, make_spec("A cat walks."))
+    last = provider.bodies[1]["messages"][-1]["content"]
+    assert last.endswith(SHORTEN) and h3_prompt.KEEP_DETAIL_SENTENCE not in last
+    assert "it has" in last and "must contain 1 to 7000 characters" in last
+
+
+@pytest.mark.asyncio
+async def test_over_maximum_word_count_asks_to_shorten_and_too_short_keeps_detail():
+    long_desc = " ".join(["She walks along the quiet street while the camera slowly follows her pace."] * 70)  # >750 words
+    assert len(long_desc.split()) > 750
+    spec = ref_image_spec()
+    provider = Provider(ref_prompt(70), ref_prompt(20))
+    await run(provider, spec)
+    last = provider.bodies[1]["messages"][-1]["content"]
+    assert last.endswith(SHORTEN) and h3_prompt.KEEP_DETAIL_SENTENCE not in last
+    provider = Provider(ref_prompt(2), ref_prompt(20))
+    await run(provider, spec)
+    last = provider.bodies[1]["messages"][-1]["content"]
+    assert last.endswith(h3_prompt.KEEP_DETAIL_SENTENCE) and SHORTEN not in last
+
+
+def test_ordinary_repairs_and_empty_answers_keep_the_detail_sentence():
+    for violations in (("A: x",), (h3_prompt._V_LENGTH,)):
+        assert h3_prompt._repair_message(violations, (), base=True).endswith(h3_prompt.KEEP_DETAIL_SENTENCE)
