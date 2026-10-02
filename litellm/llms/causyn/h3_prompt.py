@@ -942,6 +942,12 @@ TRUNCATION_REPAIR_MESSAGE_BASE = (
 )
 
 
+KEEP_DETAIL_SENTENCE = (
+    "Keep everything that was already correct, including the level of detail and length of the descriptive section; "
+    "change only what is needed to fix the listed points."
+)
+
+
 def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...], base: bool = False) -> str:
     listed = "\n".join(f"- {violation}" for violation in violations)
     if base:
@@ -949,13 +955,15 @@ def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...], base: 
             "Your previous answer has these problems:\n"
             f"{listed}\n"
             "Fix exactly these items and keep everything else unchanged. "
-            "Return the complete prompt again in the same three-field format."
+            "Return the complete prompt again in the same three-field format.\n"
+            f"{KEEP_DETAIL_SENTENCE}"
         )
     return (
         "Your previous answer broke these output rules:\n"
         f"{listed}\n"
         f"The provided media labels are exactly: {', '.join(labels) or 'none'}.\n"
-        "Write the complete prompt again in the same six-section format and fix every point."
+        "Write the complete prompt again in the same six-section format and fix every point.\n"
+        f"{KEEP_DETAIL_SENTENCE}"
     )
 
 
@@ -1285,6 +1293,9 @@ class H3PromptRewriter:
                     # check: a usable first answer beats a permanent failure.
                     return result(prompt, total, [*hard_failure.violations, *literal])
                 raise
+            # Never worse: critic defects are not re-evaluated on the repaired answer, so compare deterministic findings only.
+            if hard_failure is None and len(repaired_soft) > sum(not v.startswith("Fidelity: ") for v in soft):
+                return result(prompt, total, soft)
             return result(repaired_prompt, total, repaired_soft)
         finally:
             if not keep_first_answer:

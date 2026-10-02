@@ -535,3 +535,62 @@ async def test_repair_failing_an_older_check_still_raises():
     provider = Provider(broken, BAD_TIMES)
     with pytest.raises(RewriteError):
         await run(provider, make_spec("A cat walks.", duration=5))
+
+
+# ----------------------------------------------------------------------------- never-worse repair
+
+
+def ref_prompt(repeats: int) -> str:
+    desc = " ".join(["She walks along the quiet street while the camera slowly follows her pace."] * repeats)
+    return (
+        "subject_definitions:\n<Subject 1> is the woman from <Picture 1> in the coat of <Picture 2>.\n\n"
+        "summary:\n[reference generation] A woman walks.\n\n"
+        "retention_analysis:\n<Subject 1> (appears in [Shot 1]): fully_preserved - face from <Picture 1>\n"
+        "and the coat of <Picture 2>.\n"
+        "<Picture 2>: fully_preserved - the coat.\n\n"
+        f"detailed_description:\nA calm look.\n[Shot 1] {desc}\n\n"
+        "overall_soundscape:\nSoft footsteps.\n\nnon_diegetic_music:\nN/A"
+    )
+
+
+def ref_image_spec() -> ContextIRRequest:
+    return make_spec("A woman walks.", "reference_image", "reference_image", duration=8)
+
+
+@pytest.mark.asyncio
+async def test_a_terser_repair_that_adds_deterministic_findings_loses_to_the_first_answer():
+    first, short = ref_prompt(20), ref_prompt(2)  # 2 repeats: below the 200-word soft minimum
+    provider = Provider(first, short, critic=["The coat is wrong"])
+    result = await run(provider, ref_image_spec())
+    assert result.prompt == first
+    assert result.soft_violations == ("Fidelity: The coat is wrong",)
+    assert result.usage.prompt_tokens == 100 + 7 + 100  # all three calls are still paid
+
+
+@pytest.mark.asyncio
+async def test_a_repair_with_equal_or_fewer_deterministic_findings_wins():
+    first, fixed = ref_prompt(20), ref_prompt(21)
+    provider = Provider(first, fixed, critic=["The coat is wrong"])
+    result = await run(provider, ref_image_spec())
+    assert result.prompt == fixed and result.soft_violations == ()
+    # equal count (one finding each) is not "strictly more": the repair is kept
+    provider = Provider(ref_prompt(2), ref_prompt(3), critic=[])
+    result = await run(provider, ref_image_spec())
+    assert result.prompt == ref_prompt(3)
+
+
+@pytest.mark.asyncio
+async def test_a_repair_that_drops_a_quoted_line_loses_to_the_first_answer():
+    provider = Provider(GOOD_QUOTE.replace("</d>", "</d> A fidelity-flagged flourish"), BAD_QUOTE, critic=["flourish is odd"])
+    result = await run(provider, QUOTE_SPEC())
+    assert "flourish" in result.prompt and any(v.startswith("Fidelity:") for v in result.soft_violations)
+
+
+@pytest.mark.parametrize("base", [True, False])
+def test_every_repair_message_keeps_the_detail_sentence(base):
+    message = h3_prompt._repair_message(("A: x",), ("<Picture 1>",), base=base)
+    assert message.endswith(
+        "Keep everything that was already correct, including the level of detail and length of the descriptive "
+        "section; change only what is needed to fix the listed points."
+    )
+    assert base or "The provided media labels are exactly: <Picture 1>." in message
