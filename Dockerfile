@@ -24,8 +24,16 @@
 #   - nodejs-26 26.8.1-r4 (26.10.0-r3 needs OpenSSL 4; production runs 26.8.1-r4)
 #   - cyrus-sasl-heimdal-libs 2.1.28-r57 (r58 needs OpenSSL 4; builder-only,
 #     pulled in transitively)
-# Remove both pins when the base digest moves to an OpenSSL-4 world (and then
-# drop `openssl`/`openssl-dev` 3.x with it).
+# Later the same day more builder-only packages moved to OpenSSL 4 (the deploy
+# failed again with the same etc/ssl/ca.cnf conflict); pinned to their last
+# OpenSSL-3 builds, found by simulating `apk add` on the digest below:
+#   - rust-1.98 1.98.1-r1 (r2 links libssl.so.4)
+#   - libcurl-openssl4 8.22.0-r3, ngtcp2 1.25.0-r4, libldap 2.6.10-r5 (rust's
+#     curl chain; r4 / r5 / 2.7 need OpenSSL 4)
+#   - npm 12.0.2-r0 (`npm` now resolves to npm-12 12.2.0, which needs nodejs-26
+#     26.10.0 and therefore OpenSSL 4)
+# Remove all of these pins when the base digest moves to an OpenSSL-4 world (and
+# then drop `openssl`/`openssl-dev` 3.x with it).
 ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:7e62cecd3c5712dba6e52c5260afb8f9d7a23b9bbcdd26ad7508a811e74b766d
 
 # Runtime image
@@ -71,12 +79,15 @@ RUN for attempt in 1 2 3 4 5; do \
             gcc \
             python-3.13 \
             python-3.13-dev \
-            rust \
+            "rust-1.98=1.98.1-r1" \
             openssl \
             openssl-dev \
             "nodejs-26=26.8.1-r4" \
             "cyrus-sasl-heimdal-libs=2.1.28-r57" \
-            npm \
+            "npm=12.0.2-r0" \
+            "libcurl-openssl4=8.22.0-r3" \
+            "ngtcp2=1.25.0-r4" \
+            "libldap=2.6.10-r5" \
             libsndfile \
         && exit 0; \
         echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
