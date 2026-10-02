@@ -558,25 +558,38 @@ def ref_image_spec() -> ContextIRRequest:
 
 
 @pytest.mark.asyncio
-async def test_a_terser_repair_that_adds_deterministic_findings_loses_to_the_first_answer():
-    first, short = ref_prompt(20), ref_prompt(2)  # 2 repeats: below the 200-word soft minimum
-    provider = Provider(first, short, critic=["The coat is wrong"])
+async def test_a_repair_that_adds_deterministic_findings_loses_to_the_first_answer():
+    first = ref_prompt(2)  # one finding: below the 200-word soft minimum
+    worse = first.replace("[Shot 1] ", "[Shot 1] <d>[English] hello there</d> ")  # plus invented dialogue
+    provider = Provider(first, worse)
     result = await run(provider, ref_image_spec())
     assert result.prompt == first
-    assert result.soft_violations == ("Fidelity: The coat is wrong",)
-    assert result.usage.prompt_tokens == 100 + 7 + 100  # all three calls are still paid
+    assert len(result.soft_violations) == 1 and "200 to 750 words" in result.soft_violations[0]
+    assert result.usage.prompt_tokens == 200  # both calls are still paid
 
 
 @pytest.mark.asyncio
 async def test_a_repair_with_equal_or_fewer_deterministic_findings_wins():
-    first, fixed = ref_prompt(20), ref_prompt(21)
-    provider = Provider(first, fixed, critic=["The coat is wrong"])
+    provider = Provider(ref_prompt(2), ref_prompt(20))
     result = await run(provider, ref_image_spec())
-    assert result.prompt == fixed and result.soft_violations == ()
+    assert result.prompt == ref_prompt(20) and result.soft_violations == ()
     # equal count (one finding each) is not "strictly more": the repair is kept
-    provider = Provider(ref_prompt(2), ref_prompt(3), critic=[])
+    provider = Provider(ref_prompt(2), ref_prompt(3))
     result = await run(provider, ref_image_spec())
     assert result.prompt == ref_prompt(3)
+
+
+@pytest.mark.asyncio
+async def test_ref2va_never_calls_the_critic_but_base_modes_do():
+    audio = make_spec("A girl sings.", "reference_image", "reference_image", audio=True)
+    for spec in (ref_image_spec(), audio):
+        provider = Provider(ref_prompt(20), ref_prompt(20), critic=["would be ignored"])
+        result = await run(provider, spec)
+        assert provider.critic_bodies == []
+        assert all(not v.startswith("Fidelity:") for v in result.soft_violations)
+    provider = Provider(t2va_prompt("[Shot 1] A cat walks."), critic=[])
+    await run(provider, make_spec("A cat walks."))
+    assert len(provider.critic_bodies) == 1
 
 
 @pytest.mark.asyncio

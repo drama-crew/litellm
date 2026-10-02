@@ -1219,9 +1219,10 @@ class H3PromptRewriter:
                 validate_prompt(prompt, spec, facts, soft=soft if ref2va else None)
             except RewriteError as failure:
                 hard_failure = failure
-        # Deterministic fidelity findings (none for a request with a reference video, whose path is unchanged).
+        # Deterministic fidelity findings (none with a reference video). The critic runs for t2va/i2va/fl2va/l2va only:
+        # evaluation showed it does not improve any Ref2VA request.
         literal = [] if truncated or has_video else literal_violations(prompt, spec)
-        if hard_failure is None and not truncated and not has_video and critic_enabled():
+        if hard_failure is None and not truncated and not ref2va and critic_enabled():
             budget = _remaining(started)
             if budget >= MIN_REPAIR_BUDGET_S:
                 defects, critic_usage = await self.fidelity_defects(prepared, prompt, budget)
