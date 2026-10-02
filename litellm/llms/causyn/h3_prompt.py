@@ -143,6 +143,9 @@ class RewriteError(Exception):
         super().__init__(message)
         # Validator findings (each starts with a fixed phrase) for the one-shot repair message; never public.
         self.violations = violations
+        # True for the base-mode structural checks added later (shot timestamps, last-frame alignment): every
+        # older check had already passed when it is set, so an answer failing only these is still usable.
+        self.new_checks_only = False
         self.status_code = status_code
         self.retryable = status_code == 429 if retryable is None else retryable
         self.retry_after = retry_after
@@ -877,7 +880,9 @@ def validate_prompt(
     if spec.mode != "ref2va":
         base_hard = _base_violations(prompt, spec, prompt[positions[0] : positions[1]])
         if base_hard:
-            raise RewriteError(base_hard[0].split(": ", 1)[0], violations=tuple(base_hard))
+            failure = RewriteError(base_hard[0].split(": ", 1)[0], violations=tuple(base_hard))
+            failure.new_checks_only = True
+            raise failure
     if spec.mode == "ref2va":
         hard, found_soft = ref2va_violations(prompt, spec, facts)
         if hard:
@@ -1113,7 +1118,9 @@ class H3PromptRewriter:
     async def fidelity_defects(
         self, spec: ContextIRRequest, prompt: str, budget: float
     ) -> tuple[tuple[str, ...], RewriteUsage]:
-        """Defects a cheap critic call finds in `prompt`, plus the call's usage. Strictly fail-open: any error -> none."""
+        """Defects a cheap critic call finds in `prompt`, plus the call's usage. Strictly fail-open: any error -> none.
+
+        `spec` must be the prepared request, so the critic sees the same fetched data-URL images as the rewrite call."""
         usage = RewriteUsage()
         try:
             model = critic_model()
@@ -1209,7 +1216,7 @@ class H3PromptRewriter:
         if hard_failure is None and not truncated and not has_video and critic_enabled():
             budget = _remaining(started)
             if budget >= MIN_REPAIR_BUDGET_S:
-                defects, critic_usage = await self.fidelity_defects(spec, prompt, budget)
+                defects, critic_usage = await self.fidelity_defects(prepared, prompt, budget)
                 usage = _sum_usage(usage, critic_usage)
                 soft.extend(f"Fidelity: {defect}" for defect in defects)
         soft.extend(literal)
@@ -1270,9 +1277,13 @@ class H3PromptRewriter:
             try:
                 validate_prompt(repaired_prompt, spec, facts, soft=repaired_soft)
                 repaired_soft.extend([] if has_video else literal_violations(repaired_prompt, spec))
-            except RewriteError:
+            except RewriteError as repair_failure:
                 if hard_failure is None:  # the repair made it worse: keep the first answer
                     return result(prompt, total, soft)
+                if repair_failure.new_checks_only and hard_failure.new_checks_only:
+                    # Only the structural checks added later still fail and the first answer passed every older
+                    # check: a usable first answer beats a permanent failure.
+                    return result(prompt, total, [*hard_failure.violations, *literal])
                 raise
             return result(repaired_prompt, total, repaired_soft)
         finally:

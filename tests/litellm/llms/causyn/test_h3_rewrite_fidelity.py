@@ -283,7 +283,7 @@ async def test_failed_repair_call_keeps_a_soft_only_first_answer():
 # 13
 @pytest.mark.asyncio
 async def test_hard_failure_surviving_the_repair_raises_non_retryable():
-    bad = t2va_prompt("[Shot 1] A cat. [Shot 2] At 00:09.000, cut.")
+    bad = "integrated_multimodal_description: [Shot 1] A cat.\noverall_soundscape: x"  # an older check fails
     provider = Provider(bad, bad)
     with pytest.raises(RewriteError) as caught:
         await run(provider, make_spec("A cat walks.", duration=5))
@@ -474,3 +474,64 @@ async def test_unknown_base_rewrite_model_fails_before_any_http_call(monkeypatch
         await run(provider, make_spec("A cat walks."))
     assert caught.value.status_code == 503 and caught.value.retryable is False
     assert provider.bodies == [] and called == []
+
+
+# ----------------------------------------------------------------------------- final fix round
+
+
+@pytest.mark.asyncio
+async def test_critic_sends_the_prepared_images_never_the_original_urls(monkeypatch):
+    original = "https://private.example/first.png?sig=SECRET"
+    prepared_url = "data:image/jpeg;base64,PREPARED"
+    spec = ContextIRRequest.model_validate(
+        {
+            "model": "MiniMax-H3",
+            "content": [
+                {"type": "text", "text": "A cat walks."},
+                {"type": "image_url", "image_url": {"url": original}, "role": "first_frame"},
+            ],
+            "duration": 5,
+            "ratio": "16:9",
+        }
+    )
+
+    async def prepare(client, request):
+        swapped = ContextIRRequest.model_validate(
+            json.loads(request.model_dump_json().replace(original, prepared_url))
+        )
+        return swapped, h3_media.PreparedRaw(videos=(), audios=())
+
+    monkeypatch.setattr(h3_media, "prepare_media_with_raw", prepare)
+    good = (
+        "For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.\n"
+        + t2va_prompt("[Shot 1] A cat walks.")
+    )
+    provider = Provider(good, critic=[])
+    await run(provider, spec)
+    rewrite_urls = [p["image_url"]["url"] for p in provider.bodies[0]["messages"][1]["content"] if p["type"] == "image_url"]
+    critic_urls = [p["image_url"]["url"] for p in provider.critic_bodies[0]["messages"][0]["content"] if p["type"] == "image_url"]
+    assert critic_urls == rewrite_urls == [prepared_url]
+    assert "private.example" not in json.dumps(provider.critic_bodies[0]) and "SECRET" not in json.dumps(provider.critic_bodies[0])
+
+
+BAD_TIMES = t2va_prompt("[Shot 1] A cat. [Shot 2] At 00:09.000, cut.")
+
+
+@pytest.mark.asyncio
+async def test_repair_failing_only_new_checks_keeps_the_first_answer():
+    provider = Provider(BAD_TIMES, BAD_TIMES)
+    result = await run(provider, make_spec("A cat walks.", duration=5))
+    assert result.prompt == BAD_TIMES and len(provider.bodies) == 2
+    assert any("invalid shot timestamps" in v for v in result.soft_violations)
+
+
+@pytest.mark.asyncio
+async def test_repair_failing_an_older_check_still_raises():
+    broken = "integrated_multimodal_description: [Shot 1] A cat walks.\noverall_soundscape: x"  # missing field
+    provider = Provider(BAD_TIMES, broken)
+    with pytest.raises(RewriteError):
+        await run(provider, make_spec("A cat walks.", duration=5))
+    # an older-check failure in the first answer is never excused, even if the repair has a new-check failure
+    provider = Provider(broken, BAD_TIMES)
+    with pytest.raises(RewriteError):
+        await run(provider, make_spec("A cat walks.", duration=5))
