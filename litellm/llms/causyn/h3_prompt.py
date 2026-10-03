@@ -256,7 +256,7 @@ _MEMO_SIZE = 32
 FACTS_MEMO_MAX_BYTES = 64 * 1024 * 1024
 _FACTS_MEMO: OrderedDict[str, RefFacts] = OrderedDict()
 _FIRST_ANSWERS: OrderedDict[str, tuple[str, RewriteUsage]] = OrderedDict()
-_PLAN_NOTES: OrderedDict[str, tuple[str, RewriteUsage]] = OrderedDict()
+_PLAN_NOTES: OrderedDict[str, str] = OrderedDict()
 
 
 def _remember(store: OrderedDict, key: str, value: object) -> None:
@@ -1026,13 +1026,13 @@ def plan_enabled() -> bool:
 
 
 def plan_model() -> str | None:
-    """Allow-listed model for the observe and plan calls; an unknown value skips the plan stage with a single warning."""
+    """Model for the observe and plan calls: only reasoning-off models; anything else skips the stage with one warning."""
     chosen = os.getenv(ref2va_plan.PLAN_MODEL_ENV, "").strip() or REF2VA_DEFAULT_MODEL
-    if chosen in REF2VA_MODEL_CAPS:
+    if chosen in ref2va_plan.PLAN_MODELS:
         return chosen
     if ref2va_plan.PLAN_MODEL_ENV + chosen not in _warned_models:
         _warned_models.add(ref2va_plan.PLAN_MODEL_ENV + chosen)
-        _log.warning("%s is not an allow-listed model, the Ref2VA plan stage is skipped: %r", ref2va_plan.PLAN_MODEL_ENV, chosen[:80])
+        _log.warning("%s is not a supported plan model, the Ref2VA plan stage is skipped: %r", ref2va_plan.PLAN_MODEL_ENV, chosen[:80])
     return None
 
 
@@ -1089,6 +1089,25 @@ def _response_detail(response: httpx.Response) -> str:
         )
     except Exception:  # noqa: BLE001
         return f"unreadable reply, {len(response.content)} bytes"
+
+
+def _leaf_errors(exc: BaseException) -> str:
+    """Class names (and upstream status codes) of the leaf errors in an exception group; never any message text."""
+    leaves = exc.exceptions if isinstance(exc, BaseExceptionGroup) else (exc,)
+    names = []
+    for leaf in leaves:
+        status = getattr(leaf, "upstream_status", None)
+        names.append(type(leaf).__name__ + (f"({status})" if status is not None else ""))
+    return ",".join(names)
+
+
+def _plan_retry_delay(failure: RewriteError) -> float:
+    """Pause before the single in-stage retry: the provider's retry-after when it is a number, at most 5 s."""
+    try:
+        wanted = float(failure.retry_after) if failure.retry_after is not None else 1.0
+    except ValueError:
+        wanted = 1.0
+    return min(ref2va_plan.PLAN_RETRY_AFTER_MAX_S, max(0.0, wanted))
 
 
 class H3PromptRewriter:
@@ -1204,16 +1223,20 @@ class H3PromptRewriter:
             return (), usage
 
     async def ref2va_plan_notes(
-        self, spec: ContextIRRequest, key: str, started: float
+        self, spec: ContextIRRequest, key: str, started: float, answer_cached: bool = False
     ) -> tuple[str | None, RewriteUsage]:
-        """Directing-plan notes for an image-only Ref2VA request plus the stage's usage. Strictly fail-open: any error -> none.
+        """Directing-plan notes for an image-only Ref2VA request plus the usage this call spent. Strictly fail-open.
 
-        `spec` must be the prepared request (images as data URLs). Observe each picture, then plan the whole shot."""
+        `spec` must be the prepared request (images as data URLs). A memo hit reports no usage: the attempt that paid
+        for the stage already billed it."""
         usage = RewriteUsage()
         try:
             if not plan_enabled():
                 return None, usage
             if any(not isinstance(item, ImageItem) for item in spec.ordered_media):
+                return None, usage
+            urls = [item.image_url.url for item in spec.ordered_media if isinstance(item, ImageItem)]
+            if not urls:
                 return None, usage
             model = plan_model()
             if model is None:
@@ -1222,7 +1245,9 @@ class H3PromptRewriter:
             memoized = _PLAN_NOTES.get(memo_key)
             if memoized is not None:
                 _PLAN_NOTES.move_to_end(memo_key)
-                return memoized
+                return memoized, usage
+            if answer_cached:  # the notes would only ride along in a repair message: not worth the spend
+                return None, usage
             budget = min(
                 ref2va_plan.PLAN_STAGE_MAX_S,
                 _remaining(started) - MIN_REPAIR_BUDGET_S - ref2va_plan.PLAN_STAGE_RESERVE_S,
@@ -1231,66 +1256,84 @@ class H3PromptRewriter:
                 _log.info("H3 Ref2VA plan stage skipped: no time budget")
                 return None, usage
             began = time.monotonic()
-            urls = [item.image_url.url for item in spec.ordered_media if isinstance(item, ImageItem)]
-            reasoning = REF2VA_MODEL_REASONING[model][0]
+            deadline = began + budget
+            reasoning = ref2va_plan.PLAN_REASONING
             spent: list[RewriteUsage] = []
-            gate = asyncio.Semaphore(ref2va_plan.OBSERVE_CONCURRENCY)
 
             async def call(messages: list[dict[str, JsonValue]], max_tokens: int) -> str:
-                try:
-                    completed = await self._complete(model, messages, budget, settings=(reasoning, max_tokens))
-                except TruncatedRewriteError as cut:
-                    spent.append(cut.usage)
-                    raise
-                spent.append(completed.usage)
-                return completed.choices[0].message.content
+                for attempt in (0, 1):
+                    try:
+                        completed = await self._complete(
+                            model, messages, deadline - time.monotonic(), settings=(reasoning, max_tokens)
+                        )
+                    except TruncatedRewriteError as cut:
+                        spent.append(cut.usage)
+                        raise
+                    except RewriteError as failure:
+                        left = deadline - time.monotonic()
+                        delay = _plan_retry_delay(failure)
+                        if attempt or not failure.retryable or left - delay < ref2va_plan.PLAN_STAGE_MIN_S:
+                            raise
+                        await asyncio.sleep(delay)
+                        continue
+                    spent.append(completed.usage)
+                    return completed.choices[0].message.content
+                raise AssertionError("unreachable")
 
             async def observe(url: str) -> str:
-                async with gate:
-                    return await call(
-                        [
-                            {"role": "system", "content": ref2va_plan.OBSERVE},
-                            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
-                        ],
-                        ref2va_plan.OBSERVE_MAX_TOKENS,
-                    )
+                return await call(
+                    [
+                        {"role": "system", "content": ref2va_plan.OBSERVE},
+                        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
+                    ],
+                    ref2va_plan.OBSERVE_MAX_TOKENS,
+                )
 
+            reason = "failed"
             try:
-                async with asyncio.timeout(budget):
-                    async with asyncio.TaskGroup() as group:
-                        tasks = [group.create_task(observe(url)) for url in urls]
-                    observations = [task.result() for task in tasks]
-                    content: list[dict[str, JsonValue]] = []
-                    for number, (url, seen) in enumerate(zip(urls, observations), 1):
-                        content += [
-                            {"type": "text", "text": f"Picture {number}:"},
-                            {"type": "image_url", "image_url": {"url": url}},
-                            {"type": "text", "text": f"Observation of picture {number}:\n{seen}"},
-                        ]
-                    content.append({"type": "text", "text": f"USER REQUEST ({spec.duration} s):\n{spec.prompt}"})
-                    raw = await call(
-                        [
-                            {
-                                "role": "system",
-                                "content": ref2va_plan.PLAN.format(duration=spec.duration, n=len(urls)),
-                            },
-                            {"role": "user", "content": content},
-                        ],
-                        ref2va_plan.PLAN_MAX_TOKENS,
-                    )
+                try:
+                    async with asyncio.timeout(budget):
+                        async with asyncio.TaskGroup() as group:
+                            tasks = [group.create_task(observe(url)) for url in urls]
+                        observations = [task.result() for task in tasks]
+                        content: list[dict[str, JsonValue]] = []
+                        with_images = len(urls) <= ref2va_plan.PLAN_IMAGES_MAX
+                        for number, (url, seen) in enumerate(zip(urls, observations), 1):
+                            content.append({"type": "text", "text": f"Picture {number}:"})
+                            if with_images:
+                                content.append({"type": "image_url", "image_url": {"url": url}})
+                            content.append({"type": "text", "text": f"Observation of picture {number}:\n{seen}"})
+                        content.append({"type": "text", "text": f"USER REQUEST ({spec.duration} s):\n{spec.prompt}"})
+                        raw = await call(
+                            [
+                                {
+                                    "role": "system",
+                                    "content": ref2va_plan.PLAN.format(duration=spec.duration, n=len(urls)),
+                                },
+                                {"role": "user", "content": content},
+                            ],
+                            ref2va_plan.plan_max_tokens(len(urls)),
+                        )
+                except TimeoutError:
+                    reason = "timed out"
+                    raise
                 notes = ref2va_plan.plan_notes(ref2va_plan.parse_plan(raw), len(urls))
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    leaves = exc.exceptions if isinstance(exc, BaseExceptionGroup) else (exc,)
+                    if any(getattr(leaf, "detail", None) == "TimeoutError" for leaf in leaves):
+                        reason = "timed out"  # a call hit the stage deadline before the outer timeout fired
+                    _log.info("H3 Ref2VA plan stage %s: %s", reason, _leaf_errors(exc))
+                raise
             finally:
                 for part in spent:
                     usage = _sum_usage(usage, part)
-                _log.info(
-                    "H3 Ref2VA plan stage took %.1fs, cost %s", time.monotonic() - began, usage.cost
-                )
-            _remember(_PLAN_NOTES, memo_key, (notes, usage))
+                _log.info("H3 Ref2VA plan stage took %.1fs, cost %s", time.monotonic() - began, usage.cost)
+            _remember(_PLAN_NOTES, memo_key, notes)
             return notes, usage
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001  # the plan is optional: never fail the rewrite
-            _log.info("H3 Ref2VA plan stage skipped: %s", type(exc).__name__)
+        except Exception:  # noqa: BLE001  # the plan is optional: never fail the rewrite (reason logged above)
             return None, usage
 
     async def rewrite(self, spec: ContextIRRequest) -> RewriteResult:
@@ -1322,7 +1365,9 @@ class H3PromptRewriter:
         user = prepared.user_content(facts, model, send_video_enabled()) if ref2va else prepared.user_content()
         plan_usage = RewriteUsage()
         if ref2va and not any(isinstance(item, (VideoItem, AudioItem)) for item in spec.content):
-            notes, plan_usage = await self.ref2va_plan_notes(prepared, key, started)
+            notes, plan_usage = await self.ref2va_plan_notes(
+                prepared, key, started, answer_cached=(key + model) in _FIRST_ANSWERS
+            )
             if notes is not None:
                 user.append({"type": "text", "text": "\n\n" + notes})
         messages: list[dict[str, JsonValue]] = [

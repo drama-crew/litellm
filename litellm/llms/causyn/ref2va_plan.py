@@ -10,8 +10,11 @@ import re
 PLAN_ENV = "CAUSYN_H3_REF2VA_PLAN"
 PLAN_MODEL_ENV = "CAUSYN_H3_REF2VA_PLAN_MODEL"
 OBSERVE_MAX_TOKENS = 600
-PLAN_MAX_TOKENS = 3000
-OBSERVE_CONCURRENCY = 4
+PLAN_MAX_TOKENS_CAP = 4000
+PLAN_IMAGES_MAX = 4  # above this the plan call gets the observations only (cost cap)
+PLAN_REASONING = {"enabled": False}
+PLAN_MODELS = frozenset({"qwen/qwen3.8-flash", "qwen/qwen3.8-omni-flash"})  # reasoning-off models only
+PLAN_RETRY_AFTER_MAX_S = 5.0
 PLAN_STAGE_MAX_S = 45.0
 PLAN_STAGE_MIN_S = 10.0
 PLAN_STAGE_RESERVE_S = 30.0
@@ -118,6 +121,10 @@ def parse_plan(text: str) -> dict:
     if not (isinstance(beats, list) and beats):
         raise ValueError("plan has no beats")
     return plan
+
+
+def plan_max_tokens(n_pictures: int) -> int:
+    return min(PLAN_MAX_TOKENS_CAP, 1500 + 300 * n_pictures)
 
 
 def plan_notes(plan: dict, n_pictures: int) -> str:
