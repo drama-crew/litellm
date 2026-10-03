@@ -1286,7 +1286,7 @@ class H3PromptRewriter:
                         {"role": "system", "content": ref2va_plan.OBSERVE},
                         {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
                     ],
-                    ref2va_plan.OBSERVE_MAX_TOKENS,
+                    ref2va_plan.observe_max_tokens(len(urls)),
                 )
 
             reason = "failed"
@@ -1308,7 +1308,7 @@ class H3PromptRewriter:
                             [
                                 {
                                     "role": "system",
-                                    "content": ref2va_plan.PLAN.format(duration=spec.duration, n=len(urls)),
+                                    "content": ref2va_plan.plan_system(spec.duration, len(urls)),
                                 },
                                 {"role": "user", "content": content},
                             ],

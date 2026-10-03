@@ -383,6 +383,10 @@ async def test_nine_pictures_observe_concurrently_and_plan_with_text_only():
     assert provider.stages().count("observe") == 9 and active["peak"] == 9
     plan = next(b for b in provider.bodies if stage_of(b) == "plan")
     assert plan["max_tokens"] == 4000
+    assert ref2va_plan.MANY_RULE in plan["messages"][0]["content"]
+    assert plan["messages"][0]["content"].index("11. There are") < plan["messages"][0]["content"].index("Return ONLY JSON:")
+    assert all(b["max_tokens"] == 350 for b in provider.bodies if stage_of(b) == "observe")
+    assert "Length: with this many subjects" in json.dumps(provider.bodies[-1])
     kinds = [p["type"] for p in plan["messages"][1]["content"]]
     assert "image_url" not in kinds and kinds.count("text") == 9 * 2 + 1
     assert plan["messages"][1]["content"][0]["text"] == "Picture 1:"
@@ -475,3 +479,17 @@ async def test_timeout_is_logged_with_its_own_reason(monkeypatch, caplog):
     with caplog.at_level("INFO"):
         await run(Provider(observe=slow), spec_of("image", "image2"))
     assert any("timed out" in r.getMessage() for r in caplog.records)
+
+
+def test_many_picture_notes_end_with_the_length_line_and_few_picture_texts_are_unchanged():
+    many = ref2va_plan.plan_notes(PLAN, 5)
+    assert many.endswith(
+        "\nLength: with this many subjects keep each subject definition to one compact sentence "
+        "and the whole prompt under 6000 characters."
+    )
+    assert many.startswith(ref2va_plan.plan_notes(PLAN, 4))
+    assert ref2va_plan.plan_notes(PLAN, 4) == ref2va_plan.NOTES.format(plan=GOLDEN_RENDER)
+    assert ref2va_plan.plan_notes(PLAN, 3).endswith("Do not add dialogue beyond the plan.")
+    assert ref2va_plan.plan_system(8, 3) == ref2va_plan.PLAN.format(duration=8, n=3)
+    assert "11." not in ref2va_plan.plan_system(8, 4)
+    assert ref2va_plan.observe_max_tokens(4) == 600 and ref2va_plan.observe_max_tokens(5) == 350

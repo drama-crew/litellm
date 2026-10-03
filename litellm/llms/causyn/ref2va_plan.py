@@ -10,6 +10,7 @@ import re
 PLAN_ENV = "CAUSYN_H3_REF2VA_PLAN"
 PLAN_MODEL_ENV = "CAUSYN_H3_REF2VA_PLAN_MODEL"
 OBSERVE_MAX_TOKENS = 600
+OBSERVE_MAX_TOKENS_MANY = 350  # more than PLAN_IMAGES_MAX pictures
 PLAN_MAX_TOKENS_CAP = 4000
 PLAN_IMAGES_MAX = 4  # above this the plan call gets the observations only (cost cap)
 PLAN_REASONING = {"enabled": False}
@@ -127,5 +128,24 @@ def plan_max_tokens(n_pictures: int) -> int:
     return min(PLAN_MAX_TOKENS_CAP, 1500 + 300 * n_pictures)
 
 
+MANY_RULE = "11. There are more than 4 pictures: give each entity 3-5 appearance facts and use at most 7 beats.\n\n"
+MANY_LENGTH = (
+    "Length: with this many subjects keep each subject definition to one compact sentence "
+    "and the whole prompt under 6000 characters."
+)
+
+
+def observe_max_tokens(n_pictures: int) -> int:
+    return OBSERVE_MAX_TOKENS_MANY if n_pictures > PLAN_IMAGES_MAX else OBSERVE_MAX_TOKENS
+
+
+def plan_system(duration: int, n_pictures: int) -> str:
+    text = PLAN
+    if n_pictures > PLAN_IMAGES_MAX:
+        text = text.replace("Return ONLY JSON:", MANY_RULE + "Return ONLY JSON:", 1)
+    return text.format(duration=duration, n=n_pictures)
+
+
 def plan_notes(plan: dict, n_pictures: int) -> str:
-    return NOTES.format(plan=render_plan(plan, n_pictures))
+    notes = NOTES.format(plan=render_plan(plan, n_pictures))
+    return notes + "\n" + MANY_LENGTH if n_pictures > PLAN_IMAGES_MAX else notes
