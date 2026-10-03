@@ -35,11 +35,14 @@ CUT_MSG = "The rewritten H3 prompt does not mirror the source video's shot cuts"
 def clean_state(monkeypatch):
     h3_prompt._FACTS_MEMO.clear()
     h3_prompt._FIRST_ANSWERS.clear()
+    h3_prompt._PLAN_NOTES.clear()
     h3_prompt._warned_models.clear()
     monkeypatch.delenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", raising=False)
     monkeypatch.delenv("CAUSYN_H3_REWRITE_SEND_VIDEO", raising=False)
     # The optional fidelity critic is covered in test_h3_rewrite_fidelity.py; here it would add provider calls.
     monkeypatch.setenv("CAUSYN_H3_REWRITE_CRITIC", "0")
+    # The observe/plan stage has its own tests (test_h3_ref2va_plan.py); here it would add provider calls.
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_PLAN", "0")
 
 
 def item(kind: str, url: str | None = None) -> dict:

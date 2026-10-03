@@ -25,6 +25,8 @@ def clean_state(monkeypatch):
     h3_prompt._FACTS_MEMO.clear()
     h3_prompt._FIRST_ANSWERS.clear()
     h3_prompt._warned_models.clear()
+    h3_prompt._PLAN_NOTES.clear()
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_PLAN", "0")  # covered in test_h3_ref2va_plan.py; would add provider calls here
     for name in ("CAUSYN_H3_REWRITE_CRITIC", "CAUSYN_H3_REWRITE_CRITIC_MODEL", "CAUSYN_H3_REF2VA_REWRITE_MODEL"):
         monkeypatch.delenv(name, raising=False)
 

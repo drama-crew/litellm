@@ -23,6 +23,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, ValidationInfo, field_validator, model_validator
 from typing_extensions import Self
 
+from litellm.llms.causyn import ref2va_plan
 from litellm.llms.causyn.ref_media_facts import (
     AudioFacts,
     VideoFacts,
@@ -255,6 +256,7 @@ _MEMO_SIZE = 32
 FACTS_MEMO_MAX_BYTES = 64 * 1024 * 1024
 _FACTS_MEMO: OrderedDict[str, RefFacts] = OrderedDict()
 _FIRST_ANSWERS: OrderedDict[str, tuple[str, RewriteUsage]] = OrderedDict()
+_PLAN_NOTES: OrderedDict[str, tuple[str, RewriteUsage]] = OrderedDict()
 
 
 def _remember(store: OrderedDict, key: str, value: object) -> None:
@@ -1019,6 +1021,21 @@ def critic_model() -> str | None:
     return None
 
 
+def plan_enabled() -> bool:
+    return os.getenv(ref2va_plan.PLAN_ENV, "").strip() != "0"
+
+
+def plan_model() -> str | None:
+    """Allow-listed model for the observe and plan calls; an unknown value skips the plan stage with a single warning."""
+    chosen = os.getenv(ref2va_plan.PLAN_MODEL_ENV, "").strip() or REF2VA_DEFAULT_MODEL
+    if chosen in REF2VA_MODEL_CAPS:
+        return chosen
+    if ref2va_plan.PLAN_MODEL_ENV + chosen not in _warned_models:
+        _warned_models.add(ref2va_plan.PLAN_MODEL_ENV + chosen)
+        _log.warning("%s is not an allow-listed model, the Ref2VA plan stage is skipped: %r", ref2va_plan.PLAN_MODEL_ENV, chosen[:80])
+    return None
+
+
 def parse_defects(text: str) -> tuple[str, ...] | None:
     """Defects from the first JSON object in a critic reply; None when the reply is unusable."""
     decoder = json.JSONDecoder()
@@ -1186,6 +1203,96 @@ class H3PromptRewriter:
             _log.info("H3 rewrite fidelity critic skipped: %s", type(exc).__name__)
             return (), usage
 
+    async def ref2va_plan_notes(
+        self, spec: ContextIRRequest, key: str, started: float
+    ) -> tuple[str | None, RewriteUsage]:
+        """Directing-plan notes for an image-only Ref2VA request plus the stage's usage. Strictly fail-open: any error -> none.
+
+        `spec` must be the prepared request (images as data URLs). Observe each picture, then plan the whole shot."""
+        usage = RewriteUsage()
+        try:
+            if not plan_enabled():
+                return None, usage
+            if any(not isinstance(item, ImageItem) for item in spec.ordered_media):
+                return None, usage
+            model = plan_model()
+            if model is None:
+                return None, usage
+            memo_key = key + "plan" + model
+            memoized = _PLAN_NOTES.get(memo_key)
+            if memoized is not None:
+                _PLAN_NOTES.move_to_end(memo_key)
+                return memoized
+            budget = min(
+                ref2va_plan.PLAN_STAGE_MAX_S,
+                _remaining(started) - MIN_REPAIR_BUDGET_S - ref2va_plan.PLAN_STAGE_RESERVE_S,
+            )
+            if budget < ref2va_plan.PLAN_STAGE_MIN_S:
+                _log.info("H3 Ref2VA plan stage skipped: no time budget")
+                return None, usage
+            began = time.monotonic()
+            urls = [item.image_url.url for item in spec.ordered_media if isinstance(item, ImageItem)]
+            reasoning = REF2VA_MODEL_REASONING[model][0]
+            spent: list[RewriteUsage] = []
+            gate = asyncio.Semaphore(ref2va_plan.OBSERVE_CONCURRENCY)
+
+            async def call(messages: list[dict[str, JsonValue]], max_tokens: int) -> str:
+                try:
+                    completed = await self._complete(model, messages, budget, settings=(reasoning, max_tokens))
+                except TruncatedRewriteError as cut:
+                    spent.append(cut.usage)
+                    raise
+                spent.append(completed.usage)
+                return completed.choices[0].message.content
+
+            async def observe(url: str) -> str:
+                async with gate:
+                    return await call(
+                        [
+                            {"role": "system", "content": ref2va_plan.OBSERVE},
+                            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
+                        ],
+                        ref2va_plan.OBSERVE_MAX_TOKENS,
+                    )
+
+            try:
+                async with asyncio.timeout(budget):
+                    async with asyncio.TaskGroup() as group:
+                        tasks = [group.create_task(observe(url)) for url in urls]
+                    observations = [task.result() for task in tasks]
+                    content: list[dict[str, JsonValue]] = []
+                    for number, (url, seen) in enumerate(zip(urls, observations), 1):
+                        content += [
+                            {"type": "text", "text": f"Picture {number}:"},
+                            {"type": "image_url", "image_url": {"url": url}},
+                            {"type": "text", "text": f"Observation of picture {number}:\n{seen}"},
+                        ]
+                    content.append({"type": "text", "text": f"USER REQUEST ({spec.duration} s):\n{spec.prompt}"})
+                    raw = await call(
+                        [
+                            {
+                                "role": "system",
+                                "content": ref2va_plan.PLAN.format(duration=spec.duration, n=len(urls)),
+                            },
+                            {"role": "user", "content": content},
+                        ],
+                        ref2va_plan.PLAN_MAX_TOKENS,
+                    )
+                notes = ref2va_plan.plan_notes(ref2va_plan.parse_plan(raw), len(urls))
+            finally:
+                for part in spent:
+                    usage = _sum_usage(usage, part)
+                _log.info(
+                    "H3 Ref2VA plan stage took %.1fs, cost %s", time.monotonic() - began, usage.cost
+                )
+            _remember(_PLAN_NOTES, memo_key, (notes, usage))
+            return notes, usage
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001  # the plan is optional: never fail the rewrite
+            _log.info("H3 Ref2VA plan stage skipped: %s", type(exc).__name__)
+            return None, usage
+
     async def rewrite(self, spec: ContextIRRequest) -> RewriteResult:
         if not self.api_key:
             raise RewriteError("H3 prompt rewrite is not configured", 503)
@@ -1213,6 +1320,11 @@ class H3PromptRewriter:
             else ""
         )
         user = prepared.user_content(facts, model, send_video_enabled()) if ref2va else prepared.user_content()
+        plan_usage = RewriteUsage()
+        if ref2va and not any(isinstance(item, (VideoItem, AudioItem)) for item in spec.content):
+            notes, plan_usage = await self.ref2va_plan_notes(prepared, key, started)
+            if notes is not None:
+                user.append({"type": "text", "text": "\n\n" + notes})
         messages: list[dict[str, JsonValue]] = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -1231,6 +1343,7 @@ class H3PromptRewriter:
                 usage = completed.usage
             except TruncatedRewriteError as cut:
                 prompt, usage, truncated = "", cut.usage, True
+            usage = _sum_usage(usage, plan_usage)  # a cached first answer already carries the plan usage
         keep_first_answer = False
         soft: list[str] = []
         hard_failure: RewriteError | None = None
