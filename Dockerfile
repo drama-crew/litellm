@@ -32,8 +32,14 @@
 #     curl chain; r4 / r5 / 2.7 need OpenSSL 4)
 #   - npm 12.0.2-r0 (`npm` now resolves to npm-12 12.2.0, which needs nodejs-26
 #     26.10.0 and therefore OpenSSL 4)
-# Remove all of these pins when the base digest moves to an OpenSSL-4 world (and
-# then drop `openssl`/`openssl-dev` 3.x with it).
+# 2026-10-03: python-3.13 3.13.16_git20261002-r1 was rebuilt against OpenSSL 4
+# as well (builder AND runtime broke). Instead of chasing one more pin, both
+# `apk add` lines now forbid the OpenSSL-4 libraries outright
+# ("!openssl-4.0-libcrypto" "!openssl-4.0-libssl"), so the resolver must pick
+# the last OpenSSL-3 build of every package (python-3.13 -> ..._git20261002-r0)
+# or fail loudly instead of installing a conflicting build.
+# Remove all of these pins and constraints when the base digest moves to an
+# OpenSSL-4 world (and then drop `openssl`/`openssl-dev` 3.x with it).
 ARG LITELLM_BUILD_IMAGE=cgr.dev/chainguard/wolfi-base@sha256:7e62cecd3c5712dba6e52c5260afb8f9d7a23b9bbcdd26ad7508a811e74b766d
 
 # Runtime image
@@ -89,6 +95,8 @@ RUN for attempt in 1 2 3 4 5; do \
             "ngtcp2=1.25.0-r4" \
             "libldap=2.6.10-r5" \
             libsndfile \
+            "!openssl-4.0-libcrypto" \
+            "!openssl-4.0-libssl" \
         && exit 0; \
         echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
         sleep 5; \
@@ -212,7 +220,7 @@ USER root
 
 # node (without npm) is required by the prisma CLI at runtime
 RUN for attempt in 1 2 3 4 5; do \
-        timeout -k 30s 900s apk --timeout 60 add --no-cache bash openssl tzdata "nodejs-26=26.8.1-r4" python-3.13 libsndfile && exit 0; \
+        timeout -k 30s 900s apk --timeout 60 add --no-cache bash openssl tzdata "nodejs-26=26.8.1-r4" python-3.13 libsndfile "!openssl-4.0-libcrypto" "!openssl-4.0-libssl" && exit 0; \
         echo "apk add failed (attempt $attempt/5), retrying in 5s..." >&2; \
         sleep 5; \
     done; \
