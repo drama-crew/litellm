@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 
 PLAN_ENV = "CAUSYN_H3_REF2VA_PLAN"
 PLAN_MODEL_ENV = "CAUSYN_H3_REF2VA_PLAN_MODEL"
@@ -39,8 +40,10 @@ Rules:
 1. Pictures supply APPEARANCE (identity, clothing, objects, place, style), never events. Take the action from the
    request. A picture is not the first frame: do not open the video on the picture's pose/framing unless asked; adapt
    pose, framing and setting to the request.
-2. Bind each picture to exactly one entity (person, creature, object, or a scene/place) or exclude it with a reason.
-   Several pictures of the same thing form one entity. A place picture becomes a scene entity.
+2. Bind each picture to exactly one entity (person, creature, object, or a scene/place). Several pictures of the same
+   thing form one entity. A place picture becomes a scene entity. Every picture the user supplied is used — one the
+   request does not mention still appears (as a prop, a background element or the setting); exclude a picture only when
+   using it would contradict the request, and give that reason.
 3. When the request changes an aspect of a referenced subject (outfit, hairstyle, setting...), keep the identity from
    the picture and apply the requested change; record it under "changed". Never contradict the request.
 4. Appearance facts: 5-10 concrete traits copied exactly from the picture/observation (colours, materials, shapes,
@@ -54,11 +57,22 @@ Rules:
    as the user stated. Refer to entities as {{e1}}.
 7. Camera: "Static Shot" unless the user asked for a movement or the action leaves the frame; never choose a move that
    crops or hides a requested subject, garment or prop. Keep every requested subject in frame when they must interact.
-8. Speech: only lines the user wrote, verbatim. If the user says people talk/converse but gives no words, they talk
-   naturally (visible lip movement) and the speech is indistinct background conversation — never silent mouthing.
-9. Music: "absent" unless the user asked for music or the request is explicitly a commercial, trailer, montage or
-   music video; then describe instrumentation and tempo. Ambience: ONE sentence, 28-46 words, 3-6 sound sources that
-   are physically present in the shot (no unrelated rooms, appliances or crowds).
+8. Speech: only lines the user wrote, verbatim and in their original language (never translate, paraphrase or
+   shorten). Give each line to the entity that speaks it with a concrete voice (gender, age, timbre, pace, emotion), the
+   beat where it starts and whether the speaker is on screen; on-screen speakers' lips move in sync. Pace: a {duration}-s
+   clip fits about {words} English words or {chars} Chinese characters, so start the line early enough to finish it. If
+   the user says people talk but gives no words, they talk naturally and the speech is indistinct background
+   conversation (no line) — never silent mouthing.
+9. Sound effects: every sound the user asked for must appear. Add at most 3 other effects, only for clearly audible
+   physical events the beats show (footsteps while walking, impacts, objects handled or set down, animal calls,
+   vehicles, water, an instrument being played), each tied to its beat. No effect for quiet movements (gestures,
+   smiles, glances, blinking, breathing, a raised hand, standing or sitting still, clothing, hair) and no sound without
+   a visible source.
+   Ambience: ONE sentence, 28-46 words, 3-6 sound sources physically present in the shot.
+   Music: "absent" unless the user asked for music or the request is explicitly a commercial, trailer, montage or
+   music video; then follow the user's style, instrumentation, tempo and dynamics (non_diegetic unless it is played on
+   screen). Music played or heard on screen (an instrument, a performance, a radio, a party) is diegetic and synced to
+   the visible playing. Never add music the user did not ask for under speech.
 10. requirements: list every explicit user requirement (subject, attribute, action, place, camera, style, sound).
 
 Return ONLY JSON:
@@ -68,9 +82,11 @@ Return ONLY JSON:
    "changed":["requested change applied to this subject"]}}],
  "excluded_pictures":[{{"picture":2,"reason":"..."}}],
  "camera":"official value","beats":["{{e1}} ... (start state)","...","... (end state)"],
- "dialogue":[{{"speaker":"e1","text":"verbatim","language":"English"}}],
- "music":{{"status":"absent|non_diegetic|diegetic","description":"..."}},
+ "speech":[{{"speaker":"e1","voice":"gender, age, timbre, pace, emotion","text":"verbatim","language":"English",
+   "beat":2,"visibility":"onscreen"}}],
+ "sound_effects":[{{"beat":3,"source":"{{e1}} walking","sound":"crisp footsteps on gravel"}}],
  "ambience":"one sentence",
+ "music":{{"status":"absent|non_diegetic|diegetic","description":"instrumentation, tempo, rhythm, dynamics, level"}},
  "requirements":["..."]}}"""
 
 NOTES = """DIRECTING PLAN (prepared by the director for this request from the pictures and the user's words; follow it):
@@ -79,8 +95,34 @@ NOTES = """DIRECTING PLAN (prepared by the director for this request from the pi
 How to use it: define one <Subject N> per entity, bound to its picture(s), with its appearance facts. Write exactly
 one retention_analysis line per subject (level, what is kept, what changes). Write the detailed_description as one
 continuous shot following the beats in order with the planned camera; add nothing the plan does not contain (no
-extra events, people, sounds or music). Use the music decision (absent -> N/A) and the ambience sentence.
+extra events, people, sounds or music). Audio: introduce each speaker with a stable ID such as (S1) and the
+planned voice, and write each line as <d>[Language] exact text</d> at its beat with the speaker's lips moving; describe
+each sound effect inside the beat where its action happens; overall_soundscape = the ambience sentence plus the
+recurring effects (no dialogue, no music); non_diegetic_music = the music decision (N/A when absent or diegetic);
+diegetic music is described in the action, synced to the visible playing.
+The audio lines come in addition to the visual description, never instead of it: keep every subject definition and
+the detailed_description as visually detailed as they would be without them.
 Pictures are references, not frames. Do not add dialogue beyond the plan."""
+
+
+_NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def _norm_line(text):
+    return _NON_WORD.sub("", unicodedata.normalize("NFKC", str(text)).casefold())
+
+
+def user_lines_only(speech, prompt):
+    """Keep only planned lines whose words the user actually wrote (the plan model sometimes invents dialogue)."""
+    if not isinstance(speech, list):
+        return []
+    ref = _norm_line(prompt)
+    return [sp for sp in speech if isinstance(sp, dict) and _norm_line(sp.get("text", "")) and _norm_line(sp.get("text", "")) in ref]
+
+
+def _items(value):
+    """A plan list field, or nothing when the model returned a string/dict instead (the stage is fail-open)."""
+    return value if isinstance(value, list) else []
 
 
 def render_plan(plan, n_pictures):
@@ -95,8 +137,18 @@ def render_plan(plan, n_pictures):
     lines.append(f"Camera: {plan.get('camera')}")
     lines.append("Beats (in order, one continuous shot):")
     lines += [f"  {i}. {b}" for i, b in enumerate(plan.get("beats", []), 1)]
-    if plan.get("dialogue"):
-        lines.append("Dialogue (verbatim): " + json.dumps(plan["dialogue"], ensure_ascii=False))
+    names = {e.get("id"): e.get("name") for e in plan.get("entities", []) if isinstance(e, dict)}
+    for sp in _items(plan.get("speech") or plan.get("dialogue")):
+        if not isinstance(sp, dict):
+            continue
+        who = sp.get("speaker")
+        who = f"{{{who}}} ({names[who]})" if isinstance(who, str) and who in names else str(who or "a speaker")
+        lines.append(f"Speech at beat {sp.get('beat')}: {who}, voice {sp.get('voice', '')}, {sp.get('visibility', 'onscreen')}, "
+                     f"says in {sp.get('language', '')}: {json.dumps(sp.get('text', ''), ensure_ascii=False)}")
+    for fx in _items(plan.get("sound_effects")):
+        if not isinstance(fx, dict):
+            continue
+        lines.append(f"Sound effect at beat {fx.get('beat')}: {fx.get('source')} — {fx.get('sound')}")
     m = plan.get("music") or {}
     lines.append(f"Music: {m.get('status')} — {m.get('description', '')}")
     lines.append(f"Ambience: {plan.get('ambience', '')}")
@@ -143,7 +195,7 @@ def plan_system(duration: int, n_pictures: int) -> str:
     text = PLAN
     if n_pictures > PLAN_IMAGES_MAX:
         text = text.replace("Return ONLY JSON:", MANY_RULE + "Return ONLY JSON:", 1)
-    return text.format(duration=duration, n=n_pictures)
+    return text.format(duration=duration, n=n_pictures, words=round(duration * 2.5), chars=round(duration * 4))
 
 
 def plan_notes(plan: dict, n_pictures: int) -> str:

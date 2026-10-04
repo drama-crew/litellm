@@ -259,7 +259,7 @@ async def test_non_ref2va_truncation_goes_through_the_repair_path():
     provider = Provider("cut off", good, finish=["length"], critic=[])
     result = await run(provider, make_spec("A cat walks."))
     assert result.prompt == good
-    assert provider.bodies[0]["max_tokens"] == 8192 and provider.bodies[0]["model"] == "qwen/qwen3.8-flash"
+    assert provider.bodies[0]["max_tokens"] == 3072 and provider.bodies[0]["model"] == "qwen/qwen3.8-flash"
     assert provider.bodies[0]["reasoning"] == {"enabled": False}
     assert provider.bodies[1]["messages"][-1]["content"] == h3_prompt.TRUNCATION_REPAIR_MESSAGE_BASE
 
@@ -447,7 +447,7 @@ async def test_retryable_repair_failure_after_hard_failure_reuses_the_first_answ
 @pytest.mark.parametrize(
     "model,reasoning,max_tokens",
     [
-        ("qwen/qwen3.8-omni-flash", {"enabled": False}, 8192),
+        ("qwen/qwen3.8-omni-flash", {"enabled": False}, 3072),
         ("qwen/qwen3.8-max-0902", {"enabled": True, "effort": "low"}, 12000),
     ],
 )

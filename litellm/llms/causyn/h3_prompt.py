@@ -57,9 +57,12 @@ REF2VA_MODEL_CAPS: dict[str, frozenset[str]] = {
     "qwen/qwen3.8-max-0902": frozenset({"text", "image", "video"}),
 }
 # Per-model reasoning request and completion budget. max-0902 rejects `reasoning.enabled=false`.
+# Reasoning-off writers sometimes fall into a repetition loop; the longest legitimate rewrite is ~1.5k tokens, so cap
+# the output at 3072 (2x headroom) and let a runaway end fast as finish_reason=length -> the one truncation repair.
+WRITER_MAX_TOKENS = 3072
 REF2VA_MODEL_REASONING: dict[str, tuple[dict[str, JsonValue], int]] = {
-    "qwen/qwen3.8-flash": ({"enabled": False}, 8192),
-    "qwen/qwen3.8-omni-flash": ({"enabled": False}, 8192),
+    "qwen/qwen3.8-flash": ({"enabled": False}, WRITER_MAX_TOKENS),
+    "qwen/qwen3.8-omni-flash": ({"enabled": False}, WRITER_MAX_TOKENS),
     "qwen/qwen3.8-max-0902": ({"enabled": True, "effort": "low"}, 12000),
 }
 MAX_RAW_VIDEO_BYTES = 20 * 1024 * 1024
@@ -1317,7 +1320,11 @@ class H3PromptRewriter:
                 except TimeoutError:
                     reason = "timed out"
                     raise
-                notes = ref2va_plan.plan_notes(ref2va_plan.parse_plan(raw), len(urls))
+                plan = ref2va_plan.parse_plan(raw)
+                # The plan model sometimes invents a spoken line: keep only lines the user actually wrote.
+                plan["speech"] = ref2va_plan.user_lines_only(plan.get("speech") or plan.get("dialogue"), spec.prompt)
+                plan.pop("dialogue", None)
+                notes = ref2va_plan.plan_notes(plan, len(urls))
             except BaseException as exc:
                 if isinstance(exc, Exception):
                     leaves = exc.exceptions if isinstance(exc, BaseExceptionGroup) else (exc,)

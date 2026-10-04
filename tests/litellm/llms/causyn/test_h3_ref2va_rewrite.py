@@ -522,8 +522,8 @@ async def test_model_env_selects_allow_listed_models_and_ref2va_only(patched, mo
 @pytest.mark.parametrize(
     "model,reasoning,max_tokens",
     [
-        ("qwen/qwen3.8-flash", {"enabled": False}, 8192),
-        ("qwen/qwen3.8-omni-flash", {"enabled": False}, 8192),
+        ("qwen/qwen3.8-flash", {"enabled": False}, 3072),
+        ("qwen/qwen3.8-omni-flash", {"enabled": False}, 3072),
         ("qwen/qwen3.8-max-0902", {"enabled": True, "effort": "low"}, 12000),
     ],
 )
@@ -655,9 +655,9 @@ async def test_non_ref2va_payload_is_byte_identical_to_the_previous_code_path(mo
         with pytest.raises(RewriteError):
             await H3PromptRewriter(client, "k").rewrite(spec)
     assert len(seen) == 2  # the invalid answer "x" gets its one repair call
-    # Only max_tokens changed (4096 -> 8192); everything else in the payload is byte-identical.
-    assert b'"max_tokens":8192' in seen[0]
-    assert hashlib.sha256(seen[0].replace(b'"max_tokens":8192', b'"max_tokens":4096')).hexdigest() == golden["sha256"]
+    # Only max_tokens changed (4096 -> 3072); everything else in the payload is byte-identical.
+    assert b'"max_tokens":3072' in seen[0]
+    assert hashlib.sha256(seen[0].replace(b'"max_tokens":3072', b'"max_tokens":4096')).hexdigest() == golden["sha256"]
 
 
 # ----------------------------------------------------------------------------- real perception, no patches
@@ -1119,6 +1119,7 @@ async def test_truncated_first_answer_is_repaired_once_without_echoing_it(patche
     messages = bodies[1]["messages"]
     assert [m["role"] for m in messages] == ["system", "user", "user"]
     assert messages[2]["content"] == h3_prompt.TRUNCATION_REPAIR_MESSAGE
+    assert bodies[0]["max_tokens"] == 3072 == h3_prompt.WRITER_MAX_TOKENS  # a runaway loop ends fast as a truncation
     assert "The runner sprints" not in json.dumps(messages)
     assert "350–500 words" in messages[2]["content"] and "do not repeat sentences" in messages[2]["content"]
 
@@ -1147,7 +1148,7 @@ async def test_non_ref2va_double_truncation_is_permanent_after_one_repair():
         with pytest.raises(RewriteError) as caught:
             await H3PromptRewriter(client, "k").rewrite(spec)
     assert len(bodies) == 2 and caught.value.retryable is False
-    assert bodies[0]["max_tokens"] == 8192 and bodies[0]["reasoning"] == {"enabled": False}
+    assert bodies[0]["max_tokens"] == 3072 and bodies[0]["reasoning"] == {"enabled": False}
 
 
 # ----------------------------------------------------------------------------- final-review fixes

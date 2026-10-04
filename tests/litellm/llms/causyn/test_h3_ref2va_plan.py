@@ -47,16 +47,22 @@ PLAN = {
     "excluded_pictures": [{"picture": 4, "reason": "duplicate of picture 1"}],
     "camera": "Static Shot",
     "beats": ["{e1} stands (start state)", "{e1} lifts {e2}", "{e1} pours tea (end state)"],
-    "dialogue": [{"speaker": "e1", "text": "Hello, 你好", "language": "English"}],
-    "music": {"status": "absent", "description": ""},
+    "speech": [
+        {"speaker": "e1", "voice": "female, 20s, warm, calm", "text": "Tea is ready", "language": "English", "beat": 3, "visibility": "onscreen"},
+        {"speaker": "e9", "voice": "elderly man, low", "text": "好香啊", "language": "Chinese", "beat": 2, "visibility": "offscreen"},
+    ],
+    "sound_effects": [
+        {"beat": 2, "source": "{e1} lifting {e2}", "sound": "soft clink of enamel"},
+        {"beat": 3, "source": "{e1} pouring tea", "sound": "tea splashing into a cup"},
+    ],
+    "music": {"status": "non_diegetic", "description": "gentle piano, slow tempo"},
     "ambience": "Quiet kitchen with a ticking clock.",
     "requirements": ["woman", "kettle"],
 }
-# Output of the evaluated prototype's render_plan(PLAN, 4).
+# Output of the evaluated prototype's render_plan(PLAN, 4) (pod_lite_a3.py, h3-rewrite-allmodes-eval-20261002).
 GOLDEN_RENDER = (
     "Look: soft daylight, painterly\n"
-    "Entity e1 = a young woman (character; from picture 1, picture 2; retention fully_preserved): "
-    "short black hair; red wool coat. Requested changes: wears a blue scarf\n"
+    "Entity e1 = a young woman (character; from picture 1, picture 2; retention fully_preserved): short black hair; red wool coat. Requested changes: wears a blue scarf\n"
     "Entity e2 = a teal kettle (object; from picture 3; retention weak_reference): teal enamel\n"
     "Excluded picture 4: duplicate of picture 1\n"
     "Camera: Static Shot\n"
@@ -64,8 +70,11 @@ GOLDEN_RENDER = (
     "  1. {e1} stands (start state)\n"
     "  2. {e1} lifts {e2}\n"
     "  3. {e1} pours tea (end state)\n"
-    'Dialogue (verbatim): [{"speaker": "e1", "text": "Hello, 你好", "language": "English"}]\n'
-    "Music: absent — \n"
+    "Speech at beat 3: {e1} (a young woman), voice female, 20s, warm, calm, onscreen, says in English: \"Tea is ready\"\n"
+    "Speech at beat 2: e9, voice elderly man, low, offscreen, says in Chinese: \"好香啊\"\n"
+    "Sound effect at beat 2: {e1} lifting {e2} — soft clink of enamel\n"
+    "Sound effect at beat 3: {e1} pouring tea — tea splashing into a cup\n"
+    "Music: non_diegetic — gentle piano, slow tempo\n"
     "Ambience: Quiet kitchen with a ticking clock.\n"
     "User requirements to cover: woman; kettle"
 )
@@ -103,9 +112,9 @@ def clean_state(monkeypatch):
     monkeypatch.setattr(h3_prompt, "perceive_media", perceive)
 
 
-def spec_of(*kinds: str, duration: int = 8) -> ContextIRRequest:
+def spec_of(*kinds: str, duration: int = 8, prompt: str = "A woman walks.") -> ContextIRRequest:
     urls = {"image": IMG, "image2": IMG2}
-    content: list[dict] = [{"type": "text", "text": "A woman walks."}]
+    content: list[dict] = [{"type": "text", "text": prompt}]
     for kind in kinds:
         if kind.startswith("image"):
             content.append({"type": "image_url", "image_url": {"url": urls[kind]}, "role": "reference_image"})
@@ -179,7 +188,7 @@ async def test_image_only_ref2va_observes_each_picture_plans_then_writes_with_th
         assert body["model"] == "qwen/qwen3.8-omni-flash"
     assert {b["messages"][1]["content"][0]["image_url"]["url"] for b in observes} == {IMG, IMG2}
     plan = next(b for b in provider.bodies if stage_of(b) == "plan")
-    assert plan["messages"][0]["content"] == ref2va_plan.PLAN.format(duration=8, n=2)
+    assert plan["messages"][0]["content"] == ref2va_plan.PLAN.format(duration=8, n=2, words=20, chars=32)
     assert plan["max_tokens"] == 1500 + 300 * 2
     content = plan["messages"][1]["content"]
     assert [p["type"] for p in content] == ["text", "image_url", "text"] * 2 + ["text"]
@@ -490,6 +499,72 @@ def test_many_picture_notes_end_with_the_length_line_and_few_picture_texts_are_u
     assert many.startswith(ref2va_plan.plan_notes(PLAN, 4))
     assert ref2va_plan.plan_notes(PLAN, 4) == ref2va_plan.NOTES.format(plan=GOLDEN_RENDER)
     assert ref2va_plan.plan_notes(PLAN, 3).endswith("Do not add dialogue beyond the plan.")
-    assert ref2va_plan.plan_system(8, 3) == ref2va_plan.PLAN.format(duration=8, n=3)
+    assert ref2va_plan.plan_system(8, 3) == ref2va_plan.PLAN.format(duration=8, n=3, words=20, chars=32)
     assert "11." not in ref2va_plan.plan_system(8, 4)
     assert ref2va_plan.observe_max_tokens(4) == 600 and ref2va_plan.observe_max_tokens(5) == 350
+
+
+# ----------------------------------------------------------------------------- audio-aware plan (speech / sfx / music)
+
+OLD_STYLE_PLAN = {**PLAN, "dialogue": [{"speaker": "e1", "text": "Hello", "language": "English"}]}
+del OLD_STYLE_PLAN["speech"], OLD_STYLE_PLAN["sound_effects"]
+# Output of the evaluated prototype's render_plan for the old-style "dialogue" plan above (speech lines only).
+GOLDEN_OLD_SPEECH_LINE = 'Speech at beat None: {e1} (a young woman), voice , onscreen, says in English: "Hello"'
+
+
+def test_old_style_dialogue_plan_still_renders_its_speech_lines():
+    rendered = ref2va_plan.render_plan(OLD_STYLE_PLAN, 4)
+    assert GOLDEN_OLD_SPEECH_LINE in rendered.split("\n")
+    assert "Sound effect" not in rendered
+
+
+@pytest.mark.parametrize("bad", ["a string", {"speaker": "e1"}, 7, None])
+def test_render_plan_tolerates_non_list_speech_and_sound_effects(bad):
+    plan = {**PLAN, "speech": bad, "sound_effects": bad}
+    rendered = ref2va_plan.render_plan(plan, 4)
+    assert "Speech at beat" not in rendered and "Sound effect" not in rendered
+    assert "Music: non_diegetic" in rendered
+
+
+def test_render_plan_skips_non_dict_items_and_unhashable_speakers():
+    plan = {**PLAN, "speech": ["x", {"speaker": ["e1"], "text": "hi"}], "sound_effects": [3, None]}
+    rendered = ref2va_plan.render_plan(plan, 4)
+    assert rendered.count("Speech at beat") == 1 and "Sound effect" not in rendered
+
+
+def test_plan_system_states_the_speech_pace_for_the_duration():
+    short = ref2va_plan.plan_system(5, 2)
+    assert "about 12 English words or 20 Chinese characters" in short
+    assert "11." not in short
+    many = ref2va_plan.plan_system(10, 6)
+    assert "25 English words or 40 Chinese characters" in many
+    assert ref2va_plan.MANY_RULE.strip() in many
+
+
+def test_user_lines_only_keeps_what_the_user_wrote():
+    prompt = 'A man says "Good morning, everyone!" then 她说：“我们走吧。”'
+    lines = [
+        {"text": "Good morning everyone"},  # trailing punctuation differs
+        {"text": "我们走吧"},  # full-width quotes/punctuation in the prompt
+        {"text": "Nice weather today"},  # invented
+        {"text": "  ..  "},  # empty once normalised
+        "Good morning",  # not a dict
+    ]
+    assert ref2va_plan.user_lines_only(lines, prompt) == lines[:2]
+    for bad in ("a string", {"text": "Good morning"}, None, 3):
+        assert ref2va_plan.user_lines_only(bad, prompt) == []
+
+
+@pytest.mark.asyncio
+async def test_invented_speech_is_dropped_before_the_writer_sees_the_plan():
+    invented = dict(PLAN, speech=[
+        {"speaker": "e1", "voice": "v", "text": "I really love this sunny afternoon", "language": "English", "beat": 2, "visibility": "onscreen"},
+        {"speaker": "e1", "voice": "v", "text": "Hello there", "language": "English", "beat": 3, "visibility": "onscreen"},
+    ])
+    spec = spec_of("image", "image2", prompt="A woman waves and says Hello there!")
+    provider = Provider(plan=lambda body: completion(body, json.dumps(invented)))
+    await run(provider, spec)
+    (writer,) = writer_bodies(provider)
+    notes = json.dumps(writer["messages"][1]["content"], ensure_ascii=False)
+    assert "sunny afternoon" not in notes
+    assert "Hello there" in notes
