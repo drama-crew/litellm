@@ -720,6 +720,29 @@ async def test_exhausted_truncation_gets_one_fresh_recovery_and_keeps_paid_usage
 
 
 @pytest.mark.asyncio
+async def test_recovery_timeout_retries_the_recovery_without_repeating_the_primary(monkeypatch):
+    provider = Provider("runaway", "unused", ref_prompt(20), finish=["length", "stop", "stop"])
+
+    def interrupted(request):
+        response = provider(request)
+        if len(provider.bodies) == 2:
+            raise httpx.ReadTimeout("recovery interrupted", request=request)
+        return response
+
+    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 30.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(interrupted)) as client:
+        rewriter = H3PromptRewriter(client, "key")
+        with pytest.raises(RewriteError) as failure:
+            await rewriter.rewrite(ref_image_spec())
+        assert failure.value.retryable
+        assert next(iter(h3_prompt._FIRST_ANSWERS.values()))[0] == ""
+        result = await rewriter.rewrite(ref_image_spec())
+    assert result.prompt == ref_prompt(20) and len(provider.bodies) == 3
+    assert provider.bodies[1]["messages"] == provider.bodies[2]["messages"]
+    assert result.usage.prompt_tokens == 200 and h3_prompt._FIRST_ANSWERS == {}
+
+
+@pytest.mark.asyncio
 async def test_fresh_truncation_recovery_counts_new_plan_usage(monkeypatch):
     plan_costs = iter((0.0003, 0.0004))
 

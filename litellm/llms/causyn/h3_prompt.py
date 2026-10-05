@@ -1546,10 +1546,12 @@ class H3PromptRewriter:
                 messages.append(
                     {"role": "user", "content": TRUNCATION_REPAIR_MESSAGE if ref2va else TRUNCATION_REPAIR_MESSAGE_BASE}
                 )
+                if image_only:
+                    _remember(_FIRST_ANSWERS, answer_key, ("", usage))
                 try:
                     again = await self._complete(model, messages, remaining, ref2va)
                 except RewriteError as recovery_failure:
-                    keep_first_answer = cached_answer is not None and recovery_failure.retryable
+                    keep_first_answer = image_only and recovery_failure.retryable
                     raise
                 again_soft: list[str] = []
                 again_prompt = again.choices[0].message.content.strip()
