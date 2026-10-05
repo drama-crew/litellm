@@ -1366,7 +1366,7 @@ class H3PromptRewriter:
                             [
                                 {
                                     "role": "system",
-                                    "content": ref2va_plan.plan_system(spec.duration, len(urls)),
+                                    "content": ref2va_plan.plan_system(spec.duration, len(urls), spec.prompt),
                                 },
                                 {"role": "user", "content": content},
                             ],

@@ -610,6 +610,32 @@ def test_plan_system_states_the_speech_pace_for_the_duration():
     assert ref2va_plan.MANY_RULE.strip() in many
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("user_request", "detailed_sound"),
+    [
+        ("A man watches a bird in the park.", False),
+        ("The presenter stands still in front of the camera.", False),
+        ("A girl paints on a canvas while soft music plays.", False),
+        ("A person strikes the bell. Sound: a bell ringing.", True),
+        ("A lamp lights the street; a faint rustle of leaves can be heard.", True),
+        ("图1的人敲钟，保留钟的声音。", True),
+        ("No dialogue, music or sound effects. Keep the video silent.", True),
+    ],
+)
+async def test_only_requested_sound_changes_the_director_instructions(user_request, detailed_sound):
+    provider = Provider()
+    await run(provider, spec_of("image", "image2", prompt=user_request))
+    instructions = next(body for body in provider.bodies if stage_of(body) == "plan")["messages"][0]["content"]
+    baseline = ref2va_plan.PLAN.format(duration=8, n=2, words=20, chars=32)
+    if detailed_sound:
+        assert "attack and decay" in instructions
+        assert "never invent extra sources to fill a quota" in instructions
+        assert "Silent requests override all incidental effects" in instructions
+    else:
+        assert instructions == baseline
+
+
 def test_user_lines_only_keeps_what_the_user_wrote():
     prompt = 'A man says "Good morning, everyone!" then 她说：“我们走吧。”'
     lines = [

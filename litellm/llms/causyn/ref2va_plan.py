@@ -69,13 +69,7 @@ Rules:
    vehicles, water, an instrument being played), each tied to its beat. No effect for quiet movements (gestures,
    smiles, glances, blinking, breathing, a raised hand, standing or sitting still, clothing, hair) and no sound without
    a visible source.
-   For each required or justified effect, describe its audible character: name the source and physical event,
-   supported material/contact surface, attack and decay (sharp click, dull thud, short ring, sustained hiss), and
-   recurrence tied to the action (one strike, each footfall, continuous flow). Use only qualities justified by the
-   request or visible source; do not invent material, an exact rate, louder intensity, or a new event. Prioritise
-   the requested sound over incidental room tone. Silent requests override all incidental effects.
-   Ambience: ONE concise sentence containing only sound sources established by the request or shot. A quiet
-   scene may have only room tone; never invent extra sources to fill a quota.
+   Ambience: ONE sentence, 28-46 words, 3-6 sound sources physically present in the shot.
    Music: "absent" unless the user asked for music or the request is explicitly a commercial, trailer, montage or
    music video; then follow the user's style, instrumentation, tempo and dynamics (non_diegetic unless it is played on
    screen). Music played or heard on screen (an instrument, a performance, a radio, a party) is diegetic and synced to
@@ -233,12 +227,33 @@ MANY_LENGTH = (
 )
 
 
+AUDIO_DETAILS = """   For each required or justified effect, describe its audible character: name the source and physical event,
+   supported material/contact surface, attack and decay (sharp click, dull thud, short ring, sustained hiss), and
+   recurrence tied to the action (one strike, each footfall, continuous flow). Use only qualities justified by the
+   request or visible source; do not invent material, an exact rate, louder intensity, or a new event. Prioritise
+   the requested sound over incidental room tone. Silent requests override all incidental effects.
+   Ambience: ONE concise sentence containing only sound sources established by the request or shot. A quiet
+   scene may have only room tone; never invent extra sources to fill a quota.
+"""
+
+
 def observe_max_tokens(n_pictures: int) -> int:
     return OBSERVE_MAX_TOKENS_MANY if n_pictures > PLAN_IMAGES_MAX else OBSERVE_MAX_TOKENS
 
 
-def plan_system(duration: int, n_pictures: int) -> str:
+def plan_system(duration: int, n_pictures: int, user_request: str = "") -> str:
     text = PLAN
+    if re.search(
+        r"\b(?:sounds?|noises?|sfx|foley|audible|rustl(?:e|es|ing)|clink(?:s|ing)?|room tone|silent|silence)\b"
+        r"|can be heard|音效|声音|声响|静音",
+        user_request,
+        re.I,
+    ):
+        text = text.replace(
+            "   Ambience: ONE sentence, 28-46 words, 3-6 sound sources physically present in the shot.\n",
+            AUDIO_DETAILS,
+            1,
+        )
     if n_pictures > PLAN_IMAGES_MAX:
         text = text.replace("Return ONLY JSON:", MANY_RULE + "Return ONLY JSON:", 1)
     return text.format(duration=duration, n=n_pictures, words=round(duration * 2.5), chars=round(duration * 4))
