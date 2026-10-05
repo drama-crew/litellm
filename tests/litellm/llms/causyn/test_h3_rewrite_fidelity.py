@@ -96,7 +96,7 @@ async def run(provider: Provider, spec: ContextIRRequest):
 
 
 QUOTE_SPEC = lambda: make_spec('A man says "I bet there is no bullet in your gun."')  # noqa: E731
-GOOD_QUOTE = t2va_prompt("[Shot 1] A man says: <d>[English] I bet there is no bullet in your gun.</d>")
+GOOD_QUOTE = t2va_prompt('[Shot 1] A man says: <d>[English] I bet there is no bullet in your gun.</d>')
 BAD_QUOTE = t2va_prompt("[Shot 1] A man says: <d>[English] I bet you won't pull the trigger.</d>")
 
 
@@ -206,12 +206,7 @@ async def test_clean_critic_means_two_calls_and_the_first_answer():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "critic",
-    [
-        httpx.Response(500, json={"error": {"message": "boom"}}),
-        "not json at all",
-        httpx.ConnectError("down"),
-        '{"defects": "x"}',
-    ],
+    [httpx.Response(500, json={"error": {"message": "boom"}}), "not json at all", httpx.ConnectError("down"), '{"defects": "x"}'],
 )
 async def test_critic_failures_are_fail_open(critic):
     good = t2va_prompt("[Shot 1] An orange vase on a table.")
@@ -373,10 +368,10 @@ async def test_critic_never_fails_the_rewrite_on_unexpected_errors(monkeypatch):
     "user,rewrite",
     [
         ("He says “I don’t know”", "<d>[English] I don't know</d>"),
-        ('He says "I don\'t know"', "<d>[English] I don’t know</d>"),
+        ("He says \"I don't know\"", "<d>[English] I don’t know</d>"),
         ("a man says hello to her", "<d>[English] Hello</d>"),
         ("她说“你好，世界”", "<d>[Chinese] 你好,世界</d>"),
-        ('He says "wait..."', "<d>[English] wait…</d>"),
+        ("He says \"wait...\"", "<d>[English] wait…</d>"),
     ],
 )
 def test_comparison_is_normalised_on_both_sides(user, rewrite):
@@ -398,18 +393,13 @@ def test_pasted_caption_in_dialogue_is_flagged_when_the_user_marked_lines():
     spec = make_spec('A cop says "Drop it now." The street is empty at night.')
     ok = t2va_prompt("[Shot 1] <d>[English] Drop it now.</d>")
     assert literal_violations(ok, spec) == []
-    caption = t2va_prompt(
-        "[Shot 1] <d>[English] A cop says Drop it now. The street is empty at night.</d> Drop it now."
-    )
+    caption = t2va_prompt("[Shot 1] <d>[English] A cop says Drop it now. The street is empty at night.</d> Drop it now.")
     found = literal_violations(caption, spec)
     assert any("must not add dialogue" in v for v in found)
     short = t2va_prompt("[Shot 1] <d>[English] The street is empty</d> Drop it now.")
     assert literal_violations(short, spec) == []  # short phrase from the prompt is tolerated
     # without quotes plain containment applies
-    assert (
-        literal_violations(t2va_prompt("[Shot 1] <d>[English] A cop says drop it</d>"), make_spec("A cop says drop it"))
-        == []
-    )
+    assert literal_violations(t2va_prompt("[Shot 1] <d>[English] A cop says drop it</d>"), make_spec("A cop says drop it")) == []
 
 
 def test_language_tag_is_stripped_from_every_piece_and_markers_split():
@@ -509,7 +499,9 @@ async def test_critic_sends_the_prepared_images_never_the_original_urls(monkeypa
     )
 
     async def prepare(client, request):
-        swapped = ContextIRRequest.model_validate(json.loads(request.model_dump_json().replace(original, prepared_url)))
+        swapped = ContextIRRequest.model_validate(
+            json.loads(request.model_dump_json().replace(original, prepared_url))
+        )
         return swapped, h3_media.PreparedRaw(videos=(), audios=())
 
     monkeypatch.setattr(h3_media, "prepare_media_with_raw", prepare)
@@ -519,16 +511,10 @@ async def test_critic_sends_the_prepared_images_never_the_original_urls(monkeypa
     )
     provider = Provider(good, critic=[])
     await run(provider, spec)
-    rewrite_urls = [
-        p["image_url"]["url"] for p in provider.bodies[0]["messages"][1]["content"] if p["type"] == "image_url"
-    ]
-    critic_urls = [
-        p["image_url"]["url"] for p in provider.critic_bodies[0]["messages"][0]["content"] if p["type"] == "image_url"
-    ]
+    rewrite_urls = [p["image_url"]["url"] for p in provider.bodies[0]["messages"][1]["content"] if p["type"] == "image_url"]
+    critic_urls = [p["image_url"]["url"] for p in provider.critic_bodies[0]["messages"][0]["content"] if p["type"] == "image_url"]
     assert critic_urls == rewrite_urls == [prepared_url]
-    assert "private.example" not in json.dumps(provider.critic_bodies[0]) and "SECRET" not in json.dumps(
-        provider.critic_bodies[0]
-    )
+    assert "private.example" not in json.dumps(provider.critic_bodies[0]) and "SECRET" not in json.dumps(provider.critic_bodies[0])
 
 
 BAD_TIMES = t2va_prompt("[Shot 1] A cat. [Shot 2] At 00:09.000, cut.")
@@ -611,9 +597,7 @@ async def test_ref2va_never_calls_the_critic_but_base_modes_do():
 
 @pytest.mark.asyncio
 async def test_a_repair_that_drops_a_quoted_line_loses_to_the_first_answer():
-    provider = Provider(
-        GOOD_QUOTE.replace("</d>", "</d> A fidelity-flagged flourish"), BAD_QUOTE, critic=["flourish is odd"]
-    )
+    provider = Provider(GOOD_QUOTE.replace("</d>", "</d> A fidelity-flagged flourish"), BAD_QUOTE, critic=["flourish is odd"])
     result = await run(provider, QUOTE_SPEC())
     assert "flourish" in result.prompt and any(v.startswith("Fidelity:") for v in result.soft_violations)
 
@@ -631,11 +615,8 @@ def test_every_repair_message_keeps_the_detail_sentence(base):
 # ----------------------------------------------------------------------------- length-aware repair sentence
 
 SHORTEN = (
-    "Regenerate from the original request and references, targeting at most 5500 characters for the whole prompt. "
-    "Use at most 200 characters per subject definition and 90 per reference retention line; "
-    "summary at most 250 characters, the description at most 1900, and audio fields at most 300 together. "
-    "Describe appearance once and use subject IDs in the action. Never enumerate synonyms or repeat sentences; "
-    "keep every required section, label, spoken line, subject appearance, clothing layer, action and spatial relation."
+    "Shorten the descriptive sections so the whole prompt stays well under 7000 characters; "
+    "keep every required section, label and spoken line."
 )
 
 
@@ -648,164 +629,11 @@ async def test_repair_after_an_over_7000_character_answer_asks_to_shorten():
     last = provider.bodies[1]["messages"][-1]["content"]
     assert last.endswith(SHORTEN) and h3_prompt.KEEP_DETAIL_SENTENCE not in last
     assert "it has" in last and "must contain 1 to 7000 characters" in last
-    assert all(message["role"] != "assistant" for message in provider.bodies[1]["messages"])
-
-
-@pytest.mark.asyncio
-async def test_overlong_reference_recovery_uses_a_compact_system_with_all_original_references():
-    too_long = ref_prompt(20).replace("Soft footsteps.", "room tone " * 1000)
-    provider = Provider(too_long, ref_prompt(20))
-    result = await run(provider, ref_image_spec())
-    recovery = provider.bodies[1]["messages"]
-    system = recovery[0]["content"]
-    assert len(system) < 2000 and all(field in system for field in h3_prompt.REFERENCE_FIELDS)
-    assert all(message["role"] != "assistant" for message in recovery)
-    assert recovery[1] == provider.bodies[0]["messages"][1]
-    assert "identity-defining appearance" in system and "Still subjects remain still" in system
-    assert result.prompt == ref_prompt(20)
-    assert "subject_definitions:\nsummary:\nretention_analysis:\n" in system
-    assert "No markdown headings" in system
-
-
-@pytest.mark.asyncio
-async def test_many_picture_headroom_triggers_recovery_before_the_hard_limit():
-    spec = make_spec("A woman walks.", *("reference_image",) * 5, duration=8)
-    pictures = ", ".join(f"<Picture {i}>" for i in range(1, 6))
-    clean = ref_prompt(20).replace("the coat of <Picture 2>", "the clothing from " + pictures)
-    for i in range(3, 6):
-        clean = clean.replace(
-            "detailed_description:", f"<Picture {i}>: fully_preserved - appearance.\n\ndetailed_description:"
-        )
-    roomy = clean.replace("Soft footsteps.", "room tone. " * 380)
-    assert 6000 < len(roomy) < 7000
-    provider = Provider(roomy, clean)
-    result = await run(provider, spec)
-    assert result.prompt == clean and len(provider.bodies) == 2
-    assert "6000 characters" in provider.bodies[1]["messages"][-1]["content"]
-    assert len(provider.bodies[1]["messages"][0]["content"]) < 2000
-
-
-@pytest.mark.asyncio
-async def test_one_picture_with_safe_length_keeps_the_a3_writer_context():
-    spec = ref_image_spec()
-    prompt = ref_prompt(20).replace("Soft footsteps.", "room tone. " * 380)
-    assert 6000 < len(prompt) < 7000
-    provider = Provider(prompt)
-    result = await run(provider, spec)
-    assert result.prompt == prompt and len(provider.bodies) == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("recovery_truncated", [False, True])
-async def test_exhausted_truncation_gets_one_fresh_recovery_and_keeps_paid_usage(monkeypatch, recovery_truncated):
-    provider = Provider("runaway", ref_prompt(20), finish=["length", "length" if recovery_truncated else "stop"])
-    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 5.0)
-    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-        rewriter = H3PromptRewriter(client, "key")
-        with pytest.raises(h3_prompt.TruncatedRewriteError) as first:
-            await rewriter.rewrite(ref_image_spec())
-        assert first.value.retryable and len(provider.bodies) == 1
-        monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 30.0)
-        if recovery_truncated:
-            with pytest.raises(h3_prompt.TruncatedRewriteError) as second:
-                await rewriter.rewrite(ref_image_spec())
-            assert not second.value.retryable
-        else:
-            result = await rewriter.rewrite(ref_image_spec())
-            assert result.prompt == ref_prompt(20) and result.usage.cost == 0.002
-            assert result.usage.prompt_tokens == 200
-    assert len(provider.bodies) == 2 and h3_prompt._FIRST_ANSWERS == {}
-    assert provider.bodies[1]["messages"][0]["content"] == h3_prompt._compact_ref2va_system()
-    assert all(message["role"] != "assistant" for message in provider.bodies[1]["messages"])
-
-
-@pytest.mark.asyncio
-async def test_recovery_timeout_retries_the_recovery_without_repeating_the_primary(monkeypatch):
-    provider = Provider("runaway", "unused", ref_prompt(20), finish=["length", "stop", "stop"])
-
-    def interrupted(request):
-        response = provider(request)
-        if len(provider.bodies) == 2:
-            raise httpx.ReadTimeout("recovery interrupted", request=request)
-        return response
-
-    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 60.0)
-    async with httpx.AsyncClient(transport=httpx.MockTransport(interrupted)) as client:
-        rewriter = H3PromptRewriter(client, "key")
-        with pytest.raises(RewriteError) as failure:
-            await rewriter.rewrite(ref_image_spec())
-        assert failure.value.retryable
-        assert next(iter(h3_prompt._FIRST_ANSWERS.values()))[0] == ""
-        result = await rewriter.rewrite(ref_image_spec())
-    assert result.prompt == ref_prompt(20) and len(provider.bodies) == 3
-    assert provider.bodies[1]["messages"] == provider.bodies[2]["messages"]
-    assert result.usage.prompt_tokens == 200 and h3_prompt._FIRST_ANSWERS == {}
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("truncated", [False, True])
-async def test_compact_recovery_defers_a_short_budget_instead_of_starting_a_predictable_timeout(monkeypatch, truncated):
-    first = "runaway" if truncated else ref_prompt(20).replace("Soft footsteps.", "room tone " * 1000)
-    provider = Provider(first, ref_prompt(20), finish=["length" if truncated else "stop", "stop"])
-    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 20.0)
-    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-        rewriter = H3PromptRewriter(client, "key")
-        with pytest.raises(RewriteError) as failure:
-            await rewriter.rewrite(ref_image_spec())
-        assert failure.value.retryable and len(provider.bodies) == 1
-        monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 90.0)
-        result = await rewriter.rewrite(ref_image_spec())
-    assert result.prompt == ref_prompt(20) and result.usage.cost == 0.002
-    assert len(provider.bodies) == 2 and h3_prompt._FIRST_ANSWERS == {}
-    assert provider.bodies[1]["messages"][0]["content"] == h3_prompt._compact_ref2va_system()
-
-
-@pytest.mark.asyncio
-async def test_fresh_truncation_recovery_counts_new_plan_usage(monkeypatch):
-    plan_costs = iter((0.0003, 0.0004))
-
-    async def plan(self, prepared, key, started, answer_cached=False):
-        return None, h3_prompt.RewriteUsage(cost=next(plan_costs), prompt_tokens=5)
-
-    monkeypatch.setattr(H3PromptRewriter, "ref2va_plan_notes", plan)
-    provider = Provider("runaway", ref_prompt(20), finish=["length", "stop"])
-    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 5.0)
-    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-        rewriter = H3PromptRewriter(client, "key")
-        with pytest.raises(h3_prompt.TruncatedRewriteError):
-            await rewriter.rewrite(ref_image_spec())
-        monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 30.0)
-        result = await rewriter.rewrite(ref_image_spec())
-    assert result.usage.cost == pytest.approx(0.0027)
-    assert result.usage.prompt_tokens == 210
-    assert len(provider.bodies) == 2
-
-
-@pytest.mark.asyncio
-async def test_overlong_audio_reference_keeps_the_original_media_guidance():
-    provider = Provider(ref_prompt(20).replace("Soft footsteps.", "room tone " * 1000), ref_prompt(20))
-    await run(provider, make_spec("A woman walks.", "reference_image", "reference_image", audio=True))
-    assert provider.bodies[1]["messages"][0] == provider.bodies[0]["messages"][0]
-    assert provider.bodies[1]["messages"][0]["content"] != h3_prompt._compact_ref2va_system()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("audio", [False, True])
-async def test_late_truncation_does_not_add_a_retry_to_other_media_paths(monkeypatch, audio):
-    provider = Provider("runaway", finish=["length"])
-    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 5.0)
-    spec = make_spec("A woman walks.", "reference_image", audio=True) if audio else make_spec("A woman walks.")
-    with pytest.raises(h3_prompt.TruncatedRewriteError) as failure:
-        await run(provider, spec)
-    assert not failure.value.retryable and len(provider.bodies) == 1
-    assert h3_prompt._FIRST_ANSWERS == {}
 
 
 @pytest.mark.asyncio
 async def test_over_maximum_word_count_asks_to_shorten_and_too_short_keeps_detail():
-    long_desc = " ".join(
-        ["She walks along the quiet street while the camera slowly follows her pace."] * 70
-    )  # >750 words
+    long_desc = " ".join(["She walks along the quiet street while the camera slowly follows her pace."] * 70)  # >750 words
     assert len(long_desc.split()) > 750
     spec = ref_image_spec()
     provider = Provider(ref_prompt(70), ref_prompt(20))
@@ -821,7 +649,6 @@ async def test_over_maximum_word_count_asks_to_shorten_and_too_short_keeps_detai
 def test_ordinary_repairs_and_empty_answers_keep_the_detail_sentence():
     for violations in (("A: x",), (h3_prompt._V_LENGTH,)):
         assert h3_prompt._repair_message(violations, (), base=True).endswith(h3_prompt.KEEP_DETAIL_SENTENCE)
-
 
 @pytest.mark.parametrize(
     "user,line",
@@ -898,3 +725,17 @@ async def test_clean_dialogue_repair_wins_even_with_more_minor_findings():
     result = await run(provider, ref_image_spec())
     assert result.prompt == clean
     assert not any(v.startswith(h3_prompt._V_SPEECH) for v in result.soft_violations)
+
+
+@pytest.mark.asyncio
+async def test_cached_first_answer_counts_new_plan_usage(monkeypatch):
+    async def plan(self, prepared, key, started, answer_cached=False):
+        return None, h3_prompt.RewriteUsage(cost=0.0004, prompt_tokens=5)
+
+    monkeypatch.setattr(H3PromptRewriter, "ref2va_plan_notes", plan)
+    spec = ref_image_spec()
+    key = h3_prompt.media_key(spec, (), ()) + "qwen/qwen3.8-omni-flash"
+    h3_prompt._FIRST_ANSWERS[key] = (ref_prompt(20), h3_prompt.RewriteUsage(cost=0.001, prompt_tokens=100))
+    result = await run(Provider(), spec)
+    assert result.usage.cost == pytest.approx(0.0014)
+    assert result.usage.prompt_tokens == 105

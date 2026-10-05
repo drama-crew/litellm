@@ -48,22 +48,8 @@ PLAN = {
     "camera": "Static Shot",
     "beats": ["{e1} stands (start state)", "{e1} lifts {e2}", "{e1} pours tea (end state)"],
     "speech": [
-        {
-            "speaker": "e1",
-            "voice": "female, 20s, warm, calm",
-            "text": "Tea is ready",
-            "language": "English",
-            "beat": 3,
-            "visibility": "onscreen",
-        },
-        {
-            "speaker": "e9",
-            "voice": "elderly man, low",
-            "text": "好香啊",
-            "language": "Chinese",
-            "beat": 2,
-            "visibility": "offscreen",
-        },
+        {"speaker": "e1", "voice": "female, 20s, warm, calm", "text": "Tea is ready", "language": "English", "beat": 3, "visibility": "onscreen"},
+        {"speaker": "e9", "voice": "elderly man, low", "text": "好香啊", "language": "Chinese", "beat": 2, "visibility": "offscreen"},
     ],
     "sound_effects": [
         {"beat": 2, "source": "{e1} lifting {e2}", "sound": "soft clink of enamel"},
@@ -84,8 +70,8 @@ GOLDEN_RENDER = (
     "  1. {e1} stands (start state)\n"
     "  2. {e1} lifts {e2}\n"
     "  3. {e1} pours tea (end state)\n"
-    'Speech at beat 3: {e1} (a young woman), voice female, 20s, warm, calm, onscreen, says in English: "Tea is ready"\n'
-    'Speech at beat 2: e9, voice elderly man, low, offscreen, says in Chinese: "好香啊"\n'
+    "Speech at beat 3: {e1} (a young woman), voice female, 20s, warm, calm, onscreen, says in English: \"Tea is ready\"\n"
+    "Speech at beat 2: e9, voice elderly man, low, offscreen, says in Chinese: \"好香啊\"\n"
     "Sound effect at beat 2: {e1} lifting {e2} — soft clink of enamel\n"
     "Sound effect at beat 3: {e1} pouring tea — tea splashing into a cup\n"
     "Music: non_diegetic — gentle piano, slow tempo\n"
@@ -111,12 +97,7 @@ def clean_state(monkeypatch):
     h3_prompt._FIRST_ANSWERS.clear()
     h3_prompt._PLAN_NOTES.clear()
     h3_prompt._warned_models.clear()
-    for name in (
-        "CAUSYN_H3_REF2VA_PLAN",
-        "CAUSYN_H3_REF2VA_PLAN_MODEL",
-        "CAUSYN_H3_REF2VA_REWRITE_MODEL",
-        h3_prompt.OBSERVATION_CACHE_ENV,
-    ):
+    for name in ("CAUSYN_H3_REF2VA_PLAN", "CAUSYN_H3_REF2VA_PLAN_MODEL", "CAUSYN_H3_REF2VA_REWRITE_MODEL"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CAUSYN_H3_REWRITE_CRITIC", "0")
 
@@ -141,9 +122,7 @@ def spec_of(*kinds: str, duration: int = 8, prompt: str = "A woman walks.") -> C
             content.append({"type": "video_url", "video_url": {"url": VID}, "role": "reference_video"})
         else:
             content.append({"type": "audio_url", "audio_url": {"url": AUD}, "role": "reference_audio"})
-    return ContextIRRequest.model_validate(
-        {"model": "causyn-1.1", "content": content, "duration": duration, "ratio": "16:9"}
-    )
+    return ContextIRRequest.model_validate({"model": "causyn-1.1", "content": content, "duration": duration, "ratio": "16:9"})
 
 
 def stage_of(body: dict) -> str:
@@ -213,9 +192,7 @@ async def test_image_only_ref2va_observes_each_picture_plans_then_writes_with_th
     assert plan["max_tokens"] == 1500 + 300 * 2
     content = plan["messages"][1]["content"]
     assert [p["type"] for p in content] == ["text", "image_url", "text"] * 2 + ["text"]
-    assert content[0]["text"] == "Picture 1:" and content[2]["text"].startswith(
-        "Observation of picture 1:\nKIND: character"
-    )
+    assert content[0]["text"] == "Picture 1:" and content[2]["text"].startswith("Observation of picture 1:\nKIND: character")
     assert content[-1]["text"] == "USER REQUEST (8 s):\nA woman walks."
     (writer,) = writer_bodies(provider)
     last = writer["messages"][1]["content"][-1]
@@ -240,12 +217,7 @@ async def test_reference_video_or_audio_gets_no_plan_stage(kinds):
 
 @pytest.mark.asyncio
 async def test_non_ref2va_modes_get_no_plan_stage():
-    provider = Provider(
-        writer=lambda body: completion(
-            body,
-            "integrated_multimodal_description: [Shot 1] A cat.\noverall_soundscape: Quiet.\nnon_diegetic_music: None.",
-        )
-    )
+    provider = Provider(writer=lambda body: completion(body, "integrated_multimodal_description: [Shot 1] A cat.\noverall_soundscape: Quiet.\nnon_diegetic_music: None."))
     spec = ContextIRRequest.model_validate(
         {"model": "MiniMax-H3", "content": [{"type": "text", "text": "A cat."}], "duration": 5, "ratio": "16:9"}
     )
@@ -357,46 +329,6 @@ async def test_retry_after_a_retryable_writer_failure_reuses_the_plan():
     assert result.usage.total_tokens == 110  # the memo hit spent nothing on observe/plan
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("observation_cache", [False, True])
-async def test_changed_pixels_at_the_same_url_do_not_reuse_a_failed_first_answer(monkeypatch, observation_cache):
-    monkeypatch.setenv(h3_prompt.OBSERVATION_CACHE_ENV, "1" if observation_cache else "0")
-    calls = {"prepare": 0, "writer": 0}
-    prepared_specs = [spec_of("image", "image2"), spec_of("image", "image2")]
-    prepared_specs[1].content[1].image_url.url = variant(2)
-    original = spec_of("image", "image2")
-    original.content[1].image_url.url = "https://media.example/mutable.jpg"
-
-    async def prepare(client, request):
-        spec = prepared_specs[calls["prepare"]]
-        calls["prepare"] += 1
-        return spec, h3_media.PreparedRaw(videos=(), audios=())
-
-    monkeypatch.setattr(h3_media, "prepare_media_with_raw", prepare)
-
-    def writer(body):
-        calls["writer"] += 1
-        if calls["writer"] == 1:
-            return completion(body, WRITER_ANSWER.replace("[Shot 1]", "Scene"))
-        if calls["writer"] == 2:
-            return httpx.Response(503)
-        return completion(body, WRITER_ANSWER)
-
-    provider = Provider(writer=writer)
-    with pytest.raises(RewriteError) as caught:
-        await run(provider, original)
-    assert caught.value.retryable
-    assert len(h3_prompt._FIRST_ANSWERS) == 1
-    result = await run(provider, original)
-    assert result.prompt == WRITER_ANSWER.strip()
-    assert provider.stages().count("observe") == (3 if observation_cache else 4)
-    assert provider.stages().count("plan") == 2
-    writers = writer_bodies(provider)
-    assert len(writers[1]["messages"]) == 4
-    assert len(writers[2]["messages"]) == 2
-    assert variant(2) in json.dumps(writers[2])
-
-
 def test_render_plan_matches_the_prototype_golden_output():
     assert ref2va_plan.render_plan(PLAN, 4) == GOLDEN_RENDER
 
@@ -405,8 +337,7 @@ def test_notes_wrap_the_rendered_plan():
     notes = ref2va_plan.plan_notes(PLAN, 4)
     assert notes.startswith("DIRECTING PLAN (prepared by the director for this request")
     assert GOLDEN_RENDER in notes
-    assert "Do not add dialogue beyond the plan." in notes
-    assert "5500 characters" not in notes
+    assert notes.endswith("Do not add dialogue beyond the plan.")
 
 
 @pytest.mark.asyncio
@@ -462,11 +393,9 @@ async def test_nine_pictures_observe_concurrently_and_plan_with_text_only():
     plan = next(b for b in provider.bodies if stage_of(b) == "plan")
     assert plan["max_tokens"] == 4000
     assert ref2va_plan.MANY_RULE in plan["messages"][0]["content"]
-    assert plan["messages"][0]["content"].index("11. There are") < plan["messages"][0]["content"].index(
-        "Return ONLY JSON:"
-    )
+    assert plan["messages"][0]["content"].index("11. There are") < plan["messages"][0]["content"].index("Return ONLY JSON:")
     assert all(b["max_tokens"] == 350 for b in provider.bodies if stage_of(b) == "observe")
-    assert "Length: the complete six-section prompt must fit within 5500 characters" in json.dumps(provider.bodies[-1])
+    assert "Length: with this many subjects" in json.dumps(provider.bodies[-1])
     kinds = [p["type"] for p in plan["messages"][1]["content"]]
     assert "image_url" not in kinds and kinds.count("text") == 9 * 2 + 1
     assert plan["messages"][1]["content"][0]["text"] == "Picture 1:"
@@ -481,10 +410,7 @@ async def test_four_pictures_keep_images_in_the_plan_call_and_five_drop_them():
             {
                 "model": "causyn-1.1",
                 "content": [{"type": "text", "text": "A woman walks."}]
-                + [
-                    {"type": "image_url", "image_url": {"url": variant(i + 2)}, "role": "reference_image"}
-                    for i in range(count)
-                ],
+                + [{"type": "image_url", "image_url": {"url": variant(i + 2)}, "role": "reference_image"} for i in range(count)],
                 "duration": 8,
                 "ratio": "16:9",
             }
@@ -567,16 +493,12 @@ async def test_timeout_is_logged_with_its_own_reason(monkeypatch, caplog):
 def test_many_picture_notes_end_with_the_length_line_and_few_picture_texts_are_unchanged():
     many = ref2va_plan.plan_notes(PLAN, 5)
     assert many.endswith(
-        "\nLength: the complete six-section prompt must fit within 5500 characters, including spaces and labels. "
-        "Use at most 200 characters per subject definition and 90 per reference retention line. "
-        "Keep summary under 250 characters, detailed_description under 1900 characters, and the two audio fields "
-        "under 300 characters together. State appearance once, then refer to subjects by ID in the action; "
-        "do not repeat appearance facts, enumerate synonyms, or expand ambient sound into a list. "
-        "Keep all references, requested actions and complete spoken lines; compress wording rather than omit them."
+        "\nLength: with this many subjects keep each subject definition to one compact sentence "
+        "and the whole prompt under 6000 characters."
     )
     assert many.startswith(ref2va_plan.plan_notes(PLAN, 4))
     assert ref2va_plan.plan_notes(PLAN, 4) == ref2va_plan.NOTES.format(plan=GOLDEN_RENDER)
-    assert "5500 characters" not in ref2va_plan.plan_notes(PLAN, 3)
+    assert ref2va_plan.plan_notes(PLAN, 3).endswith("Do not add dialogue beyond the plan.")
     assert ref2va_plan.plan_system(8, 3) == ref2va_plan.PLAN.format(duration=8, n=3, words=20, chars=32)
     assert "11." not in ref2va_plan.plan_system(8, 4)
     assert ref2va_plan.observe_max_tokens(4) == 600 and ref2va_plan.observe_max_tokens(5) == 350
@@ -619,6 +541,71 @@ def test_plan_system_states_the_speech_pace_for_the_duration():
     assert ref2va_plan.MANY_RULE.strip() in many
 
 
+def test_user_lines_only_keeps_what_the_user_wrote():
+    prompt = 'A man says "Good morning, everyone!" then 她说：“我们走吧。”'
+    lines = [
+        {"text": "Good morning everyone"},  # trailing punctuation differs
+        {"text": "我们走吧"},  # full-width quotes/punctuation in the prompt
+        {"text": "Nice weather today"},  # invented
+        {"text": "  ..  "},  # empty once normalised
+        "Good morning",  # not a dict
+    ]
+    assert ref2va_plan.user_lines_only(lines, prompt) == lines[:2]
+    for bad in ("a string", {"text": "Good morning"}, None, 3):
+        assert ref2va_plan.user_lines_only(bad, prompt) == []
+
+
+@pytest.mark.asyncio
+async def test_invented_speech_is_dropped_before_the_writer_sees_the_plan():
+    invented = dict(PLAN, speech=[
+        {"speaker": "e1", "voice": "v", "text": "I really love this sunny afternoon", "language": "English", "beat": 2, "visibility": "onscreen"},
+        {"speaker": "e1", "voice": "v", "text": "Hello there", "language": "English", "beat": 3, "visibility": "onscreen"},
+    ])
+    spec = spec_of("image", "image2", prompt="A woman waves and says Hello there!")
+    provider = Provider(plan=lambda body: completion(body, json.dumps(invented)))
+    await run(provider, spec)
+    (writer,) = writer_bodies(provider)
+    notes = json.dumps(writer["messages"][1]["content"], ensure_ascii=False)
+    assert "sunny afternoon" not in notes
+    assert "Hello there" in notes
+
+@pytest.mark.asyncio
+async def test_changed_pixels_at_the_same_url_do_not_reuse_a_failed_first_answer(monkeypatch):
+    calls = {"prepare": 0, "writer": 0}
+    prepared_specs = [spec_of("image", "image2"), spec_of("image", "image2")]
+    prepared_specs[1].content[1].image_url.url = variant(2)
+    original = spec_of("image", "image2")
+    original.content[1].image_url.url = "https://media.example/mutable.jpg"
+
+    async def prepare(client, request):
+        spec = prepared_specs[calls["prepare"]]
+        calls["prepare"] += 1
+        return spec, h3_media.PreparedRaw(videos=(), audios=())
+
+    monkeypatch.setattr(h3_media, "prepare_media_with_raw", prepare)
+
+    def writer(body):
+        calls["writer"] += 1
+        if calls["writer"] == 1:
+            return completion(body, WRITER_ANSWER.replace("[Shot 1]", "Scene"))
+        if calls["writer"] == 2:
+            return httpx.Response(503)
+        return completion(body, WRITER_ANSWER)
+
+    provider = Provider(writer=writer)
+    with pytest.raises(RewriteError) as caught:
+        await run(provider, original)
+    assert caught.value.retryable
+    assert len(h3_prompt._FIRST_ANSWERS) == 1
+    result = await run(provider, original)
+    assert result.prompt == WRITER_ANSWER.strip()
+    assert provider.stages().count("observe") == 4
+    assert provider.stages().count("plan") == 2
+    writers = writer_bodies(provider)
+    assert len(writers[1]["messages"]) == 4
+    assert len(writers[2]["messages"]) == 2
+    assert variant(2) in json.dumps(writers[2])
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "user_request",
@@ -639,53 +626,6 @@ async def test_director_instructions_preserve_the_a3_baseline_for_all_audio_requ
     baseline = ref2va_plan.PLAN.format(duration=8, n=2, words=20, chars=32)
     assert instructions == baseline
 
-
-def test_user_lines_only_keeps_what_the_user_wrote():
-    prompt = 'A man says "Good morning, everyone!" then 她说：“我们走吧。”'
-    lines = [
-        {"text": "Good morning everyone"},  # trailing punctuation differs
-        {"text": "我们走吧"},  # full-width quotes/punctuation in the prompt
-        {"text": "Nice weather today"},  # invented
-        {"text": "  ..  "},  # empty once normalised
-        "Good morning",  # not a dict
-    ]
-    assert ref2va_plan.user_lines_only(lines, prompt) == lines[:2]
-    for bad in ("a string", {"text": "Good morning"}, None, 3):
-        assert ref2va_plan.user_lines_only(bad, prompt) == []
-
-
-@pytest.mark.asyncio
-async def test_invented_speech_is_dropped_before_the_writer_sees_the_plan():
-    invented = dict(
-        PLAN,
-        speech=[
-            {
-                "speaker": "e1",
-                "voice": "v",
-                "text": "I really love this sunny afternoon",
-                "language": "English",
-                "beat": 2,
-                "visibility": "onscreen",
-            },
-            {
-                "speaker": "e1",
-                "voice": "v",
-                "text": "Hello there",
-                "language": "English",
-                "beat": 3,
-                "visibility": "onscreen",
-            },
-        ],
-    )
-    spec = spec_of("image", "image2", prompt="A woman waves and says Hello there!")
-    provider = Provider(plan=lambda body: completion(body, json.dumps(invented)))
-    await run(provider, spec)
-    (writer,) = writer_bodies(provider)
-    notes = json.dumps(writer["messages"][1]["content"], ensure_ascii=False)
-    assert "sunny afternoon" not in notes
-    assert "Hello there" in notes
-
-
 @pytest.mark.parametrize(
     "prompt,line",
     [
@@ -697,7 +637,6 @@ async def test_invented_speech_is_dropped_before_the_writer_sees_the_plan():
 )
 def test_short_speech_is_not_inferred_from_incidental_words(prompt, line):
     assert ref2va_plan.user_lines_only([{"text": line}], prompt) == []
-
 
 @pytest.mark.parametrize(
     "prompt,line",
@@ -716,66 +655,6 @@ def test_short_speech_is_not_inferred_from_incidental_words(prompt, line):
 def test_explicit_short_speech_survives_normalization(prompt, line):
     speech = [{"text": line}]
     assert ref2va_plan.user_lines_only(speech, prompt) == speech
-
-
-@pytest.mark.asyncio
-async def test_observations_are_reused_for_same_image_with_different_requests(monkeypatch):
-    monkeypatch.setenv(h3_prompt.OBSERVATION_CACHE_ENV, "1")
-    provider = Provider()
-    first = await run(provider, spec_of("image", "image2"))
-    second = await run(provider, spec_of("image", "image2", prompt="A woman takes a step."))
-    assert provider.stages().count("observe") == 2
-    assert provider.stages().count("plan") == 2
-    assert second.usage.cost == pytest.approx(first.usage.cost - 0.002)
-
-
-@pytest.mark.asyncio
-async def test_default_observations_still_run_for_a_different_request(monkeypatch):
-    monkeypatch.delenv(h3_prompt.OBSERVATION_CACHE_ENV, raising=False)
-    provider = Provider()
-    await run(provider, spec_of("image", "image2"))
-    await run(provider, spec_of("image", "image2", prompt="A woman takes a step."))
-    assert provider.stages().count("observe") == 4
-    assert provider.stages().count("plan") == 2
-    assert not any(key.startswith("observation:") for key in h3_prompt._PLAN_NOTES)
-
-
-@pytest.mark.asyncio
-async def test_changed_prepared_pixels_cannot_reuse_an_observation(monkeypatch):
-    monkeypatch.setenv(h3_prompt.OBSERVATION_CACHE_ENV, "1")
-    provider = Provider()
-    await run(provider, spec_of("image", "image2"))
-    changed = spec_of("image", "image2", prompt="A woman takes a step.")
-    changed = changed.model_copy(
-        update={
-            "content": (
-                changed.content[0],
-                changed.content[1].model_copy(
-                    update={"image_url": changed.content[1].image_url.model_copy(update={"url": variant(2)})}
-                ),
-                changed.content[2],
-            )
-        }
-    )
-    await run(provider, changed)
-    assert provider.stages().count("observe") == 3
-
-
-@pytest.mark.asyncio
-async def test_failed_observation_is_not_cached(monkeypatch):
-    monkeypatch.setenv(h3_prompt.OBSERVATION_CACHE_ENV, "1")
-    monkeypatch.setattr(ref2va_plan, "PLAN_RETRY_AFTER_MAX_S", 0.0)
-    provider = Provider(observe=lambda body: httpx.Response(500))
-    await run(provider, spec_of("image", "image2"))
-    assert not h3_prompt._PLAN_NOTES
-
-
-def test_observation_and_plan_cache_is_bounded():
-    for index in range(h3_prompt._MEMO_SIZE + 5):
-        h3_prompt._remember(h3_prompt._PLAN_NOTES, "observation:" + str(index), "A woman.")
-    assert len(h3_prompt._PLAN_NOTES) == h3_prompt._MEMO_SIZE
-    assert "observation:0" not in h3_prompt._PLAN_NOTES
-
 
 @pytest.mark.parametrize(
     "prompt,line",

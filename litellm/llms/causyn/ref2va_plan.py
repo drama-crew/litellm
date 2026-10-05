@@ -220,12 +220,8 @@ def plan_max_tokens(n_pictures: int) -> int:
 
 MANY_RULE = "11. There are more than 4 pictures: give each entity 3-5 appearance facts and use at most 7 beats.\n\n"
 MANY_LENGTH = (
-    "Length: the complete six-section prompt must fit within 5500 characters, including spaces and labels. "
-    "Use at most 200 characters per subject definition and 90 per reference retention line. "
-    "Keep summary under 250 characters, detailed_description under 1900 characters, and the two audio fields "
-    "under 300 characters together. State appearance once, then refer to subjects by ID in the action; "
-    "do not repeat appearance facts, enumerate synonyms, or expand ambient sound into a list. "
-    "Keep all references, requested actions and complete spoken lines; compress wording rather than omit them."
+    "Length: with this many subjects keep each subject definition to one compact sentence "
+    "and the whole prompt under 6000 characters."
 )
 
 

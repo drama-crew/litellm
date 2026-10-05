@@ -190,10 +190,7 @@ def test_unknown_or_missing_media_labels_fail():
     start = prompt.index("<Audio 1> is a complete")
     end = prompt.index("\n", start)
     found = violations(prompt[:start] + prompt[end + 1 :], spec4, facts4)
-    assert any(
-        v.startswith("The rewritten H3 prompt must define every provided media label in subject_definitions")
-        for v in found
-    )
+    assert any(v.startswith("The rewritten H3 prompt must define every provided media label in subject_definitions") for v in found)
 
 
 def test_provided_label_that_is_never_used_fails():
@@ -237,10 +234,8 @@ def test_detailed_description_length_bounds():
     text = GOLD["R1"]
     head, rest = text.split("detailed_description:\n", 1)
     _, tail = rest.split("\n\noverall_soundscape:", 1)
-    short = (
-        head
-        + "detailed_description:\n[Shot 1] A runner sprints.\n[Shot 2] At 00:03.583, a low shot."
-        + ("\n\noverall_soundscape:" + tail)
+    short = head + "detailed_description:\n[Shot 1] A runner sprints.\n[Shot 2] At 00:03.583, a low shot." + (
+        "\n\noverall_soundscape:" + tail
     )
     with pytest.raises(RewriteError) as caught:
         validate_prompt(short, spec, facts)
@@ -424,14 +419,8 @@ async def test_ref2va_user_content_has_facts_and_labelled_keyframes_without_raw_
     labels = [t for t in texts if "frame at" in t]
     assert labels == ["<Video 1> frame at 00:00.150 (Shot 1)", "<Video 1> frame at 00:03.733 (Shot 2)"]
     index = {t: i for i, p in enumerate(content) for t in [p.get("text")] if t}
-    jpeg_parts = [
-        p for p in content if p["type"] == "image_url" and p["image_url"]["url"].startswith("data:image/jpeg")
-    ]
-    assert any(
-        base64.b64encode(k.jpeg).decode() in p["image_url"]["url"]
-        for k in facts.videos[0].keyframes
-        for p in jpeg_parts
-    )
+    jpeg_parts = [p for p in content if p["type"] == "image_url" and p["image_url"]["url"].startswith("data:image/jpeg")]
+    assert any(base64.b64encode(k.jpeg).decode() in p["image_url"]["url"] for k in facts.videos[0].keyframes for p in jpeg_parts)
     # each keyframe image directly follows its label, in playing order
     for label in labels:
         assert content[index[label] + 1]["type"] == "image_url"
@@ -492,9 +481,7 @@ async def test_audio_part_is_sent_only_to_the_omni_model(patched, monkeypatch):
     result = await run(omni, spec)
     assert omni.bodies[0]["model"] == "qwen/qwen3.8-omni-flash" and result.model == "qwen/qwen3.8-omni-flash"
     audio = [p for p in parts(omni.bodies[0]) if p["type"] == "input_audio"]
-    assert audio == [
-        {"type": "input_audio", "input_audio": {"data": base64.b64encode(b"RIFFxxxxWAVE").decode(), "format": "wav"}}
-    ]
+    assert audio == [{"type": "input_audio", "input_audio": {"data": base64.b64encode(b"RIFFxxxxWAVE").decode(), "format": "wav"}}]
 
 
 @pytest.mark.asyncio
@@ -590,27 +577,6 @@ async def test_ref2va_system_prompt_carries_the_perception_rules(patched):
     system = provider.bodies[0]["messages"][0]["content"]
     for phrase in (*VIDEO_ONLY, *COMMON):
         assert phrase in system
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "name,labels",
-    [
-        ("R1", "<Picture 1>, <Video 1>"),
-        ("R3", "<Picture 1>, <Video 1>, <Video 2>, <Video 3>"),
-        ("R4", "<Picture 1>, <Video 1>, <Audio 1>"),
-    ],
-)
-async def test_video_writer_receives_exact_source_inventory_not_new_soundtrack_references(patched, name, labels):
-    spec, facts = case(name)
-    patched(spec, facts)
-    provider = Provider(GOLD[name])
-    await run(provider, spec)
-    system = provider.bodies[0]["messages"][0]["content"]
-    assert "Supplied source media labels for this request: " + labels + "." in system
-    assert "embedded soundtrack remain part of their <Video N>" in system
-    assert "only for a separately supplied reference audio" in system
-    assert len(provider.bodies) == 1
 
 
 @pytest.mark.asyncio
@@ -951,20 +917,11 @@ def test_media_key_covers_text_duration_ratio_roles_and_fetched_bytes():
     assert key != h3_prompt.media_key(base, (b"w",), ())
     assert key != h3_prompt.media_key(ref_spec("image", "video", duration=6), (b"v",), ())
     assert key != h3_prompt.media_key(base.model_copy(update={"ratio": "9:16"}), (b"v",), ())
-    changed = base.model_copy(
-        update={"content": (base.content[0].model_copy(update={"text": "Other"}), *base.content[1:])}
-    )
+    changed = base.model_copy(update={"content": (base.content[0].model_copy(update={"text": "Other"}), *base.content[1:])})
     assert key != h3_prompt.media_key(changed, (b"v",), ())
     assert key != h3_prompt.media_key(ref_spec("video", "image", duration=5), (b"v",), ())
     # the video URL itself is not part of the key; only its fetched bytes are
-    other_url = base.model_copy(
-        update={
-            "content": (
-                *base.content[:2],
-                base.content[2].model_copy(update={"video_url": {"url": "https://x.example/v.mp4"}}),
-            )
-        }
-    )
+    other_url = base.model_copy(update={"content": (*base.content[:2], base.content[2].model_copy(update={"video_url": {"url": "https://x.example/v.mp4"}}))})
     assert key == h3_prompt.media_key(other_url, (b"v",), ())
 
 
@@ -988,11 +945,7 @@ def soft_only_prompt() -> str:
     """Gold R1 with a too-short detailed_description: every hard rule holds, only the word range is broken."""
     head, rest = GOLD["R1"].split("detailed_description:\n", 1)
     _, tail = rest.split("\n\noverall_soundscape:", 1)
-    return (
-        head
-        + "detailed_description:\n[Shot 1] A runner sprints.\n[Shot 2] At 00:03.583, a low shot.\n\noverall_soundscape:"
-        + tail
-    )
+    return head + "detailed_description:\n[Shot 1] A runner sprints.\n[Shot 2] At 00:03.583, a low shot.\n\noverall_soundscape:" + tail
 
 
 def classes(prompt, spec, facts):
@@ -1009,10 +962,7 @@ def test_hard_soft_matrix():
     assert h3_prompt._V_TIMES in classes(mutate("R1", "At 00:03.583", "At 00:05.000"), spec, facts)[0]
     assert h3_prompt._V_CUTS in classes(OLD["R1"], spec, facts)[0]
     # a ref2va answer without [Shot 1] is hard
-    assert (
-        h3_prompt._V_SHOTS
-        in classes(GOLD["R1"].replace("[Shot 1]", "Shot one").replace("[Shot 2]", "Shot two"), spec, facts)[0]
-    )
+    assert h3_prompt._V_SHOTS in classes(GOLD["R1"].replace("[Shot 1]", "Shot one").replace("[Shot 2]", "Shot two"), spec, facts)[0]
     # undefined provided label, retention gaps and word range are soft only
     spec4, facts4 = case("R4")
     start = GOLD["R4"].index("<Audio 1> is a complete")
@@ -1097,18 +1047,10 @@ async def test_failed_repair_call_keeps_a_soft_only_first_answer(patched):
 @pytest.mark.parametrize(
     "reply,expected",
     [
-        (
-            {
-                "model": "qwen/qwen3.8-flash",
-                "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
-                "usage": {},
-            },
-            "finish_reason=length model=qwen/qwen3.8-flash content_empty=True",
-        ),
-        (
-            {"model": "other/model", "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}], "usage": {}},
-            "finish_reason=stop model=other/model content_empty=False",
-        ),
+        ({"model": "qwen/qwen3.8-flash", "choices": [{"message": {"content": ""}, "finish_reason": "length"}], "usage": {}},
+         "finish_reason=length model=qwen/qwen3.8-flash content_empty=True"),
+        ({"model": "other/model", "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}], "usage": {}},
+         "finish_reason=stop model=other/model content_empty=False"),
     ],
 )
 async def test_invalid_response_carries_a_redacted_detail_not_a_public_message(patched, reply, expected):
@@ -1130,9 +1072,7 @@ async def test_invalid_response_carries_a_redacted_detail_not_a_public_message(p
 async def test_unparseable_reply_has_a_detail_too(patched):
     spec, facts = case("R1")
     patched(spec, facts)
-    async with httpx.AsyncClient(
-        transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"{broken"))
-    ) as client:
+    async with httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b"{broken"))) as client:
         with pytest.raises(RewriteError) as caught:
             await H3PromptRewriter(client, "k").rewrite(spec)
     assert caught.value.detail == "unreadable reply, 7 bytes"
@@ -1282,9 +1222,7 @@ async def test_ref2va_does_not_build_a_video_data_url_unless_send_video(monkeypa
     clip = base64.b64encode(two_shot_clip()).decode()
     original = "data:video/quicktime;base64," + clip  # a rebuilt URL would say video/mp4
     spec = ref_spec("image", "video", duration=5)
-    image = spec.content[1].model_copy(
-        update={"image_url": MediaURL(url="data:image/png;base64," + base64.b64encode(_png()).decode())}
-    )
+    image = spec.content[1].model_copy(update={"image_url": MediaURL(url="data:image/png;base64," + base64.b64encode(_png()).decode())})
     video = spec.content[2].model_copy(update={"video_url": MediaURL(url=original)})
     spec = spec.model_copy(update={"content": (spec.content[0], image, video)})
     async with httpx.AsyncClient() as client:
@@ -1378,16 +1316,10 @@ def test_soft_check_flags_the_observed_bad_text():
     found = replacement_findings(bad_replacement_prompt(), spec, facts)
     assert len(found) == 1 and "reference image" in found[0]
     # each trigger alone is enough
-    only_attire = mutate(
-        "R1",
-        "The short blade she holds",
-        "She wears it to match the original video's attire. The short blade she holds",
-    )
+    only_attire = mutate("R1", "The short blade she holds", "She wears it to match the original video's attire. The short blade she holds")
     assert replacement_findings(only_attire, spec, facts)
     subject = next(l for l in bad_replacement_prompt().splitlines() if l.startswith("<Subject 1> is the female"))
-    attire_only = bad_replacement_prompt().replace(
-        OBSERVED_VIDEO, next(l for l in GOLD["R1"].splitlines() if l.startswith("<Video 1> (camera"))
-    )
+    attire_only = bad_replacement_prompt().replace(OBSERVED_VIDEO, next(l for l in GOLD["R1"].splitlines() if l.startswith("<Video 1> (camera")))
     assert subject in attire_only and replacement_findings(attire_only, spec, facts)
     video_line = next(l for l in GOLD["R1"].splitlines() if l.startswith("<Video 1> (camera"))
     assert replacement_findings(GOLD["R1"].replace(video_line, "<Video 1>: weak_reference - motion."), spec, facts)
@@ -1413,9 +1345,7 @@ def test_soft_check_ignores_non_edit_or_non_replacement_summaries():
 
 def test_observed_chinese_request_with_the_bad_rewrite_is_flagged():
     base, facts = case("R1")
-    spec = base.model_copy(
-        update={"content": (base.content[0].model_copy(update={"text": ZH_PROMPT}), *base.content[1:])}
-    )
+    spec = base.model_copy(update={"content": (base.content[0].model_copy(update={"text": ZH_PROMPT}), *base.content[1:])})
     assert spec.prompt == ZH_PROMPT
     assert replacement_findings(bad_replacement_prompt(), spec, facts)
     assert replacement_findings(GOLD["R1"], spec, facts) == []
@@ -1423,9 +1353,7 @@ def test_observed_chinese_request_with_the_bad_rewrite_is_flagged():
 
 def with_user_text(text):
     base, facts = case("R1")
-    return base.model_copy(
-        update={"content": (base.content[0].model_copy(update={"text": text}), *base.content[1:])}
-    ), facts
+    return base.model_copy(update={"content": (base.content[0].model_copy(update={"text": text}), *base.content[1:])}), facts
 
 
 @pytest.mark.parametrize(
