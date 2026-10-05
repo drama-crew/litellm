@@ -96,7 +96,7 @@ async def run(provider: Provider, spec: ContextIRRequest):
 
 
 QUOTE_SPEC = lambda: make_spec('A man says "I bet there is no bullet in your gun."')  # noqa: E731
-GOOD_QUOTE = t2va_prompt('[Shot 1] A man says: <d>[English] I bet there is no bullet in your gun.</d>')
+GOOD_QUOTE = t2va_prompt("[Shot 1] A man says: <d>[English] I bet there is no bullet in your gun.</d>")
 BAD_QUOTE = t2va_prompt("[Shot 1] A man says: <d>[English] I bet you won't pull the trigger.</d>")
 
 
@@ -206,7 +206,12 @@ async def test_clean_critic_means_two_calls_and_the_first_answer():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "critic",
-    [httpx.Response(500, json={"error": {"message": "boom"}}), "not json at all", httpx.ConnectError("down"), '{"defects": "x"}'],
+    [
+        httpx.Response(500, json={"error": {"message": "boom"}}),
+        "not json at all",
+        httpx.ConnectError("down"),
+        '{"defects": "x"}',
+    ],
 )
 async def test_critic_failures_are_fail_open(critic):
     good = t2va_prompt("[Shot 1] An orange vase on a table.")
@@ -367,10 +372,10 @@ async def test_critic_never_fails_the_rewrite_on_unexpected_errors(monkeypatch):
     "user,rewrite",
     [
         ("He says “I don’t know”", "<d>[English] I don't know</d>"),
-        ("He says \"I don't know\"", "<d>[English] I don’t know</d>"),
+        ('He says "I don\'t know"', "<d>[English] I don’t know</d>"),
         ("a man says hello to her", "<d>[English] Hello</d>"),
         ("她说“你好，世界”", "<d>[Chinese] 你好,世界</d>"),
-        ("He says \"wait...\"", "<d>[English] wait…</d>"),
+        ('He says "wait..."', "<d>[English] wait…</d>"),
     ],
 )
 def test_comparison_is_normalised_on_both_sides(user, rewrite):
@@ -392,13 +397,18 @@ def test_pasted_caption_in_dialogue_is_flagged_when_the_user_marked_lines():
     spec = make_spec('A cop says "Drop it now." The street is empty at night.')
     ok = t2va_prompt("[Shot 1] <d>[English] Drop it now.</d>")
     assert literal_violations(ok, spec) == []
-    caption = t2va_prompt("[Shot 1] <d>[English] A cop says Drop it now. The street is empty at night.</d> Drop it now.")
+    caption = t2va_prompt(
+        "[Shot 1] <d>[English] A cop says Drop it now. The street is empty at night.</d> Drop it now."
+    )
     found = literal_violations(caption, spec)
     assert any("must not add dialogue" in v for v in found)
     short = t2va_prompt("[Shot 1] <d>[English] The street is empty</d> Drop it now.")
     assert literal_violations(short, spec) == []  # short phrase from the prompt is tolerated
     # without quotes plain containment applies
-    assert literal_violations(t2va_prompt("[Shot 1] <d>[English] A cop says drop it</d>"), make_spec("A cop says drop it")) == []
+    assert (
+        literal_violations(t2va_prompt("[Shot 1] <d>[English] A cop says drop it</d>"), make_spec("A cop says drop it"))
+        == []
+    )
 
 
 def test_language_tag_is_stripped_from_every_piece_and_markers_split():
@@ -498,9 +508,7 @@ async def test_critic_sends_the_prepared_images_never_the_original_urls(monkeypa
     )
 
     async def prepare(client, request):
-        swapped = ContextIRRequest.model_validate(
-            json.loads(request.model_dump_json().replace(original, prepared_url))
-        )
+        swapped = ContextIRRequest.model_validate(json.loads(request.model_dump_json().replace(original, prepared_url)))
         return swapped, h3_media.PreparedRaw(videos=(), audios=())
 
     monkeypatch.setattr(h3_media, "prepare_media_with_raw", prepare)
@@ -510,10 +518,16 @@ async def test_critic_sends_the_prepared_images_never_the_original_urls(monkeypa
     )
     provider = Provider(good, critic=[])
     await run(provider, spec)
-    rewrite_urls = [p["image_url"]["url"] for p in provider.bodies[0]["messages"][1]["content"] if p["type"] == "image_url"]
-    critic_urls = [p["image_url"]["url"] for p in provider.critic_bodies[0]["messages"][0]["content"] if p["type"] == "image_url"]
+    rewrite_urls = [
+        p["image_url"]["url"] for p in provider.bodies[0]["messages"][1]["content"] if p["type"] == "image_url"
+    ]
+    critic_urls = [
+        p["image_url"]["url"] for p in provider.critic_bodies[0]["messages"][0]["content"] if p["type"] == "image_url"
+    ]
     assert critic_urls == rewrite_urls == [prepared_url]
-    assert "private.example" not in json.dumps(provider.critic_bodies[0]) and "SECRET" not in json.dumps(provider.critic_bodies[0])
+    assert "private.example" not in json.dumps(provider.critic_bodies[0]) and "SECRET" not in json.dumps(
+        provider.critic_bodies[0]
+    )
 
 
 BAD_TIMES = t2va_prompt("[Shot 1] A cat. [Shot 2] At 00:09.000, cut.")
@@ -596,7 +610,9 @@ async def test_ref2va_never_calls_the_critic_but_base_modes_do():
 
 @pytest.mark.asyncio
 async def test_a_repair_that_drops_a_quoted_line_loses_to_the_first_answer():
-    provider = Provider(GOOD_QUOTE.replace("</d>", "</d> A fidelity-flagged flourish"), BAD_QUOTE, critic=["flourish is odd"])
+    provider = Provider(
+        GOOD_QUOTE.replace("</d>", "</d> A fidelity-flagged flourish"), BAD_QUOTE, critic=["flourish is odd"]
+    )
     result = await run(provider, QUOTE_SPEC())
     assert "flourish" in result.prompt and any(v.startswith("Fidelity:") for v in result.soft_violations)
 
@@ -632,7 +648,9 @@ async def test_repair_after_an_over_7000_character_answer_asks_to_shorten():
 
 @pytest.mark.asyncio
 async def test_over_maximum_word_count_asks_to_shorten_and_too_short_keeps_detail():
-    long_desc = " ".join(["She walks along the quiet street while the camera slowly follows her pace."] * 70)  # >750 words
+    long_desc = " ".join(
+        ["She walks along the quiet street while the camera slowly follows her pace."] * 70
+    )  # >750 words
     assert len(long_desc.split()) > 750
     spec = ref_image_spec()
     provider = Provider(ref_prompt(70), ref_prompt(20))
@@ -648,3 +666,42 @@ async def test_over_maximum_word_count_asks_to_shorten_and_too_short_keeps_detai
 def test_ordinary_repairs_and_empty_answers_keep_the_detail_sentence():
     for violations in (("A: x",), (h3_prompt._V_LENGTH,)):
         assert h3_prompt._repair_message(violations, (), base=True).endswith(h3_prompt.KEEP_DETAIL_SENTENCE)
+
+
+@pytest.mark.parametrize(
+    "user,line",
+    [
+        ("A child waves in the kitchen.", "Hi"),
+        ("The high shelf is blue.", "hi"),
+        ("The person nods, then waits.", "then"),
+        ("看着明天的日历，点点头。", "明天"),
+    ],
+)
+def test_invented_short_dialogue_cannot_hide_in_user_prose(user, line):
+    spec = make_spec(user, "reference_image")
+    found = literal_violations(t2va_prompt(f"<d>[English] {line}</d>"), spec)
+    assert any("must not add dialogue" in v for v in found)
+
+
+@pytest.mark.parametrize("user,line", [('She says "Hi!"', "Hi!"), ("她说：“走！”", "走！")])
+def test_short_explicit_dialogue_is_preserved(user, line):
+    spec = make_spec(user, "reference_image")
+    assert not literal_violations(t2va_prompt(f"<d>[English] {line}</d>"), spec)
+
+
+def test_dropped_one_character_quoted_line_is_reported():
+    spec = make_spec("她说：“走”", "reference_image")
+    found = literal_violations(t2va_prompt("[Shot 1] She silently nods."), spec)
+    assert any("quoted text verbatim" in v and "走" in v for v in found)
+
+
+@pytest.mark.parametrize("user", ['She says "Hi!"', "She says 'Hi!'", "She says ‘Hi!’"])
+def test_dropped_short_line_cannot_hide_inside_child(user):
+    spec = make_spec(user, "reference_image")
+    found = literal_violations(t2va_prompt("[Shot 1] A child silently nods."), spec)
+    assert any("quoted text verbatim" in v and "Hi" in v for v in found)
+
+
+def test_contractions_and_possessives_do_not_create_speech_requirements():
+    spec = make_spec("A child's toy doesn't move.", "reference_image")
+    assert not literal_violations(t2va_prompt("[Shot 1] A child's toy is still."), spec)

@@ -31,7 +31,6 @@ import ipaddress
 import re
 import socket
 import functools
-import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
@@ -63,7 +62,6 @@ IMAGE_FORMATS = "JPEG, PNG, WEBP, HEIC, HEIF"
 PUBLIC_HOST_MESSAGE = "media URL must point to a public internet host"
 
 Kind = Literal["image", "video", "audio"]
-
 
 
 class MediaBusyError(Exception):
@@ -119,9 +117,7 @@ def _gate(name: str) -> _Gate:
     return loop_gates[name]
 
 
-_HEIF_BRANDS = frozenset(
-    {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1"}
-)
+_HEIF_BRANDS = frozenset({b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1"})
 _AVIF_BRANDS = frozenset({b"avif", b"avis"})
 _BLOCKED_SUFFIXES = (
     ".localhost",

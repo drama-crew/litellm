@@ -20,8 +20,22 @@ from importlib.resources import files
 from typing import Literal
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from typing_extensions import Self
+
+try:
+    from builtins import BaseExceptionGroup
+except ImportError:
+    from exceptiongroup import BaseExceptionGroup
 
 from litellm.llms.causyn import ref2va_plan
 from litellm.llms.causyn.ref_media_facts import (
@@ -626,9 +640,7 @@ def _section(prompt: str, fields: tuple[str, ...], name: str) -> str:
     return prompt[start : min(later) if later else len(prompt)]
 
 
-def ref2va_violations(
-    prompt: str, spec: ContextIRRequest, facts: RefFacts | None
-) -> tuple[list[str], list[str]]:
+def ref2va_violations(prompt: str, spec: ContextIRRequest, facts: RefFacts | None) -> tuple[list[str], list[str]]:
     """(hard, soft) findings beyond the section layout; each starts with a fixed phrase, details follow a colon.
 
     Hard: unknown labels, shot numbering, timestamps, source-cut alignment (they break generation).
@@ -651,7 +663,9 @@ def ref2va_violations(
     times = tuple(_seconds(*match.groups()) for match in _TIMESTAMP.finditer(description))
     if any(later <= earlier for earlier, later in zip(times, times[1:])) or any(t >= spec.duration for t in times):
         # Without a reference video there are no source timings to protect, so this is only a quality finding.
-        (hard if any(isinstance(item, VideoItem) for item in spec.content) else soft).append(f"{_V_TIMES}: 'At MM:SS.mmm' must strictly increase and stay below {spec.duration}.000")
+        (hard if any(isinstance(item, VideoItem) for item in spec.content) else soft).append(
+            f"{_V_TIMES}: 'At MM:SS.mmm' must strictly increase and stay below {spec.duration}.000"
+        )
     words = len(description.split())
     if not DESCRIPTION_WORDS[0] <= words <= DESCRIPTION_WORDS[1]:
         soft.append(f"{_V_WORDS}: it has {words}, aim for 350-500")
@@ -674,9 +688,10 @@ def ref2va_violations(
             line_labels.add(match.group(0))
         elif match or not line_labels:  # an undefined label, or text before any label line; wrapped text is fine
             bad.append(line[:40])
-    unmentioned = sorted([label for label in subjects if label not in line_labels] + [
-        label for label in provided if label not in retention
-    ])
+    unmentioned = sorted(
+        [label for label in subjects if label not in line_labels]
+        + [label for label in provided if label not in retention]
+    )
     if bad:
         soft.append(f"{_V_RETENTION}: {bad[0]!r}")
     elif unmentioned:
@@ -704,7 +719,8 @@ def _replacement_subject_text(subject_definitions: str) -> str:
 
 def _source_attire_mentioned(text: str) -> bool:
     return any(
-        not _NEGATION.search(text[max(0, match.start() - 40) : match.start()]) for match in _SOURCE_ATTIRE.finditer(text)
+        not _NEGATION.search(text[max(0, match.start() - 40) : match.start()])
+        for match in _SOURCE_ATTIRE.finditer(text)
     )
 
 
@@ -768,7 +784,9 @@ def _base_violations(prompt: str, spec: ContextIRRequest, description: str) -> l
     later = sorted({n for n in numbers if n >= 2})
     times = [starts.get(n) for n in later]
     if any(t is None for t in times):
-        found.append(f"{_V_TIMES}: every later [Shot k] needs 'At MM:SS.mmm', missing for Shot {later[times.index(None)]}")
+        found.append(
+            f"{_V_TIMES}: every later [Shot k] needs 'At MM:SS.mmm', missing for Shot {later[times.index(None)]}"
+        )
     elif any(b <= a for a, b in zip(times, times[1:])) or any(not 0 < t < spec.duration for t in times):
         found.append(f"{_V_TIMES}: 'At MM:SS.mmm' must strictly increase and stay between 0 and {spec.duration}.000")
     if spec.mode in {"fl2va", "l2va"} and numbers:
@@ -778,15 +796,28 @@ def _base_violations(prompt: str, spec: ContextIRRequest, description: str) -> l
     return found
 
 
-_CURLY_QUOTED = re.compile(r"\u201c([^\u201d]{2,300})\u201d|\u300c([^\u300d]{2,300})\u300d|\u300e([^\u300f]{2,300})\u300f")
+_CURLY_QUOTED = re.compile(
+    r"\u201c([^\u201d]{1,300})\u201d|\u300c([^\u300d]{1,300})\u300d|\u300e([^\u300f]{1,300})\u300f"
+    r"|\u2018([^\n]{1,300}?)\u2019"
+    r"|(?<![\w'])'([^\n]{1,300}?)'(?!\w)"
+)
 # A straight pair counts only when opened/closed at a boundary (not inside a word: 12" pizza and a 14" pan).
-_STRAIGHT_QUOTED = re.compile(r'(?<![A-Za-z0-9_"])"([^"]{2,300})"(?![A-Za-z0-9_])')
+_STRAIGHT_QUOTED = re.compile(r'(?<![A-Za-z0-9_"])"([^"]{1,300})"(?![A-Za-z0-9_])')
 _DIALOGUE = re.compile(r"<d>(.*?)</d>", re.DOTALL)
 _DIALOGUE_MARKERS = re.compile(r"</?(?:cutoff|scenetrans)\s*/?>")
 _LANG_TAG = re.compile(r"^\s*\[[^\]\n]+\]")
 _TRAILING_PUNCT = ".!?\u3002\uff01\uff1f\u2026,\uff0c "
 _QUOTE_MAP = str.maketrans(
-    {"\u2018": "'", "\u2019": "'", "\u201b": "'", "\u2032": "'", "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u3002": "."}
+    {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201b": "'",
+        "\u2032": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u201e": '"',
+        "\u3002": ".",
+    }
 )
 _SPEECH_MAX_WORDS = 12
 _V_QUOTED = "The rewritten H3 prompt must keep the user's quoted text verbatim: "
@@ -823,7 +854,11 @@ def literal_violations(prompt: str, spec: ContextIRRequest) -> list[str]:
     user = _fold(spec.prompt)
     rewrite = _fold(prompt)
     quotes = [(raw, _norm(raw)) for raw in _quoted_spans(spec.prompt)]
-    missing = [raw.strip() for raw, norm in dict(quotes).items() if norm and norm not in rewrite]
+    missing = [
+        raw.strip()
+        for raw, norm in dict(quotes).items()
+        if norm and re.search(r"(?<!\w)" + re.escape(norm) + r"(?!\w)", rewrite) is None
+    ]
     if missing:
         found.append(_V_QUOTED + "; ".join(missing))
     if not any(isinstance(item, AudioItem) for item in spec.content):
@@ -836,11 +871,13 @@ def literal_violations(prompt: str, spec: ContextIRRequest) -> list[str]:
                 if not text:
                     continue
                 if spans:  # the user marked their lines: a short line from the prompt, or part of a marked line
-                    ok = any(text in span for span in spans) or (
-                        len(text.split()) <= _SPEECH_MAX_WORDS and text in user
+                    ok = any(re.search(r"(?<!\w)" + re.escape(text) + r"(?!\w)", span) for span in spans) or (
+                        len(text.split()) <= _SPEECH_MAX_WORDS
+                        and text in user
+                        and ref2va_plan.user_line_written(shown, spec.prompt)
                     )
                 else:
-                    ok = text in user
+                    ok = ref2va_plan.user_line_written(shown, spec.prompt)
                 if not ok:
                     invented.append(shown[:120])
         if invented:
@@ -1020,7 +1057,9 @@ def critic_model() -> str | None:
         return chosen
     if CRITIC_MODEL_ENV + chosen not in _warned_models:
         _warned_models.add(CRITIC_MODEL_ENV + chosen)
-        _log.warning("%s is not an allow-listed model, the fidelity critic is skipped: %r", CRITIC_MODEL_ENV, chosen[:80])
+        _log.warning(
+            "%s is not an allow-listed model, the fidelity critic is skipped: %r", CRITIC_MODEL_ENV, chosen[:80]
+        )
     return None
 
 
@@ -1035,7 +1074,11 @@ def plan_model() -> str | None:
         return chosen
     if ref2va_plan.PLAN_MODEL_ENV + chosen not in _warned_models:
         _warned_models.add(ref2va_plan.PLAN_MODEL_ENV + chosen)
-        _log.warning("%s is not a supported plan model, the Ref2VA plan stage is skipped: %r", ref2va_plan.PLAN_MODEL_ENV, chosen[:80])
+        _log.warning(
+            "%s is not a supported plan model, the Ref2VA plan stage is skipped: %r",
+            ref2va_plan.PLAN_MODEL_ENV,
+            chosen[:80],
+        )
     return None
 
 
@@ -1244,7 +1287,8 @@ class H3PromptRewriter:
             model = plan_model()
             if model is None:
                 return None, usage
-            memo_key = key + "plan" + model
+            image_digest = await asyncio.to_thread(lambda: hashlib.sha256(json.dumps(urls).encode()).hexdigest())
+            memo_key = key + "plan" + model + image_digest
             memoized = _PLAN_NOTES.get(memo_key)
             if memoized is not None:
                 _PLAN_NOTES.move_to_end(memo_key)
@@ -1284,13 +1328,24 @@ class H3PromptRewriter:
                 raise AssertionError("unreachable")
 
             async def observe(url: str) -> str:
-                return await call(
+                tokens = ref2va_plan.observe_max_tokens(len(urls))
+                observation_digest = await asyncio.to_thread(
+                    lambda: hashlib.sha256((model + str(tokens) + ref2va_plan.OBSERVE + url).encode()).hexdigest()
+                )
+                observation_key = "observation:" + observation_digest
+                cached = _PLAN_NOTES.get(observation_key)
+                if cached is not None:
+                    _PLAN_NOTES.move_to_end(observation_key)
+                    return cached
+                observed = await call(
                     [
                         {"role": "system", "content": ref2va_plan.OBSERVE},
                         {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]},
                     ],
-                    ref2va_plan.observe_max_tokens(len(urls)),
+                    tokens,
                 )
+                _remember(_PLAN_NOTES, observation_key, observed)
+                return observed
 
             reason = "failed"
             try:
@@ -1369,6 +1424,13 @@ class H3PromptRewriter:
             if ref2va
             else ""
         )
+        if ref2va and any(isinstance(item, VideoItem) for item in spec.content):
+            system += (
+                "\nSupplied source media labels for this request: " + ", ".join(_provided_labels(spec)) + ". "
+                "Decoded frames and an embedded soundtrack remain part of their <Video N>; "
+                "they do not create additional <Picture N> or <Audio N> references. "
+                "Use an <Audio N> label only for a separately supplied reference audio listed above."
+            )
         user = prepared.user_content(facts, model, send_video_enabled()) if ref2va else prepared.user_content()
         plan_usage = RewriteUsage()
         if ref2va and not any(isinstance(item, (VideoItem, AudioItem)) for item in spec.content):
@@ -1451,7 +1513,9 @@ class H3PromptRewriter:
                     raise hard_failure
                 return result(prompt, usage, soft)  # soft-only first answer is acceptable as is
             listed = (
-                (*(hard_failure.violations or (str(hard_failure),)), *literal) if hard_failure is not None else tuple(soft)
+                (*(hard_failure.violations or (str(hard_failure),)), *literal)
+                if hard_failure is not None
+                else tuple(soft)
             )
             _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
             messages += [

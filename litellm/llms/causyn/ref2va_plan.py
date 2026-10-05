@@ -2,6 +2,7 @@
 
 Pure text and parsing helpers; the provider calls live in `H3PromptRewriter.ref2va_plan_notes`.
 """
+
 from __future__ import annotations
 
 import json
@@ -68,7 +69,13 @@ Rules:
    vehicles, water, an instrument being played), each tied to its beat. No effect for quiet movements (gestures,
    smiles, glances, blinking, breathing, a raised hand, standing or sitting still, clothing, hair) and no sound without
    a visible source.
-   Ambience: ONE sentence, 28-46 words, 3-6 sound sources physically present in the shot.
+   For each required or justified effect, describe its audible character: name the source and physical event,
+   supported material/contact surface, attack and decay (sharp click, dull thud, short ring, sustained hiss), and
+   recurrence tied to the action (one strike, each footfall, continuous flow). Use only qualities justified by the
+   request or visible source; do not invent material, an exact rate, louder intensity, or a new event. Prioritise
+   the requested sound over incidental room tone. Silent requests override all incidental effects.
+   Ambience: ONE concise sentence containing only sound sources established by the request or shot. A quiet
+   scene may have only room tone; never invent extra sources to fill a quota.
    Music: "absent" unless the user asked for music or the request is explicitly a commercial, trailer, montage or
    music video; then follow the user's style, instrumentation, tempo and dynamics (non_diegetic unless it is played on
    screen). Music played or heard on screen (an instrument, a performance, a radio, a party) is diegetic and synced to
@@ -102,22 +109,55 @@ recurring effects (no dialogue, no music); non_diegetic_music = the music decisi
 diegetic music is described in the action, synced to the visible playing.
 The audio lines come in addition to the visual description, never instead of it: keep every subject definition and
 the detailed_description as visually detailed as they would be without them.
-Pictures are references, not frames. Do not add dialogue beyond the plan."""
+Pictures are references, not frames. Do not add dialogue beyond the plan.
+Length: target at most 5500 characters for the complete six-section prompt. Compress repeated phrasing and
+incidental ambience first; preserve every requested action, appearance fact, reference binding and complete spoken
+line. Keep sound descriptions concrete and brief; do not repeat the same effect in every beat."""
 
 
 _NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
+_LINE_WORDS = re.compile(r"[^\W_]+", re.UNICODE)
+_SHORT_QUOTED = re.compile(
+    r'"([^"\n]{1,300})"|“([^”\n]{1,300})”|「([^」\n]{1,300})」|『([^』\n]{1,300})』'
+    r"|(?<![\w'])'([^\n]{1,300}?)'(?!\w)|‘([^\n]{1,300}?)’"
+)
+_SPEECH_CUE = re.compile(
+    r"(?:\b(?:says?|said|asks?|replies|shouts?|whispers?|exclaims?|calls?|yells?|utters?)\b|(?:说|喊|问|回答|台词)[：:]?)\s*[:：]?\s*(?:[\w’ -]+?\s+(?:and|then)\s+)?(?:[\"'“‘「『]\s*)?$",
+    re.I,
+)
 
 
-def _norm_line(text):
-    return _NON_WORD.sub("", unicodedata.normalize("NFKC", str(text)).casefold())
+def _norm_line(text: str) -> str:
+    return _NON_WORD.sub("", unicodedata.normalize("NFKC", text).casefold())
+
+
+def user_line_written(text: str, prompt: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    words = tuple(_LINE_WORDS.findall(normalized))
+    if not words:
+        return False
+    source = unicodedata.normalize("NFKC", prompt).casefold()
+    if any(
+        _norm_line(text) == _norm_line(next(g for g in m.groups() if g is not None))
+        for m in _SHORT_QUOTED.finditer(source)
+    ):
+        return True
+    start_boundary = "" if re.search(r"[㐀-鿿]", normalized) else r"(?<!\w)"
+    pattern = start_boundary + r"[\W_]+".join(re.escape(w) for w in words) + r"(?!\w)"
+    matches = tuple(re.finditer(pattern, source))
+    if len(words) >= 3 or len(_norm_line(text)) >= 12:
+        return bool(matches)
+    return any(_SPEECH_CUE.search(source[: m.start()]) is not None for m in matches)
 
 
 def user_lines_only(speech, prompt):
-    """Keep only planned lines whose words the user actually wrote (the plan model sometimes invents dialogue)."""
     if not isinstance(speech, list):
         return []
-    ref = _norm_line(prompt)
-    return [sp for sp in speech if isinstance(sp, dict) and _norm_line(sp.get("text", "")) and _norm_line(sp.get("text", "")) in ref]
+    return [
+        sp
+        for sp in speech
+        if isinstance(sp, dict) and isinstance(sp.get("text"), str) and user_line_written(sp["text"], prompt)
+    ]
 
 
 def _items(value):
@@ -129,9 +169,11 @@ def render_plan(plan, n_pictures):
     lines = [f"Look: {plan.get('look', '')}"]
     for e in plan.get("entities", []):
         pics = ", ".join(f"picture {p}" for p in e.get("pictures", []))
-        lines.append(f"Entity {e['id']} = {e.get('name')} ({e.get('kind')}; from {pics}; retention {e.get('retention')}): "
-                     + "; ".join(e.get("appearance_facts", []))
-                     + (f". Requested changes: {'; '.join(e['changed'])}" if e.get("changed") else ""))
+        lines.append(
+            f"Entity {e['id']} = {e.get('name')} ({e.get('kind')}; from {pics}; retention {e.get('retention')}): "
+            + "; ".join(e.get("appearance_facts", []))
+            + (f". Requested changes: {'; '.join(e['changed'])}" if e.get("changed") else "")
+        )
     for x in plan.get("excluded_pictures", []):
         lines.append(f"Excluded picture {x.get('picture')}: {x.get('reason')}")
     lines.append(f"Camera: {plan.get('camera')}")
@@ -143,8 +185,10 @@ def render_plan(plan, n_pictures):
             continue
         who = sp.get("speaker")
         who = f"{{{who}}} ({names[who]})" if isinstance(who, str) and who in names else str(who or "a speaker")
-        lines.append(f"Speech at beat {sp.get('beat')}: {who}, voice {sp.get('voice', '')}, {sp.get('visibility', 'onscreen')}, "
-                     f"says in {sp.get('language', '')}: {json.dumps(sp.get('text', ''), ensure_ascii=False)}")
+        lines.append(
+            f"Speech at beat {sp.get('beat')}: {who}, voice {sp.get('voice', '')}, {sp.get('visibility', 'onscreen')}, "
+            f"says in {sp.get('language', '')}: {json.dumps(sp.get('text', ''), ensure_ascii=False)}"
+        )
     for fx in _items(plan.get("sound_effects")):
         if not isinstance(fx, dict):
             continue
@@ -183,7 +227,7 @@ def plan_max_tokens(n_pictures: int) -> int:
 MANY_RULE = "11. There are more than 4 pictures: give each entity 3-5 appearance facts and use at most 7 beats.\n\n"
 MANY_LENGTH = (
     "Length: with this many subjects keep each subject definition to one compact sentence "
-    "and the whole prompt under 6000 characters."
+    "and still honour the global 5500-character target."
 )
 
 
