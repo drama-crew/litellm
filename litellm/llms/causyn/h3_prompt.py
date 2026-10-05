@@ -994,8 +994,8 @@ KEEP_DETAIL_SENTENCE = (
 
 
 SHORTEN_SENTENCE = (
-    "Shorten the descriptive sections so the whole prompt stays well under 7000 characters; "
-    "keep every required section, label and spoken line."
+    "Shorten repeated or optional descriptive wording to target at most 5500 characters for the whole prompt; "
+    "keep every required section, label, spoken line, subject appearance, clothing layer, action and spatial relation."
 )
 
 
