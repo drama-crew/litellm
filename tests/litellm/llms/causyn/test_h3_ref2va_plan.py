@@ -352,6 +352,44 @@ async def test_retry_after_a_retryable_writer_failure_reuses_the_plan():
     assert result.usage.total_tokens == 110  # the memo hit spent nothing on observe/plan
 
 
+@pytest.mark.asyncio
+async def test_changed_pixels_at_the_same_url_do_not_reuse_a_failed_first_answer(monkeypatch):
+    calls = {"prepare": 0, "writer": 0}
+    prepared_specs = [spec_of("image", "image2"), spec_of("image", "image2")]
+    prepared_specs[1].content[1].image_url.url = variant(2)
+    original = spec_of("image", "image2")
+    original.content[1].image_url.url = "https://media.example/mutable.jpg"
+
+    async def prepare(client, request):
+        spec = prepared_specs[calls["prepare"]]
+        calls["prepare"] += 1
+        return spec, h3_media.PreparedRaw(videos=(), audios=())
+
+    monkeypatch.setattr(h3_media, "prepare_media_with_raw", prepare)
+
+    def writer(body):
+        calls["writer"] += 1
+        if calls["writer"] == 1:
+            return completion(body, WRITER_ANSWER.replace("[Shot 1]", "Scene"))
+        if calls["writer"] == 2:
+            return httpx.Response(503)
+        return completion(body, WRITER_ANSWER)
+
+    provider = Provider(writer=writer)
+    with pytest.raises(RewriteError) as caught:
+        await run(provider, original)
+    assert caught.value.retryable
+    assert len(h3_prompt._FIRST_ANSWERS) == 1
+    result = await run(provider, original)
+    assert result.prompt == WRITER_ANSWER.strip()
+    assert provider.stages().count("observe") == 3
+    assert provider.stages().count("plan") == 2
+    writers = writer_bodies(provider)
+    assert len(writers[1]["messages"]) == 4
+    assert len(writers[2]["messages"]) == 2
+    assert variant(2) in json.dumps(writers[2])
+
+
 def test_render_plan_matches_the_prototype_golden_output():
     assert ref2va_plan.render_plan(PLAN, 4) == GOLDEN_RENDER
 

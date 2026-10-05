@@ -1407,7 +1407,7 @@ class H3PromptRewriter:
         model = ref2va_model() if ref2va else base_model()  # a misconfigured model fails before any media is fetched
         prepared, raw = await h3_media.prepare_media_with_raw(self.client, spec)
         # One key per request (hashed off the event loop) serves both the facts memo and the first-answer cache.
-        key = await asyncio.to_thread(media_key, spec, raw.videos, raw.audios)
+        key = await asyncio.to_thread(media_key, prepared, raw.videos, raw.audios)
         facts = await perceive_media(prepared, raw, key) if ref2va else None
         # The provider clock starts once fetch and perception are done; the attempt deadline still bounds it.
         started = time.monotonic()
