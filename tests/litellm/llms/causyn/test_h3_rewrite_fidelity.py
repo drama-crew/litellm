@@ -663,6 +663,101 @@ async def test_overlong_reference_recovery_uses_a_compact_system_with_all_origin
     assert recovery[1] == provider.bodies[0]["messages"][1]
     assert "identity-defining appearance" in system and "Still subjects remain still" in system
     assert result.prompt == ref_prompt(20)
+    assert "subject_definitions:\nsummary:\nretention_analysis:\n" in system
+    assert "No markdown headings" in system
+
+
+@pytest.mark.asyncio
+async def test_many_picture_headroom_triggers_recovery_before_the_hard_limit():
+    spec = make_spec("A woman walks.", *("reference_image",) * 5, duration=8)
+    pictures = ", ".join(f"<Picture {i}>" for i in range(1, 6))
+    clean = ref_prompt(20).replace("the coat of <Picture 2>", "the clothing from " + pictures)
+    for i in range(3, 6):
+        clean = clean.replace(
+            "detailed_description:", f"<Picture {i}>: fully_preserved - appearance.\n\ndetailed_description:"
+        )
+    roomy = clean.replace("Soft footsteps.", "room tone. " * 380)
+    assert 6000 < len(roomy) < 7000
+    provider = Provider(roomy, clean)
+    result = await run(provider, spec)
+    assert result.prompt == clean and len(provider.bodies) == 2
+    assert "6000 characters" in provider.bodies[1]["messages"][-1]["content"]
+    assert len(provider.bodies[1]["messages"][0]["content"]) < 2000
+
+
+@pytest.mark.asyncio
+async def test_one_picture_with_safe_length_keeps_the_a3_writer_context():
+    spec = ref_image_spec()
+    prompt = ref_prompt(20).replace("Soft footsteps.", "room tone. " * 380)
+    assert 6000 < len(prompt) < 7000
+    provider = Provider(prompt)
+    result = await run(provider, spec)
+    assert result.prompt == prompt and len(provider.bodies) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recovery_truncated", [False, True])
+async def test_exhausted_truncation_gets_one_fresh_recovery_and_keeps_paid_usage(monkeypatch, recovery_truncated):
+    provider = Provider("runaway", ref_prompt(20), finish=["length", "length" if recovery_truncated else "stop"])
+    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 5.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        rewriter = H3PromptRewriter(client, "key")
+        with pytest.raises(h3_prompt.TruncatedRewriteError) as first:
+            await rewriter.rewrite(ref_image_spec())
+        assert first.value.retryable and len(provider.bodies) == 1
+        monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 30.0)
+        if recovery_truncated:
+            with pytest.raises(h3_prompt.TruncatedRewriteError) as second:
+                await rewriter.rewrite(ref_image_spec())
+            assert not second.value.retryable
+        else:
+            result = await rewriter.rewrite(ref_image_spec())
+            assert result.prompt == ref_prompt(20) and result.usage.cost == 0.002
+            assert result.usage.prompt_tokens == 200
+    assert len(provider.bodies) == 2 and h3_prompt._FIRST_ANSWERS == {}
+    assert provider.bodies[1]["messages"][0]["content"] == h3_prompt._compact_ref2va_system()
+    assert all(message["role"] != "assistant" for message in provider.bodies[1]["messages"])
+
+
+@pytest.mark.asyncio
+async def test_fresh_truncation_recovery_counts_new_plan_usage(monkeypatch):
+    plan_costs = iter((0.0003, 0.0004))
+
+    async def plan(self, prepared, key, started, answer_cached=False):
+        return None, h3_prompt.RewriteUsage(cost=next(plan_costs), prompt_tokens=5)
+
+    monkeypatch.setattr(H3PromptRewriter, "ref2va_plan_notes", plan)
+    provider = Provider("runaway", ref_prompt(20), finish=["length", "stop"])
+    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 5.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        rewriter = H3PromptRewriter(client, "key")
+        with pytest.raises(h3_prompt.TruncatedRewriteError):
+            await rewriter.rewrite(ref_image_spec())
+        monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 30.0)
+        result = await rewriter.rewrite(ref_image_spec())
+    assert result.usage.cost == pytest.approx(0.0027)
+    assert result.usage.prompt_tokens == 210
+    assert len(provider.bodies) == 2
+
+
+@pytest.mark.asyncio
+async def test_overlong_audio_reference_keeps_the_original_media_guidance():
+    provider = Provider(ref_prompt(20).replace("Soft footsteps.", "room tone " * 1000), ref_prompt(20))
+    await run(provider, make_spec("A woman walks.", "reference_image", "reference_image", audio=True))
+    assert provider.bodies[1]["messages"][0] == provider.bodies[0]["messages"][0]
+    assert provider.bodies[1]["messages"][0]["content"] != h3_prompt._compact_ref2va_system()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audio", [False, True])
+async def test_late_truncation_does_not_add_a_retry_to_other_media_paths(monkeypatch, audio):
+    provider = Provider("runaway", finish=["length"])
+    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 5.0)
+    spec = make_spec("A woman walks.", "reference_image", audio=True) if audio else make_spec("A woman walks.")
+    with pytest.raises(h3_prompt.TruncatedRewriteError) as failure:
+        await run(provider, spec)
+    assert not failure.value.retryable and len(provider.bodies) == 1
+    assert h3_prompt._FIRST_ANSWERS == {}
 
 
 @pytest.mark.asyncio

@@ -111,7 +111,12 @@ def clean_state(monkeypatch):
     h3_prompt._FIRST_ANSWERS.clear()
     h3_prompt._PLAN_NOTES.clear()
     h3_prompt._warned_models.clear()
-    for name in ("CAUSYN_H3_REF2VA_PLAN", "CAUSYN_H3_REF2VA_PLAN_MODEL", "CAUSYN_H3_REF2VA_REWRITE_MODEL"):
+    for name in (
+        "CAUSYN_H3_REF2VA_PLAN",
+        "CAUSYN_H3_REF2VA_PLAN_MODEL",
+        "CAUSYN_H3_REF2VA_REWRITE_MODEL",
+        h3_prompt.OBSERVATION_CACHE_ENV,
+    ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CAUSYN_H3_REWRITE_CRITIC", "0")
 
@@ -353,7 +358,9 @@ async def test_retry_after_a_retryable_writer_failure_reuses_the_plan():
 
 
 @pytest.mark.asyncio
-async def test_changed_pixels_at_the_same_url_do_not_reuse_a_failed_first_answer(monkeypatch):
+@pytest.mark.parametrize("observation_cache", [False, True])
+async def test_changed_pixels_at_the_same_url_do_not_reuse_a_failed_first_answer(monkeypatch, observation_cache):
+    monkeypatch.setenv(h3_prompt.OBSERVATION_CACHE_ENV, "1" if observation_cache else "0")
     calls = {"prepare": 0, "writer": 0}
     prepared_specs = [spec_of("image", "image2"), spec_of("image", "image2")]
     prepared_specs[1].content[1].image_url.url = variant(2)
@@ -382,7 +389,7 @@ async def test_changed_pixels_at_the_same_url_do_not_reuse_a_failed_first_answer
     assert len(h3_prompt._FIRST_ANSWERS) == 1
     result = await run(provider, original)
     assert result.prompt == WRITER_ANSWER.strip()
-    assert provider.stages().count("observe") == 3
+    assert provider.stages().count("observe") == (3 if observation_cache else 4)
     assert provider.stages().count("plan") == 2
     writers = writer_bodies(provider)
     assert len(writers[1]["messages"]) == 4
@@ -712,7 +719,8 @@ def test_explicit_short_speech_survives_normalization(prompt, line):
 
 
 @pytest.mark.asyncio
-async def test_observations_are_reused_for_same_image_with_different_requests():
+async def test_observations_are_reused_for_same_image_with_different_requests(monkeypatch):
+    monkeypatch.setenv(h3_prompt.OBSERVATION_CACHE_ENV, "1")
     provider = Provider()
     first = await run(provider, spec_of("image", "image2"))
     second = await run(provider, spec_of("image", "image2", prompt="A woman takes a step."))
@@ -722,7 +730,19 @@ async def test_observations_are_reused_for_same_image_with_different_requests():
 
 
 @pytest.mark.asyncio
-async def test_changed_prepared_pixels_cannot_reuse_an_observation():
+async def test_default_observations_still_run_for_a_different_request(monkeypatch):
+    monkeypatch.delenv(h3_prompt.OBSERVATION_CACHE_ENV, raising=False)
+    provider = Provider()
+    await run(provider, spec_of("image", "image2"))
+    await run(provider, spec_of("image", "image2", prompt="A woman takes a step."))
+    assert provider.stages().count("observe") == 4
+    assert provider.stages().count("plan") == 2
+    assert not any(key.startswith("observation:") for key in h3_prompt._PLAN_NOTES)
+
+
+@pytest.mark.asyncio
+async def test_changed_prepared_pixels_cannot_reuse_an_observation(monkeypatch):
+    monkeypatch.setenv(h3_prompt.OBSERVATION_CACHE_ENV, "1")
     provider = Provider()
     await run(provider, spec_of("image", "image2"))
     changed = spec_of("image", "image2", prompt="A woman takes a step.")
@@ -743,6 +763,7 @@ async def test_changed_prepared_pixels_cannot_reuse_an_observation():
 
 @pytest.mark.asyncio
 async def test_failed_observation_is_not_cached(monkeypatch):
+    monkeypatch.setenv(h3_prompt.OBSERVATION_CACHE_ENV, "1")
     monkeypatch.setattr(ref2va_plan, "PLAN_RETRY_AFTER_MAX_S", 0.0)
     provider = Provider(observe=lambda body: httpx.Response(500))
     await run(provider, spec_of("image", "image2"))

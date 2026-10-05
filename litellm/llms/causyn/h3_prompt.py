@@ -82,6 +82,7 @@ REF2VA_MODEL_REASONING: dict[str, tuple[dict[str, JsonValue], int]] = {
 MAX_RAW_VIDEO_BYTES = 20 * 1024 * 1024
 REF2VA_MODEL_ENV = "CAUSYN_H3_REF2VA_REWRITE_MODEL"
 SEND_VIDEO_ENV = "CAUSYN_H3_REWRITE_SEND_VIDEO"
+OBSERVATION_CACHE_ENV = "CAUSYN_H3_REF2VA_OBSERVATION_CACHE"
 PERCEPTION_BUDGET_S = 20.0
 CUT_TOLERANCE_S = 0.35
 DESCRIPTION_WORDS = (200, 750)
@@ -1002,10 +1003,31 @@ SHORTEN_SENTENCE = (
 )
 
 
+def _compact_ref2va_system() -> str:
+    return (
+        "Write only a complete H3 reference-to-video prompt in plain text. Start with subject_definitions:. "
+        "Each section heading is its exact label immediately followed by a colon, on its own line. "
+        "No markdown headings, asterisks or code fences. Use these exact heading lines in order:\n"
+        + "\n".join(field + ":" for field in REFERENCE_FIELDS)
+        + "\nPut each section's text below its heading. Define each subject once as <Subject N>, bound to "
+        "the provided <Picture N>, <Video N> or "
+        "<Audio N>. Preserve every reference, identity-defining appearance and explicit user requirement. "
+        "Write one short retention line per media label: <Label> (appears in [Shot 1]): "
+        "fully_preserved|partially_preserved|attribute_transfer|weak_reference - what is kept or changed. "
+        "The summary states the task as [reference generation] or [video editing]. "
+        "In detailed_description use [Shot N], the requested camera, ordered physical actions, and "
+        "only requested cuts. Still subjects remain still. Follow the supplied directing plan and "
+        "measured media facts. Dialogue only when supplied, verbatim as <d>[Language] text</d>; "
+        "preserve the planned sound and music decisions. Do not add entities or events. " + SHORTEN_SENTENCE
+    )
+
+
 def _too_long(violation: str) -> bool:
     """The over-7000-characters violation, or the word-count violation in its over-maximum form."""
     if violation.startswith(_V_LENGTH):
         return ": it has " in violation
+    if violation.startswith("A many-picture H3 prompt should stay within 6000 characters"):
+        return True
     if violation.startswith(_V_WORDS):
         found = re.search(r"it has (\d+)", violation)
         return found is not None and int(found.group(1)) > DESCRIPTION_WORDS[1]
@@ -1332,11 +1354,12 @@ class H3PromptRewriter:
 
             async def observe(url: str) -> str:
                 tokens = ref2va_plan.observe_max_tokens(len(urls))
+                cache_enabled = os.getenv(OBSERVATION_CACHE_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
                 observation_digest = await asyncio.to_thread(
                     lambda: hashlib.sha256((model + str(tokens) + ref2va_plan.OBSERVE + url).encode()).hexdigest()
                 )
                 observation_key = "observation:" + observation_digest
-                cached = _PLAN_NOTES.get(observation_key)
+                cached = _PLAN_NOTES.get(observation_key) if cache_enabled else None
                 if cached is not None:
                     _PLAN_NOTES.move_to_end(observation_key)
                     return cached
@@ -1347,7 +1370,8 @@ class H3PromptRewriter:
                     ],
                     tokens,
                 )
-                _remember(_PLAN_NOTES, observation_key, observed)
+                if cache_enabled:
+                    _remember(_PLAN_NOTES, observation_key, observed)
                 return observed
 
             reason = "failed"
@@ -1407,6 +1431,7 @@ class H3PromptRewriter:
         from litellm.llms.causyn import h3_media
 
         ref2va = spec.mode == "ref2va"
+        image_only = ref2va and not any(isinstance(item, (VideoItem, AudioItem)) for item in spec.content)
         model = ref2va_model() if ref2va else base_model()  # a misconfigured model fails before any media is fetched
         prepared, raw = await h3_media.prepare_media_with_raw(self.client, spec)
         # One key per request (hashed off the event loop) serves both the facts memo and the first-answer cache.
@@ -1436,9 +1461,9 @@ class H3PromptRewriter:
             )
         user = prepared.user_content(facts, model, send_video_enabled()) if ref2va else prepared.user_content()
         plan_usage = RewriteUsage()
-        if ref2va and not any(isinstance(item, (VideoItem, AudioItem)) for item in spec.content):
+        if image_only:
             notes, plan_usage = await self.ref2va_plan_notes(
-                prepared, key, started, answer_cached=(key + model) in _FIRST_ANSWERS
+                prepared, key, started, answer_cached=bool(_FIRST_ANSWERS.get(key + model, ("", None))[0])
             )
             if notes is not None:
                 user.append({"type": "text", "text": "\n\n" + notes})
@@ -1453,6 +1478,8 @@ class H3PromptRewriter:
         truncated = False
         if cached_answer is not None:
             prompt, usage = cached_answer
+            usage = _sum_usage(usage, plan_usage)
+            truncated = not prompt
         else:
             try:
                 completed = await self._complete(model, messages, max(5.0, _remaining(started)), ref2va)
@@ -1472,6 +1499,8 @@ class H3PromptRewriter:
         # Deterministic fidelity findings (none with a reference video). The critic runs for t2va/i2va/fl2va/l2va only:
         # evaluation showed it does not improve any Ref2VA request.
         literal = [] if truncated or has_video else literal_violations(prompt, spec)
+        if image_only and len(spec.ordered_media) > ref2va_plan.PLAN_IMAGES_MAX and 6000 < len(prompt) <= 7000:
+            soft.append(f"A many-picture H3 prompt should stay within 6000 characters: it has {len(prompt)} characters")
         if hard_failure is None and not truncated and not ref2va and critic_enabled():
             budget = _remaining(started)
             if budget >= MIN_REPAIR_BUDGET_S:
@@ -1502,13 +1531,26 @@ class H3PromptRewriter:
                 # The cut-off text is not echoed back (it may be huge or looping): ask again, concisely.
                 remaining = _remaining(started)
                 if remaining < MIN_REPAIR_BUDGET_S:
+                    if image_only and cached_answer is None:
+                        _remember(_FIRST_ANSWERS, answer_key, ("", usage))
+                        keep_first_answer = True
+                        raise TruncatedRewriteError(
+                            "H3 prompt rewrite needs its single recovery attempt", 502, retryable=True
+                        )
                     raise TruncatedRewriteError(
                         "H3 prompt rewrite provider returned an invalid response", 502, retryable=False
                     )
+                if image_only:
+                    system = _compact_ref2va_system()
+                    messages[0]["content"] = system
                 messages.append(
                     {"role": "user", "content": TRUNCATION_REPAIR_MESSAGE if ref2va else TRUNCATION_REPAIR_MESSAGE_BASE}
                 )
-                again = await self._complete(model, messages, remaining, ref2va)  # a second truncation raises
+                try:
+                    again = await self._complete(model, messages, remaining, ref2va)
+                except RewriteError as recovery_failure:
+                    keep_first_answer = cached_answer is not None and recovery_failure.retryable
+                    raise
                 again_soft: list[str] = []
                 again_prompt = again.choices[0].message.content.strip()
                 validate_prompt(again_prompt, spec, facts, soft=again_soft)
@@ -1529,21 +1571,9 @@ class H3PromptRewriter:
             _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
             if not any(_too_long(v) for v in listed):
                 messages.append({"role": "assistant", "content": prompt})
-            elif ref2va:
-                system = (
-                    "Write only a complete H3 reference-to-video prompt, using these exact section labels in order: "
-                    + ", ".join(REFERENCE_FIELDS)
-                    + ". Define each subject once as <Subject N>, bound to the provided <Picture N>, <Video N> or "
-                    "<Audio N>. Preserve every reference, identity-defining appearance and explicit user requirement. "
-                    "Write one short retention line per media label: <Label> (appears in [Shot 1]): "
-                    "fully_preserved|partially_preserved|attribute_transfer|weak_reference - what is kept or changed. "
-                    "The summary states the task as [reference generation] or [video editing]. "
-                    "In detailed_description use [Shot N], the requested camera, ordered physical actions, and "
-                    "only requested cuts. Still subjects remain still. Follow the supplied directing plan and "
-                    "measured media facts. Dialogue only when supplied, verbatim as <d>[Language] text</d>; "
-                    "preserve the planned sound and music decisions. Do not add entities or events. " + SHORTEN_SENTENCE
-                )
-                messages[0] = {"role": "system", "content": system}
+            elif image_only:
+                system = _compact_ref2va_system()
+                messages[0]["content"] = system
             messages.append(
                 {"role": "user", "content": _repair_message(listed, _provided_labels(spec), base=not ref2va)}
             )
