@@ -729,7 +729,7 @@ async def test_recovery_timeout_retries_the_recovery_without_repeating_the_prima
             raise httpx.ReadTimeout("recovery interrupted", request=request)
         return response
 
-    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 30.0)
+    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 60.0)
     async with httpx.AsyncClient(transport=httpx.MockTransport(interrupted)) as client:
         rewriter = H3PromptRewriter(client, "key")
         with pytest.raises(RewriteError) as failure:
@@ -740,6 +740,24 @@ async def test_recovery_timeout_retries_the_recovery_without_repeating_the_prima
     assert result.prompt == ref_prompt(20) and len(provider.bodies) == 3
     assert provider.bodies[1]["messages"] == provider.bodies[2]["messages"]
     assert result.usage.prompt_tokens == 200 and h3_prompt._FIRST_ANSWERS == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("truncated", [False, True])
+async def test_compact_recovery_defers_a_short_budget_instead_of_starting_a_predictable_timeout(monkeypatch, truncated):
+    first = "runaway" if truncated else ref_prompt(20).replace("Soft footsteps.", "room tone " * 1000)
+    provider = Provider(first, ref_prompt(20), finish=["length" if truncated else "stop", "stop"])
+    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 20.0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        rewriter = H3PromptRewriter(client, "key")
+        with pytest.raises(RewriteError) as failure:
+            await rewriter.rewrite(ref_image_spec())
+        assert failure.value.retryable and len(provider.bodies) == 1
+        monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 90.0)
+        result = await rewriter.rewrite(ref_image_spec())
+    assert result.prompt == ref_prompt(20) and result.usage.cost == 0.002
+    assert len(provider.bodies) == 2 and h3_prompt._FIRST_ANSWERS == {}
+    assert provider.bodies[1]["messages"][0]["content"] == h3_prompt._compact_ref2va_system()
 
 
 @pytest.mark.asyncio

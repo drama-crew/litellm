@@ -88,6 +88,7 @@ CUT_TOLERANCE_S = 0.35
 DESCRIPTION_WORDS = (200, 750)
 AUDIO_PART_BUDGET_BYTES = 12 * 1024 * 1024
 MIN_REPAIR_BUDGET_S = 10.0
+COMPACT_REPAIR_RESERVE_S = 40.0
 CRITIC_ENV = "CAUSYN_H3_REWRITE_CRITIC"
 CRITIC_MODEL_ENV = "CAUSYN_H3_REWRITE_CRITIC_MODEL"
 CRITIC_TIMEOUT_S = 20.0
@@ -1530,7 +1531,9 @@ class H3PromptRewriter:
             if truncated:
                 # The cut-off text is not echoed back (it may be huge or looping): ask again, concisely.
                 remaining = _remaining(started)
-                if remaining < MIN_REPAIR_BUDGET_S:
+                if remaining < MIN_REPAIR_BUDGET_S or (
+                    image_only and cached_answer is None and remaining < COMPACT_REPAIR_RESERVE_S
+                ):
                     if image_only and cached_answer is None:
                         _remember(_FIRST_ANSWERS, answer_key, ("", usage))
                         keep_first_answer = True
@@ -1561,15 +1564,24 @@ class H3PromptRewriter:
             if hard_failure is None and not soft:
                 return result(prompt, usage, [])
             remaining = _remaining(started)
-            if remaining < MIN_REPAIR_BUDGET_S:
-                if hard_failure is not None:
-                    raise hard_failure
-                return result(prompt, usage, soft)  # soft-only first answer is acceptable as is
             listed = (
                 (*(hard_failure.violations or (str(hard_failure),)), *literal)
                 if hard_failure is not None
                 else tuple(soft)
             )
+            if (
+                image_only
+                and cached_answer is None
+                and remaining < COMPACT_REPAIR_RESERVE_S
+                and any(_too_long(v) for v in listed)
+            ):
+                _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
+                keep_first_answer = True
+                raise RewriteError("H3 prompt rewrite needs its length recovery attempt", 502, retryable=True)
+            if remaining < MIN_REPAIR_BUDGET_S:
+                if hard_failure is not None:
+                    raise hard_failure
+                return result(prompt, usage, soft)  # soft-only first answer is acceptable as is
             _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
             if not any(_too_long(v) for v in listed):
                 messages.append({"role": "assistant", "content": prompt})
