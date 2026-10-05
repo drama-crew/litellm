@@ -667,3 +667,23 @@ def test_explicit_short_speech_survives_normalization(prompt, line):
 )
 def test_short_explicit_lines_keep_progressive_verbs_and_word_cues(prompt, line):
     assert ref2va_plan.user_lines_only([{"text": line}], prompt) == [{"text": line}]
+
+
+@pytest.mark.parametrize(
+    "prompt,line",
+    [
+        ("She speaks Hi.", "Hi"),
+        ("He responded OK.", "OK"),
+        ("He asked Wait?", "Wait"),
+        ("She whispered Bye.", "Bye"),
+        ("Voice-over: Hi there.", "Hi there"),
+        ("V.O.: OK.", "OK"),
+        ("Narration: Wait.", "Wait"),
+        ("她的旁白：走！", "走"),
+        ("She says in French Bonjour.", "Bonjour"),
+        ("She says loudly Hi.", "Hi"),
+        ("Use <d>[English] Hi!</d>.", "Hi"),
+    ],
+)
+def test_explicit_short_speech_cues_preserve_verbs_voiceover_and_dialogue_markup(prompt, line):
+    assert ref2va_plan.user_lines_only([{"text": line}], prompt) == [{"text": line}]

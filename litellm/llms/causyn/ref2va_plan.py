@@ -111,11 +111,16 @@ _LINE_WORDS = re.compile(r"[^\W_]+", re.UNICODE)
 _SHORT_QUOTED = re.compile(
     r'"([^"\n]{1,300})"|“([^”\n]{1,300})”|「([^」\n]{1,300})」|『([^』\n]{1,300})』'
     r"|(?<![\w'])'([^\n]{1,300}?)'(?!\w)|‘([^\n]{1,300}?)’"
+    r"|<d>\s*(?:\[[^\]\n]+\]\s*)?([^<\n]{1,300})</d>"
 )
 _SPEECH_CUE = re.compile(
-    r"(?:\b(?:say(?:s|ing)?|said|ask(?:s|ing)?|repl(?:y|ies|ying)|shout(?:s|ing)?|whisper(?:s|ing)?|"
-    r"exclaim(?:s|ing)?|call(?:s|ing)?|yell(?:s|ing)?|utter(?:s|ing)?)\b|(?:说|喊|问|回答|台词)[：:]?)"
-    r"\s*[:：]?\s*(?:(?:just|exactly|the words?|the phrase|the line)\s+)?"
+    r"(?:\b(?:say(?:s|ing)?|said|speak(?:s|ing)?|spoke|ask(?:s|ed|ing)?|repl(?:y|ies|ied|ying)|"
+    r"respond(?:s|ed|ing)?|answer(?:s|ed|ing)?|shout(?:s|ed|ing)?|whisper(?:s|ed|ing)?|"
+    r"exclaim(?:s|ed|ing)?|call(?:s|ed|ing)?|yell(?:s|ed|ing)?|utter(?:s|ed|ing)?|narrat(?:e|es|ed|ing))\b|"
+    r"\b(?:dialogue|narration|voice[ -]?over|v\.?o\.?|spoken line)\s*[:：]|"
+    r"(?:说|喊|问|回答|台词|对白|旁白|朗读)[：:]?)"
+    r"\s*[:：]?\s*(?:(?:just|exactly|the words?|the phrase|the line|loudly|softly|quietly|aloud|out|"
+    r"in\s+[^\W_]+(?:\s+(?:voice|language))?)\s+)*"
     r"(?:[\w’ -]+?\s+(?:and|then)\s+)?(?:[\"'“‘「『]\s*)?$",
     re.I,
 )
