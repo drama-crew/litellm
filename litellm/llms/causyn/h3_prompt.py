@@ -1529,6 +1529,21 @@ class H3PromptRewriter:
             _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
             if not any(_too_long(v) for v in listed):
                 messages.append({"role": "assistant", "content": prompt})
+            elif ref2va:
+                system = (
+                    "Write only a complete H3 reference-to-video prompt, using these exact section labels in order: "
+                    + ", ".join(REFERENCE_FIELDS)
+                    + ". Define each subject once as <Subject N>, bound to the provided <Picture N>, <Video N> or "
+                    "<Audio N>. Preserve every reference, identity-defining appearance and explicit user requirement. "
+                    "Write one short retention line per media label: <Label> (appears in [Shot 1]): "
+                    "fully_preserved|partially_preserved|attribute_transfer|weak_reference - what is kept or changed. "
+                    "The summary states the task as [reference generation] or [video editing]. "
+                    "In detailed_description use [Shot N], the requested camera, ordered physical actions, and "
+                    "only requested cuts. Still subjects remain still. Follow the supplied directing plan and "
+                    "measured media facts. Dialogue only when supplied, verbatim as <d>[Language] text</d>; "
+                    "preserve the planned sound and music decisions. Do not add entities or events. " + SHORTEN_SENTENCE
+                )
+                messages[0] = {"role": "system", "content": system}
             messages.append(
                 {"role": "user", "content": _repair_message(listed, _provided_labels(spec), base=not ref2va)}
             )

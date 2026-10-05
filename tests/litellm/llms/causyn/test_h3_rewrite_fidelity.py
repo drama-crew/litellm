@@ -652,6 +652,20 @@ async def test_repair_after_an_over_7000_character_answer_asks_to_shorten():
 
 
 @pytest.mark.asyncio
+async def test_overlong_reference_recovery_uses_a_compact_system_with_all_original_references():
+    too_long = ref_prompt(20).replace("Soft footsteps.", "room tone " * 1000)
+    provider = Provider(too_long, ref_prompt(20))
+    result = await run(provider, ref_image_spec())
+    recovery = provider.bodies[1]["messages"]
+    system = recovery[0]["content"]
+    assert len(system) < 2000 and all(field in system for field in h3_prompt.REFERENCE_FIELDS)
+    assert all(message["role"] != "assistant" for message in recovery)
+    assert recovery[1] == provider.bodies[0]["messages"][1]
+    assert "identity-defining appearance" in system and "Still subjects remain still" in system
+    assert result.prompt == ref_prompt(20)
+
+
+@pytest.mark.asyncio
 async def test_over_maximum_word_count_asks_to_shorten_and_too_short_keeps_detail():
     long_desc = " ".join(
         ["She walks along the quiet street while the camera slowly follows her pace."] * 70
