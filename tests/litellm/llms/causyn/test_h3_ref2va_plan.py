@@ -421,7 +421,7 @@ async def test_nine_pictures_observe_concurrently_and_plan_with_text_only():
         "Return ONLY JSON:"
     )
     assert all(b["max_tokens"] == 350 for b in provider.bodies if stage_of(b) == "observe")
-    assert "Length: with this many subjects" in json.dumps(provider.bodies[-1])
+    assert "Length: the complete six-section prompt must fit within 5500 characters" in json.dumps(provider.bodies[-1])
     kinds = [p["type"] for p in plan["messages"][1]["content"]]
     assert "image_url" not in kinds and kinds.count("text") == 9 * 2 + 1
     assert plan["messages"][1]["content"][0]["text"] == "Picture 1:"
@@ -522,8 +522,10 @@ async def test_timeout_is_logged_with_its_own_reason(monkeypatch, caplog):
 def test_many_picture_notes_end_with_the_length_line_and_few_picture_texts_are_unchanged():
     many = ref2va_plan.plan_notes(PLAN, 5)
     assert many.endswith(
-        "\nLength: with this many subjects keep each subject definition to one compact sentence "
-        "and still honour the global 5500-character target."
+        "\nLength: the complete six-section prompt must fit within 5500 characters, including spaces and labels. "
+        "With this many subjects, use one brief sentence per subject definition and one brief retention line per "
+        "reference. Keep the detailed_description near 350 words, with no repeated appearance or ambience paragraphs. "
+        "Keep all references, requested actions and complete spoken lines; compress wording rather than omit them."
     )
     assert many.startswith(ref2va_plan.plan_notes(PLAN, 4))
     assert ref2va_plan.plan_notes(PLAN, 4) == ref2va_plan.NOTES.format(plan=GOLDEN_RENDER)
@@ -691,3 +693,16 @@ def test_observation_and_plan_cache_is_bounded():
         h3_prompt._remember(h3_prompt._PLAN_NOTES, "observation:" + str(index), "A woman.")
     assert len(h3_prompt._PLAN_NOTES) == h3_prompt._MEMO_SIZE
     assert "observation:0" not in h3_prompt._PLAN_NOTES
+
+
+@pytest.mark.parametrize(
+    "prompt,line",
+    [
+        ("The woman is saying Hi.", "Hi"),
+        ("A man is whispering OK.", "OK"),
+        ("The child should say just Hi.", "Hi"),
+        ("She should reply the word OK.", "OK"),
+    ],
+)
+def test_short_explicit_lines_keep_progressive_verbs_and_word_cues(prompt, line):
+    assert ref2va_plan.user_lines_only([{"text": line}], prompt) == [{"text": line}]

@@ -122,7 +122,10 @@ _SHORT_QUOTED = re.compile(
     r"|(?<![\w'])'([^\n]{1,300}?)'(?!\w)|‘([^\n]{1,300}?)’"
 )
 _SPEECH_CUE = re.compile(
-    r"(?:\b(?:says?|said|asks?|replies|shouts?|whispers?|exclaims?|calls?|yells?|utters?)\b|(?:说|喊|问|回答|台词)[：:]?)\s*[:：]?\s*(?:[\w’ -]+?\s+(?:and|then)\s+)?(?:[\"'“‘「『]\s*)?$",
+    r"(?:\b(?:say(?:s|ing)?|said|ask(?:s|ing)?|repl(?:y|ies|ying)|shout(?:s|ing)?|whisper(?:s|ing)?|"
+    r"exclaim(?:s|ing)?|call(?:s|ing)?|yell(?:s|ing)?|utter(?:s|ing)?)\b|(?:说|喊|问|回答|台词)[：:]?)"
+    r"\s*[:：]?\s*(?:(?:just|exactly|the words?|the phrase|the line)\s+)?"
+    r"(?:[\w’ -]+?\s+(?:and|then)\s+)?(?:[\"'“‘「『]\s*)?$",
     re.I,
 )
 
@@ -226,8 +229,10 @@ def plan_max_tokens(n_pictures: int) -> int:
 
 MANY_RULE = "11. There are more than 4 pictures: give each entity 3-5 appearance facts and use at most 7 beats.\n\n"
 MANY_LENGTH = (
-    "Length: with this many subjects keep each subject definition to one compact sentence "
-    "and still honour the global 5500-character target."
+    "Length: the complete six-section prompt must fit within 5500 characters, including spaces and labels. "
+    "With this many subjects, use one brief sentence per subject definition and one brief retention line per "
+    "reference. Keep the detailed_description near 350 words, with no repeated appearance or ambience paragraphs. "
+    "Keep all references, requested actions and complete spoken lines; compress wording rather than omit them."
 )
 
 
