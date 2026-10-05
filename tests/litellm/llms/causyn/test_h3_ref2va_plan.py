@@ -361,7 +361,7 @@ def test_notes_wrap_the_rendered_plan():
     assert notes.startswith("DIRECTING PLAN (prepared by the director for this request")
     assert GOLDEN_RENDER in notes
     assert "Do not add dialogue beyond the plan." in notes
-    assert "5500 characters" in notes
+    assert "5500 characters" not in notes
 
 
 @pytest.mark.asyncio
@@ -529,7 +529,7 @@ def test_many_picture_notes_end_with_the_length_line_and_few_picture_texts_are_u
     )
     assert many.startswith(ref2va_plan.plan_notes(PLAN, 4))
     assert ref2va_plan.plan_notes(PLAN, 4) == ref2va_plan.NOTES.format(plan=GOLDEN_RENDER)
-    assert "5500 characters" in ref2va_plan.plan_notes(PLAN, 3)
+    assert "5500 characters" not in ref2va_plan.plan_notes(PLAN, 3)
     assert ref2va_plan.plan_system(8, 3) == ref2va_plan.PLAN.format(duration=8, n=3, words=20, chars=32)
     assert "11." not in ref2va_plan.plan_system(8, 4)
     assert ref2va_plan.observe_max_tokens(4) == 600 and ref2va_plan.observe_max_tokens(5) == 350

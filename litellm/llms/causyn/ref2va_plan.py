@@ -109,10 +109,7 @@ recurring effects (no dialogue, no music); non_diegetic_music = the music decisi
 diegetic music is described in the action, synced to the visible playing.
 The audio lines come in addition to the visual description, never instead of it: keep every subject definition and
 the detailed_description as visually detailed as they would be without them.
-Pictures are references, not frames. Do not add dialogue beyond the plan.
-Length: target at most 5500 characters for the complete six-section prompt. Compress repeated phrasing and
-incidental ambience first; preserve every requested action, appearance fact, reference binding and complete spoken
-line. Keep sound descriptions concrete and brief; do not repeat the same effect in every beat."""
+Pictures are references, not frames. Do not add dialogue beyond the plan."""
 
 
 _NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
