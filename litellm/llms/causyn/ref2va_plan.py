@@ -221,39 +221,20 @@ def plan_max_tokens(n_pictures: int) -> int:
 MANY_RULE = "11. There are more than 4 pictures: give each entity 3-5 appearance facts and use at most 7 beats.\n\n"
 MANY_LENGTH = (
     "Length: the complete six-section prompt must fit within 5500 characters, including spaces and labels. "
-    "With this many subjects, use one brief sentence per subject definition and one brief retention line per "
-    "reference. Keep the detailed_description near 350 words, with no repeated appearance or ambience paragraphs. "
+    "Use at most 200 characters per subject definition and 90 per reference retention line. "
+    "Keep summary under 250 characters, detailed_description under 1900 characters, and the two audio fields "
+    "under 300 characters together. State appearance once, then refer to subjects by ID in the action; "
+    "do not repeat appearance facts, enumerate synonyms, or expand ambient sound into a list. "
     "Keep all references, requested actions and complete spoken lines; compress wording rather than omit them."
 )
-
-
-AUDIO_DETAILS = """   For each required or justified effect, describe its audible character: name the source and physical event,
-   supported material/contact surface, attack and decay (sharp click, dull thud, short ring, sustained hiss), and
-   recurrence tied to the action (one strike, each footfall, continuous flow). Use only qualities justified by the
-   request or visible source; do not invent material, an exact rate, louder intensity, or a new event. Prioritise
-   the requested sound over incidental room tone. Silent requests override all incidental effects.
-   Ambience: ONE concise sentence containing only sound sources established by the request or shot. A quiet
-   scene may have only room tone; never invent extra sources to fill a quota.
-"""
 
 
 def observe_max_tokens(n_pictures: int) -> int:
     return OBSERVE_MAX_TOKENS_MANY if n_pictures > PLAN_IMAGES_MAX else OBSERVE_MAX_TOKENS
 
 
-def plan_system(duration: int, n_pictures: int, user_request: str = "") -> str:
+def plan_system(duration: int, n_pictures: int) -> str:
     text = PLAN
-    if re.search(
-        r"\b(?:sounds?|noises?|sfx|foley|audible|rustl(?:e|es|ing)|clink(?:s|ing)?|room tone|silent|silence)\b"
-        r"|can be heard|音效|声音|声响|静音",
-        user_request,
-        re.I,
-    ):
-        text = text.replace(
-            "   Ambience: ONE sentence, 28-46 words, 3-6 sound sources physically present in the shot.\n",
-            AUDIO_DETAILS,
-            1,
-        )
     if n_pictures > PLAN_IMAGES_MAX:
         text = text.replace("Return ONLY JSON:", MANY_RULE + "Return ONLY JSON:", 1)
     return text.format(duration=duration, n=n_pictures, words=round(duration * 2.5), chars=round(duration * 4))

@@ -994,7 +994,10 @@ KEEP_DETAIL_SENTENCE = (
 
 
 SHORTEN_SENTENCE = (
-    "Shorten repeated or optional descriptive wording to target at most 5500 characters for the whole prompt; "
+    "Regenerate from the original request and references, targeting at most 5500 characters for the whole prompt. "
+    "Use at most 200 characters per subject definition and 90 per reference retention line; "
+    "summary at most 250 characters, the description at most 1900, and audio fields at most 300 together. "
+    "Describe appearance once and use subject IDs in the action. Never enumerate synonyms or repeat sentences; "
     "keep every required section, label, spoken line, subject appearance, clothing layer, action and spatial relation."
 )
 
@@ -1366,7 +1369,7 @@ class H3PromptRewriter:
                             [
                                 {
                                     "role": "system",
-                                    "content": ref2va_plan.plan_system(spec.duration, len(urls), spec.prompt),
+                                    "content": ref2va_plan.plan_system(spec.duration, len(urls)),
                                 },
                                 {"role": "user", "content": content},
                             ],
@@ -1476,8 +1479,14 @@ class H3PromptRewriter:
                 usage = _sum_usage(usage, critic_usage)
                 soft.extend(f"Fidelity: {defect}" for defect in defects)
         soft.extend(literal)
+        invented = tuple(v for v in literal if v.startswith(_V_SPEECH))
+        if hard_failure is None and invented:
+            hard_failure = RewriteError(_V_SPEECH, violations=invented)
 
         def result(text: str, used: RewriteUsage, leftover: list[str]) -> RewriteResult:
+            invented_lines = tuple(v for v in leftover if v.startswith(_V_SPEECH))
+            if invented_lines:
+                raise RewriteError(_V_SPEECH, violations=invented_lines)
             if leftover:
                 _log.info("H3 rewrite accepted with soft violations: %s", [v.split(": ", 1)[0][-60:] for v in leftover])
             return RewriteResult(
@@ -1518,10 +1527,11 @@ class H3PromptRewriter:
                 else tuple(soft)
             )
             _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
-            messages += [
-                {"role": "assistant", "content": prompt},
-                {"role": "user", "content": _repair_message(listed, _provided_labels(spec), base=not ref2va)},
-            ]
+            if not any(_too_long(v) for v in listed):
+                messages.append({"role": "assistant", "content": prompt})
+            messages.append(
+                {"role": "user", "content": _repair_message(listed, _provided_labels(spec), base=not ref2va)}
+            )
             try:
                 repaired = await self._complete(model, messages, remaining, ref2va)
             except RewriteError as call_failure:

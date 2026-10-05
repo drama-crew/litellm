@@ -280,9 +280,10 @@ async def test_failed_repair_call_keeps_a_soft_only_first_answer():
                 return httpx.Response(503)
             return super().__call__(request)
 
-    provider = Flaky(BAD_QUOTE, critic=[])
+    missing = t2va_prompt("[Shot 1] A man stands still.")
+    provider = Flaky(missing, critic=[])
     result = await run(provider, QUOTE_SPEC())
-    assert result.prompt == BAD_QUOTE and len(provider.bodies) == 2
+    assert result.prompt == missing and len(provider.bodies) == 2
     assert any("quoted text" in v for v in result.soft_violations)
     assert h3_prompt._FIRST_ANSWERS == {}
 
@@ -630,7 +631,10 @@ def test_every_repair_message_keeps_the_detail_sentence(base):
 # ----------------------------------------------------------------------------- length-aware repair sentence
 
 SHORTEN = (
-    "Shorten repeated or optional descriptive wording to target at most 5500 characters for the whole prompt; "
+    "Regenerate from the original request and references, targeting at most 5500 characters for the whole prompt. "
+    "Use at most 200 characters per subject definition and 90 per reference retention line; "
+    "summary at most 250 characters, the description at most 1900, and audio fields at most 300 together. "
+    "Describe appearance once and use subject IDs in the action. Never enumerate synonyms or repeat sentences; "
     "keep every required section, label, spoken line, subject appearance, clothing layer, action and spatial relation."
 )
 
@@ -644,6 +648,7 @@ async def test_repair_after_an_over_7000_character_answer_asks_to_shorten():
     last = provider.bodies[1]["messages"][-1]["content"]
     assert last.endswith(SHORTEN) and h3_prompt.KEEP_DETAIL_SENTENCE not in last
     assert "it has" in last and "must contain 1 to 7000 characters" in last
+    assert all(message["role"] != "assistant" for message in provider.bodies[1]["messages"])
 
 
 @pytest.mark.asyncio
@@ -705,3 +710,41 @@ def test_dropped_short_line_cannot_hide_inside_child(user):
 def test_contractions_and_possessives_do_not_create_speech_requirements():
     spec = make_spec("A child's toy doesn't move.", "reference_image")
     assert not literal_violations(t2va_prompt("[Shot 1] A child's toy is still."), spec)
+
+
+@pytest.mark.asyncio
+async def test_invented_line_surviving_repair_cannot_return_as_a_soft_violation():
+    invented = ref_prompt(20).replace("[Shot 1] ", "[Shot 1] <d>[English] Hi!</d> ")
+    provider = Provider(invented, invented)
+    with pytest.raises(RewriteError, match="must not add dialogue") as caught:
+        await run(provider, ref_image_spec())
+    assert not caught.value.retryable and len(provider.bodies) == 2
+
+
+@pytest.mark.asyncio
+async def test_invented_line_cannot_fall_back_after_failed_repair():
+    invented = ref_prompt(20).replace("[Shot 1] ", "[Shot 1] <d>[English] Hi!</d> ")
+    provider = Provider(invented, "invalid fields")
+    with pytest.raises(RewriteError):
+        await run(provider, ref_image_spec())
+    assert len(provider.bodies) == 2
+
+
+@pytest.mark.asyncio
+async def test_invented_line_cannot_return_without_a_repair_budget(monkeypatch):
+    invented = ref_prompt(20).replace("[Shot 1] ", "[Shot 1] <d>[English] Hi!</d> ")
+    monkeypatch.setattr(h3_prompt, "_remaining", lambda started: 0.0)
+    provider = Provider(invented)
+    with pytest.raises(RewriteError, match="must not add dialogue"):
+        await run(provider, ref_image_spec())
+    assert len(provider.bodies) == 1
+
+
+@pytest.mark.asyncio
+async def test_clean_dialogue_repair_wins_even_with_more_minor_findings():
+    invented = ref_prompt(20).replace("[Shot 1] ", "[Shot 1] <d>[English] Hi!</d> ")
+    clean = ref_prompt(2)
+    provider = Provider(invented, clean)
+    result = await run(provider, ref_image_spec())
+    assert result.prompt == clean
+    assert not any(v.startswith(h3_prompt._V_SPEECH) for v in result.soft_violations)

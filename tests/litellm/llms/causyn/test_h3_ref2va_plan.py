@@ -561,8 +561,10 @@ def test_many_picture_notes_end_with_the_length_line_and_few_picture_texts_are_u
     many = ref2va_plan.plan_notes(PLAN, 5)
     assert many.endswith(
         "\nLength: the complete six-section prompt must fit within 5500 characters, including spaces and labels. "
-        "With this many subjects, use one brief sentence per subject definition and one brief retention line per "
-        "reference. Keep the detailed_description near 350 words, with no repeated appearance or ambience paragraphs. "
+        "Use at most 200 characters per subject definition and 90 per reference retention line. "
+        "Keep summary under 250 characters, detailed_description under 1900 characters, and the two audio fields "
+        "under 300 characters together. State appearance once, then refer to subjects by ID in the action; "
+        "do not repeat appearance facts, enumerate synonyms, or expand ambient sound into a list. "
         "Keep all references, requested actions and complete spoken lines; compress wording rather than omit them."
     )
     assert many.startswith(ref2va_plan.plan_notes(PLAN, 4))
@@ -612,28 +614,23 @@ def test_plan_system_states_the_speech_pace_for_the_duration():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("user_request", "detailed_sound"),
+    "user_request",
     [
-        ("A man watches a bird in the park.", False),
-        ("The presenter stands still in front of the camera.", False),
-        ("A girl paints on a canvas while soft music plays.", False),
-        ("A person strikes the bell. Sound: a bell ringing.", True),
-        ("A lamp lights the street; a faint rustle of leaves can be heard.", True),
-        ("图1的人敲钟，保留钟的声音。", True),
-        ("No dialogue, music or sound effects. Keep the video silent.", True),
+        "A man watches a bird in the park.",
+        "The presenter stands still in front of the camera.",
+        "A girl paints on a canvas while soft music plays.",
+        "A person strikes the bell. Sound: a bell ringing.",
+        "A lamp lights the street; a faint rustle of leaves can be heard.",
+        "图1的人敲钟，保留钟的声音。",
+        "No dialogue, music or sound effects. Keep the video silent.",
     ],
 )
-async def test_only_requested_sound_changes_the_director_instructions(user_request, detailed_sound):
+async def test_director_instructions_preserve_the_a3_baseline_for_all_audio_requests(user_request):
     provider = Provider()
     await run(provider, spec_of("image", "image2", prompt=user_request))
     instructions = next(body for body in provider.bodies if stage_of(body) == "plan")["messages"][0]["content"]
     baseline = ref2va_plan.PLAN.format(duration=8, n=2, words=20, chars=32)
-    if detailed_sound:
-        assert "attack and decay" in instructions
-        assert "never invent extra sources to fill a quota" in instructions
-        assert "Silent requests override all incidental effects" in instructions
-    else:
-        assert instructions == baseline
+    assert instructions == baseline
 
 
 def test_user_lines_only_keeps_what_the_user_wrote():
