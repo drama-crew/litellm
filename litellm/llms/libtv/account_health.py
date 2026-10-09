@@ -22,9 +22,10 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Optional, Sequence
 
+from litellm.llms.libtv.account_balance import BalanceSample, probe_account_balance
 from litellm.llms.libtv.common import LIBTV_PASSPORT_BASE, LibTVError, build_libtv_headers
 from litellm.llms.libtv.persistence import account_key as derive_account_key
 
@@ -50,6 +51,10 @@ PROBE_NAME = "getUserInfo"
 
 def account_sample_key(account_key: str) -> str:
     return f"{ACCOUNT_HEALTH_PREFIX}:sample:{account_key}"
+
+
+def account_label_key(account_key: str) -> str:
+    return f"{ACCOUNT_HEALTH_PREFIX}:label:{account_key}"
 
 
 def _claim_key(account_key: str) -> str:
@@ -179,6 +184,7 @@ class LibTVAccountHealthProber:
         checked_at = self._now()
         status = STATUS_UNKNOWN
         reason: str | None = None
+        credits: BalanceSample | None = None
         client = None
         try:
             factory = self._client_factory or _default_http_client_factory
@@ -190,6 +196,8 @@ class LibTVAccountHealthProber:
                 timeout=PROBE_TIMEOUT_SECONDS,
             )
             status, reason = self._read_response(response)
+            if status == STATUS_HEALTHY:
+                credits = await probe_account_balance(client, token=account.token, webid=account.webid, now=self._now)
         except LibTVError as exc:
             status, reason = STATUS_UNKNOWN, f"probe error: {exc.status_code}"
         except Exception as exc:  # noqa: BLE001  # a probe fault is "unknown", never a silent success
@@ -197,6 +205,7 @@ class LibTVAccountHealthProber:
         finally:
             await self._close(client)
         reason = self._redact(reason, account.token)
+        reason = self._redact(reason, account.webid)
         return {
             "status": status,
             "reason": reason,
@@ -205,6 +214,7 @@ class LibTVAccountHealthProber:
             "probe": PROBE_NAME,
             "checked_at": checked_at,
             "received_at": self._now(),
+            "credits": asdict(credits) if credits is not None else None,
         }
 
     def _read_response(self, response: Any) -> tuple[str, str | None]:
@@ -278,6 +288,7 @@ class LibTVAccountHealthProber:
         ttl = max(1, int(self._interval * SAMPLE_TTL_MULTIPLIER))
         try:
             await self._redis.set(account_sample_key(account.account_key), json.dumps(sample), ex=ttl)
+            await self._redis.set(account_label_key(account.account_key), account.label)
             await self._redis.zadd(ACCOUNT_HEALTH_SEEN_KEY, {account.account_key: sample["received_at"]})
         except Exception:  # noqa: BLE001  # publishing is best effort; the monitor reads the miss as stale
             logger.warning("libtv account health: failed to publish sample", exc_info=True)
@@ -319,6 +330,7 @@ class LibTVAccountHealthProber:
             ]
             if stale:
                 await self._redis.zrem(ACCOUNT_HEALTH_SEEN_KEY, *stale)
+                await self._redis.delete(*(account_label_key(k) for k in stale))
                 logger.info("libtv account health: pruned %d retired account(s)", len(stale))
         except Exception:  # noqa: BLE001  # housekeeping must never break the probe cycle
             logger.warning("libtv account health: registry prune failed", exc_info=True)

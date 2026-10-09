@@ -22,6 +22,7 @@ from litellm.llms.libtv.account_health import (
     LibTVAccount,
     LibTVAccountHealthProber,
     account_sample_key,
+    account_label_key,
     discover_libtv_accounts,
     probe_interval_seconds,
 )
@@ -65,9 +66,7 @@ def test_discover_returns_one_account_per_distinct_credential():
 def test_discover_resolves_os_environ_indirection(monkeypatch):
     monkeypatch.setenv("LIBTV_TOKEN_X", "real-token")
     monkeypatch.setenv("LIBTV_WEBID_X", "real-webid")
-    router = _Router(
-        [_deployment("d1", "libtv/star-video2.5", "os.environ/LIBTV_TOKEN_X", "os.environ/LIBTV_WEBID_X")]
-    )
+    router = _Router([_deployment("d1", "libtv/star-video2.5", "os.environ/LIBTV_TOKEN_X", "os.environ/LIBTV_WEBID_X")])
     accounts = discover_libtv_accounts(router)
     assert accounts[0].token == "real-token"
     assert accounts[0].webid == "real-webid"
@@ -100,6 +99,7 @@ class _Resp:
         self._payload = payload
         self.headers = {}
         self.text = json.dumps(payload)
+        self.content = self.text.encode()
 
     def json(self):
         return self._payload
@@ -116,6 +116,9 @@ class _ProbeClient:
         if self.exc is not None:
             raise self.exc
         return _Resp(self.payload)
+
+    async def get(self, url, headers=None, timeout=None):
+        return _Resp({"code": 0, "data": {"attr": {"usablePower": 15000}}})
 
 
 _ACCOUNT = LibTVAccount(label="acct-1", token="tok-1", webid="web-1", account_key=account_key("tok-1"))
@@ -208,6 +211,11 @@ class _FakeRedis:
             removed += bucket.pop(member, None) is not None
         return removed
 
+    async def delete(self, *keys):
+        for key in keys:
+            self.strings.pop(key, None)
+        return len(keys)
+
 
 @pytest.mark.asyncio
 async def test_publish_writes_a_sample_and_registers_the_account():
@@ -220,15 +228,14 @@ async def test_publish_writes_a_sample_and_registers_the_account():
     assert stored["received_at"] > 0
     # The monitor discovers accounts from this registry instead of being told.
     assert _ACCOUNT.account_key in redis.zsets[ACCOUNT_HEALTH_SEEN_KEY]
+    assert redis.strings[account_label_key(_ACCOUNT.account_key)] == _ACCOUNT.label
 
 
 @pytest.mark.asyncio
 async def test_sample_expires_so_a_stopped_prober_reads_as_missing_not_healthy():
     redis = _FakeRedis()
     client = _ProbeClient(payload={"code": 0, "data": {"uuid": "u"}})
-    prober = LibTVAccountHealthProber(
-        redis_client=redis, http_client_factory=lambda: client, interval_seconds=60
-    )
+    prober = LibTVAccountHealthProber(redis_client=redis, http_client_factory=lambda: client, interval_seconds=60)
     await prober.probe_and_publish(_ACCOUNT)
     ttl = redis.ttls[account_sample_key(_ACCOUNT.account_key)]
     assert ttl is not None and ttl > 60
@@ -347,9 +354,7 @@ async def test_startup_hook_declines_to_run_without_redis(monkeypatch):
     from litellm.llms.libtv import account_health
 
     monkeypatch.delenv("LIBTV_ACCOUNT_HEALTH_ENABLED", raising=False)
-    monkeypatch.setattr(
-        "litellm.llms.libtv.transfer.get_transfer_redis", lambda *a, **k: None
-    )
+    monkeypatch.setattr("litellm.llms.libtv.transfer.get_transfer_redis", lambda *a, **k: None)
     router = _Router([_deployment("acct-1", "libtv/star-video2.5", "tok-1", "web-1")])
     # Samples with nowhere to go would make the monitor read every account as
     # missing -- a monitor that alarms on our own misconfiguration is worse than

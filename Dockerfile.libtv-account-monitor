@@ -1,0 +1,7 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG BASE_IMAGE
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${SOURCE_REVISION}
+LABEL org.drama.libtv-monitor.base-image=${BASE_IMAGE}
+COPY litellm/llms/libtv/account_health.py litellm/llms/libtv/account_balance.py /app/.venv/lib/python3.13/site-packages/litellm/llms/libtv/
