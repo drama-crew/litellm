@@ -54,13 +54,22 @@ class View(BaseModel):
     # Public, non-leaking reason the platform attaches when it ends a task itself (e.g. rejected input media).
     # Optional so a platform that predates the field still parses.
     error_message: str | None = None
+    error: dict[str, JsonValue] | None = None
 
 
 # Seconds a client should wait after a saturated media-validation 503 (Retry-After).
 MEDIA_BUSY_RETRY_AFTER_S = 10
 IDEMPOTENCY_CONFLICT = "Idempotency-Key was already used for a different request"
 CANCEL_TOO_LATE = "Task can no longer be cancelled; generation has already started"
-CANCEL_PENDING = "Task cancellation is pending; the submission outcome is not yet known. Query the task for its final state"
+CANCEL_PENDING = (
+    "Task cancellation is pending; the submission outcome is not yet known. Query the task for its final state"
+)
+
+
+class AdmissionFailure(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    code: str
+    message: str
 
 
 def platform_rejection(status: int, detail: object, path: str) -> HTTPException:
@@ -76,6 +85,14 @@ def platform_rejection(status: int, detail: object, path: str) -> HTTPException:
     code = detail.get("code") if isinstance(detail, dict) else None
     text = detail.get("message") if isinstance(detail, dict) else detail
     text = text if isinstance(text, str) else ""
+    if status == 429 and code == "insufficient_compute":
+        return HTTPException(
+            429,
+            detail=AdmissionFailure(
+                code="insufficient_compute", message="The direct video queue is full; retry later"
+            ).model_dump(),
+            headers=httpx.Headers((("Retry-After", "10"), ("x-drama-submission", "not_sent"))),
+        )
     if status == 409:
         if code == "idempotency_conflict" or "idempotency" in text.lower():
             return HTTPException(409, IDEMPOTENCY_CONFLICT)
@@ -206,7 +223,8 @@ def video(view: View) -> VideoObject:
         else "queued",
         moderation_status=view.moderation_status,
         generation_status=view.state,
-        error={"code": "input_media_rejected", "message": view.error_message} if view.error_message else None,
+        error=view.error
+        or ({"code": "input_media_rejected", "message": view.error_message} if view.error_message else None),
     )
     result._hidden_params = {"moderation_public_parameters": view.parameters, "moderation_public_usage": view.usage}
     if view.state == "completed" and isinstance(output.get("url"), str):

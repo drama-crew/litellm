@@ -1028,6 +1028,38 @@ def test_causyn_h3_deadline_covers_heaviest_ref2va_run_plus_queue_wait():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requested,remaining", [(None, 300), (2_000_000_120.0, 120), (2_000_005_400.0, 300)])
+async def test_direct_deadline_includes_prior_queue_wait_and_cannot_be_extended(enqueued, requested, remaining):
+    params = _params(prompt_processing="direct")
+    if requested is not None:
+        params["execution_deadline_ts"] = requested
+    await CausynVideoHandler(clock=lambda: 2_000_000_000.0).avideo_generation(
+        model="causyn-1.1",
+        prompt="a kite",
+        api_key=None,
+        api_base=None,
+        logging_obj=None,
+        optional_params=params,
+    )
+    assert enqueued.payloads[0]["deadline_ts"] == 2_000_000_000.0 + remaining
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deadline", [True, "tomorrow", float("nan"), float("inf"), 2_000_000_000.0])
+async def test_invalid_or_expired_deadline_never_enqueues(enqueued, deadline):
+    with pytest.raises(CustomLLMError):
+        await CausynVideoHandler(clock=lambda: 2_000_000_000.0).avideo_generation(
+            model="causyn-1.1",
+            prompt="a kite",
+            api_key=None,
+            api_base=None,
+            logging_obj=None,
+            optional_params=_params(prompt_processing="direct", execution_deadline_ts=deadline),
+        )
+    assert not enqueued.payloads
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("roles", [("first_frame", "last_frame"), ("reference", "reference")])
 @pytest.mark.parametrize("prompt", ["  A kite flies.\n听见海浪。  ", "<scene>Caller-authored structure</scene>"])
 async def test_direct_prompt_skips_context_ir_and_preserves_text(enqueued, roles, prompt):

@@ -13,6 +13,7 @@ from litellm.proxy.video_endpoints import moderation_execution as execution
 from litellm.proxy.video_endpoints.moderation_metering import BillingBinding, PhaseEvent
 from litellm.proxy.video_endpoints.moderation_metering_projection import BillingFacts
 from litellm.types.videos.utils import encode_video_id_with_provider
+from litellm.types.videos.main import VideoObject
 
 SECRET = "synthetic-collect-secret-long-enough-32-bytes"
 NOW = datetime.now(timezone.utc)
@@ -110,6 +111,8 @@ async def run_collect(monkeypatch, status_error, submit, completion=None):
         return {}
 
     async def read(*args, **kwargs):
+        if isinstance(status_error, VideoObject):
+            return status_error
         raise status_error
 
     monkeypatch.setattr(execution.bridge, "platform", platform)
@@ -131,6 +134,23 @@ def not_found():
     error = litellm.NotFoundError(message="causyn video was not found", model="causyn-1.1", llm_provider="causyn")
     error.__cause__ = ProviderTaskNotFound("causyn video was not found")
     return error
+
+
+@pytest.mark.asyncio
+async def test_worker_failure_code_survives_the_platform_collection_receipt(monkeypatch):
+    response, posts = await run_collect(
+        monkeypatch,
+        VideoObject(
+            id=NATIVE,
+            object="video",
+            status="failed",
+            error={"code": "deadline_exceeded", "message": "video generation failed", "kind": "permanent"},
+        ),
+        submit_phase(),
+    )
+    assert response.status_code == 200
+    assert posts[-1][0] == "/intents/intent/output"
+    assert posts[-1][1]["facts"]["error"]["code"] == "deadline_exceeded"
 
 
 @pytest.mark.asyncio

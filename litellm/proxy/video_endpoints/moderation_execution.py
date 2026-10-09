@@ -544,6 +544,7 @@ async def collect(body: Ticket, request: Request, authorization: Annotated[str |
             "url": result._hidden_params.get("url"),
             "staging_key": stored.get("staging_key"),
             "media_type": "video",
+            **({"error": bridge.JSON_OBJECT.validate_python(result.error)} if result.error else {}),
         }
         if result.status == "completed" and not facts["url"] and not facts["staging_key"]:
             from litellm.proxy.video_endpoints.moderation_content import materialize_content

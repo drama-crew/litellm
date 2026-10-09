@@ -95,6 +95,7 @@ CAUSYN_DEADLINE_SECONDS = 1800.0
 # from queue entry, so leave room to wait behind another job. The ARK per-request cap
 # (3300 s) and the app-side causyn-1.1 timeout (5700 s) are sized around this value.
 CAUSYN_H3_DEADLINE_SECONDS = 5400.0
+CAUSYN_H3_DIRECT_DEADLINE_SECONDS = 300.0
 _INTERNAL_VIDEO_FLAG = "DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_FLAG_ALIAS = "OH_DRAMA_INTERNAL_VIDEO_ENABLED"
 _CAUSYN_H3_FLAG = "DRAMA_CAUSYN_1_1_ENABLED"
@@ -126,6 +127,7 @@ _CAUSYN_USER_PARAMS = frozenset(
         "generate_audio",
         "seed",
         "prompt_processing",
+        "execution_deadline_ts",
         # LiteLLM exposes this standard request field, but it is not sent to the
         # worker request payload.
         "user",
@@ -1453,10 +1455,24 @@ class CausynVideoHandler(CustomLLM):
         durable_metadata = metadata_model
         serialized_metadata = durable_metadata.model_dump()
         serialized_metadata["pricing"] = durable_metadata.pricing.model_dump(exclude_none=True)
+        local_deadline = self._clock() + (
+            CAUSYN_H3_DIRECT_DEADLINE_SECONDS
+            if spec.model == CAUSYN_H3_MODEL and optional_params.get("prompt_processing") == "direct"
+            else spec.deadline_seconds
+        )
+        requested_deadline = optional_params.get("execution_deadline_ts", local_deadline)
+        if (
+            isinstance(requested_deadline, bool)
+            or not isinstance(requested_deadline, (int, float))
+            or not math.isfinite(requested_deadline)
+        ):
+            raise _bad_request("execution_deadline_ts must be a finite timestamp")
+        if requested_deadline <= self._clock():
+            raise _bad_request("Video generation deadline has expired")
         payload = {
             "task_id": task_id,
             "model": spec.model,
-            "deadline_ts": self._clock() + spec.deadline_seconds,
+            "deadline_ts": min(local_deadline, requested_deadline),
             "request": request,
             "task_metadata": serialized_metadata,
         }

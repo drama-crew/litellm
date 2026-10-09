@@ -6,13 +6,14 @@ import inspect
 import json
 import re
 import uuid
-from typing import Annotated
+from typing import Annotated, Literal
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from starlette.routing import Match
-from pydantic import TypeAdapter, ValidationError
+from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from litellm._logging import verbose_proxy_logger
 from litellm.llms.causyn.context_ir import ContextIRService, get_context_ir_service
@@ -70,15 +71,85 @@ class H3Error(Exception):
         super().__init__(message)
 
 
-def error_response(code: int, message: str) -> JSONResponse:
+class PublicError(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    type: str
+    code: str
+    message: str
+    http_code: str
+    retryable: bool
+
+
+class ErrorEnvelope(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    type: Literal["error"] = "error"
+    error: PublicError
+    request_id: str
+
+
+class HTTPErrorDetail(BaseModel):
+    model_config = ConfigDict(frozen=True)
+    code: str | None = None
+    message: str | None = None
+
+
+PUBLIC_ERROR_CODES = (
+    (400, "invalid_request"),
+    (401, "invalid_api_key"),
+    (402, "insufficient_balance"),
+    (403, "permission_denied"),
+    (404, "task_not_found"),
+    (405, "method_not_allowed"),
+    (409, "task_state_conflict"),
+    (422, "unsupported_parameter"),
+    (429, "rate_limit_exceeded"),
+    (503, "service_unavailable"),
+)
+
+
+def error_response(code: int, message: str, *, error_code: str | None = None) -> JSONResponse:
+    request_id = uuid.uuid4().hex
+    public_code = error_code or next((name for status, name in PUBLIC_ERROR_CODES if status == code), "internal_error")
     return JSONResponse(
         status_code=code,
-        content={
-            "type": "error",
-            "error": {"type": ERROR_TYPES.get(code, "server_error"), "message": message, "http_code": str(code)},
-            "request_id": uuid.uuid4().hex,
-        },
+        headers=httpx.Headers(
+            (("X-Request-ID", request_id), *((("Retry-After", "10"),) if code in (429, 503) else ()))
+        ),
+        content=ErrorEnvelope(
+            error=PublicError(
+                type="insufficient_compute_error"
+                if public_code == "insufficient_compute"
+                else ERROR_TYPES.get(code, "server_error"),
+                code=public_code,
+                message=message,
+                http_code=str(code),
+                retryable=code in (429, 500, 503, 504),
+            ),
+            request_id=request_id,
+        ).model_dump(),
     )
+
+
+def http_error_response(exc: HTTPException) -> JSONResponse:
+    if exc.status_code in (401, 403):
+        return error_response(exc.status_code, public_auth_message(exc.status_code, str(exc.detail)))
+    detail = TypeAdapter(object).validate_python(exc.detail)
+    fields = HTTPErrorDetail.model_validate(detail) if isinstance(detail, dict) else HTTPErrorDetail()
+    public_code = (
+        "insufficient_compute"
+        if fields.code == "insufficient_compute"
+        else "idempotency_conflict"
+        if exc.status_code == 409 and "idempotency" in str(detail).lower()
+        else None
+    )
+    message = fields.message
+    response = error_response(
+        exc.status_code, message if isinstance(message, str) else str(detail), error_code=public_code
+    )
+    for name, value in () if exc.headers is None else exc.headers.items():
+        if name.lower() in ("retry-after", "x-drama-submission"):
+            response.headers[name] = value
+    return response
 
 
 def task_owner(auth: UserAPIKeyAuth) -> str:
@@ -102,7 +173,9 @@ async def preauthenticate(request: Request) -> None:
     decision without touching the stream. Any budget reservation the gate makes is released at once:
     the post-parse dependency makes the one that counts.
     """
-    _safe_set_request_parsed_body(request, {"model": AUTH_MODEL if request.url.path == IR_PREFIX + "/v2/h3_context_ir" else INTERNAL_MODEL})
+    _safe_set_request_parsed_body(
+        request, {"model": AUTH_MODEL if request.url.path == IR_PREFIX + "/v2/h3_context_ir" else INTERNAL_MODEL}
+    )
     override = request.app.dependency_overrides.get(user_api_key_auth)
     if override is not None:
         # Test/embedding overrides are arbitrary callables: hand them the request only when they ask for it.
@@ -222,12 +295,7 @@ class MiniMaxH3Route(APIRoute):
                     return error_response(code, public_auth_message(code, str(exc.message)))
                 return error_response(code, exc.message if code < 500 else "Video provider request failed")
             except HTTPException as exc:
-                if exc.status_code in (401, 403):
-                    return error_response(exc.status_code, public_auth_message(exc.status_code, str(exc.detail)))
-                response = error_response(exc.status_code, str(exc.detail))
-                if exc.headers and "Retry-After" in exc.headers:
-                    response.headers["Retry-After"] = exc.headers["Retry-After"]
-                return response
+                return http_error_response(exc)
             except RuntimeError:
                 verbose_proxy_logger.exception("MiniMax H3 request failed")
                 return error_response(500, "Video request failed")
@@ -264,6 +332,9 @@ async def create_video(
     if not isinstance(video, VideoObject) or not video.id:
         raise H3Error(500, "Video provider returned an invalid task")
     if video.id.startswith(moderation_bridge.PREFIX):
+        response.headers["Retry-After"] = "10"
+        response.headers["Location"] = request.url.path.rsplit("/", 1)[0] + "/query/video_generation/" + video.id
+        response.headers["X-Request-ID"] = uuid.uuid4().hex
         return {"task_id": video.id}
     raise H3Error(503, "Durable moderation admission is required")
 
@@ -281,6 +352,9 @@ async def query_video(
         moderated = await moderation_bridge.query(request, auth, video_id)
         if moderated is None:
             raise H3Error(404, "Task not found")
+        response.headers["X-Request-ID"] = uuid.uuid4().hex
+        if moderated.status in ("queued", "in_progress"):
+            response.headers["Retry-After"] = "10"
         return {"task": moderation_bridge.v2_task(moderated, h3=True)}
     if ir_service is not None:
         return await query_context_ir_task(video_id, task_owner(auth), ir_service)

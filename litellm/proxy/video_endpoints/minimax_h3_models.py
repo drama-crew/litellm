@@ -231,6 +231,8 @@ class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
 class MiniMaxH3DirectCreate(MiniMaxH3Create):
     """Direct facade: same limits as the IR prefix; its prompt is passed unchanged instead of being rewritten."""
 
+    duration: int = Field(ge=5, le=15, strict=True)
+
 
 class MiniMaxTask(StrictModel):
     v: Literal[1] = 1

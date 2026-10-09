@@ -111,6 +111,14 @@ def stack(monkeypatch):
 HEADERS = {"Authorization": "Bearer allowed"}
 
 
+def test_direct_rejects_duration_below_native_limit_before_admission(stack):
+    client, app, state = stack
+    response = client.post(h3.DIRECT_PREFIX + "/v2/video_generation", json=body(duration=4), headers=HEADERS)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert state["platform"] == []
+
+
 # ------------------------------------------------------------------ F2: auth before body
 
 
@@ -183,10 +191,18 @@ async def test_bad_key_on_get_and_delete_routes_uses_the_same_fixed_message(stac
 
 def test_401_never_leaks_key_material_or_table_names(stack):
     client, _, _ = stack
-    response = client.post("/video/minimax-h3/direct/v2/video_generation", json=body(), headers={"Authorization": "Bearer leaky"})
+    response = client.post(
+        "/video/minimax-h3/direct/v2/video_generation", json=body(), headers={"Authorization": "Bearer leaky"}
+    )
     assert response.status_code == 401
     text = response.text
-    for forbidden in ("Key Hash", "LiteLLM_VerificationTokenTable", "0123456789abcdef", "sk-...", "Unable to find token"):
+    for forbidden in (
+        "Key Hash",
+        "LiteLLM_VerificationTokenTable",
+        "0123456789abcdef",
+        "sk-...",
+        "Unable to find token",
+    ):
         assert forbidden not in text
 
 
@@ -222,7 +238,9 @@ async def test_pre_authentication_releases_any_budget_reservation(stack, monkeyp
 
     monkeypatch.setattr(h3, "release_budget_reservation", release)
     app.dependency_overrides[h3.user_api_key_auth] = auth
-    await asgi(app, "GET", "/video/minimax-h3/v2/query/video_generation/mod_video_1", {"authorization": "Bearer allowed"}, [])
+    await asgi(
+        app, "GET", "/video/minimax-h3/v2/query/video_generation/mod_video_1", {"authorization": "Bearer allowed"}, []
+    )
     assert released and released[0] == {"entries": []}
 
 
@@ -277,7 +295,8 @@ def test_error_types_cover_409_and_503():
 def test_idempotency_key_reuse_is_a_409_conflict(stack, prefix):
     client, _, state = stack
     state["reply"] = lambda request, data: httpx.Response(
-        409, json={"detail": {"code": "idempotency_conflict", "message": "idempotency key does not match original request"}}
+        409,
+        json={"detail": {"code": "idempotency_conflict", "message": "idempotency key does not match original request"}},
     )
     response = client.post(
         prefix + "/v2/video_generation", json=body(), headers={**HEADERS, "Idempotency-Key": "same-key"}
@@ -290,7 +309,9 @@ def test_idempotency_key_reuse_is_a_409_conflict(stack, prefix):
 
 def test_platform_string_detail_mentioning_idempotency_is_also_a_409(stack):
     client, _, state = stack
-    state["reply"] = lambda request, data: httpx.Response(409, json={"detail": "Idempotency-Key reused with a different request"})
+    state["reply"] = lambda request, data: httpx.Response(
+        409, json={"detail": "Idempotency-Key reused with a different request"}
+    )
     response = client.post(
         "/video/minimax-h3/v2/video_generation", json=body(), headers={**HEADERS, "Idempotency-Key": "k"}
     )
@@ -345,6 +366,49 @@ def test_other_platform_client_errors_keep_their_status(stack):
     assert response.status_code == 404
 
 
+def test_direct_queue_saturation_is_retryable_and_proven_not_sent(stack):
+    client, _, state = stack
+    state["reply"] = lambda request, data: httpx.Response(
+        429, json={"detail": {"code": "insufficient_compute", "message": "queue full"}}
+    )
+    response = client.post("/video/minimax-h3/direct/v2/video_generation", json=body(), headers=HEADERS)
+    assert response.status_code == 429
+    error = response.json()["error"]
+    assert error["code"] == "insufficient_compute" and error["retryable"] is True
+    assert error["type"] == "insufficient_compute_error"
+    assert response.headers["Retry-After"] == "10"
+    assert response.headers["x-drama-submission"] == "not_sent"
+    assert response.headers["x-request-id"] == response.json()["request_id"]
+
+
+def test_direct_creation_and_pending_poll_advertise_the_poll_interval(stack):
+    client, _, _ = stack
+    created = client.post("/video/minimax-h3/direct/v2/video_generation", json=body(), headers=HEADERS)
+    assert created.status_code == 200 and created.json()["task_id"] == "mod_video_1"
+    assert created.headers["Retry-After"] == "10"
+    assert created.headers["Location"] == "/video/minimax-h3/direct/v2/query/video_generation/mod_video_1"
+    response = client.get(created.headers["Location"], headers=HEADERS)
+    assert response.status_code == 200 and response.json()["task"]["status"] == "queued"
+    assert response.headers["Retry-After"] == "10"
+    assert response.headers["X-Request-ID"]
+
+
+def test_typed_async_failure_reaches_direct_query_without_private_provider_details(stack):
+    client, _, state = stack
+    state["reply"] = lambda request, data: httpx.Response(
+        200,
+        json=state["view"](
+            "mod_video_1",
+            state="failed",
+            error={"code": "execution_expired", "message": "The task expired before generation could start"},
+        ),
+    )
+    response = client.get("/video/minimax-h3/direct/v2/query/video_generation/mod_video_1", headers=HEADERS)
+    assert response.status_code == 200
+    assert response.json()["task"]["status"] == "failed"
+    assert response.json()["task"]["error"]["code"] == "execution_expired"
+
+
 # ------------------------------------------------------------------ platform error_message passthrough
 
 
@@ -366,7 +430,14 @@ def test_view_error_message_surfaces_in_v2_task_and_video_object():
 
 def test_old_platform_without_error_message_still_parses():
     view = bridge.View.model_validate(
-        {"id": "mod_video_f", "state": "failed", "model": "causyn-1.1", "moderation_status": "pending", "policy_source": "model", "created_at": 1}
+        {
+            "id": "mod_video_f",
+            "state": "failed",
+            "model": "causyn-1.1",
+            "moderation_status": "pending",
+            "policy_source": "model",
+            "created_at": 1,
+        }
     )
     assert view.error_message is None
     assert bridge.video(view).error is None
@@ -376,7 +447,8 @@ def test_old_platform_without_error_message_still_parses():
 def test_error_message_reaches_the_query_response(stack):
     client, _, state = stack
     state["reply"] = lambda request, data: httpx.Response(
-        200, json=state["view"]("mod_video_1", state="failed", error_message="reference image 2 could not be used: blocked")
+        200,
+        json=state["view"]("mod_video_1", state="failed", error_message="reference image 2 could not be used: blocked"),
     )
     response = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS)
     assert response.status_code == 200
