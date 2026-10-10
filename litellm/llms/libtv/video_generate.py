@@ -38,6 +38,11 @@ TASK_TYPE_VIDEO_GENERATE = "video_generate"
 # server/worker_runner/protocol.py:TASK_TYPE_VIDEO_GENERATE_REF2VA; a typo puts
 # tasks on a stream nobody consumes, which looks like "queued forever".
 TASK_TYPE_VIDEO_GENERATE_REF2VA = "video_generate_ref2va"
+# Test worker pool: the same two routes on streams only test workers consume. Must stay byte-identical to the
+# platform's server/worker_runner/protocol.py counterparts.
+TASK_TYPE_VIDEO_GENERATE_TEST = "video_generate_test"
+TASK_TYPE_VIDEO_GENERATE_REF2VA_TEST = "video_generate_ref2va_test"
+WORKER_POOL_TEST = "test"
 
 STATUS_QUEUED = "queued"
 STATUS_CLAIMED = "claimed"
@@ -62,7 +67,11 @@ _STATUS_TO_PUBLIC = {
     STATUS_CLAIMED: "claimed",
 }
 
-_ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request", "staging_upload", "task_metadata"})
+# ``worker_pool`` is routing metadata for this module only (it picks the stream/admission set) and is never
+# copied into the worker envelope. Absent or None means the production pool.
+_ALLOWED_TOP_LEVEL_KEYS = frozenset(
+    {"task_id", "model", "deadline_ts", "request", "staging_upload", "task_metadata", "worker_pool"}
+)
 
 # The allowed set doubled as the required set until 2026-08-23, which made
 # staging_upload mandatory at enqueue. It is now injected later, by the
@@ -71,7 +80,7 @@ _ALLOWED_TOP_LEVEL_KEYS = frozenset({"task_id", "model", "deadline_ts", "request
 # here. Splitting the two sets keeps the closed-key rejection exactly as strict
 # as before -- an unrecognized top-level field is still refused -- while making
 # this one field optional rather than loosening the check for everything.
-_REQUIRED_TOP_LEVEL_KEYS = _ALLOWED_TOP_LEVEL_KEYS - {"staging_upload"}
+_REQUIRED_TOP_LEVEL_KEYS = _ALLOWED_TOP_LEVEL_KEYS - {"staging_upload", "worker_pool"}
 
 # F7: closed key sets for the three nested objects spec §1.1 fully documents
 # (request={prompt,duration_seconds,resolution,ratio,seed,references};
@@ -110,17 +119,21 @@ def stream_key(task_type: str) -> str:
     return f"worker:tasks:{task_type}"
 
 
-def task_type_for_references(references: "tuple[dict[str, str], ...]") -> str:
-    """Pick the queue from the reference roles.
+def task_type_for_references(references: "tuple[dict[str, str], ...]", pool: str | None = None) -> str:
+    """Pick the queue from the reference roles and the worker pool.
 
     Ref2VA is exactly "all roles are `reference`". Keyframes and the
     no-reference (text-to-video) case both stay on the shared stream, which is
-    what the existing vdn8-backed worker serves.
+    what the existing vdn8-backed worker serves. ``pool == "test"`` selects the
+    ``*_test`` counterpart of whichever type that is; ``None`` is production.
     """
+    if pool not in (None, WORKER_POOL_TEST):
+        raise ValueError(f"unknown worker pool: {pool!r}")
     roles = [reference.get("role") for reference in references]
-    if roles and all(role == "reference" for role in roles):
-        return TASK_TYPE_VIDEO_GENERATE_REF2VA
-    return TASK_TYPE_VIDEO_GENERATE
+    is_ref2va = bool(roles) and all(role == "reference" for role in roles)
+    if pool == WORKER_POOL_TEST:
+        return TASK_TYPE_VIDEO_GENERATE_REF2VA_TEST if is_ref2va else TASK_TYPE_VIDEO_GENERATE_TEST
+    return TASK_TYPE_VIDEO_GENERATE_REF2VA if is_ref2va else TASK_TYPE_VIDEO_GENERATE
 
 
 def alive_zset_key(task_type: str) -> str:
@@ -285,6 +298,13 @@ def _reject_invalid_prompt_processing(request: dict) -> None:
         )
 
 
+def _reject_invalid_worker_pool(payload: dict) -> None:
+    pool = payload.get("worker_pool")
+    # ``is`` / ``type`` guards: ``True == 1`` and subclasses must not slip through an equality test.
+    if pool is not None and not (type(pool) is str and pool == WORKER_POOL_TEST):
+        raise VideoGenerateError("invalid_params", f"worker_pool must be absent or {WORKER_POOL_TEST!r}")
+
+
 def _validate_shape(payload: Any) -> None:
     if not isinstance(payload, dict):
         raise VideoGenerateError("invalid_params", "request body must be a JSON object")
@@ -312,6 +332,7 @@ def _validate_shape(payload: Any) -> None:
     deadline_ts = payload.get("deadline_ts")
     if isinstance(deadline_ts, bool) or not isinstance(deadline_ts, (int, float)):
         raise VideoGenerateError("invalid_params", "deadline_ts must be a number")
+    _reject_invalid_worker_pool(payload)
     request = payload.get("request")
     if not isinstance(request, dict):
         raise VideoGenerateError("invalid_params", "request must be an object")
@@ -432,7 +453,8 @@ async def enqueue_video_generate(
     # admission check and the stream must follow the same decision -- checking
     # liveness on the shared queue would admit a ref2va task with no ref2va
     # worker alive (and reject one when only the ref2va worker is up).
-    task_type = task_type_for_references(tuple(payload["request"].get("references") or ()))
+    pool = payload.get("worker_pool")
+    task_type = task_type_for_references(tuple(payload["request"].get("references") or ()), pool)
     alive = await _alive_workers(redis, task_type)
     if not alive:
         raise VideoGenerateError("no_worker_available", f"no live {task_type} worker")
@@ -472,6 +494,7 @@ async def enqueue_video_generate(
             envelope=json.dumps(envelope),
             deadline=payload["deadline_ts"],
             stream=stream_key(task_type),
+            pool=pool,
         ):
             raise VideoGenerateError("no_capacity_available", "Causyn video queue is full")
         return task_id

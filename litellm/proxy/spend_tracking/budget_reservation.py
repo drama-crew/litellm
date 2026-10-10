@@ -925,9 +925,14 @@ def estimate_request_max_cost(
     route: str,
     llm_router: Optional[Router],
 ) -> Optional[float]:
-    if route == "/video/minimax-h3/v2/h3_context_ir":
+    if route in ("/video/minimax-h3/v2/h3_context_ir", "/video/minimax-h3-test/v2/h3_context_ir"):
         return 4.0
-    for prefix in ("/video/minimax-h3", "/video/minimax-h3/direct"):
+    for prefix in (
+        "/video/minimax-h3",
+        "/video/minimax-h3/direct",
+        "/video/minimax-h3-test",
+        "/video/minimax-h3-test/direct",
+    ):
         if route == prefix + "/v2/query/video_generation" or route.startswith(
             (prefix + "/v2/query/video_generation/", prefix + "/v2/video_generation/")
         ):

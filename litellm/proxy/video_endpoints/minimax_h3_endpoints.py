@@ -36,7 +36,16 @@ from litellm.proxy.video_endpoints.minimax_h3_models import (
     MiniMaxH3Create,
     MiniMaxH3DirectCreate,
 )
-from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, INTERNAL_MODEL, IR_PREFIX, namespace
+from litellm.proxy.video_endpoints.minimax_h3_paths import (
+    DIRECT_PREFIX,
+    INTERNAL_MODEL,
+    IR_PREFIX,
+    TEST_DIRECT_PREFIX,
+    TEST_IR_PREFIX,
+    WORKER_POOL_TEST,
+    is_test_path,
+    namespace,
+)
 from litellm.types.videos.main import VideoObject
 
 BODY_LIMIT = 64 * 1024 * 1024
@@ -56,6 +65,11 @@ ERROR_TYPES = {
 INVALID_KEY_MESSAGE = "Invalid or missing API key"
 # Key material that an upstream auth message may carry: virtual keys and 64-hex key hashes.
 _KEY_MATERIAL = re.compile(r"sk-[A-Za-z0-9_\-.]+|\b[a-f0-9]{64}\b")
+IR_CREATE_PATHS = frozenset({IR_PREFIX + "/v2/h3_context_ir", TEST_IR_PREFIX + "/v2/h3_context_ir"})
+LIST_PATHS = frozenset(
+    prefix + "/v2/query/video_generation" for prefix in (IR_PREFIX, DIRECT_PREFIX, TEST_IR_PREFIX, TEST_DIRECT_PREFIX)
+)
+DIRECT_CREATE_PATHS = frozenset(prefix + "/v2/video_generation" for prefix in (DIRECT_PREFIX, TEST_DIRECT_PREFIX))
 STATUS_NAMES = {
     "queued": "queued",
     "in_progress": "running",
@@ -174,7 +188,7 @@ async def preauthenticate(request: Request) -> None:
     the post-parse dependency makes the one that counts.
     """
     _safe_set_request_parsed_body(
-        request, {"model": AUTH_MODEL if request.url.path == IR_PREFIX + "/v2/h3_context_ir" else INTERNAL_MODEL}
+        request, {"model": AUTH_MODEL if request.url.path in IR_CREATE_PATHS else INTERNAL_MODEL}
     )
     override = request.app.dependency_overrides.get(user_api_key_auth)
     if override is not None:
@@ -207,11 +221,8 @@ async def read_json_body(request: Request) -> bytearray:
 
 
 async def prepare_request(request: Request) -> None:
-    is_ir_create = request.url.path == IR_PREFIX + "/v2/h3_context_ir"
-    is_ir_list = request.url.path in {
-        IR_PREFIX + "/v2/query/video_generation",
-        DIRECT_PREFIX + "/v2/query/video_generation",
-    }
+    is_ir_create = request.url.path in IR_CREATE_PATHS
+    is_ir_list = request.url.path in LIST_PATHS
     public_id = TypeAdapter(str).validate_python(request.path_params.get("video_id", ""))
     is_ir = is_ir_create
     request.scope["h3_namespace"] = namespace(request.url.path)
@@ -246,13 +257,17 @@ async def prepare_request(request: Request) -> None:
             request.scope["causyn_context_ir_spec"] = spec_ir
             _safe_set_request_parsed_body(request, {"model": AUTH_MODEL})
         else:
-            is_direct = request.url.path == DIRECT_PREFIX + "/v2/video_generation"
+            is_direct = request.url.path in DIRECT_CREATE_PATHS
             spec = (MiniMaxH3DirectCreate if is_direct else MiniMaxH3Create).model_validate_json(raw)
             request.scope["minimax_h3_spec"] = spec
             body = spec.internal_body()
             if is_direct:
                 request.scope["causyn_direct_prompt"] = True
                 body["prompt_processing"] = "direct"
+            if is_test_path(request.url.path):
+                # Server-set routing flag: the stored payload carries it through the moderation continuation.
+                request.scope["causyn_test_pool"] = True
+                body["worker_pool"] = WORKER_POOL_TEST
             _safe_set_request_parsed_body(request, body)
     elif is_ir_list:
         _safe_set_request_parsed_body(request, {"model": INTERNAL_MODEL})
@@ -312,6 +327,8 @@ router = APIRouter(route_class=MiniMaxH3Route)
 fallback_router = APIRouter()
 
 
+@router.post(TEST_DIRECT_PREFIX + "/v2/video_generation", tags=["MiniMax H3"])
+@router.post(TEST_IR_PREFIX + "/v2/video_generation", tags=["MiniMax H3"])
 @router.post(DIRECT_PREFIX + "/v2/video_generation", tags=["MiniMax H3"])
 @router.post(IR_PREFIX + "/v2/video_generation", tags=["MiniMax H3"])
 async def create_video(
@@ -339,6 +356,8 @@ async def create_video(
     raise H3Error(503, "Durable moderation admission is required")
 
 
+@router.get(TEST_DIRECT_PREFIX + "/v2/query/video_generation/{video_id}", tags=["MiniMax H3"])
+@router.get(TEST_IR_PREFIX + "/v2/query/video_generation/{video_id}", tags=["MiniMax H3"])
 @router.get(DIRECT_PREFIX + "/v2/query/video_generation/{video_id}", tags=["MiniMax H3"])
 @router.get(IR_PREFIX + "/v2/query/video_generation/{video_id}", tags=["MiniMax H3"])
 async def query_video(
@@ -368,6 +387,16 @@ async def query_context_ir_task(video_id: str, owner: str, service: ContextIRSer
     return {"task": task.public()}
 
 
+@fallback_router.api_route(
+    TEST_IR_PREFIX + "/{unmatched:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
+@fallback_router.api_route(
+    TEST_IR_PREFIX,
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
 @fallback_router.api_route(
     IR_PREFIX + "/{unmatched:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],

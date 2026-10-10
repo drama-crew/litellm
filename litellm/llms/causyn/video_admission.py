@@ -1,11 +1,31 @@
 from __future__ import annotations
 
+import os
 from typing import Protocol
 
 from litellm.llms.libtv.transfer import STATUS_TTL_SECONDS, status_key
 
 ACTIVE = "causyn:video:admitted"
 MAX_ADMITTED = 8
+TEST_POOL = "test"
+TEST_POOL_MAX_ADMITTED_ENV = "CAUSYN_TEST_POOL_MAX_ADMITTED"
+TEST_POOL_MAX_ADMITTED_DEFAULT = 2
+
+
+def active_key(pool: str | None = None) -> str:
+    """Active-set key: production keeps the original global key, the test pool has its own."""
+    return ACTIVE if pool is None else f"{ACTIVE}:{pool}"
+
+
+def max_admitted(pool: str | None = None) -> int:
+    """Admission cap: production is the fixed ``MAX_ADMITTED``; the test pool reads its env cap (default 2)."""
+    if pool is None:
+        return MAX_ADMITTED
+    try:
+        value = int(os.getenv(TEST_POOL_MAX_ADMITTED_ENV, ""))
+    except ValueError:
+        return TEST_POOL_MAX_ADMITTED_DEFAULT
+    return value if value >= 1 else TEST_POOL_MAX_ADMITTED_DEFAULT
 
 
 class RedisPort(Protocol):
@@ -37,6 +57,7 @@ async def admit_video(
     envelope: str,
     deadline: float,
     stream: str = "worker:tasks:video_generate",
+    pool: str | None = None,
 ) -> bool:
     """Admit one causyn video task.
 
@@ -46,6 +67,9 @@ async def admit_video(
     ``video_generate_ref2va`` while the XADD went to ``video_generate``
     (observed in production 2026-09-15). The default keeps every non-ref2va
     caller unchanged.
+
+    ``pool`` selects the active set and its cap (``None`` = production, unchanged). The Lua script sweeps
+    terminal tasks out of whichever set it is given, so a test task is released from the test set only.
     """
     result = await redis.eval(
         ADMIT,
@@ -53,13 +77,13 @@ async def admit_video(
         status_key(task_id),
         f"worker:task:metadata:{task_id}",
         stream,
-        ACTIVE,
+        active_key(pool),
         task_id,
         metadata,
         envelope,
         STATUS_TTL_SECONDS,
         status_key(""),
-        MAX_ADMITTED,
+        max_admitted(pool),
         deadline,
     )
     return result != -1

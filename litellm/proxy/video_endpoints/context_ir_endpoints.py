@@ -16,7 +16,7 @@ from litellm.llms.causyn.h3_prompt import ContextIRRequest, RewriteError
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
 from litellm.proxy.video_endpoints.minimax_h3_endpoints import MiniMaxH3Route, task_owner
-from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, IR_PREFIX
+from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, IR_PREFIX, TEST_DIRECT_PREFIX, TEST_IR_PREFIX
 
 router = APIRouter(route_class=MiniMaxH3Route)
 Auth = Annotated[UserAPIKeyAuth, Depends(user_api_key_auth)]
@@ -43,6 +43,7 @@ class ListParams(BaseModel):
     )
 
 
+@router.post(TEST_IR_PREFIX + "/v2/h3_context_ir", tags=["MiniMax H3"])
 @router.post(IR_PREFIX + "/v2/h3_context_ir", tags=["MiniMax H3"])
 async def create_context_ir(request: Request, auth: Auth, service: Service) -> dict[str, str]:
     spec = request.scope.get("causyn_context_ir_spec")
@@ -127,6 +128,8 @@ async def accept_context_ir(
         raise
 
 
+@router.get(TEST_DIRECT_PREFIX + "/v2/query/video_generation", tags=["MiniMax H3"])
+@router.get(TEST_IR_PREFIX + "/v2/query/video_generation", tags=["MiniMax H3"])
 @router.get(DIRECT_PREFIX + "/v2/query/video_generation", tags=["MiniMax H3"])
 @router.get(IR_PREFIX + "/v2/query/video_generation", tags=["MiniMax H3"])
 async def list_context_ir(request: Request, auth: Auth) -> dict[str, JsonValue]:
@@ -138,6 +141,8 @@ async def list_context_ir(request: Request, auth: Auth) -> dict[str, JsonValue]:
     raise RewriteError("Moderation control service is required", 503)
 
 
+@router.delete(TEST_DIRECT_PREFIX + "/v2/video_generation/{video_id}", tags=["MiniMax H3"])
+@router.delete(TEST_IR_PREFIX + "/v2/video_generation/{video_id}", tags=["MiniMax H3"])
 @router.delete(DIRECT_PREFIX + "/v2/video_generation/{video_id}", tags=["MiniMax H3"])
 @router.delete(IR_PREFIX + "/v2/video_generation/{video_id}", tags=["MiniMax H3"])
 async def delete_context_ir(video_id: str, request: Request, auth: Auth) -> dict[str, str]:

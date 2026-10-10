@@ -19,7 +19,7 @@ from litellm.proxy.common_utils.http_parsing_utils import _read_request_body
 from litellm.proxy.video_endpoints import context_ir_endpoints, endpoints
 from litellm.proxy.video_endpoints import minimax_h3_endpoints as h3
 from litellm.proxy.video_endpoints import moderation_bridge as bridge
-from litellm.proxy.video_endpoints.minimax_h3_paths import PREFIXES
+from litellm.proxy.video_endpoints.minimax_h3_paths import ALL_PREFIXES, PREFIXES, TEST_PREFIXES
 
 LEAKY = (
     "Authentication Error, Invalid proxy server token passed. Received API Key = sk-...abcd, "
@@ -247,7 +247,7 @@ async def test_pre_authentication_releases_any_budget_reservation(stack, monkeyp
 # ------------------------------------------------------------------ F3: envelope for unknown routes
 
 
-@pytest.mark.parametrize("prefix", PREFIXES)
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
 @pytest.mark.parametrize(
     "method,path,expected",
     [
@@ -453,3 +453,30 @@ def test_error_message_reaches_the_query_response(stack):
     response = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS)
     assert response.status_code == 200
     assert response.json()["task"]["error"]["message"] == "reference image 2 could not be used: blocked"
+
+
+@pytest.mark.parametrize("prefix", TEST_PREFIXES)
+def test_test_prefix_fallback_does_not_shadow_real_routes_or_production(stack, prefix):
+    client, _, _ = stack
+    assert client.post(prefix + "/v2/video_generation", json=body(), headers=HEADERS).status_code == 200
+    assert client.get("/video/minimax-h3-testing/x").json().get("detail") == "Not Found"
+    assert client.get("/video/minimax-h3-test").json()["error"]["http_code"] == "404"
+
+
+@pytest.mark.parametrize("prefix", TEST_PREFIXES)
+def test_bad_key_on_test_prefix_is_rejected_before_the_body_is_read(stack, prefix):
+    client, _, state = stack
+    response = client.post(prefix + "/v2/video_generation", json=body(), headers={"Authorization": "Bearer wrong"})
+    assert response.status_code == 401
+    assert response.json()["error"]["message"] == "Invalid or missing API key"
+
+
+@pytest.mark.parametrize("prefix", TEST_PREFIXES)
+@pytest.mark.parametrize(
+    "header", ["x-litellm-model", "custom-llm-provider", "x-drama-moderation-admission", "x-drama-moderation-read"]
+)
+def test_test_prefix_rejects_routing_and_admission_overrides(stack, prefix, header):
+    client, _, state = stack
+    response = client.post(prefix + "/v2/video_generation", json=body(), headers={**HEADERS, header: "x"})
+    assert response.status_code == 400
+    assert not state["platform"]

@@ -1139,3 +1139,123 @@ def test_tasks_persisted_with_the_native_adaptive_profile_still_deserialize_and_
         }
     )
     assert _result_geometry_matches(metadata, result)
+
+
+# --- test worker pool ------------------------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_worker_pool_test_reaches_the_enqueue_payload_on_the_direct_path(enqueued) -> None:
+    await CausynVideoHandler(task_id_factory=lambda: TASK_ID).avideo_generation(
+        model="causyn-1.1",
+        prompt="a kite",
+        api_key=None,
+        api_base=None,
+        logging_obj=None,
+        optional_params=_params(prompt_processing="direct", worker_pool="test"),
+    )
+    payload = enqueued.payloads[0]
+    assert payload["worker_pool"] == "test"
+    assert "worker_pool" not in payload["request"]  # routing flag, never forwarded to the worker request
+
+
+@pytest.mark.asyncio
+async def test_worker_pool_test_survives_the_context_ir_rewrite_hop(enqueued) -> None:
+    await CausynVideoHandler(prompt_submit=fake_submit, task_id_factory=lambda: TASK_ID).avideo_generation(
+        model="causyn-1.1",
+        prompt="a kite",
+        api_key=None,
+        api_base=None,
+        logging_obj=None,
+        optional_params=_params(worker_pool="test"),
+    )
+    payload = enqueued.payloads[0]
+    assert payload["worker_pool"] == "test"
+    assert payload["request"]["prompt"] == "structured: a kite"
+
+
+@pytest.mark.asyncio
+async def test_production_payload_carries_no_worker_pool_key_on_either_path(enqueued) -> None:
+    for optional in (_params(), _params(prompt_processing="direct")):
+        await CausynVideoHandler(prompt_submit=fake_submit, task_id_factory=lambda: TASK_ID).avideo_generation(
+            model="causyn-1.1", prompt="a kite", api_key=None, api_base=None, logging_obj=None, optional_params=optional
+        )
+    assert len(enqueued.payloads) == 2 and all("worker_pool" not in p for p in enqueued.payloads)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pool", [None, "prod", "TEST", "", True, 1, ["test"]])
+async def test_invalid_worker_pool_never_enqueues(enqueued, pool) -> None:
+    with pytest.raises(CustomLLMError) as error:
+        await CausynVideoHandler(prompt_submit=fake_submit).avideo_generation(
+            model="causyn-1.1",
+            prompt="a kite",
+            api_key=None,
+            api_base=None,
+            logging_obj=None,
+            optional_params=_params(prompt_processing="direct", worker_pool=pool),
+        )
+    assert error.value.status_code == 400
+    assert not enqueued.payloads
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("direct", [True, False])
+@pytest.mark.parametrize(
+    "roles,test_stream,prod_stream",
+    [
+        ((), "video_generate_test", "video_generate"),
+        (("first_frame", "last_frame"), "video_generate_test", "video_generate"),
+        (("reference",), "video_generate_ref2va_test", "video_generate_ref2va"),
+    ],
+)
+async def test_handler_to_real_enqueue_lands_on_the_test_stream_only(direct, roles, test_stream, prod_stream) -> None:
+    """Handler -> (Context IR rewrite | direct) -> real enqueue against fakeredis, for t2va / fl2va / ref2va."""
+    from litellm.llms.libtv.video_generate import stream_key
+
+    refs = [
+        {"role": role, "media_type": "image", "url": f"https://source.example/{i}.png"}
+        for i, role in enumerate(roles)
+    ]
+    async with fakeredis.aioredis.FakeRedis() as ir_redis, fakeredis.aioredis.FakeRedis() as worker_redis:
+        for task_type in ("video_generate", "video_generate_ref2va", "video_generate_test", "video_generate_ref2va_test"):
+            await worker_redis.zadd(alive_zset_key(task_type), {"w": time.time()})
+
+        async def real_submit(payload, billing):
+            async def rewrite(spec):
+                return RewriteResult(prompt="structured: " + spec.prompt, usage=RewriteUsage(), system_sha256="a" * 64)
+
+            async def settle(task):
+                pass
+
+            async def deliver(task):
+                await deliver_video_prompt(task, redis_factory=lambda: worker_redis)
+
+            service = ContextIRService(ContextIRStore(ir_redis), rewrite=rewrite, deliver=deliver, settle=settle)
+            task = await service.create(
+                VideoPromptInput.model_validate(payload.request).context_ir(),
+                owner="test",
+                billing=billing,
+                task_id="h3_ir_" + payload.task_id,
+                video_payload=payload.model_dump(mode="json"),
+                listed=False,
+            )
+            await service.process(task.id)
+            assert (await service.store.get(task.id)).status == "succeeded"
+
+        handler = CausynVideoHandler(
+            prompt_submit=real_submit, redis_factory=lambda: worker_redis, task_id_factory=lambda: TASK_ID
+        )
+        extra = {"prompt_processing": "direct"} if direct else {}
+        await handler.avideo_generation(
+            model="causyn-1.1",
+            prompt="a kite",
+            api_key=None,
+            api_base=None,
+            logging_obj=None,
+            optional_params=_params(aspect_ratio="16:9", worker_pool="test", references=refs, **extra),
+        )
+        assert await worker_redis.xlen(stream_key(test_stream)) == 1
+        assert await worker_redis.xlen(stream_key(prod_stream)) == 0
+        assert await worker_redis.zcard("causyn:video:admitted:test") == 1
+        assert await worker_redis.zcard("causyn:video:admitted") == 0

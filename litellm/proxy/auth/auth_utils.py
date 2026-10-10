@@ -1301,6 +1301,8 @@ _VIDEO_RETRIEVAL_ROUTES = frozenset(
         "/videos/{video_id}/content",
         "/video/minimax-h3/v2/query/video_generation/{video_id}",
         "/video/minimax-h3/direct/v2/query/video_generation/{video_id}",
+        "/video/minimax-h3-test/v2/query/video_generation/{video_id}",
+        "/video/minimax-h3-test/direct/v2/query/video_generation/{video_id}",
     }
 )
 
@@ -1312,6 +1314,8 @@ def _is_video_retrieval_route(route: str) -> bool:
     for prefix in (
         "/video/minimax-h3/v2/query/video_generation/",
         "/video/minimax-h3/direct/v2/query/video_generation/",
+        "/video/minimax-h3-test/v2/query/video_generation/",
+        "/video/minimax-h3-test/direct/v2/query/video_generation/",
     ):
         if normalized_route.startswith(prefix):
             suffix = normalized_route.removeprefix(prefix)
@@ -1352,7 +1356,12 @@ def _is_video_mutation_route(route: str, method: str = "POST") -> bool:
     if method.upper() != "POST":
         return False
     normalized_route = route.rstrip("/")
-    if normalized_route in {"/video/minimax-h3/v2/video_generation", "/video/minimax-h3/direct/v2/video_generation"}:
+    if normalized_route in {
+        "/video/minimax-h3/v2/video_generation",
+        "/video/minimax-h3/direct/v2/video_generation",
+        "/video/minimax-h3-test/v2/video_generation",
+        "/video/minimax-h3-test/direct/v2/video_generation",
+    }:
         return True
     for prefix in ("/v1/videos", "/videos"):
         if normalized_route == prefix:

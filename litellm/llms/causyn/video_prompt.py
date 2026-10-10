@@ -5,7 +5,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, JsonValue, SerializerFunctionWrapHandler, model_serializer
 
 from litellm.llms.causyn.context_ir_store import PREFIX, BillingIdentity, ContextIRTask, RedisPort
 from litellm.llms.causyn.h3_prompt import ContextIRRequest, RewriteError
@@ -70,6 +70,16 @@ class VideoSubmission(BaseModel):
     deadline_ts: float
     request: dict[str, JsonValue]
     task_metadata: dict[str, JsonValue]
+    # Trusted pool routing (None = production). Survives the durable Context IR hop inside the stored payload.
+    worker_pool: Literal["test"] | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_production_pool(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        """Production payloads stay byte-identical: the key exists only for the test pool."""
+        data: dict[str, object] = handler(self)
+        if data.get("worker_pool") is None:
+            data.pop("worker_pool", None)
+        return data
 
 
 def rewritten_video_payload(task: ContextIRTask) -> VideoSubmission:

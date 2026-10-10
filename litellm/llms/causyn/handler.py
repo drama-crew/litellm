@@ -127,6 +127,10 @@ _CAUSYN_USER_PARAMS = frozenset(
         "generate_audio",
         "seed",
         "prompt_processing",
+        # Trusted routing flag (test worker pool). Never public: the proxy admits it only from the
+        # test-prefix handlers or a moderation continuation; here it is validated and lifted out of the
+        # worker request into the payload's routing metadata.
+        "worker_pool",
         "execution_deadline_ts",
         # LiteLLM exposes this standard request field, but it is not sent to the
         # worker request payload.
@@ -659,6 +663,15 @@ def _requested_direct_prompt(optional_params: dict[str, object], spec: _ModelSpe
     return True
 
 
+def _requested_worker_pool(optional_params: dict[str, object], spec: _ModelSpec) -> str | None:
+    if "worker_pool" not in optional_params:
+        return None
+    pool = optional_params["worker_pool"]
+    if spec.model != CAUSYN_H3_MODEL or type(pool) is not str or pool != "test":
+        raise _bad_request("worker_pool must be test and requires causyn-1.1")
+    return pool
+
+
 def _request(
     model: str, prompt: object, optional_params: dict[str, object]
 ) -> tuple[dict[str, object], int, str, str, _ModelSpec]:
@@ -671,6 +684,7 @@ def _request(
     if unsupported:
         raise _bad_request(f"unsupported causyn video parameter: {', '.join(unsupported)}")
     direct_prompt = _requested_direct_prompt(optional_params, spec)
+    _requested_worker_pool(optional_params, spec)
     requested_resolution = _resolution(optional_params, spec)
     references = (
         _h3_references(optional_params) if spec.model == CAUSYN_H3_MODEL else _legacy_references(optional_params)
@@ -1476,6 +1490,9 @@ class CausynVideoHandler(CustomLLM):
             "request": request,
             "task_metadata": serialized_metadata,
         }
+        worker_pool = _requested_worker_pool(optional_params, spec)
+        if worker_pool is not None:
+            payload["worker_pool"] = worker_pool
         try:
             settings = self._settings_factory()
             if spec.model == CAUSYN_H3_MODEL and optional_params.get("prompt_processing") != "direct":

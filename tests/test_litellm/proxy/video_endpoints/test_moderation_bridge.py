@@ -668,3 +668,137 @@ async def test_producer_not_sent_failures_keep_their_existing_path_and_record_no
 
     recorded, _ = await _run_execute(monkeypatch, ("intent-1", "nonce-9"), refused)
     assert recorded == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prefix,namespace,pooled",
+    [
+        ("/video/minimax-h3", "minimax-h3", False),
+        ("/video/minimax-h3/direct", "minimax-h3-direct", False),
+        ("/video/minimax-h3-test", "minimax-h3-test", True),
+        ("/video/minimax-h3-test/direct", "minimax-h3-direct-test", True),
+    ],
+)
+async def test_worker_pool_survives_moderation_admission_and_resume(monkeypatch, prefix, namespace, pooled):
+    """The pool rides in the stored payload; the continuation rebuilds the request (scope lost) and re-trusts it."""
+    from litellm.proxy.video_endpoints import minimax_h3_endpoints as h3
+    from litellm.proxy.video_endpoints.moderation_execution import execution_request, invoke
+
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "http://platform.test")
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", "synthetic-token")
+    monkeypatch.setenv("LITELLM_VIDEO_ID_SECRET", "synthetic-secret")
+    app = FastAPI()
+    app.include_router(h3.router)
+    auth = UserAPIKeyAuth(api_key="a" * 64, user_id="owner", team_id="owner", metadata={"openapi_key_id": "key-id"})
+    app.dependency_overrides[user_api_key_auth] = lambda: auth
+    captured = []
+
+    async def platform_request(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "mod_video_pool",
+                "state": "input_moderation",
+                "model": "causyn-1.1",
+                "moderation_status": "pending",
+                "created_at": 1,
+                "policy_source": "model",
+                "output": None,
+            },
+        )
+
+    app.state.moderation_transport = httpx.MockTransport(platform_request)
+    with patch.object(ProxyBaseLLMRequestProcessing, "base_process_llm_request", AsyncMock()) as provider:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                prefix + "/v2/video_generation",
+                json={
+                    "model": "minimax-h3",
+                    "resolution": "768P",
+                    "duration": 5,
+                    "ratio": "16:9",
+                    "content": [{"type": "text", "text": "a kite"}],
+                },
+            )
+        assert response.status_code == 200, response.text
+        assert provider.await_count == 0
+    stored = captured[0]
+    assert stored["namespace"] == namespace
+    assert ("worker_pool" in stored["payload"]) is pooled
+    assert stored["payload"].get("worker_pool") == ("test" if pooled else None)
+    # Continuation: a fresh internal request (no h3 scope flags); ADMITTED re-trusts the stored payload.
+    request = execution_request(
+        Request({"type": "http", "method": "POST", "path": "/", "headers": [], "app": app}),
+        stored["payload"],
+        "/v1/videos",
+    )
+    assert "causyn_test_pool" not in request.scope and "causyn_direct_prompt" not in request.scope
+    seen = []
+
+    async def process(processor, **kwargs):
+        seen.append(processor.data)
+        return VideoObject(id="native", object="video", status="queued")
+
+    with patch.object(ProxyBaseLLMRequestProcessing, "base_process_llm_request", process):
+        result = await invoke(request, auth, stored["payload"], "avideo_generation")
+    assert result.id == "native"
+    assert seen[0].get("worker_pool") == ("test" if pooled else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["/v1/videos", "/videos"])
+@pytest.mark.parametrize("pool", ["test", "prod", "", None])
+async def test_public_video_body_cannot_set_worker_pool(monkeypatch, route, pool):
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "http://platform.test")
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", "test-token")
+    app = FastAPI()
+    app.include_router(endpoints.router)
+    app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(
+        api_key="a" * 64, user_id="owner", team_id="owner", metadata={"openapi_key_id": "key-id"}
+    )
+    platform = AsyncMock()
+    monkeypatch.setattr(bridge, "platform", platform)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(route, json={"model": "causyn-1.1", "prompt": "kite", "worker_pool": pool})
+    assert response.status_code == 422, response.text
+    assert platform.await_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path,payload",
+    [
+        ("/v1/videos/mod_video_source/remix", {"prompt": "x"}),
+        ("/v1/videos/edits", {"prompt": "x", "video": {"id": "mod_video_source"}}),
+        ("/v1/videos/extensions", {"prompt": "x", "video": {"id": "mod_video_source"}}),
+    ],
+)
+async def test_no_other_video_route_accepts_worker_pool(monkeypatch, path, payload):
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "http://platform.test")
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", "test-token")
+    app = FastAPI()
+    app.include_router(endpoints.router)
+    app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(
+        api_key="a" * 64, user_id="owner", team_id="owner", metadata={"openapi_key_id": "key-id"}
+    )
+    platform = AsyncMock()
+    monkeypatch.setattr(bridge, "platform", platform)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(path, json={**payload, "model": "causyn-1.1", "worker_pool": "test"})
+    assert response.status_code == 422, response.text
+    assert platform.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_pool_other_than_test_is_rejected_even_when_trusted():
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "moderation_admission": bridge.ADMITTED})
+    for bad in ("prod", "", None, True):
+        with pytest.raises(Exception) as error:
+            endpoints.check_worker_pool(request, {"model": "causyn-1.1", "worker_pool": bad})
+        assert error.value.status_code == 422
+    with pytest.raises(Exception):
+        endpoints.check_worker_pool(request, {"model": "sora-2", "worker_pool": "test"})
+    endpoints.check_worker_pool(request, {"model": "causyn-1.1", "worker_pool": "test"})
+    endpoints.check_worker_pool(request, {"model": "causyn-1.1"})

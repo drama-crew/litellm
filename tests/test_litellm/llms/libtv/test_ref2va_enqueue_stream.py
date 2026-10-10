@@ -122,3 +122,31 @@ class TestCausynAdmissionHonoursRouting:
         source = inspect.getsource(vg.enqueue_video_generate)
         assert "admit_video(" in source
         assert "stream=stream_key(task_type)" in source
+
+
+class TestTestPoolTaskTypes:
+    """测试池：同一套路由规则，但落在独立的 *_test 流上；生产（pool=None）字节不变。"""
+
+    def test_test_task_types_are_byte_identical_to_the_platform_strings(self):
+        from litellm.llms.libtv.video_generate import (
+            TASK_TYPE_VIDEO_GENERATE_REF2VA_TEST,
+            TASK_TYPE_VIDEO_GENERATE_TEST,
+        )
+
+        assert TASK_TYPE_VIDEO_GENERATE_TEST == "video_generate_test"
+        assert TASK_TYPE_VIDEO_GENERATE_REF2VA_TEST == "video_generate_ref2va_test"
+        assert stream_key(TASK_TYPE_VIDEO_GENERATE_TEST) == "worker:tasks:video_generate_test"
+
+    def test_test_pool_picks_the_test_variant_of_every_route(self):
+        assert task_type_for_references((_ref("reference"),), "test") == "video_generate_ref2va_test"
+        assert task_type_for_references((_ref("first_frame"), _ref("last_frame")), "test") == "video_generate_test"
+        assert task_type_for_references((), "test") == "video_generate_test"
+
+    def test_no_pool_is_unchanged(self):
+        assert task_type_for_references((_ref("reference"),), None) == TASK_TYPE_VIDEO_GENERATE_REF2VA
+        assert task_type_for_references((), None) == TASK_TYPE_VIDEO_GENERATE
+        assert task_type_for_references((_ref("reference"),)) == TASK_TYPE_VIDEO_GENERATE_REF2VA
+
+    def test_unknown_pool_is_refused(self):
+        with pytest.raises(ValueError):
+            task_type_for_references((), "prod")

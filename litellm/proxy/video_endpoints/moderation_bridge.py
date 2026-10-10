@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, IR_PREFIX
+from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, IR_PREFIX, TEST_DIRECT_PREFIX, TEST_IR_PREFIX
 from litellm.types.videos.main import CharacterObject, VideoObject
 
 PREFIX = "mod_video_"
@@ -28,6 +28,9 @@ INTAKE_ROUTES = frozenset(
         IR_PREFIX + "/v2/video_generation",
         DIRECT_PREFIX + "/v2/video_generation",
         IR_PREFIX + "/v2/h3_context_ir",
+        TEST_IR_PREFIX + "/v2/video_generation",
+        TEST_DIRECT_PREFIX + "/v2/video_generation",
+        TEST_IR_PREFIX + "/v2/h3_context_ir",
         "/videos/{video_id}/remix",
         "/v1/videos/{video_id}/remix",
         "/videos/edits",

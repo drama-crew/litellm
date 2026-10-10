@@ -21,7 +21,7 @@ from litellm.proxy.video_endpoints.minimax_h3_models import (
     decode_task,
     encode_task,
 )
-from litellm.proxy.video_endpoints.minimax_h3_paths import PREFIXES
+from litellm.proxy.video_endpoints.minimax_h3_paths import ALL_PREFIXES, PREFIXES, TEST_PREFIXES
 
 
 @pytest.fixture
@@ -342,3 +342,73 @@ def test_task_authentication_and_expiry(monkeypatch):
         decode_task(encoded[:-8] + "abcdefgh")
     with pytest.raises(ValueError):
         decode_task(encode_task(task.model_copy(update={"created_at": int(time.time()) - 8 * 86400})))
+
+
+# --- test worker pool facade ---------------------------------------------------------------------------------
+
+TEST_NAMESPACES = {
+    "/video/minimax-h3": "minimax-h3",
+    "/video/minimax-h3/direct": "minimax-h3-direct",
+    "/video/minimax-h3-test": "minimax-h3-test",
+    "/video/minimax-h3-test/direct": "minimax-h3-direct-test",
+}
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_every_prefix_has_its_own_namespace_and_only_test_prefixes_carry_the_pool(api, prefix):
+    client, calls, _, _ = api
+    created = client.post(
+        prefix + "/v2/video_generation", json=body(), headers={"Authorization": "Bearer allowed"}
+    )
+    assert created.status_code == 200, created.text
+    admitted = calls[0][1]
+    assert admitted["namespace"] == TEST_NAMESPACES[prefix]
+    assert admitted["payload"].get("prompt_processing") == ("direct" if prefix.endswith("/direct") else None)
+    if prefix in TEST_PREFIXES:
+        assert admitted["payload"]["worker_pool"] == "test"
+    else:
+        assert "worker_pool" not in admitted["payload"]
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_test_and_production_tasks_are_invisible_to_each_other(api, prefix):
+    client, calls, _, owner = api
+    headers = {"Authorization": "Bearer allowed"}
+    task_id = client.post(prefix + "/v2/video_generation", json=body(), headers=headers).json()["task_id"]
+    path = prefix + "/v2/query/video_generation/" + task_id
+    assert client.get(path, headers=headers).status_code == 200
+    assert client.get(prefix + "/v2/query/video_generation", headers=headers).json()["total"] == 1
+    assert client.delete(prefix + "/v2/video_generation/" + task_id, headers=headers).json()["action"] == "cancelled"
+    for other in (value for value in ALL_PREFIXES if value != prefix):
+        assert client.get(other + "/v2/query/video_generation/" + task_id, headers=headers).status_code == 404
+        assert client.delete(other + "/v2/video_generation/" + task_id, headers=headers).status_code == 404
+        assert client.get(other + "/v2/query/video_generation", headers=headers).json()["total"] == 0
+    namespaces = {data["namespace"] for _, data in calls if "namespace" in data}
+    assert namespaces == {TEST_NAMESPACES[prefix]} | {TEST_NAMESPACES[o] for o in ALL_PREFIXES if o != prefix}
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+@pytest.mark.parametrize("pool", ["test", "prod", "", None, True])
+def test_a_public_body_can_never_choose_the_worker_pool(api, prefix, pool):
+    client, calls, _, _ = api
+    response = client.post(
+        prefix + "/v2/video_generation", json=body(worker_pool=pool), headers={"Authorization": "Bearer allowed"}
+    )
+    assert response.status_code in (400, 422), response.text
+    assert response.json()["type"] == "error"
+    assert not calls
+
+
+def test_test_prefix_mirrors_every_v2_route_of_the_production_facade():
+    def suffixes(prefix):
+        found = set()
+        for router in (h3.router, context_ir_endpoints.router):
+            for route in router.routes:
+                if route.path.startswith(prefix + "/v2/"):
+                    found |= {(method, route.path[len(prefix) :]) for method in route.methods}
+        return found
+
+    assert suffixes("/video/minimax-h3-test") == suffixes("/video/minimax-h3")
+    assert suffixes("/video/minimax-h3-test/direct") == suffixes("/video/minimax-h3/direct")
+    assert ("POST", "/v2/h3_context_ir") in suffixes("/video/minimax-h3-test")
+    assert len(suffixes("/video/minimax-h3-test")) >= 4

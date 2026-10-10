@@ -30,6 +30,30 @@ from litellm.types.videos.utils import (
 router = APIRouter()
 
 
+def check_worker_pool(request: Request, data: object, *, generation: bool = True) -> None:
+    """Reject ``worker_pool`` unless a trusted source set it (the test-prefix handlers or a moderation continuation).
+
+    Mirrors the ``prompt_processing`` trust check: a public caller can never opt a request into (or out of) the
+    test worker pool. Only the causyn-1.1 generation route understands the flag; every other body-carrying video
+    route refuses it outright.
+    """
+    if not isinstance(data, dict) or "worker_pool" not in data:
+        return
+    pool = data["worker_pool"]
+    trusted = (
+        request.scope.get("causyn_test_pool") is True
+        or request.scope.get("moderation_admission") is moderation_bridge.ADMITTED
+    )
+    if not (
+        generation
+        and type(pool) is str
+        and pool == "test"
+        and data.get("model") == "causyn-1.1"
+        and trusted
+    ):
+        raise HTTPException(422, "worker_pool is not a supported parameter")
+
+
 @router.post(
     "/v1/videos",
     dependencies=[Depends(user_api_key_auth)],
@@ -81,6 +105,7 @@ async def video_generation(
 
     # Read request body
     data = await _read_request_body(request=request)
+    check_worker_pool(request, data)
     if "prompt_processing" in data and (
         data["prompt_processing"] != "direct"
         or data.get("model") != "causyn-1.1"
@@ -493,6 +518,7 @@ async def video_remix(
     # Read request body
     body = await request.body()
     data = orjson.loads(body)
+    check_worker_pool(request, data, generation=False)
     moderated = await moderation_bridge.submit(
         request, user_api_key_dict, {**data, "source_video_id": video_id}, "avideo_remix"
     )
@@ -598,6 +624,7 @@ async def video_create_character(
     )
 
     data = await _read_request_body(request=request)
+    check_worker_pool(request, data, generation=False)
     target_model_name = extract_model_from_target_model_names(data.get("target_model_names"))
     if target_model_name and not data.get("model"):
         data["model"] = target_model_name
@@ -815,6 +842,7 @@ async def video_edit(
 
     body = await request.body()
     data = orjson.loads(body)
+    check_worker_pool(request, data, generation=False)
     moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_edit")
     if moderated is not None:
         return moderated
@@ -918,6 +946,7 @@ async def video_extension(
 
     body = await request.body()
     data = orjson.loads(body)
+    check_worker_pool(request, data, generation=False)
     moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_extension")
     if moderated is not None:
         return moderated
