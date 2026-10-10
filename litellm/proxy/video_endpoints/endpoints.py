@@ -143,51 +143,59 @@ async def video_generation(
         return moderated
     # Trust check passed: hand the pool to the provider through the trusted channel and take it out of the
     # parameters, which are public-controlled once merged. Always set, so nothing inherited can leak in.
-    from litellm.llms.causyn.worker_pool import set_trusted_worker_pool
+    from litellm.llms.causyn.worker_pool import reset_trusted_worker_pool, set_trusted_worker_pool
 
-    set_trusted_worker_pool(data.pop("worker_pool", None))
-    if input_reference is not None:
-        input_reference_file = await batch_to_bytesio([input_reference])
-        if input_reference_file:
-            data["input_reference"] = input_reference_file[0]
-
-    history_id = await openapi_log_capture.start(
-        request,
-        user_api_key_dict,
-        {k: v for k, v in data.items() if k != "input_reference" or isinstance(v, (str, dict, list, type(None)))},
-    )
-    # Process request using ProxyBaseLLMRequestProcessing
-    processor = ProxyBaseLLMRequestProcessing(data=data)
+    pool = data.pop("worker_pool", None)
+    if pool is not None:
+        # Keep the request-scoped log capture (and anything else keyed on the scope) aware of the pool: a
+        # moderation continuation builds a fresh scope, so the flag set by the test-prefix handler is gone.
+        request.scope["causyn_test_pool"] = True
+    pool_token = set_trusted_worker_pool(pool)
     try:
-        result = await processor.base_process_llm_request(
-            request=request,
-            fastapi_response=fastapi_response,
-            user_api_key_dict=user_api_key_dict,
-            route_type="avideo_generation",
-            proxy_logging_obj=proxy_logging_obj,
-            llm_router=llm_router,
-            general_settings=general_settings,
-            proxy_config=proxy_config,
-            select_data_generator=select_data_generator,
-            model=None,
-            user_model=user_model,
-            user_temperature=user_temperature,
-            user_request_timeout=user_request_timeout,
-            user_max_tokens=user_max_tokens,
-            user_api_base=user_api_base,
-            version=version,
+        if input_reference is not None:
+            input_reference_file = await batch_to_bytesio([input_reference])
+            if input_reference_file:
+                data["input_reference"] = input_reference_file[0]
+
+        history_id = await openapi_log_capture.start(
+            request,
+            user_api_key_dict,
+            {k: v for k, v in data.items() if k != "input_reference" or isinstance(v, (str, dict, list, type(None)))},
         )
-        await moderation_bridge.capture(request, result)
-        await openapi_log_capture.submitted(history_id, result)
-        return result
-    except Exception as e:
-        await openapi_log_capture.failed(history_id, e)
-        raise await processor._handle_llm_api_exception(
-            e=e,
-            user_api_key_dict=user_api_key_dict,
-            proxy_logging_obj=proxy_logging_obj,
-            version=version,
-        )
+        # Process request using ProxyBaseLLMRequestProcessing
+        processor = ProxyBaseLLMRequestProcessing(data=data)
+        try:
+            result = await processor.base_process_llm_request(
+                request=request,
+                fastapi_response=fastapi_response,
+                user_api_key_dict=user_api_key_dict,
+                route_type="avideo_generation",
+                proxy_logging_obj=proxy_logging_obj,
+                llm_router=llm_router,
+                general_settings=general_settings,
+                proxy_config=proxy_config,
+                select_data_generator=select_data_generator,
+                model=None,
+                user_model=user_model,
+                user_temperature=user_temperature,
+                user_request_timeout=user_request_timeout,
+                user_max_tokens=user_max_tokens,
+                user_api_base=user_api_base,
+                version=version,
+            )
+            await moderation_bridge.capture(request, result)
+            await openapi_log_capture.submitted(history_id, result)
+            return result
+        except Exception as e:
+            await openapi_log_capture.failed(history_id, e)
+            raise await processor._handle_llm_api_exception(
+                e=e,
+                user_api_key_dict=user_api_key_dict,
+                proxy_logging_obj=proxy_logging_obj,
+                version=version,
+            )
+    finally:
+        reset_trusted_worker_pool(pool_token)
 
 
 @router.get(

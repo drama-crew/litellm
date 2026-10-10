@@ -650,3 +650,51 @@ async def test_moderation_continuation_still_routes_trusted_pool_through_the_rea
     sent = stack.state.enqueued[0]
     assert sent.get("worker_pool") == ("test" if pooled else None)
     assert "worker_pool" not in sent["request"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+@pytest.mark.parametrize("pooled,endpoint", [(True, "minimax_h3_test"), (False, "videos")])
+async def test_continuation_history_row_carries_the_pool_for_the_monitor(stack, monkeypatch, pooled, endpoint):
+    """The continuation row is the one that is submitted/probed; it must be tagged like the intake row."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from starlette.requests import Request as StarletteRequest
+
+    from litellm.llms.causyn.worker_pool import trusted_worker_pool
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.video_endpoints import openapi_log_capture as capture
+    from litellm.proxy.video_endpoints.moderation_execution import execution_request, invoke
+
+    db = SimpleNamespace(execute_raw=AsyncMock(), query_raw=AsyncMock())
+    monkeypatch.setattr(capture, "database", lambda: db)
+    payload = {"model": "causyn-1.1", "prompt": "kite", "seconds": "5", "size": "768p", "aspect_ratio": "16:9", "prompt_processing": "direct"}
+    if pooled:
+        payload["worker_pool"] = "test"
+    auth = UserAPIKeyAuth(api_key="a" * 64, user_id="owner", models=["causyn-1.1"])
+    base = StarletteRequest({"type": "http", "method": "POST", "path": "/", "headers": [], "app": stack.app})
+    request = execution_request(base, payload, "/v1/videos")
+    assert "causyn_test_pool" not in request.scope  # the continuation scope starts without the flag
+    await invoke(request, auth, payload, "avideo_generation")
+    created = [call.args for call in db.execute_raw.call_args_list if "INSERT INTO" in call.args[0]]
+    assert len(created) == 1 and created[0][4] == endpoint
+    assert trusted_worker_pool() is None  # reset after the request
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+async def test_trusted_pool_is_reset_even_when_the_request_fails(stack):
+    from starlette.requests import Request as StarletteRequest
+
+    from litellm.llms.causyn.worker_pool import trusted_worker_pool
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.video_endpoints.moderation_execution import execution_request, invoke
+
+    payload = {"model": "causyn-1.1", "prompt": "kite", "seconds": "5", "size": "480p", "aspect_ratio": "16:9", "prompt_processing": "direct", "worker_pool": "test"}
+    auth = UserAPIKeyAuth(api_key="a" * 64, models=["causyn-1.1"])
+    base = StarletteRequest({"type": "http", "method": "POST", "path": "/", "headers": [], "app": stack.app})
+    with pytest.raises(Exception):
+        await invoke(execution_request(base, payload, "/v1/videos"), auth, payload, "avideo_generation")
+    assert trusted_worker_pool() is None
+    assert not stack.state.enqueued
