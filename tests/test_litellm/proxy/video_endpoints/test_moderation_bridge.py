@@ -738,13 +738,17 @@ async def test_worker_pool_survives_moderation_admission_and_resume(monkeypatch,
     seen = []
 
     async def process(processor, **kwargs):
-        seen.append(processor.data)
+        from litellm.llms.causyn.worker_pool import trusted_worker_pool
+
+        seen.append((dict(processor.data), trusted_worker_pool()))
         return VideoObject(id="native", object="video", status="queued")
 
     with patch.object(ProxyBaseLLMRequestProcessing, "base_process_llm_request", process):
         result = await invoke(request, auth, stored["payload"], "avideo_generation")
     assert result.id == "native"
-    assert seen[0].get("worker_pool") == ("test" if pooled else None)
+    data, trusted = seen[0]
+    assert "worker_pool" not in data  # lifted out of the (public-controlled) parameters
+    assert trusted == ("test" if pooled else None)
 
 
 @pytest.mark.asyncio

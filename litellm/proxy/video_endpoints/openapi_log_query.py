@@ -17,7 +17,7 @@ from litellm.proxy.video_endpoints.openapi_logs import Database, Status
 class LogFilters(BaseModel):
     page: int = Field(default=1, ge=1, le=10000)
     page_size: int = Field(default=20, ge=1, le=50)
-    endpoint: Literal["videos", "minimax_h3"] | None = None
+    endpoint: Literal["videos", "minimax_h3", "minimax_h3_test"] | None = None
     status: Status | None = None
     model: str | None = Field(default=None, max_length=200)
     task_id: str | None = Field(default=None, max_length=16384)

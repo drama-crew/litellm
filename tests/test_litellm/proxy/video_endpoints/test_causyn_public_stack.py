@@ -584,3 +584,69 @@ def test_old_video_path_rejects_direct_flag_before_submission(stack):
     )
     assert result.status_code == 400, result.text
     assert not stack.state.enqueued
+
+
+# --- test worker pool: public input can never reach the *_test streams -------------------------------------------
+
+
+def _h3_body(**extra: object) -> dict[str, object]:
+    return {
+        "model": "causyn-1.1",
+        "prompt": "kite",
+        "seconds": "5",
+        "aspect_ratio": "16:9",
+        "model_info": {"id": "causyn-1-1"},
+        **extra,
+    }
+
+
+_SMUGGLED = [
+    {"worker_pool": "test"},
+    {"extra_body": {"worker_pool": "test"}},
+    {"extra_body": '{"worker_pool": "test"}'},
+    {"extra_body": {"nested": [{"worker_pool": "test"}]}},
+    {"metadata": {"worker_pool": "test"}},
+    {"litellm_metadata": {"worker_pool": "test"}},
+    {"metadata": '{"worker_pool": "test"}'},
+    {"extra_body": {"prompt_processing": "direct"}},
+    {"extra_body": '{"prompt_processing": "direct"}'},
+    {"metadata": {"prompt_processing": "direct"}},
+]
+
+
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+@pytest.mark.parametrize("route", ["/v1/videos", "/videos"])
+@pytest.mark.parametrize("smuggled", _SMUGGLED, ids=lambda item: next(iter(item)) + ":" + str(item)[:40])
+def test_public_video_path_never_lets_the_caller_pick_the_pool(stack, route, smuggled):
+    body = {"model": "causyn-1.1", "prompt": "kite", "seconds": "5", "size": "768p", "aspect_ratio": "16:9"}
+    control = stack.client.post(route, json=body, headers=_auth_headers(stack.allowed_key))
+    # Valid body: it clears validation and reaches the provider (no Context IR store in this harness -> 503);
+    # only the smuggled flag can turn it into a 400/422.
+    assert control.status_code == 503 and "Context IR persistence" in control.text, control.text
+    stack.state.enqueued.clear()
+    result = stack.client.post(route, json={**body, **smuggled}, headers=_auth_headers(stack.allowed_key))
+    assert result.status_code in (400, 422), result.text
+    assert "worker_pool" in result.text or "prompt_processing" in result.text or "Direct prompt" in result.text
+    assert not stack.state.enqueued
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+@pytest.mark.parametrize("pooled", [True, False])
+async def test_moderation_continuation_still_routes_trusted_pool_through_the_real_provider(stack, pooled):
+    from starlette.requests import Request as StarletteRequest
+
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.video_endpoints.moderation_execution import execution_request, invoke
+
+    payload = {"model": "causyn-1.1", "prompt": "kite", "seconds": "5", "size": "768p", "aspect_ratio": "16:9", "prompt_processing": "direct"}
+    if pooled:
+        payload["worker_pool"] = "test"
+    auth = UserAPIKeyAuth(api_key="a" * 64, models=["causyn-1.1"])
+    base = StarletteRequest({"type": "http", "method": "POST", "path": "/", "headers": [], "app": stack.app})
+    request = execution_request(base, payload, "/v1/videos")
+    await invoke(request, auth, payload, "avideo_generation")
+    assert len(stack.state.enqueued) == 1
+    sent = stack.state.enqueued[0]
+    assert sent.get("worker_pool") == ("test" if pooled else None)
+    assert "worker_pool" not in sent["request"]

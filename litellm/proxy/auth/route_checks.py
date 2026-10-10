@@ -60,6 +60,8 @@ _PROXY_ADMIN_VIEW_ONLY_BLOCKED_ROUTES = frozenset(
 # paths directly because the request route carries the resolved key id.
 _PROXY_ADMIN_VIEW_ONLY_BLOCKED_KEY_SUFFIXES = ("/regenerate", "/reset_spend")
 
+TEST_POOL_ROUTE_PREFIX = "/video/minimax-h3-test"
+
 _AUTH_ENFORCED_PASS_THROUGH_ROUTE_GROUPS = frozenset(("openai_routes", "llm_api_routes"))
 
 
@@ -82,9 +84,45 @@ class RouteChecks:
         except Exception:
             pass
 
+        RouteChecks.enforce_test_pool_grant(route=route, valid_token=valid_token)
+
         # Check if Virtual Key is allowed to call the route - Applies to all Roles
         RouteChecks.is_virtual_key_allowed_to_call_route(route=route, valid_token=valid_token, request=request)
         return True
+
+    @staticmethod
+    def is_test_pool_route(route: str) -> bool:
+        return route == TEST_POOL_ROUTE_PREFIX or route.startswith(TEST_POOL_ROUTE_PREFIX + "/")
+
+    @staticmethod
+    def enforce_test_pool_grant(route: str, valid_token: UserAPIKeyAuth) -> None:
+        """The test worker pool facade is opt-in per key.
+
+        Unlike every other LLM route it is NOT reachable through an empty ``allowed_routes`` or through the
+        ``llm_api_routes`` / ``openai_routes`` groups: the key's ``allowed_routes`` must contain an entry that
+        itself names the test prefix (the prefix, a route under it, or a wildcard under it). Broad entries such
+        as ``/video/*`` or ``/*`` do not count. Proxy admins are exempt.
+        """
+        if not RouteChecks.is_test_pool_route(route):
+            return
+        if valid_token.user_role == LitellmUserRoles.PROXY_ADMIN:
+            return
+        allowed = valid_token.allowed_routes if isinstance(valid_token.allowed_routes, list) else []
+        for entry in allowed:
+            if not isinstance(entry, str) or entry in LiteLLMRoutes._member_names_:
+                continue
+            if not entry.rstrip("*").rstrip("/").startswith(TEST_POOL_ROUTE_PREFIX):
+                continue
+            if (
+                RouteChecks._route_matches_allowed_route(route=route, allowed_route=entry)
+                or RouteChecks._route_matches_wildcard_pattern(route=route, pattern=entry)
+                or RouteChecks._route_matches_pattern(route=route, pattern=entry)
+            ):
+                return
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This route requires an explicit grant in the key's allowed_routes",
+        )
 
     @staticmethod
     def is_virtual_key_allowed_to_call_route(

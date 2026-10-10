@@ -54,6 +54,7 @@ from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask,
 from litellm.llms.causyn.h3_prompt import RewriteError
 from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
 from litellm.llms.causyn.vdn_geometry import GEOMETRIES, LEGACY, pixel_budget, resolve_geometry
+from litellm.llms.causyn.worker_pool import TEST_POOL, trusted_worker_pool
 from litellm.llms.causyn.video_prompt import VideoPromptInput, VideoSubmission, submit_video_prompt
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError, ProviderTaskNotFound
@@ -127,10 +128,6 @@ _CAUSYN_USER_PARAMS = frozenset(
         "generate_audio",
         "seed",
         "prompt_processing",
-        # Trusted routing flag (test worker pool). Never public: the proxy admits it only from the
-        # test-prefix handlers or a moderation continuation; here it is validated and lifted out of the
-        # worker request into the payload's routing metadata.
-        "worker_pool",
         "execution_deadline_ts",
         # LiteLLM exposes this standard request field, but it is not sent to the
         # worker request payload.
@@ -664,10 +661,17 @@ def _requested_direct_prompt(optional_params: dict[str, object], spec: _ModelSpe
 
 
 def _requested_worker_pool(optional_params: dict[str, object], spec: _ModelSpec) -> str | None:
-    if "worker_pool" not in optional_params:
+    """The pool comes only from the proxy's trusted channel, never from request parameters.
+
+    Body, ``extra_body`` and metadata all merge into ``optional_params``, so a ``worker_pool`` key there is
+    public-controlled and is refused outright.
+    """
+    if "worker_pool" in optional_params:
+        raise _bad_request("unsupported causyn video parameter: worker_pool")
+    pool = trusted_worker_pool()
+    if pool is None:
         return None
-    pool = optional_params["worker_pool"]
-    if spec.model != CAUSYN_H3_MODEL or type(pool) is not str or pool != "test":
+    if spec.model != CAUSYN_H3_MODEL or pool != TEST_POOL:
         raise _bad_request("worker_pool must be test and requires causyn-1.1")
     return pool
 

@@ -30,27 +30,50 @@ from litellm.types.videos.utils import (
 router = APIRouter()
 
 
-def check_worker_pool(request: Request, data: object, *, generation: bool = True) -> None:
-    """Reject ``worker_pool`` unless a trusted source set it (the test-prefix handlers or a moderation continuation).
+_INTERNAL_FLAGS = ("worker_pool", "prompt_processing")
+_FLAG_CARRIERS = ("extra_body", "metadata", "litellm_metadata")
 
-    Mirrors the ``prompt_processing`` trust check: a public caller can never opt a request into (or out of) the
-    test worker pool. Only the causyn-1.1 generation route understands the flag; every other body-carrying video
-    route refuses it outright.
+
+def _carries_internal_flag(value: object, depth: int = 0) -> bool:
+    """True when an internal routing flag hides anywhere inside a nested/JSON-string public field."""
+    if depth > 6:
+        return False
+    if isinstance(value, str):
+        text = value.strip()
+        if not text.startswith(("{", "[")):
+            return False
+        try:
+            return _carries_internal_flag(orjson.loads(text), depth + 1)
+        except orjson.JSONDecodeError:
+            return any(flag in text for flag in _INTERNAL_FLAGS)
+    if isinstance(value, dict):
+        return any(key in _INTERNAL_FLAGS or _carries_internal_flag(child, depth + 1) for key, child in value.items())
+    if isinstance(value, list):
+        return any(_carries_internal_flag(child, depth + 1) for child in value)
+    return False
+
+
+def check_worker_pool(request: Request, data: object, *, generation: bool = True) -> None:
+    """Keep internal routing flags out of public input.
+
+    ``extra_body`` is merged into the provider's optional params, so a flag hidden there (or in metadata, as a
+    dict or a JSON string) would act like a top-level one. Those carriers are therefore refused for
+    ``worker_pool`` and ``prompt_processing`` on every route, trusted or not. A top-level ``worker_pool`` is
+    accepted only for causyn-1.1 generation from a trusted source (the test-prefix handlers or a moderation
+    continuation); the handler itself never reads it from parameters (see ``llms/causyn/worker_pool.py``).
     """
-    if not isinstance(data, dict) or "worker_pool" not in data:
+    if not isinstance(data, dict):
+        return
+    if any(_carries_internal_flag(data.get(carrier)) for carrier in _FLAG_CARRIERS):
+        raise HTTPException(422, "worker_pool and prompt_processing are not supported in nested parameters")
+    if "worker_pool" not in data:
         return
     pool = data["worker_pool"]
     trusted = (
         request.scope.get("causyn_test_pool") is True
         or request.scope.get("moderation_admission") is moderation_bridge.ADMITTED
     )
-    if not (
-        generation
-        and type(pool) is str
-        and pool == "test"
-        and data.get("model") == "causyn-1.1"
-        and trusted
-    ):
+    if not (generation and type(pool) is str and pool == "test" and data.get("model") == "causyn-1.1" and trusted):
         raise HTTPException(422, "worker_pool is not a supported parameter")
 
 
@@ -118,6 +141,11 @@ async def video_generation(
     moderated = await moderation_bridge.submit(request, user_api_key_dict, data, "avideo_generation", input_reference)
     if moderated is not None:
         return moderated
+    # Trust check passed: hand the pool to the provider through the trusted channel and take it out of the
+    # parameters, which are public-controlled once merged. Always set, so nothing inherited can leak in.
+    from litellm.llms.causyn.worker_pool import set_trusted_worker_pool
+
+    set_trusted_worker_pool(data.pop("worker_pool", None))
     if input_reference is not None:
         input_reference_file = await batch_to_bytesio([input_reference])
         if input_reference_file:

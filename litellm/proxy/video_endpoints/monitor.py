@@ -42,6 +42,8 @@ class MonitorRow(BaseModel):
     generation_id: str | None = None
     artifact_id: str | None = None
     user_id: str | None = None
+    # "test" for test-pool tasks; the platform must not raise production failure alerts for them.
+    worker_pool: str | None = None
 
 
 ROWS = TypeAdapter(list[MonitorRow])
@@ -77,7 +79,8 @@ class Credentials(BaseModel):
 COLUMNS = """id,task_id,public_task_id,model,call_source,project_id,generation_id,artifact_id,user_id,
     CASE WHEN result->'error'->>'code'='cancelled' THEN 'cancelled' ELSE status END AS status,
     started_at,observed_at,finished_at,
-    coalesce(error,result->'error'->>'message',result->>'error') AS error,result->>'trace_id' AS trace_id"""
+    coalesce(error,result->'error'->>'message',result->>'error') AS error,result->>'trace_id' AS trace_id,
+    CASE WHEN endpoint='minimax_h3_test' THEN 'test' END AS worker_pool"""
 
 
 def require_admin(auth: UserAPIKeyAuth) -> None:
@@ -99,7 +102,7 @@ async def list_pending(db: Database, since: datetime, after: str) -> MonitorPage
     rows = ROWS.validate_python(
         await db.query_raw(
             f"""SELECT {COLUMNS} FROM "LiteLLM_OpenApiLog"
-        WHERE endpoint IN ('videos','minimax_h3') AND historical=false AND id > $2
+        WHERE endpoint IN ('videos','minimax_h3','minimax_h3_test') AND historical=false AND id > $2
         AND (status IN ('queued','running','unknown') OR
              (status IN ('failed','timeout','error') AND observed_at >= $1::timestamptz))
         ORDER BY id LIMIT 50""",
@@ -218,7 +221,7 @@ async def probe(db: Database, log_id: str, model_router: Router | None, reader: 
     rows = ROWS.validate_python(
         await db.query_raw(
             f"""SELECT {COLUMNS} FROM "LiteLLM_OpenApiLog"
-        WHERE id=$1 AND endpoint IN ('videos','minimax_h3') AND historical=false""",
+        WHERE id=$1 AND endpoint IN ('videos','minimax_h3','minimax_h3_test') AND historical=false""",
             log_id,
         )
     )

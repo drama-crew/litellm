@@ -210,3 +210,26 @@ async def test_key_without_user_still_has_minimal_monitor_record(monkeypatch):
     assert "__video_monitor__" in args
     assert args[-1] == "{}"
     assert "private user input" not in str(args)
+
+
+@pytest.mark.asyncio
+async def test_test_pool_task_is_logged_under_its_own_endpoint_and_flagged_for_the_monitor(monkeypatch):
+    from starlette.requests import Request
+    from litellm.proxy.video_endpoints import openapi_log_capture as capture
+
+    db = SimpleNamespace(execute_raw=AsyncMock(), query_raw=AsyncMock())
+    monkeypatch.setattr(capture, "database", lambda: db)
+    prod = Request({"type": "http", "method": "POST", "path": "/videos", "headers": []})
+    test = Request({"type": "http", "method": "POST", "path": "/videos", "headers": [], "causyn_test_pool": True})
+    auth = UserAPIKeyAuth(api_key="test-key", user_id="owner-1")
+    await capture.start(prod, auth, {"model": "causyn-1.1"})
+    await capture.start(test, auth, {"model": "causyn-1.1"})
+    prod_args, test_args = (call.args for call in db.execute_raw.call_args_list)
+    assert prod_args[4] == "videos" and test_args[4] == "minimax_h3_test"  # still logged, distinguishable
+    db.query_raw.return_value = [record(id="a", endpoint="minimax_h3_test", worker_pool="test", status="failed")]
+    page = await monitor.list_pending(db, NOW, "")
+    assert page.items[0].worker_pool == "test"
+    assert "minimax_h3_test" in db.query_raw.call_args.args[0]
+    db.query_raw.return_value = [record(id="b", status="failed")]
+    assert (await monitor.list_pending(db, NOW, "")).items[0].worker_pool is None
+    assert "WHEN endpoint='minimax_h3_test' THEN 'test'" in monitor.COLUMNS

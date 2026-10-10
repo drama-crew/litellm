@@ -1143,17 +1143,33 @@ def test_tasks_persisted_with_the_native_adaptive_profile_still_deserialize_and_
 
 # --- test worker pool ------------------------------------------------------------------------------------------
 
+from contextlib import contextmanager
+
+from litellm.llms.causyn.worker_pool import reset_trusted_worker_pool, set_trusted_worker_pool
+
+
+@contextmanager
+def trusted_pool(pool):
+    """What the proxy does after its trust check: the only channel the handler reads the pool from."""
+    token = set_trusted_worker_pool(pool)
+    try:
+        yield
+    finally:
+        reset_trusted_worker_pool(token)
+
+
 
 @pytest.mark.asyncio
 async def test_worker_pool_test_reaches_the_enqueue_payload_on_the_direct_path(enqueued) -> None:
-    await CausynVideoHandler(task_id_factory=lambda: TASK_ID).avideo_generation(
-        model="causyn-1.1",
-        prompt="a kite",
-        api_key=None,
-        api_base=None,
-        logging_obj=None,
-        optional_params=_params(prompt_processing="direct", worker_pool="test"),
-    )
+    with trusted_pool("test"):
+        await CausynVideoHandler(task_id_factory=lambda: TASK_ID).avideo_generation(
+            model="causyn-1.1",
+            prompt="a kite",
+            api_key=None,
+            api_base=None,
+            logging_obj=None,
+            optional_params=_params(prompt_processing="direct"),
+        )
     payload = enqueued.payloads[0]
     assert payload["worker_pool"] == "test"
     assert "worker_pool" not in payload["request"]  # routing flag, never forwarded to the worker request
@@ -1161,14 +1177,15 @@ async def test_worker_pool_test_reaches_the_enqueue_payload_on_the_direct_path(e
 
 @pytest.mark.asyncio
 async def test_worker_pool_test_survives_the_context_ir_rewrite_hop(enqueued) -> None:
-    await CausynVideoHandler(prompt_submit=fake_submit, task_id_factory=lambda: TASK_ID).avideo_generation(
-        model="causyn-1.1",
-        prompt="a kite",
-        api_key=None,
-        api_base=None,
-        logging_obj=None,
-        optional_params=_params(worker_pool="test"),
-    )
+    with trusted_pool("test"):
+        await CausynVideoHandler(prompt_submit=fake_submit, task_id_factory=lambda: TASK_ID).avideo_generation(
+            model="causyn-1.1",
+            prompt="a kite",
+            api_key=None,
+            api_base=None,
+            logging_obj=None,
+            optional_params=_params(),
+        )
     payload = enqueued.payloads[0]
     assert payload["worker_pool"] == "test"
     assert payload["request"]["prompt"] == "structured: a kite"
@@ -1184,18 +1201,36 @@ async def test_production_payload_carries_no_worker_pool_key_on_either_path(enqu
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("pool", [None, "prod", "TEST", "", True, 1, ["test"]])
-async def test_invalid_worker_pool_never_enqueues(enqueued, pool) -> None:
-    with pytest.raises(CustomLLMError) as error:
-        await CausynVideoHandler(prompt_submit=fake_submit).avideo_generation(
-            model="causyn-1.1",
-            prompt="a kite",
-            api_key=None,
-            api_base=None,
-            logging_obj=None,
-            optional_params=_params(prompt_processing="direct", worker_pool=pool),
-        )
+@pytest.mark.parametrize("pool", [None, "test", "prod", "", True, 1, ["test"]])
+async def test_worker_pool_in_request_parameters_is_always_refused(enqueued, pool) -> None:
+    """Parameters (body / extra_body / metadata all merge here) are public-controlled: never a pool source."""
+    with trusted_pool("test"):
+        with pytest.raises(CustomLLMError) as error:
+            await CausynVideoHandler(prompt_submit=fake_submit).avideo_generation(
+                model="causyn-1.1",
+                prompt="a kite",
+                api_key=None,
+                api_base=None,
+                logging_obj=None,
+                optional_params=_params(prompt_processing="direct", worker_pool=pool),
+            )
     assert error.value.status_code == 400
+    assert not enqueued.payloads
+
+
+@pytest.mark.asyncio
+async def test_untrusted_channel_value_other_than_test_never_enqueues(enqueued) -> None:
+    for bad in ("prod", ""):
+        with trusted_pool(bad):
+            with pytest.raises(CustomLLMError):
+                await CausynVideoHandler(prompt_submit=fake_submit).avideo_generation(
+                    model="causyn-1.1",
+                    prompt="a kite",
+                    api_key=None,
+                    api_base=None,
+                    logging_obj=None,
+                    optional_params=_params(prompt_processing="direct"),
+                )
     assert not enqueued.payloads
 
 
@@ -1247,14 +1282,15 @@ async def test_handler_to_real_enqueue_lands_on_the_test_stream_only(direct, rol
             prompt_submit=real_submit, redis_factory=lambda: worker_redis, task_id_factory=lambda: TASK_ID
         )
         extra = {"prompt_processing": "direct"} if direct else {}
-        await handler.avideo_generation(
-            model="causyn-1.1",
-            prompt="a kite",
-            api_key=None,
-            api_base=None,
-            logging_obj=None,
-            optional_params=_params(aspect_ratio="16:9", worker_pool="test", references=refs, **extra),
-        )
+        with trusted_pool("test"):
+            await handler.avideo_generation(
+                model="causyn-1.1",
+                prompt="a kite",
+                api_key=None,
+                api_base=None,
+                logging_obj=None,
+                optional_params=_params(aspect_ratio="16:9", references=refs, **extra),
+            )
         assert await worker_redis.xlen(stream_key(test_stream)) == 1
         assert await worker_redis.xlen(stream_key(prod_stream)) == 0
         assert await worker_redis.zcard("causyn:video:admitted:test") == 1
