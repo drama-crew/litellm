@@ -19789,6 +19789,247 @@ export interface paths {
         patch: operations["unmatched_video_minimax_h3_patch"];
         trace?: never;
     };
+    "/video/minimax-h3-test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        get: operations["unmatched_video_minimax_h3_test_get"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        put: operations["unmatched_video_minimax_h3_test_put"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        post: operations["unmatched_video_minimax_h3_test_post"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        delete: operations["unmatched_video_minimax_h3_test_delete"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        options: operations["unmatched_video_minimax_h3_test_options"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        head: operations["unmatched_video_minimax_h3_test_head"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        patch: operations["unmatched_video_minimax_h3_test_patch"];
+        trace?: never;
+    };
+    "/video/minimax-h3-test/direct/v2/query/video_generation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Context Ir */
+        get: operations["list_context_ir_video_minimax_h3_test_direct_v2_query_video_generation_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/direct/v2/query/video_generation/{video_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Query Video */
+        get: operations["query_video_video_minimax_h3_test_direct_v2_query_video_generation__video_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/direct/v2/video_generation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Video */
+        post: operations["create_video_video_minimax_h3_test_direct_v2_video_generation_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/direct/v2/video_generation/{video_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Context Ir */
+        delete: operations["delete_context_ir_video_minimax_h3_test_direct_v2_video_generation__video_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/v2/h3_context_ir": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Context Ir */
+        post: operations["create_context_ir_video_minimax_h3_test_v2_h3_context_ir_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/v2/query/video_generation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Context Ir */
+        get: operations["list_context_ir_video_minimax_h3_test_v2_query_video_generation_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/v2/query/video_generation/{video_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Query Video */
+        get: operations["query_video_video_minimax_h3_test_v2_query_video_generation__video_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/v2/video_generation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Video */
+        post: operations["create_video_video_minimax_h3_test_v2_video_generation_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/v2/video_generation/{video_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Context Ir */
+        delete: operations["delete_context_ir_video_minimax_h3_test_v2_video_generation__video_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/video/minimax-h3-test/{unmatched}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        get: operations["unmatched_video_minimax_h3_test__unmatched__get"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        put: operations["unmatched_video_minimax_h3_test__unmatched__put"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        post: operations["unmatched_video_minimax_h3_test__unmatched__post"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        delete: operations["unmatched_video_minimax_h3_test__unmatched__delete"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        options: operations["unmatched_video_minimax_h3_test__unmatched__options"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        head: operations["unmatched_video_minimax_h3_test__unmatched__head"];
+        /**
+         * Unmatched
+         * @description Documented error envelope for unknown paths (404) and wrong methods (405) under both prefixes.
+         */
+        patch: operations["unmatched_video_minimax_h3_test__unmatched__patch"];
+        trace?: never;
+    };
     "/video/minimax-h3/direct/v2/query/video_generation": {
         parameters: {
             query?: never;
@@ -28061,6 +28302,8 @@ export interface components {
             trace_id?: string | null;
             /** User Id */
             user_id?: string | null;
+            /** Worker Pool */
+            worker_pool?: string | null;
         };
         /**
          * MutualTLSSecurityScheme
@@ -42372,7 +42615,7 @@ export interface operations {
                 user_id: string;
                 page?: number;
                 page_size?: number;
-                endpoint?: ("videos" | "minimax_h3") | null;
+                endpoint?: ("videos" | "minimax_h3" | "minimax_h3_test") | null;
                 status?: ("queued" | "running" | "succeeded" | "failed" | "cancelled" | "unknown") | null;
                 model?: string | null;
                 task_id?: string | null;
@@ -59738,6 +59981,528 @@ export interface operations {
         };
     };
     unmatched_video_minimax_h3_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test_delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test_head: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    list_context_ir_video_minimax_h3_test_direct_v2_query_video_generation_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: components["schemas"]["JsonValue"];
+                    };
+                };
+            };
+        };
+    };
+    query_video_video_minimax_h3_test_direct_v2_query_video_generation__video_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                video_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_video_video_minimax_h3_test_direct_v2_video_generation_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+        };
+    };
+    delete_context_ir_video_minimax_h3_test_direct_v2_video_generation__video_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                video_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_context_ir_video_minimax_h3_test_v2_h3_context_ir_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+        };
+    };
+    list_context_ir_video_minimax_h3_test_v2_query_video_generation_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: components["schemas"]["JsonValue"];
+                    };
+                };
+            };
+        };
+    };
+    query_video_video_minimax_h3_test_v2_query_video_generation__video_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                video_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_video_video_minimax_h3_test_v2_video_generation_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+        };
+    };
+    delete_context_ir_video_minimax_h3_test_v2_video_generation__video_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                video_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test__unmatched__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test__unmatched__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test__unmatched__post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test__unmatched__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test__unmatched__options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test__unmatched__head: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
+    unmatched_video_minimax_h3_test__unmatched__patch: {
         parameters: {
             query?: never;
             header?: never;

@@ -85,6 +85,8 @@ def platform_rejection(status: int, detail: object, path: str) -> HTTPException:
     """
     if status >= 500:
         return HTTPException(503, "Moderation control request was rejected")
+    if status == 404 and re.fullmatch(r"/intents/[^/]+/(?:view|cancel)", path):
+        return HTTPException(404, "Task not found")
     code = detail.get("code") if isinstance(detail, dict) else None
     text = detail.get("message") if isinstance(detail, dict) else detail
     text = text if isinstance(text, str) else ""

@@ -14,6 +14,16 @@ from litellm.proxy.video_endpoints import moderation_bridge as bridge
 from litellm.types.videos.main import VideoObject
 
 
+@pytest.mark.parametrize(
+    "path",
+    ["/intents", "/intents/list", "/lookup", "/intents/mod_video_1/receipt", "/intents/mod_video_1/nested/view"],
+)
+def test_unrelated_control_404_is_not_mislabeled_as_a_missing_task(path: str):
+    error = bridge.platform_rejection(404, "Private platform endpoint not found", path)
+    assert error.status_code == 404
+    assert error.detail == "Moderation control request was rejected"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path,payload",

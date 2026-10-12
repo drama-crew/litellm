@@ -359,11 +359,34 @@ def test_genuine_platform_failures_stay_503(stack, status):
     assert "boom" not in response.text
 
 
-def test_other_platform_client_errors_keep_their_status(stack):
+@pytest.mark.parametrize("prefix", PREFIXES)
+@pytest.mark.parametrize(
+    "method,path",
+    [("GET", "/v2/query/video_generation/mod_video_1"), ("DELETE", "/v2/video_generation/mod_video_1")],
+)
+@pytest.mark.parametrize(
+    "detail",
+    ["Task not found", {"message": "Private owner at internal.invalid was denied", "code": "private_lookup"}, None],
+)
+def test_missing_platform_task_has_a_clear_non_leaking_404(
+    stack, prefix: str, method: str, path: str, detail: dict[str, str] | str | None
+):
     client, _, state = stack
-    state["reply"] = lambda request, data: httpx.Response(404, json={"detail": "Task not found"})
-    response = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS)
+    state["reply"] = lambda request, data: (
+        httpx.Response(404, text="Private proxy upstream route was not found")
+        if detail is None
+        else httpx.Response(404, json={"detail": detail})
+    )
+    response = client.request(method, prefix + path, headers=HEADERS)
     assert response.status_code == 404
+    assert response.json()["error"] == {
+        "type": "not_found_error",
+        "code": "task_not_found",
+        "message": "Task not found",
+        "http_code": "404",
+        "retryable": False,
+    }
+    assert response.headers["x-request-id"] == response.json()["request_id"]
 
 
 def test_direct_queue_saturation_is_retryable_and_proven_not_sent(stack):
