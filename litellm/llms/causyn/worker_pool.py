@@ -8,9 +8,13 @@ handler, or a moderation continuation of one), and the provider handler reads it
 
 from __future__ import annotations
 
+import math
+import os
 from contextvars import ContextVar, Token
 
 TEST_POOL = "test"
+TEST_POOL_DIRECT_DEADLINE_ENV = "CAUSYN_TEST_POOL_DIRECT_DEADLINE_SECONDS"
+TEST_POOL_DIRECT_DEADLINE_DEFAULT = 900.0
 _TRUSTED_POOL: ContextVar[str | None] = ContextVar("causyn_trusted_worker_pool", default=None)
 
 
@@ -24,3 +28,12 @@ def reset_trusted_worker_pool(token: Token[str | None]) -> None:
 
 def trusted_worker_pool() -> str | None:
     return _TRUSTED_POOL.get()
+
+
+def test_pool_direct_deadline_seconds() -> float:
+    """Direct-mode execution budget for the test pool (slower lanes); invalid or <= 0 falls back to the default."""
+    try:
+        value = float(os.getenv(TEST_POOL_DIRECT_DEADLINE_ENV, ""))
+    except ValueError:
+        return TEST_POOL_DIRECT_DEADLINE_DEFAULT
+    return value if math.isfinite(value) and value > 0 else TEST_POOL_DIRECT_DEADLINE_DEFAULT

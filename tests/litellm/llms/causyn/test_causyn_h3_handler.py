@@ -1295,3 +1295,51 @@ async def test_handler_to_real_enqueue_lands_on_the_test_stream_only(direct, rol
         assert await worker_redis.xlen(stream_key(prod_stream)) == 0
         assert await worker_redis.zcard("causyn:video:admitted:test") == 1
         assert await worker_redis.zcard("causyn:video:admitted") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "env,requested,remaining",
+    [
+        (None, None, 900),
+        ("1200", None, 1200),
+        ("1200", 2_000_000_600.0, 600),
+        (None, 2_000_005_400.0, 900),
+        ("0", None, 900),
+        ("-3", None, 900),
+        ("abc", None, 900),
+        ("nan", None, 900),
+    ],
+)
+async def test_test_pool_direct_deadline_is_env_driven(enqueued, monkeypatch, env, requested, remaining):
+    if env is None:
+        monkeypatch.delenv("CAUSYN_TEST_POOL_DIRECT_DEADLINE_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("CAUSYN_TEST_POOL_DIRECT_DEADLINE_SECONDS", env)
+    params = _params(prompt_processing="direct")
+    if requested is not None:
+        params["execution_deadline_ts"] = requested
+    with trusted_pool("test"):
+        await CausynVideoHandler(clock=lambda: 2_000_000_000.0).avideo_generation(
+            model="causyn-1.1",
+            prompt="a kite",
+            api_key=None,
+            api_base=None,
+            logging_obj=None,
+            optional_params=params,
+        )
+    assert enqueued.payloads[0]["deadline_ts"] == 2_000_000_000.0 + remaining
+
+
+@pytest.mark.asyncio
+async def test_production_direct_deadline_ignores_test_pool_env(enqueued, monkeypatch):
+    monkeypatch.setenv("CAUSYN_TEST_POOL_DIRECT_DEADLINE_SECONDS", "1200")
+    await CausynVideoHandler(clock=lambda: 2_000_000_000.0).avideo_generation(
+        model="causyn-1.1",
+        prompt="a kite",
+        api_key=None,
+        api_base=None,
+        logging_obj=None,
+        optional_params=_params(prompt_processing="direct"),
+    )
+    assert enqueued.payloads[0]["deadline_ts"] == 2_000_000_300.0

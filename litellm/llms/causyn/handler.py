@@ -54,7 +54,7 @@ from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask,
 from litellm.llms.causyn.h3_prompt import RewriteError
 from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
 from litellm.llms.causyn.vdn_geometry import GEOMETRIES, LEGACY, pixel_budget, resolve_geometry
-from litellm.llms.causyn.worker_pool import TEST_POOL, trusted_worker_pool
+from litellm.llms.causyn.worker_pool import TEST_POOL, test_pool_direct_deadline_seconds, trusted_worker_pool
 from litellm.llms.causyn.video_prompt import VideoPromptInput, VideoSubmission, submit_video_prompt
 from litellm.llms.custom_httpx.http_handler import AsyncHTTPHandler, HTTPHandler
 from litellm.llms.custom_llm import CustomLLM, CustomLLMError, ProviderTaskNotFound
@@ -1473,8 +1473,14 @@ class CausynVideoHandler(CustomLLM):
         durable_metadata = metadata_model
         serialized_metadata = durable_metadata.model_dump()
         serialized_metadata["pricing"] = durable_metadata.pricing.model_dump(exclude_none=True)
+        # The test pool's slower lanes get their own direct budget; the pool comes only from the trusted channel.
+        direct_deadline_seconds = (
+            test_pool_direct_deadline_seconds()
+            if trusted_worker_pool() == TEST_POOL
+            else CAUSYN_H3_DIRECT_DEADLINE_SECONDS
+        )
         local_deadline = self._clock() + (
-            CAUSYN_H3_DIRECT_DEADLINE_SECONDS
+            direct_deadline_seconds
             if spec.model == CAUSYN_H3_MODEL and optional_params.get("prompt_processing") == "direct"
             else spec.deadline_seconds
         )
