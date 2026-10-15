@@ -4,15 +4,15 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import os
 import random
-import logging
 import re
 import time
 import unicodedata
 import weakref
-from contextvars import ContextVar
 from collections import OrderedDict
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
@@ -37,6 +37,10 @@ try:
 except ImportError:
     from exceptiongroup import BaseExceptionGroup
 
+from litellm.litellm_core_utils.causyn_reference_limits import (
+    CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO as CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO,
+)
+from litellm.litellm_core_utils.causyn_reference_limits import reference_count_limit_violation
 from litellm.llms.causyn import ref2va_plan
 from litellm.llms.causyn.ref_media_facts import (
     AudioFacts,
@@ -48,10 +52,6 @@ from litellm.llms.causyn.ref_media_facts import (
     render_audio_facts,
     render_video_facts,
 )
-from litellm.llms.causyn.reference_limits import (
-    CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO as CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO,
-)
-from litellm.llms.causyn.reference_limits import reference_count_limit_violation
 from litellm.proxy.video_endpoints.minimax_h3_models import (
     AudioItem,
     ContentItem,

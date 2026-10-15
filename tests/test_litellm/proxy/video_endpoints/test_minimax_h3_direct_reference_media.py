@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -13,10 +15,29 @@ from litellm.llms.causyn import public_media_policy as policy
 from litellm.proxy.video_endpoints.minimax_h3_models import MiniMaxH3Create, MiniMaxH3DirectCreate
 from litellm.proxy.video_endpoints.minimax_h3_paths import ALL_PREFIXES
 
-from .test_minimax_h3_public_media import HEADERS, png, data_url, stack  # noqa: F401
+from .test_minimax_h3_public_media import HEADERS, data_url, png, stack  # noqa: F401
 
 DIRECT = "/video/minimax-h3/direct/v2/video_generation"
 IR = "/video/minimax-h3/v2/video_generation"
+
+
+def test_public_schema_imports_before_provider_in_fresh_process() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from litellm.proxy.video_endpoints.minimax_h3_models import MiniMaxH3Create, MiniMaxH3DirectCreate; "
+            "from litellm.llms.causyn.handler import causyn_video_handler; "
+            "assert MiniMaxH3Create and MiniMaxH3DirectCreate and causyn_video_handler",
+        ],
+        cwd=Path(__file__).resolve().parents[4],
+        env={**os.environ, "LITELLM_LOCAL_MODEL_COST_MAP": "True"},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def item(kind: str, n: int) -> dict:

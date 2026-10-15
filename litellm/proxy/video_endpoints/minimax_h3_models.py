@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 
-from litellm.llms.causyn.reference_limits import reference_count_limit_violation
+from litellm.litellm_core_utils.causyn_reference_limits import reference_count_limit_violation
 
 ModelName = Literal["MiniMax-H3", "MiniMax-H3-Max", "causyn-1.1"]
 ContentModel = TypeVar("ContentModel", bound=str)

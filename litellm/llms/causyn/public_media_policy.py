@@ -26,21 +26,21 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import functools
 import io
 import ipaddress
 import re
 import socket
-import functools
 import weakref
-from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
 
+from litellm.litellm_core_utils.causyn_reference_limits import reference_count_limit_violation
 from litellm.llms.causyn.h3_media import CAUSYN_VIDEO_LIMITS, inspect_audio, inspect_video
 from litellm.llms.causyn.h3_prompt import CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS, RewriteError
-from litellm.llms.causyn.reference_limits import reference_count_limit_violation
 
 MB = 1024 * 1024
 IMAGE_MAX_BYTES = 30 * MB
