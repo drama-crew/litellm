@@ -93,7 +93,7 @@ RUN for attempt in 1 2 3 4 5; do \
             "npm=12.0.2-r0" \
             "libcurl-openssl4=8.22.0-r3" \
             "ngtcp2=1.25.0-r4" \
-            "libldap=2.6.10-r5" \
+            "libldap-2.6=2.6.14-r0" \
             libsndfile \
             "!openssl-4.0-libcrypto" \
             "!openssl-4.0-libssl" \
