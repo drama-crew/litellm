@@ -40,6 +40,7 @@ from urllib.parse import urlsplit
 
 from litellm.llms.causyn.h3_media import CAUSYN_VIDEO_LIMITS, inspect_audio, inspect_video
 from litellm.llms.causyn.h3_prompt import CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS, RewriteError
+from litellm.llms.causyn.reference_limits import reference_count_limit_violation
 
 MB = 1024 * 1024
 IMAGE_MAX_BYTES = 30 * MB
@@ -494,4 +495,10 @@ async def validate_public_media(refs: Sequence[MediaRef]) -> None:
 
 
 async def validate_public_payload(payload: Mapping[str, object]) -> None:
-    await validate_public_media(extract_media_refs(payload))
+    refs = extract_media_refs(payload)
+    image_count = sum(ref.kind == "image" and ref.role not in ("first_frame", "last_frame") for ref in refs)
+    video_count = sum(ref.kind == "video" for ref in refs)
+    audio_count = sum(ref.kind == "audio" for ref in refs)
+    if violation := reference_count_limit_violation(image_count, video_count, audio_count):
+        raise MediaPolicyError(violation)
+    await validate_public_media(refs)

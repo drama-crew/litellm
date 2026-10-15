@@ -118,7 +118,10 @@ HEADERS = {"Authorization": "Bearer allowed"}
 @pytest.mark.parametrize(
     "image,message",
     [
-        (data_url(gif(), "image/gif"), "reference image 1: unsupported format (GIF); allowed: JPEG, PNG, WEBP, HEIC, HEIF"),
+        (
+            data_url(gif(), "image/gif"),
+            "reference image 1: unsupported format (GIF); allowed: JPEG, PNG, WEBP, HEIC, HEIF",
+        ),
         (data_url(b"%PDF-1.4" + b"0" * 200), "reference image 1: unsupported format (PDF)"),
         (data_url(png((100, 100))), "reference image 1: dimensions 100x100"),
         (data_url(png((768, 256))), "reference image 1: aspect ratio"),
@@ -129,9 +132,7 @@ HEADERS = {"Authorization": "Bearer allowed"}
 )
 def test_facade_rejects_bad_media_before_anything_is_submitted(stack, prefix, image, message):
     client, _, state = stack
-    response = client.post(
-        prefix + "/v2/video_generation", json=body((image, "reference_image")), headers=HEADERS
-    )
+    response = client.post(prefix + "/v2/video_generation", json=body((image, "reference_image")), headers=HEADERS)
     assert response.status_code == 400, response.text
     assert message in response.json()["error"]["message"]
     assert response.json()["error"]["type"] == "bad_request_error"
@@ -182,6 +183,43 @@ def test_v1_videos_causyn_public_path_applies_the_same_policy(stack, references)
     assert not state["platform"]
 
 
+@pytest.mark.parametrize("images,videos", [(5, 1), (9, 3), (4, 4), (10, 0)])
+def test_v1_videos_causyn_count_limits_reject_before_media_or_moderation(stack, monkeypatch, images, videos):
+    client, _, state = stack
+    refs = [
+        {"role": "reference", "media_type": "image", "url": f"https://media.example/i{i}.png"} for i in range(images)
+    ] + [{"role": "reference", "media_type": "video", "url": f"https://media.example/v{i}.mp4"} for i in range(videos)]
+
+    async def unexpected_media_validation(media):
+        pytest.fail("over-limit references must be rejected before media validation")
+
+    monkeypatch.setattr(policy, "validate_public_media", unexpected_media_validation)
+    response = client.post(
+        "/v1/videos",
+        json={"model": "causyn-1.1", "prompt": "p", "seconds": "5", "aspect_ratio": "16:9", "references": refs},
+        headers=HEADERS,
+    )
+    assert response.status_code == 400, response.text
+    expected = "at most 4 reference images" if images > 4 and videos <= 3 and images <= 9 else "reference count exceeds"
+    assert expected in response.text
+    assert not state["platform"]
+
+
+@pytest.mark.parametrize("images,videos", [(4, 3), (9, 0)])
+def test_v1_videos_causyn_legal_counts_preserve_references(stack, images, videos):
+    client, _, state = stack
+    refs = [
+        {"role": "reference", "media_type": "image", "url": f"https://media.example/i{i}.png"} for i in range(images)
+    ] + [{"role": "reference", "media_type": "video", "url": f"https://media.example/v{i}.mp4"} for i in range(videos)]
+    response = client.post(
+        "/v1/videos",
+        json={"model": "causyn-1.1", "prompt": "p", "seconds": "5", "aspect_ratio": "16:9", "references": refs},
+        headers=HEADERS,
+    )
+    assert response.status_code == 200, response.text
+    assert state["platform"][-1][1]["payload"]["references"] == refs
+
+
 def test_v1_videos_frame_fields_are_checked(stack):
     client, _, state = stack
     response = client.post(
@@ -198,7 +236,11 @@ def test_non_causyn_models_are_not_subject_to_the_public_policy(stack):
     client, _, state = stack
     response = client.post(
         "/v1/videos",
-        json={"model": "hailuo-h3", "prompt": "p", "references": [{"role": "reference", "media_type": "image", "url": "http://10.0.0.8/x.png"}]},
+        json={
+            "model": "hailuo-h3",
+            "prompt": "p",
+            "references": [{"role": "reference", "media_type": "image", "url": "http://10.0.0.8/x.png"}],
+        },
         headers=HEADERS,
     )
     assert response.status_code == 200, response.text
@@ -218,7 +260,11 @@ async def test_internal_producer_admission_bypasses_the_public_policy(stack, mon
     )
     response = client.post(
         "/v1/videos",
-        json={"model": "causyn-1.1", "prompt": "p", "references": [{"role": "reference", "media_type": "image", "url": "http://10.0.0.8/x.png"}]},
+        json={
+            "model": "causyn-1.1",
+            "prompt": "p",
+            "references": [{"role": "reference", "media_type": "image", "url": "http://10.0.0.8/x.png"}],
+        },
         headers={**HEADERS, "x-drama-moderation-admission": "ticket"},
     )
     assert response.status_code == 200, response.text
@@ -229,7 +275,9 @@ def test_policy_violation_is_a_400_with_no_internal_detail(stack, monkeypatch):
     client, _, _ = stack
 
     async def boom(payload):
-        raise policy.MediaPolicyError("reference image 1: unsupported format (GIF); allowed: JPEG, PNG, WEBP, HEIC, HEIF")
+        raise policy.MediaPolicyError(
+            "reference image 1: unsupported format (GIF); allowed: JPEG, PNG, WEBP, HEIC, HEIF"
+        )
 
     monkeypatch.setattr(policy, "validate_public_payload", boom)
     response = client.post("/video/minimax-h3/v2/video_generation", json=body(), headers=HEADERS)

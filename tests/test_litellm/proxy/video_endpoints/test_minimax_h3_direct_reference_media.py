@@ -11,6 +11,7 @@ import pytest
 
 from litellm.llms.causyn import public_media_policy as policy
 from litellm.proxy.video_endpoints.minimax_h3_models import MiniMaxH3Create, MiniMaxH3DirectCreate
+from litellm.proxy.video_endpoints.minimax_h3_paths import ALL_PREFIXES
 
 from .test_minimax_h3_public_media import HEADERS, png, data_url, stack  # noqa: F401
 
@@ -39,7 +40,10 @@ def payload(*kinds: str, **extra) -> dict:
         ("video", "audio"),
         ("video",) * 3,
         ("video",) * 3 + ("audio",) * 3,
-        ("image",) * 9 + ("video",) * 3,
+        ("image",) * 4 + ("video",) * 3,
+        ("image",) * 4 + ("video",) * 3 + ("audio",) * 3,
+        ("image",) * 9,
+        ("image",) * 9 + ("audio",) * 3,
         ("image", "video", "audio", "image", "audio"),
     ],
 )
@@ -53,6 +57,8 @@ REJECTS = [
     (("video",) * 4, {}, "reference count exceeds 9 images, 3 videos or 3 audio clips"),
     (("video", "audio") + ("audio",) * 3, {}, "reference count exceeds 9 images, 3 videos or 3 audio clips"),
     (("image",) * 10, {}, "reference count exceeds 9 images, 3 videos or 3 audio clips"),
+    (("image",) * 5 + ("video",), {}, "at most 4 reference images are allowed when reference video is present"),
+    (("image",) * 9 + ("video",) * 3, {}, "at most 4 reference images are allowed when reference video is present"),
     (("image",) * 9 + ("video",) * 3 + ("audio",), {}, "at most 12 reference items are allowed"),
     (("video",), {"ratio": "adaptive"}, "reference media requires an explicit ratio"),
     (("audio", "image"), {"ratio": "adaptive"}, "reference media requires an explicit ratio"),
@@ -75,6 +81,28 @@ def test_direct_endpoint_rejections(stack, kinds, extra, message):
     response = client.post(DIRECT, json=payload(*kinds, **extra), headers=HEADERS)
     assert response.status_code == 400
     assert response.json()["error"]["message"] == "Value error, " + message
+    assert not state["platform"]
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+@pytest.mark.parametrize("image_count,video_count", [(5, 1), (5, 3), (9, 1), (9, 3)])
+def test_mixed_image_cap_rejects_before_media_or_moderation(stack, monkeypatch, prefix, image_count, video_count):
+    client, _, state = stack
+
+    async def unexpected_media_validation(data):
+        pytest.fail("over-limit references must be rejected before media validation")
+
+    monkeypatch.setattr(policy, "validate_public_payload", unexpected_media_validation)
+    response = client.post(
+        prefix + "/v2/video_generation",
+        json=payload(*(("image",) * image_count + ("video",) * video_count)),
+        headers=HEADERS,
+    )
+    assert response.status_code == 400, response.text
+    assert (
+        "at most 4 reference images are allowed when reference video is present" in response.json()["error"]["message"]
+    )
+    assert response.json()["error"]["type"] == "bad_request_error"
     assert not state["platform"]
 
 
@@ -171,8 +199,20 @@ def test_submit_policy_rejects_short_inline_video(stack, monkeypatch):
     with tempfile.TemporaryDirectory() as tmp:
         out = Path(tmp) / "short.mp4"
         subprocess.run(
-            ["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "color=c=red:s=320x320:r=30:d=1",
-             "-c:v", "libx264", "-pix_fmt", "yuv420p", str(out)],
+            [
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=red:s=320x320:r=30:d=1",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(out),
+            ],
             check=True,
         )
         url = "data:video/mp4;base64," + base64.b64encode(out.read_bytes()).decode()

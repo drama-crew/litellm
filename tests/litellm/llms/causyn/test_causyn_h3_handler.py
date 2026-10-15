@@ -491,6 +491,40 @@ def test_ref2va_preserves_mixed_media_reference_order():
     assert request["references"] == refs
 
 
+@pytest.mark.parametrize("images,videos,audios", [(4, 3, 0), (4, 3, 3), (9, 0, 0), (9, 0, 3)])
+def test_ref2va_reference_count_boundaries_preserve_the_request(images: int, videos: int, audios: int) -> None:
+    refs = (
+        [_ref(f"https://source.example/i{i}.png") for i in range(images)]
+        + [_media_ref("video", f"https://source.example/v{i}.mp4") for i in range(videos)]
+        + [_media_ref("audio", f"https://source.example/a{i}.mp3") for i in range(audios)]
+    )
+    request, _, _, _, _ = mod._request("causyn-1.1", "prompt", _params(references=refs))
+    assert request["references"] == refs
+
+
+@pytest.mark.parametrize("images,videos", [(5, 1), (5, 3), (9, 1), (9, 3)])
+@pytest.mark.parametrize("direct", [False, True])
+async def test_ref2va_mixed_image_cap_rejects_before_enqueue(
+    enqueued: _Recorder, images: int, videos: int, direct: bool
+) -> None:
+    refs = [_ref(f"https://source.example/i{i}.png") for i in range(images)] + [
+        _media_ref("video", f"https://source.example/v{i}.mp4") for i in range(videos)
+    ]
+    params = _params(references=refs, **({"prompt_processing": "direct"} if direct else {}))
+    with pytest.raises(CustomLLMError) as error:
+        await CausynVideoHandler(prompt_submit=fake_submit).avideo_generation(
+            model="causyn-1.1",
+            prompt="a subject preserved",
+            api_key=None,
+            api_base=None,
+            optional_params=params,
+            logging_obj=None,
+        )
+    assert error.value.status_code == 400
+    assert "at most 4 reference images are allowed when reference video is present" in str(error.value)
+    assert enqueued.payloads == []
+
+
 def test_ref2va_rejects_more_than_three_videos():
     refs = [_media_ref("video", f"https://source.example/v{i}.mp4") for i in range(4)]
     params = _params(aspect_ratio="16:9", references=refs)
@@ -1158,7 +1192,6 @@ def trusted_pool(pool):
         reset_trusted_worker_pool(token)
 
 
-
 @pytest.mark.asyncio
 async def test_worker_pool_test_reaches_the_enqueue_payload_on_the_direct_path(enqueued) -> None:
     with trusted_pool("test"):
@@ -1249,11 +1282,15 @@ async def test_handler_to_real_enqueue_lands_on_the_test_stream_only(direct, rol
     from litellm.llms.libtv.video_generate import stream_key
 
     refs = [
-        {"role": role, "media_type": "image", "url": f"https://source.example/{i}.png"}
-        for i, role in enumerate(roles)
+        {"role": role, "media_type": "image", "url": f"https://source.example/{i}.png"} for i, role in enumerate(roles)
     ]
     async with fakeredis.aioredis.FakeRedis() as ir_redis, fakeredis.aioredis.FakeRedis() as worker_redis:
-        for task_type in ("video_generate", "video_generate_ref2va", "video_generate_test", "video_generate_ref2va_test"):
+        for task_type in (
+            "video_generate",
+            "video_generate_ref2va",
+            "video_generate_test",
+            "video_generate_ref2va_test",
+        ):
             await worker_redis.zadd(alive_zset_key(task_type), {"w": time.time()})
 
         async def real_submit(payload, billing):

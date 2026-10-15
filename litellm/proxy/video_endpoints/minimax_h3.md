@@ -40,11 +40,13 @@ Both `/video/minimax-h3/v2/video_generation` (built-in rewrite) and `/video/mini
 
 | `type` | field | `role` | limits |
 |---|---|---|---|
-| `image_url` | `image_url.url` | `reference_image` | up to 9; JPEG/PNG/WEBP |
+| `image_url` | `image_url.url` | `reference_image` | up to 9 without reference video; up to 4 with any reference video; JPEG/PNG/WEBP |
 | `video_url` | `video_url.url` | `reference_video` | up to 3; MP4/MOV, H.264/H.265, at most 50 MB, audio track (if any) AAC or MP3, sides 256-5760 px, aspect ratio 0.4-2.5, 23.976-60 fps, each 2-15 s, combined at most 15 s |
 | `audio_url` | `audio_url.url` | `reference_audio` | up to 3; WAV/MP3, at most 15 MB, each 2-15 s, combined at most 15 s |
 
-At most 12 reference items in total. Reference audio needs at least one reference image or video. Reference video/audio requires an explicit, non-adaptive `ratio` and cannot be combined with `first_frame`/`last_frame`. Each URL is a public HTTP(S) URL or a Base64 data URL. Inline data is bounded by the 64 MB request body: Base64 adds about 33%, so the largest inline video is about 45 MB; use https URLs for large media. Inline media is validated at submit (HTTP 400). URL media is validated when the platform fetches it; a task whose media is rejected then ends `failed` with `error.code=input_media_rejected` and `moderation_status=not_started`, and is not charged.
+At most 12 reference items in total. When any reference video is present, the maximum image/video combination is 3 videos plus 4 images; their combined reference-video duration must still be at most 15 seconds. Over-limit counts return HTTP 400 before media validation or task creation, including on the test-pool mirrors. Reference audio needs at least one reference image or video. Reference video/audio requires an explicit, non-adaptive `ratio` and cannot be combined with `first_frame`/`last_frame`. Each URL is a public HTTP(S) URL or a Base64 data URL. Inline data is bounded by the 64 MB request body: Base64 adds about 33%, so the largest inline video is about 45 MB; use https URLs for large media. Inline media is validated at submit (HTTP 400). URL media is validated when the platform fetches it; a task whose media is rejected then ends `failed` with `error.code=input_media_rejected` and `moderation_status=not_started`, and is not charged.
+
+The same count limits apply to public `/v1/videos` requests for `causyn-1.1`, with violations rejected before moderation admission.
 
 On the direct endpoint the text is passed unchanged, so bind media in your prompt with per-type tags `<Picture N>`, `<Video N>` and `<Audio N>`. Each type is numbered separately from 1, in the order the items appear in `content`.
 

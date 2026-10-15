@@ -52,6 +52,7 @@ from litellm.litellm_core_utils.asyncify import run_async_function  # pyright: i
 from litellm.llms.causyn.context_ir_store import PREFIX as CONTEXT_IR_PREFIX
 from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask, task_key
 from litellm.llms.causyn.h3_prompt import RewriteError
+from litellm.llms.causyn.reference_limits import reference_count_limit_violation
 from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
 from litellm.llms.causyn.vdn_geometry import GEOMETRIES, LEGACY, pixel_budget, resolve_geometry
 from litellm.llms.causyn.worker_pool import TEST_POOL, test_pool_direct_deadline_seconds, trusted_worker_pool
@@ -499,8 +500,8 @@ def _h3_shaped_references(value: object) -> tuple[dict[str, str], ...]:
             or len(audios) > _H3_REF2VA_MAX_AUDIOS
         ):
             raise _bad_request(_H3_REF2VA_ERROR)
-        if audios and not images and not videos:
-            raise _bad_request("reference audio requires at least one reference image or video")
+        if violation := reference_count_limit_violation(len(images), len(videos), len(audios)):
+            raise _bad_request(violation)
         return tuple(references)
     by_role: dict[str, dict[str, str]] = {}
     for reference in references:

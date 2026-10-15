@@ -48,6 +48,10 @@ from litellm.llms.causyn.ref_media_facts import (
     render_audio_facts,
     render_video_facts,
 )
+from litellm.llms.causyn.reference_limits import (
+    CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO as CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO,
+)
+from litellm.llms.causyn.reference_limits import reference_count_limit_violation
 from litellm.proxy.video_endpoints.minimax_h3_models import (
     AudioItem,
     ContentItem,
@@ -99,7 +103,6 @@ AUTH_MODEL = "causyn-1.1"
 # guard (--max-ref-video-total-seconds 15) and returns its own 400 for over-budget combinations.
 CAUSYN_VIDEO_REF_MAX_SECONDS = 15.0
 CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS = 15.0
-CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO = 4
 PRICE_CREDITS = 4.0
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
@@ -527,11 +530,7 @@ def causyn_reference_limit_violation(spec: ContextIRRequest) -> str | None:
     audios = [item for item in spec.content if isinstance(item, AudioItem)]
     if len(references) + len(videos) + len(audios) > 12:
         return "total reference count exceeds 12"
-    if videos and len(references) > CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO:
-        return f"at most {CAUSYN_REFERENCE_IMAGE_MAX_WITH_VIDEO} reference images are allowed when reference video is present"
-    if audios and not references and not videos:
-        return "reference audio requires at least one reference image or video"
-    return None
+    return reference_count_limit_violation(len(references), len(videos), len(audios))
 
 
 class RewriteUsage(BaseModel):

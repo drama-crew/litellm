@@ -12,6 +12,8 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing_extensions import Self
 
+from litellm.llms.causyn.reference_limits import reference_count_limit_violation
+
 ModelName = Literal["MiniMax-H3", "MiniMax-H3-Max", "causyn-1.1"]
 ContentModel = TypeVar("ContentModel", bound=str)
 Ratio = Literal["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
@@ -197,10 +199,8 @@ class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
         audios = [item for item in self.content if isinstance(item, AudioItem)]
         images = [item for item in self.content if isinstance(item, ImageItem) and item.role == "reference_image"]
         if videos or audios:
-            if len(images) + len(videos) + len(audios) > MAX_REFERENCE_ITEMS:
-                raise ValueError(f"at most {MAX_REFERENCE_ITEMS} reference items are allowed")
-            if audios and not images and not videos:
-                raise ValueError("reference audio requires at least one reference image or video")
+            if violation := reference_count_limit_violation(len(images), len(videos), len(audios)):
+                raise ValueError(violation)
             if self.ratio == "adaptive":
                 raise ValueError("reference media requires an explicit ratio")
         if self.ratio == "adaptive" and images:
