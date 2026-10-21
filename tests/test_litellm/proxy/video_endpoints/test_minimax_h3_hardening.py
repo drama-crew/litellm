@@ -443,6 +443,7 @@ def test_queue_expired_task_error_passes_through_distinct_from_execution_expired
                 "created_at": 1,
                 "state": "failed",
                 "moderation_status": "approved",
+                "policy_source": "platform",
                 "error": {"code": code, "message": msg},
             }
         )
