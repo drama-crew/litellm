@@ -97,7 +97,15 @@ CAUSYN_DEADLINE_SECONDS = 1800.0
 # from queue entry, so leave room to wait behind another job. The ARK per-request cap
 # (3300 s) and the app-side causyn-1.1 timeout (5700 s) are sized around this value.
 CAUSYN_H3_DEADLINE_SECONDS = 5400.0
-CAUSYN_H3_DIRECT_DEADLINE_SECONDS = 300.0
+# H3 direct: the 300 s limit counts GPU execution only, never queue wait. The platform owns
+# the queue TTL and sends execution_deadline_ts = begin + outer execution (the precise
+# execution timeout is enforced downstream by the CP/worker). This local default is only
+# an outer bound (queue TTL + outer execution); min() with the platform deadline still wins.
+CAUSYN_H3_DIRECT_QUEUE_TTL_SECONDS = 1800.0
+CAUSYN_H3_DIRECT_EXECUTION_OUTER_SECONDS = 720.0
+CAUSYN_H3_DIRECT_DEADLINE_SECONDS = (
+    CAUSYN_H3_DIRECT_QUEUE_TTL_SECONDS + CAUSYN_H3_DIRECT_EXECUTION_OUTER_SECONDS
+)
 _INTERNAL_VIDEO_FLAG = "DRAMA_INTERNAL_VIDEO_ENABLED"
 _INTERNAL_VIDEO_FLAG_ALIAS = "OH_DRAMA_INTERNAL_VIDEO_ENABLED"
 _CAUSYN_H3_FLAG = "DRAMA_CAUSYN_1_1_ENABLED"

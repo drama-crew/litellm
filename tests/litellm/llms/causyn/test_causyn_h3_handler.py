@@ -1061,9 +1061,17 @@ def test_causyn_h3_deadline_covers_heaviest_ref2va_run_plus_queue_wait():
     assert mod._MODEL_SPECS[mod.CAUSYN_MODEL].deadline_seconds == 1800.0
 
 
+def test_direct_outer_deadline_constants_do_not_count_queue_against_execution():
+    import litellm.llms.causyn.handler as mod
+
+    assert mod.CAUSYN_H3_DIRECT_QUEUE_TTL_SECONDS == 1800.0
+    assert mod.CAUSYN_H3_DIRECT_EXECUTION_OUTER_SECONDS == 720.0
+    assert mod.CAUSYN_H3_DIRECT_DEADLINE_SECONDS == 2520.0
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize("requested,remaining", [(None, 300), (2_000_000_120.0, 120), (2_000_005_400.0, 300)])
-async def test_direct_deadline_includes_prior_queue_wait_and_cannot_be_extended(enqueued, requested, remaining):
+@pytest.mark.parametrize("requested,remaining", [(None, 2520), (2_000_000_120.0, 120), (2_000_005_400.0, 2520)])
+async def test_direct_deadline_is_outer_queue_plus_execution_bound_and_cannot_be_extended(enqueued, requested, remaining):
     params = _params(prompt_processing="direct")
     if requested is not None:
         params["execution_deadline_ts"] = requested
