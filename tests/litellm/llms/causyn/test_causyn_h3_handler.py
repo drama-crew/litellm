@@ -1346,14 +1346,14 @@ async def test_handler_to_real_enqueue_lands_on_the_test_stream_only(direct, rol
 @pytest.mark.parametrize(
     "env,requested,remaining",
     [
-        (None, None, 900),
-        ("1200", None, 1200),
+        (None, None, 1800),
+        ("1200", None, 2100),
         ("1200", 2_000_000_600.0, 600),
-        (None, 2_000_005_400.0, 900),
-        ("0", None, 900),
-        ("-3", None, 900),
-        ("abc", None, 900),
-        ("nan", None, 900),
+        (None, 2_000_005_400.0, 1800),
+        ("0", None, 1800),
+        ("-3", None, 1800),
+        ("abc", None, 1800),
+        ("nan", None, 1800),
     ],
 )
 async def test_test_pool_direct_deadline_is_env_driven(enqueued, monkeypatch, env, requested, remaining):
@@ -1387,4 +1387,4 @@ async def test_production_direct_deadline_ignores_test_pool_env(enqueued, monkey
         logging_obj=None,
         optional_params=_params(prompt_processing="direct"),
     )
-    assert enqueued.payloads[0]["deadline_ts"] == 2_000_000_300.0
+    assert enqueued.payloads[0]["deadline_ts"] == 2_000_002_520.0

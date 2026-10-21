@@ -15,6 +15,8 @@ from contextvars import ContextVar, Token
 TEST_POOL = "test"
 TEST_POOL_DIRECT_DEADLINE_ENV = "CAUSYN_TEST_POOL_DIRECT_DEADLINE_SECONDS"
 TEST_POOL_DIRECT_DEADLINE_DEFAULT = 900.0
+# The platform test namespace queues for up to this long before the outer execution budget starts.
+TEST_POOL_QUEUE_TTL_SECONDS = 900.0
 _TRUSTED_POOL: ContextVar[str | None] = ContextVar("causyn_trusted_worker_pool", default=None)
 
 
@@ -31,9 +33,16 @@ def trusted_worker_pool() -> str | None:
 
 
 def test_pool_direct_deadline_seconds() -> float:
-    """Direct-mode execution budget for the test pool (slower lanes); invalid or <= 0 falls back to the default."""
+    """Local direct-mode cap for the test pool: queue TTL + the (env-driven) outer execution budget.
+
+    The env value is the platform's outer execution budget after begin; the local cap is queue-inclusive, so it
+    adds the test-pool queue TTL (default 900 + 900 = 1800 s) and must not undercut the platform's own bound.
+    Invalid or <= 0 env values fall back to the default budget.
+    """
     try:
         value = float(os.getenv(TEST_POOL_DIRECT_DEADLINE_ENV, ""))
     except ValueError:
-        return TEST_POOL_DIRECT_DEADLINE_DEFAULT
-    return value if math.isfinite(value) and value > 0 else TEST_POOL_DIRECT_DEADLINE_DEFAULT
+        value = TEST_POOL_DIRECT_DEADLINE_DEFAULT
+    if not (math.isfinite(value) and value > 0):
+        value = TEST_POOL_DIRECT_DEADLINE_DEFAULT
+    return TEST_POOL_QUEUE_TTL_SECONDS + value
