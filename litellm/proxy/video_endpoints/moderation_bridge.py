@@ -75,7 +75,31 @@ class AdmissionFailure(BaseModel):
     message: str
 
 
-def platform_rejection(status: int, detail: object, path: str) -> HTTPException:
+QUEUE_FULL_CODES = frozenset({"queue_full", "insufficient_compute"})
+QUEUE_FULL_RETRY_AFTER_DEFAULT_S = 10
+QUEUE_FULL_RETRY_AFTER_MIN_S = 1
+QUEUE_FULL_RETRY_AFTER_MAX_S = 300
+
+
+def _queue_full_retry_after(detail: object, headers: httpx.Headers | None) -> str:
+    """Platform-computed wait (Retry-After header, else detail.retry_after_seconds), clamped; old platforms get 10."""
+    candidates: list[object] = [headers.get("Retry-After") if headers is not None else None]
+    if isinstance(detail, dict):
+        candidates.append(detail.get("retry_after_seconds"))
+    for raw in candidates:
+        if isinstance(raw, bool) or raw is None:
+            continue
+        try:
+            seconds = int(float(raw))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        return str(max(QUEUE_FULL_RETRY_AFTER_MIN_S, min(QUEUE_FULL_RETRY_AFTER_MAX_S, seconds)))
+    return str(QUEUE_FULL_RETRY_AFTER_DEFAULT_S)
+
+
+def platform_rejection(
+    status: int, detail: object, path: str, headers: httpx.Headers | None = None
+) -> HTTPException:
     """Map a moderation-platform error to the public status.
 
     5xx is a genuine platform failure (503). A 409 is a client conflict and must never look retryable:
@@ -90,13 +114,16 @@ def platform_rejection(status: int, detail: object, path: str) -> HTTPException:
     code = detail.get("code") if isinstance(detail, dict) else None
     text = detail.get("message") if isinstance(detail, dict) else detail
     text = text if isinstance(text, str) else ""
-    if status == 429 and code == "insufficient_compute":
+    legacy_code = detail.get("legacy_code") if isinstance(detail, dict) else None
+    if status == 429 and (code in QUEUE_FULL_CODES or legacy_code in QUEUE_FULL_CODES):
         return HTTPException(
             429,
             detail=AdmissionFailure(
                 code="insufficient_compute", message="The direct video queue is full; retry later"
             ).model_dump(),
-            headers=httpx.Headers((("Retry-After", "10"), ("x-drama-submission", "not_sent"))),
+            headers=httpx.Headers(
+                (("Retry-After", _queue_full_retry_after(detail, headers)), ("x-drama-submission", "not_sent"))
+            ),
         )
     if status == 409:
         if code == "idempotency_conflict" or "idempotency" in text.lower():
@@ -206,7 +233,7 @@ async def platform(
             detail = body.get("detail") if isinstance(body, dict) else None
         except ValueError:
             detail = None
-        raise platform_rejection(response.status_code, detail, path)
+        raise platform_rejection(response.status_code, detail, path, response.headers)
     return JSON_OBJECT.validate_python(response.json())
 
 

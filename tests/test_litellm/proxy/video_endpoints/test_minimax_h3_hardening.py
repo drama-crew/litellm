@@ -404,6 +404,51 @@ def test_direct_queue_saturation_is_retryable_and_proven_not_sent(stack):
     assert response.headers["x-request-id"] == response.json()["request_id"]
 
 
+@pytest.mark.parametrize(
+    "detail,header,expected",
+    [
+        ({"code": "queue_full", "legacy_code": "insufficient_compute", "retry_after_seconds": 42}, "37", "37"),
+        ({"code": "queue_full", "legacy_code": "insufficient_compute", "retry_after_seconds": 42}, None, "42"),
+        ({"code": "queue_full", "retry_after_seconds": 9999}, None, "300"),
+        ({"code": "queue_full", "retry_after_seconds": 0}, None, "1"),
+        ({"code": "queue_full"}, "junk", "10"),
+        ({"code": "queue_full"}, None, "10"),
+        ({"code": "something_else", "legacy_code": "insufficient_compute"}, "25", "25"),
+        ({"code": "insufficient_compute"}, None, "10"),
+    ],
+)
+def test_direct_queue_full_429_passes_platform_retry_after(stack, detail, header, expected):
+    client, _, state = stack
+    headers = {"Retry-After": header} if header else {}
+    state["reply"] = lambda request, data: httpx.Response(
+        429, json={"detail": {**detail, "message": "queue full"}}, headers=headers
+    )
+    response = client.post("/video/minimax-h3/direct/v2/video_generation", json=body(), headers=HEADERS)
+    assert response.status_code == 429
+    error = response.json()["error"]
+    assert error["code"] == "insufficient_compute" and error["retryable"] is True
+    assert response.headers["Retry-After"] == expected
+    assert response.headers["x-drama-submission"] == "not_sent"
+
+
+def test_queue_expired_task_error_passes_through_distinct_from_execution_expired(stack):
+    from litellm.proxy.video_endpoints.moderation_bridge import View, v2_task, video
+
+    msg = "Video generation queue wait exceeded the limit; not charged"
+    for code in ("queue_expired", "execution_expired"):
+        view = View.model_validate(
+            {
+                "id": "mod_video_1",
+                "model": "hailuo-h3",
+                "created_at": 1,
+                "state": "failed",
+                "moderation_status": "approved",
+                "error": {"code": code, "message": msg},
+            }
+        )
+        assert v2_task(video(view), h3=True)["error"] == {"code": code, "message": msg}
+
+
 def test_direct_creation_and_pending_poll_advertise_the_poll_interval(stack):
     client, _, _ = stack
     created = client.post("/video/minimax-h3/direct/v2/video_generation", json=body(), headers=HEADERS)
