@@ -1065,12 +1065,12 @@ def test_direct_outer_deadline_constants_do_not_count_queue_against_execution():
     import litellm.llms.causyn.handler as mod
 
     assert mod.CAUSYN_H3_DIRECT_QUEUE_TTL_SECONDS == 1800.0
-    assert mod.CAUSYN_H3_DIRECT_EXECUTION_OUTER_SECONDS == 720.0
-    assert mod.CAUSYN_H3_DIRECT_DEADLINE_SECONDS == 2520.0
+    assert mod.CAUSYN_H3_DIRECT_EXECUTION_OUTER_SECONDS == 1320.0
+    assert mod.CAUSYN_H3_DIRECT_DEADLINE_SECONDS == 3120.0
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("requested,remaining", [(None, 2520), (2_000_000_120.0, 120), (2_000_005_400.0, 2520)])
+@pytest.mark.parametrize("requested,remaining", [(None, 3120), (2_000_000_120.0, 120), (2_000_005_400.0, 3120)])
 async def test_direct_deadline_is_outer_queue_plus_execution_bound_and_cannot_be_extended(enqueued, requested, remaining):
     params = _params(prompt_processing="direct")
     if requested is not None:
@@ -1387,4 +1387,4 @@ async def test_production_direct_deadline_ignores_test_pool_env(enqueued, monkey
         logging_obj=None,
         optional_params=_params(prompt_processing="direct"),
     )
-    assert enqueued.payloads[0]["deadline_ts"] == 2_000_002_520.0
+    assert enqueued.payloads[0]["deadline_ts"] == 2_000_003_120.0

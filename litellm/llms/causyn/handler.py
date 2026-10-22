@@ -102,7 +102,7 @@ CAUSYN_H3_DEADLINE_SECONDS = 5400.0
 # execution timeout is enforced downstream by the CP/worker). This local default is only
 # an outer bound (queue TTL + outer execution); min() with the platform deadline still wins.
 CAUSYN_H3_DIRECT_QUEUE_TTL_SECONDS = 1800.0
-CAUSYN_H3_DIRECT_EXECUTION_OUTER_SECONDS = 720.0
+CAUSYN_H3_DIRECT_EXECUTION_OUTER_SECONDS = 1320.0
 CAUSYN_H3_DIRECT_DEADLINE_SECONDS = (
     CAUSYN_H3_DIRECT_QUEUE_TTL_SECONDS + CAUSYN_H3_DIRECT_EXECUTION_OUTER_SECONDS
 )
