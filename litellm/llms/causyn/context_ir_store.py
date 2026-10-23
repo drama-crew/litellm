@@ -5,7 +5,7 @@ import time
 import uuid
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, JsonValue, SerializerFunctionWrapHandler, model_serializer
 
 from litellm.llms.causyn.h3_prompt import ContextIRRequest, RewriteError, RewriteResult
 
@@ -75,6 +75,15 @@ class ContextIRTask(BaseModel):
     settled: bool = False
     listed: bool = True
     notifications: tuple[Notification, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _omit_untouched_validation_failures(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        """Rollback safety: the model is extra="forbid", so an older image would reject a blob carrying the new key.
+        Keep blobs byte-compatible with the previous schema unless a validation retry actually happened."""
+        data: dict[str, object] = handler(self)
+        if data.get("validation_failures") == 0:
+            data.pop("validation_failures", None)
+        return data
 
     def public(self) -> dict[str, JsonValue]:
         return {

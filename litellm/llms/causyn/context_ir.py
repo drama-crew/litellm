@@ -65,7 +65,6 @@ DEFAULT_TASK_DEADLINE_S = 5400.0
 # 修复调用之后再整体重写，最多这么多次尝试（含第一次）。仍受重试窗口 / 渲染预留约束。
 DEFAULT_VALIDATION_MAX_ATTEMPTS = 3
 VALIDATION_RETRY_DELAY_S = 1.0
-VALIDATION_ERROR_DETAIL_MAX = 600
 
 
 def validation_max_attempts() -> int:
@@ -122,11 +121,12 @@ class RewritePolicy:
 
 
 def _violation_text(exc: RewriteError) -> str | None:
-    """Validator findings for logs / stored error_detail (fixed phrases plus measured values), bounded and redacted."""
+    """Validator findings for logs / stored error_detail (fixed phrases plus measured values).
+
+    Secret-redacted and capped by redact_provider_detail (160 characters)."""
     from litellm.llms.causyn.h3_prompt import redact_provider_detail
 
-    found = "; ".join(exc.violations) if exc.violations else str(exc)
-    return redact_provider_detail(found[:VALIDATION_ERROR_DETAIL_MAX])
+    return redact_provider_detail("; ".join(exc.violations) if exc.violations else str(exc))
 
 
 def task_deadline(task: ContextIRTask) -> float:

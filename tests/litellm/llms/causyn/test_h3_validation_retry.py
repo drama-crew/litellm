@@ -257,3 +257,79 @@ async def test_final_video_failure_exposes_the_specific_rewrite_reason(redis, pa
     assert response.status == "failed"
     assert response.error["code"] == "prompt_rewrite_failed"
     assert response.error["message"] == f"{PREFIX}: {SHOTS_MSG}"
+
+
+# --- rollback safety: blobs stay readable by the previous schema (extra="forbid") ---------------
+
+
+def test_validation_failures_is_omitted_from_the_blob_until_a_validation_retry_happened():
+    fresh = _task()
+    assert "validation_failures" not in json.loads(fresh.model_dump_json())
+    assert "validation_failures" not in fresh.model_dump(mode="json")
+    retried = _task(validation_failures=2)
+    assert json.loads(retried.model_dump_json())["validation_failures"] == 2
+    assert ContextIRTask.model_validate_json(retried.model_dump_json()).validation_failures == 2
+
+
+def test_an_old_blob_without_validation_failures_still_loads():
+    blob = json.loads(_task().model_dump_json())
+    assert "validation_failures" not in blob
+    assert ContextIRTask.model_validate_json(json.dumps(blob)).validation_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_stored_blob_of_an_untouched_task_has_no_validation_failures_key(redis):
+    store = ContextIRStore(redis)
+    service = ContextIRService(store, rewrite=lambda r: None, settle=no_settle)
+    task = await service.create(case("R1")[0], owner="owner", billing=BillingIdentity())
+    raw = await redis.get(f"causyn:context-ir:task:{task.id}")
+    assert "validation_failures" not in json.loads(raw)
+
+
+# --- handler: only our own validation reason is exposed ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "code,message",
+    [
+        ("worker_failed", f"{PREFIX}: {SHOTS_MSG}"),  # wrong code
+        ("prompt_rewrite_failed", PREFIX),  # prefix without ": "
+        ("prompt_rewrite_failed", f"{PREFIX}:{SHOTS_MSG}"),  # no space after the colon
+        ("prompt_rewrite_failed", f"{PREFIX}: " + "x" * 300),  # over 300 characters
+        ("prompt_rewrite_failed", "redis://user:secret@internal:6379 upstream failed"),  # opaque worker text
+        ("prompt_rewrite_failed", None),
+    ],
+)
+def test_public_worker_error_keeps_everything_else_opaque(code, message):
+    from litellm.llms.causyn.handler import _public_worker_error, _WorkerError
+
+    public = _public_worker_error(_WorkerError(code=code, message=message))
+    assert public["message"] == "video generation failed"
+
+
+def test_public_worker_error_exposes_the_validation_reason():
+    from litellm.llms.causyn.handler import _public_worker_error, _WorkerError
+
+    reason = f"{PREFIX}: {SHOTS_MSG}"
+    public = _public_worker_error(_WorkerError(code="prompt_rewrite_failed", message=reason))
+    assert public["message"] == reason and public["code"] == "prompt_rewrite_failed"
+
+
+# --- a fresh attempt never replays the violating first answer -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_answer_cache_is_not_reused_by_a_fresh_attempt_after_a_validation_failure(patched):
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(bad_shots(), bad_shots(), GOLD["R1"])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        rewriter = H3PromptRewriter(client, "k")
+        with pytest.raises(RewriteError) as caught:
+            await rewriter.rewrite(spec)
+        assert caught.value.validation is True
+        assert len(provider.bodies) == 2 and not h3_prompt._FIRST_ANSWERS  # nothing left to replay
+        result = await rewriter.rewrite(spec)
+    assert len(provider.bodies) == 3  # a new provider call, not the cached violating answer
+    assert provider.bodies[2]["messages"] == provider.bodies[0]["messages"]  # started over, no repair turn
+    assert result.prompt == GOLD["R1"].strip()
