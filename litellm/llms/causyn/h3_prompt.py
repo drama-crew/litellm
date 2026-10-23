@@ -99,6 +99,8 @@ CRITIC_DEFECT_CHARS = 300
 ATTEMPT_BUDGET_S = 90.0
 PUBLIC_MODEL = "causyn-h3-context-ir"
 AUTH_MODEL = "causyn-1.1"
+# Public prefix of the failure reason once every rewrite attempt produced an answer the validators rejected.
+REWRITE_INVALID_PREFIX = "prompt rewrite could not produce a valid structured prompt"
 # causyn-1.1 reference-video limits. The Ref2VA engine enforces an exact memory/row admission
 # guard (--max-ref-video-total-seconds 15) and returns its own 400 for over-budget combinations.
 CAUSYN_VIDEO_REF_MAX_SECONDS = 15.0
@@ -160,8 +162,13 @@ class RewriteError(Exception):
         detail: str | None = None,
         poll: bool = False,
         violations: tuple[str, ...] = (),
+        validation: bool = False,
     ) -> None:
         super().__init__(message)
+        # True when the rewriter's *answer* failed the structural validators (a bad sample, not a provider outage).
+        # Such a failure is not `retryable` in the transport sense, but a fresh rewrite usually passes, so the
+        # task-level policy re-runs the rewrite within a small budget (see context_ir.RewritePolicy).
+        self.validation = validation
         # Validator findings (each starts with a fixed phrase) for the one-shot repair message; never public.
         self.violations = violations
         # True for the base-mode structural checks added later (shot timestamps, last-frame alignment): every
@@ -892,7 +899,19 @@ def literal_violations(prompt: str, spec: ContextIRRequest) -> list[str]:
 def validate_prompt(
     prompt: str, spec: ContextIRRequest, facts: RefFacts | None = None, soft: list[str] | None = None
 ) -> None:
-    """Raise on any violation. With `soft` given, ref2va soft-only findings are appended to it instead of raising."""
+    """Raise on any violation. With `soft` given, ref2va soft-only findings are appended to it instead of raising.
+
+    Every failure is tagged `validation=True`: the answer was a bad sample, so a fresh rewrite may well pass."""
+    try:
+        _validate_prompt(prompt, spec, facts, soft)
+    except RewriteError as failure:
+        failure.validation = True
+        raise
+
+
+def _validate_prompt(
+    prompt: str, spec: ContextIRRequest, facts: RefFacts | None = None, soft: list[str] | None = None
+) -> None:
     if not prompt or len(prompt) > 7000:
         # "it has N characters" is added only for the too-long case (the repair message then asks to shorten).
         detail = (f"{_V_LENGTH}: it has {len(prompt)} characters",) if prompt else ()
@@ -1459,12 +1478,12 @@ class H3PromptRewriter:
         soft.extend(literal)
         invented = tuple(v for v in literal if v.startswith(_V_SPEECH))
         if hard_failure is None and invented:
-            hard_failure = RewriteError(_V_SPEECH, violations=invented)
+            hard_failure = RewriteError(_V_SPEECH, violations=invented, validation=True)
 
         def result(text: str, used: RewriteUsage, leftover: list[str]) -> RewriteResult:
             invented_lines = tuple(v for v in leftover if v.startswith(_V_SPEECH))
             if invented_lines:
-                raise RewriteError(_V_SPEECH, violations=invented_lines)
+                raise RewriteError(_V_SPEECH, violations=invented_lines, validation=True)
             if leftover:
                 _log.info("H3 rewrite accepted with soft violations: %s", [v.split(": ", 1)[0][-60:] for v in leftover])
             return RewriteResult(

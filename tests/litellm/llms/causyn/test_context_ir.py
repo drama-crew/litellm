@@ -124,9 +124,13 @@ async def test_invalid_output_failed_and_not_billable(redis):
 
     service = ContextIRService(ContextIRStore(redis), rewrite=invalid, settle=settle)
     task = await service.create(spec(), owner="owner", billing=BillingIdentity())
-    await service.process(task.id)
+    # A validator rejection is re-sampled (bounded by the legacy 3-attempt cap) before the task fails.
+    for _ in range(4):
+        await service.process(task.id)
+        await redis.delete(task_key(task.id) + ":lease")
     failed = await service.store.get(task.id)
     assert failed.status == "failed"
+    assert failed.attempts == 3 and failed.validation_failures == 3
     assert failed.settled
     assert failed.financial_actual == 0
     assert charged == [False]
@@ -776,11 +780,13 @@ async def test_permanent_provider_errors_never_retry_or_deliver(redis, failure):
             ContextIRStore(redis), rewrite=H3PromptRewriter(client, "test").rewrite, settle=no_settle, deliver=deliver
         )
         task = await service.create(spec(), owner="owner", billing=BillingIdentity())
-        await service.process(task.id)
-        await service.process(task.id)
+        for _ in range(4):
+            await service.process(task.id)
+            await redis.delete(task_key(task.id) + ":lease")
         assert (await service.store.get(task.id)).status == "failed"
-        # A cut-off or invalid answer gets one repair call in the same attempt; HTTP errors are never repaired.
-        assert calls == {"upstream": 2 if failure in {"length", "invalid"} else 1}
+        # A cut-off answer gets one repair call in the same attempt; HTTP errors are never repaired. An answer the
+        # validators reject is repaired once per attempt and re-sampled, at most 3 attempts (legacy cap).
+        assert calls == {"upstream": {"length": 2, "invalid": 6}.get(failure, 1)}
 
 
 @pytest.mark.asyncio

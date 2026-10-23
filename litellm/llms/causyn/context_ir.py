@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -28,6 +29,7 @@ from litellm.llms.causyn.h3_prompt import (
     AUTH_MODEL,
     PRICE_CREDITS,
     PUBLIC_MODEL,
+    REWRITE_INVALID_PREFIX,
     ContextIRRequest,
     RewriteError,
     RewriteResult,
@@ -59,6 +61,18 @@ REWRITE_BACKOFF_CAP_S = 60.0
 # A render (15 s reference videos: up to ~43 min natively) must still fit before the deadline.
 RENDER_RESERVE_S = 2700.0
 DEFAULT_TASK_DEADLINE_S = 5400.0
+# 改写结果被结构校验器（镜头编号、切点对齐…）拒绝时，不是上游故障而是一次坏样本：
+# 修复调用之后再整体重写，最多这么多次尝试（含第一次）。仍受重试窗口 / 渲染预留约束。
+DEFAULT_VALIDATION_MAX_ATTEMPTS = 3
+VALIDATION_RETRY_DELAY_S = 1.0
+VALIDATION_ERROR_DETAIL_MAX = 600
+
+
+def validation_max_attempts() -> int:
+    try:
+        return max(1, int(os.getenv("CAUSYN_REWRITE_VALIDATION_MAX_ATTEMPTS", DEFAULT_VALIDATION_MAX_ATTEMPTS)))
+    except ValueError:
+        return DEFAULT_VALIDATION_MAX_ATTEMPTS
 
 
 @dataclass(frozen=True)
@@ -76,19 +90,28 @@ class RewritePolicy:
         return task.rewrite_started_at if task.rewrite_started_at is not None else now
 
     def next_delay(self, task: ContextIRTask, exc: RewriteError, *, now: float | None = None) -> float | None:
-        """Seconds to wait before the next rewrite attempt, or None to give up."""
-        if not exc.retryable:
+        """Seconds to wait before the next rewrite attempt, or None to give up.
+
+        `task.validation_failures` must already include `exc` when it is a validation failure."""
+        if exc.validation and not exc.retryable:
+            if task.validation_failures >= validation_max_attempts():
+                return None
+        elif not exc.retryable:
             return None
         if self.max_attempts is not None and task.attempts >= self.max_attempts:
             return None
         now = time.time() if now is None else now
         legacy_cap = self.max_attempts is not None
-        delay = exc.retry_delay(
-            task.attempts,
-            cap=self.backoff_cap_s,
-            poll_fast=not legacy_cap,
-            jitter=1.0 if legacy_cap else max(1.0, 0.5 * min(self.backoff_cap_s, 2.0**task.attempts)),
-        )
+        if exc.validation and not exc.retryable:
+            # A fresh sample, not a rate limit: a short pause, no exponential backoff.
+            delay = VALIDATION_RETRY_DELAY_S + random.uniform(0.0, 1.0)
+        else:
+            delay = exc.retry_delay(
+                task.attempts,
+                cap=self.backoff_cap_s,
+                poll_fast=not legacy_cap,
+                jitter=1.0 if legacy_cap else max(1.0, 0.5 * min(self.backoff_cap_s, 2.0**task.attempts)),
+            )
         if legacy_cap:
             return min(delay, max(0.0, self.anchor(task, now) + self.expiry_s - now))
         if now + delay - self.anchor(task, now) > self.window_s:
@@ -96,6 +119,14 @@ class RewritePolicy:
         if task_deadline(task) - (now + delay) < self.render_reserve_s:
             return None
         return delay
+
+
+def _violation_text(exc: RewriteError) -> str | None:
+    """Validator findings for logs / stored error_detail (fixed phrases plus measured values), bounded and redacted."""
+    from litellm.llms.causyn.h3_prompt import redact_provider_detail
+
+    found = "; ".join(exc.violations) if exc.violations else str(exc)
+    return redact_provider_detail(found[:VALIDATION_ERROR_DETAIL_MAX])
 
 
 def task_deadline(task: ContextIRTask) -> float:
@@ -388,14 +419,19 @@ class ContextIRService:
                 # 尝试超时不是终态：服务侧任务多半还在跑，走 poll 路径让窗口决定何时放弃。
                 raise RewriteError("H3 prompt rewrite attempt timed out", 503, retryable=True, poll=True) from exc
         except RewriteError as exc:
+            if exc.validation:
+                attempted = attempted.model_copy(update={"validation_failures": attempted.validation_failures + 1})
             delay = policy.next_delay(attempted, exc)
-            if exc.retryable and delay is not None:
+            if delay is not None:
                 logger.warning(
-                    "Context IR rewrite transient failure for %s attempt=%s upstream_status=%s retry_in=%.1fs",
+                    "Context IR rewrite %s for %s attempt=%s validation_failures=%s upstream_status=%s retry_in=%.1fs%s",
+                    "answer rejected by validators" if exc.validation else "transient failure",
                     task_id,
                     attempted.attempts,
+                    attempted.validation_failures,
                     exc.upstream_status,
                     delay,
+                    f" violations={_violation_text(exc)}" if exc.validation else "",
                 )
                 if exc.poll and policy.max_attempts is None:
                     # 仍在运行的轮询重入不是失败：不涨退避指数，也不发 queued 通知。
@@ -407,13 +443,23 @@ class ContextIRService:
                 await self.store.retry(task_id, token, delay)
                 return
             logger.warning(
-                "Context IR rewrite failed for %s attempt=%s upstream_status=%s detail=%s message=%s",
+                "Context IR rewrite failed for %s attempt=%s upstream_status=%s detail=%s message=%s%s",
                 task_id,
                 attempted.attempts,
                 exc.upstream_status,
                 exc.detail,
                 str(exc),
+                f" violations={_violation_text(exc)}" if exc.validation else "",
             )
+            if exc.validation:
+                # Every attempt produced an answer the validators rejected: name the violation (fixed phrases only).
+                await self.fail(
+                    attempted,
+                    token,
+                    f"{REWRITE_INVALID_PREFIX}: {str(exc).rstrip(': ')}",
+                    detail=_violation_text(exc) or exc.describe_upstream(),
+                )
+                return
             await self.fail(attempted, token, str(exc), detail=exc.describe_upstream())
             return
         except Exception:

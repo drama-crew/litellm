@@ -56,6 +56,9 @@ class ContextIRTask(BaseModel):
     # Start of the first rewrite attempt (unix seconds); the retry window runs from here.
     rewrite_started_at: float | None = None
     attempts: int = 0
+    # Attempts whose answer the structural validators rejected. Counted apart from `attempts` so provider
+    # 429s/outages do not eat the (small) budget for re-sampling a bad answer. Default 0 keeps old blobs valid.
+    validation_failures: int = 0
     # 投递（进 GPU 队列）的重试计数，与改写的 attempts 分开。两个阶段的失败语义
     # 不同：改写失败有 3 次上限，投递遇到的是下游背压，上界由视频 deadline 决定。
     # 共用一个计数器会让退避永远停在同一档（改写阶段结束后它就不再增长）。

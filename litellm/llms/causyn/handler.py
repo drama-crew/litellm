@@ -52,7 +52,7 @@ from litellm.litellm_core_utils.asyncify import run_async_function  # pyright: i
 from litellm.litellm_core_utils.causyn_reference_limits import reference_count_limit_violation
 from litellm.llms.causyn.context_ir_store import PREFIX as CONTEXT_IR_PREFIX
 from litellm.llms.causyn.context_ir_store import BillingIdentity, ContextIRTask, task_key
-from litellm.llms.causyn.h3_prompt import RewriteError
+from litellm.llms.causyn.h3_prompt import REWRITE_INVALID_PREFIX, RewriteError
 from litellm.llms.causyn.topaz import TopazAdvance, TopazIndeterminateError, TopazRedis, TopazVideoAdapter
 from litellm.llms.causyn.vdn_geometry import GEOMETRIES, LEGACY, pixel_budget, resolve_geometry
 from litellm.llms.causyn.video_prompt import VideoPromptInput, VideoSubmission, submit_video_prompt
@@ -754,6 +754,7 @@ class _WorkerError(BaseModel):
 
     code: str | None = None
     kind: str | None = None
+    message: str | None = None
 
 
 class _WorkerResult(BaseModel):
@@ -1053,7 +1054,13 @@ def _public_worker_error(error: _WorkerError | None) -> dict[str, str]:
     code = raw_code if isinstance(raw_code, str) and _ERROR_CODE_PATTERN.fullmatch(raw_code) else "worker_failed"
     raw_kind = error.kind if error is not None else None
     kind = raw_kind if raw_kind in {"permanent", "transient", "unknown"} else "unknown"
-    return {"code": code, "message": "video generation failed", "kind": kind}
+    message = "video generation failed"
+    # Worker errors stay opaque. The one exception is the prompt-rewrite stage (our own process, fixed phrases): when
+    # every rewrite attempt was rejected by the structural validators, say so instead of a generic failure.
+    if code == "prompt_rewrite_failed" and error is not None and error.message is not None:
+        if error.message.startswith(REWRITE_INVALID_PREFIX + ": ") and len(error.message) <= 300:
+            message = error.message
+    return {"code": code, "message": message, "kind": kind}
 
 
 def _usage(duration: float, resolution: str = CAUSYN_RESOLUTION) -> dict[str, float | str]:
