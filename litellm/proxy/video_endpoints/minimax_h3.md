@@ -40,11 +40,11 @@ Capability gaps are explicit, never silently ignored (all reject before submissi
 
 ### `extra.prompt_expansion_mode`
 
-The official optional `extra` object is accepted with its single key `prompt_expansion_mode` (`disabled` | `balanced` | `quality`); any other key or value, including `null`, is HTTP 400. It is never forwarded: it only has to agree with the base URL, because the prefix decides whether the prompt is rewritten.
+The official optional `extra` object is accepted with its single key `prompt_expansion_mode` (`disabled` | `balanced` | `quality`). `"extra": null` is treated as absent; `"prompt_expansion_mode": null`, any other key and any other value are HTTP 400. It is never forwarded: it only has to agree with the base URL, because the prefix decides whether the prompt is rewritten. On the rewrite prefix `quality` currently behaves exactly like `balanced`: both select the built-in Context IR rewrite.
 
 | Prefix | absent | `balanced` / `quality` | `disabled` |
 | --- | --- | --- | --- |
-| `/video/minimax-h3` (rewrite) | rewrite | rewrite | 422 `unsupported_parameter`: use the `/video/minimax-h3/direct` base URL |
+| `/video/minimax-h3` (rewrite) | rewrite | rewrite (same for both) | 422 `unsupported_parameter`: use the `/video/minimax-h3/direct` base URL |
 | `/video/minimax-h3/direct` | prompt unchanged | 422 `unsupported_parameter`: use the `/video/minimax-h3` base URL | prompt unchanged |
 
 `extra` is not a field of `/v2/h3_context_ir` (as in the official schema).
@@ -114,3 +114,13 @@ Errors use `{"type":"error","error":{"type":"...","message":"...","http_code":"4
 | 500 | `server_error` |
 | 503 | `overloaded_error` (HTTP status stays 503, with `Retry-After`) |
 | 403 / 404 / 405 / 409 | `authorized_error` / `not_found_error` / `method_not_allowed_error` / `conflict_error` |
+
+## Changes (2026-10-23)
+
+For integrators already calling these endpoints:
+
+- The model is reported as `MiniMax-H3` in query and list responses. Requests accept both `MiniMax-H3` and the legacy `minimax-h3`, including `filter.model` and `h3_context_ir`. `MiniMax-H3-Max` is rejected (400).
+- `error.type` was renamed to the official set: 503 is now `overloaded_error` (was `service_unavailable_error`) and a full-queue 429 is now `rate_limit_error` (was `insufficient_compute_error`). `error.code` (still `insufficient_compute` for a full queue), `retryable` and the HTTP status are unchanged.
+- `content` is omitted from a succeeded task when there is no URL or prompt (it was `{"url": null}`).
+- `duration: 4` is rejected up front (400) on all prefixes, including `/video/minimax-h3/v2/video_generation` (it used to pass request validation and fail later) and `h3_context_ir`.
+- New: `updated_at` on every task, `usage.input_seconds` / `usage.input_audio_seconds` where measured, token usage and `content.prompt` on `h3_context_ir` tasks, and the optional `extra.prompt_expansion_mode` request field.

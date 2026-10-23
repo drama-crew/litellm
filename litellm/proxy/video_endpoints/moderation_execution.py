@@ -468,6 +468,17 @@ async def _close_dead_upstream(store: MeteringStore, intent_id: str, native_id: 
     return "closed"
 
 
+def _token_usage(value: object) -> dict[str, int]:
+    """Integer token counts of a Context IR task for the output facts; cost and anything non-integer is dropped."""
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: count
+        for key in ("total_tokens", "prompt_tokens", "completion_tokens")
+        if isinstance(count := value.get(key), int) and not isinstance(count, bool)
+    }
+
+
 @router.post("/collect", include_in_schema=False)
 async def collect(body: Ticket, request: Request, authorization: Annotated[str | None, Header()] = None):
     claims = authorize(body.ticket, authorization, "collect")
@@ -497,7 +508,14 @@ async def collect(body: Ticket, request: Request, authorization: Annotated[str |
                 f"/intents/{claims.intent_id}/financial-event",
                 {"ticket": body.ticket, "native_id": native_id, "metering_event": phase.model_dump(mode="json")},
             )
-        facts = {"status": ir.status, "content": ir.public().get("content"), "media_type": "text"}
+        public = ir.public()
+        usage = _token_usage(public.get("usage"))
+        facts = {
+            "status": ir.status,
+            "content": public.get("content"),
+            "media_type": "text",
+            **({"usage": usage} if usage else {}),
+        }
     elif task["route"] == "avideo_create_character":
         from litellm.proxy.video_endpoints.endpoints import video_get_character
 

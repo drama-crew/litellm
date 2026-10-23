@@ -670,3 +670,88 @@ async def test_execute_never_answers_not_sent_once_a_provider_attempt_succeeded(
     assert caught.value is failure
     assert execution.failure_outcome(failure) == "ambiguous"
     scope.store.void_unsent.assert_not_awaited()
+
+
+def _ir_task(status, public):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(status=status, public=lambda: public)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "public,expected_usage",
+    [
+        (
+            {
+                "content": {"prompt": "P"},
+                "usage": {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50, "cost": 0.5},
+            },
+            {"total_tokens": 50, "prompt_tokens": 30, "completion_tokens": 20},
+        ),
+        # Integers only: bools, floats, strings and unknown keys are dropped; absent usage omits the key.
+        (
+            {
+                "content": {"prompt": "P"},
+                "usage": {"total_tokens": True, "prompt_tokens": 1.5, "completion_tokens": "2", "cost": 1},
+            },
+            None,
+        ),
+        (
+            {"content": {"prompt": "P"}, "usage": {"total_tokens": 7, "prompt_tokens": 3}},
+            {"total_tokens": 7, "prompt_tokens": 3},
+        ),
+        ({"usage": {}}, None),
+        ({}, None),
+    ],
+)
+async def test_context_ir_collect_posts_integer_token_usage_in_the_output_facts(monkeypatch, public, expected_usage):
+    from litellm.llms.causyn import context_ir
+
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", SECRET)
+    monkeypatch.setattr(
+        context_ir,
+        "get_context_ir_service",
+        lambda: type(
+            "S",
+            (),
+            {"store": type("St", (), {"get": staticmethod(lambda native_id: _done(_ir_task("succeeded", public)))})()},
+        )(),
+    )
+    monkeypatch.setattr(context_ir, "financial_event", lambda task: None)
+    posts = []
+
+    async def platform(request, method, path, payload):
+        posts.append((path, payload))
+        if path.endswith("/execution"):
+            return {
+                "state": "submitted",
+                "native_id": "h3_ir_1",
+                "route": "context_ir",
+                "principal": {"fingerprint": "key", "user_id": "user", "team_id": "team"},
+            }
+        return {}
+
+    monkeypatch.setattr(execution.bridge, "platform", platform)
+    app = FastAPI()
+    app.include_router(execution.router)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://fork") as client:
+        response = await client.post(
+            "/internal/moderation/collect",
+            json={"ticket": ticket(purpose="collect")},
+            headers={"Authorization": "Bearer " + SECRET},
+        )
+    assert response.status_code == 200 and response.json() == {"accepted": True}
+    output_path, output = posts[-1]
+    assert output_path.endswith("/output")
+    facts = output["facts"]
+    assert facts["status"] == "succeeded" and facts["media_type"] == "text"
+    assert facts["content"] == public.get("content")
+    if expected_usage is None:
+        assert "usage" not in facts
+    else:
+        assert facts["usage"] == expected_usage
+
+
+async def _done(value):
+    return value
