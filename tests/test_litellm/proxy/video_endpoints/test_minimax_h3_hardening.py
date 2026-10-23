@@ -282,10 +282,10 @@ def test_fallback_does_not_shadow_real_routes_or_other_prefixes(stack):
 
 def test_error_types_cover_409_and_503():
     assert h3.ERROR_TYPES[409] == "conflict_error"
-    assert h3.ERROR_TYPES[503] == "service_unavailable_error"
+    assert h3.ERROR_TYPES[503] == "overloaded_error"
     assert h3.ERROR_TYPES[405] == "method_not_allowed_error"
     assert json.loads(h3.error_response(409, "x").body)["error"]["type"] == "conflict_error"
-    assert json.loads(h3.error_response(503, "x").body)["error"]["type"] == "service_unavailable_error"
+    assert json.loads(h3.error_response(503, "x").body)["error"]["type"] == "overloaded_error"
 
 
 # ------------------------------------------------------------------ F4/F5: 409 and 503 mapping
@@ -355,7 +355,7 @@ def test_genuine_platform_failures_stay_503(stack, status):
     state["reply"] = lambda request, data: httpx.Response(status, text="boom")
     response = client.post("/video/minimax-h3/v2/video_generation", json=body(), headers=HEADERS)
     assert response.status_code == 503
-    assert response.json()["error"]["type"] == "service_unavailable_error"
+    assert response.json()["error"]["type"] == "overloaded_error"
     assert "boom" not in response.text
 
 
@@ -398,7 +398,7 @@ def test_direct_queue_saturation_is_retryable_and_proven_not_sent(stack):
     assert response.status_code == 429
     error = response.json()["error"]
     assert error["code"] == "insufficient_compute" and error["retryable"] is True
-    assert error["type"] == "insufficient_compute_error"
+    assert error["type"] == "rate_limit_error"
     assert response.headers["Retry-After"] == "10"
     assert response.headers["x-drama-submission"] == "not_sent"
     assert response.headers["x-request-id"] == response.json()["request_id"]
@@ -549,3 +549,175 @@ def test_test_prefix_rejects_routing_and_admission_overrides(stack, prefix, head
     response = client.post(prefix + "/v2/video_generation", json=body(), headers={**HEADERS, header: "x"})
     assert response.status_code == 400
     assert not state["platform"]
+
+
+# ------------------------------------------------------------------ official V2 parity: error types, updated_at, usage
+
+
+@pytest.mark.parametrize(
+    "status,official_type,code",
+    [
+        (400, "bad_request_error", "invalid_request"),
+        (401, "authorized_error", "invalid_api_key"),
+        (402, "insufficient_balance_error", "insufficient_balance"),
+        (403, "authorized_error", "permission_denied"),
+        (404, "not_found_error", "task_not_found"),
+        (405, "method_not_allowed_error", "method_not_allowed"),
+        (409, "conflict_error", "task_state_conflict"),
+        (422, "unprocessable_entity_error", "unsupported_parameter"),
+        (429, "rate_limit_error", "rate_limit_exceeded"),
+        (500, "server_error", "internal_error"),
+        (503, "overloaded_error", "service_unavailable"),
+    ],
+)
+def test_error_type_follows_the_official_set_and_keeps_our_extension_fields(status, official_type, code):
+    payload = json.loads(h3.error_response(status, "boom").body)
+    assert payload["type"] == "error" and payload["request_id"]
+    assert payload["error"] == {
+        "type": official_type,
+        "code": code,
+        "message": "boom",
+        "http_code": str(status),
+        "retryable": status in (429, 500, 503),
+    }
+
+
+def test_queue_full_429_is_a_rate_limit_error_that_keeps_its_code(stack):
+    client, _, state = stack
+    state["reply"] = lambda request, data: httpx.Response(
+        429, json={"detail": {"code": "queue_full", "message": "queue full"}}
+    )
+    response = client.post("/video/minimax-h3/direct/v2/video_generation", json=body(), headers=HEADERS)
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "rate_limit_error"
+    assert response.json()["error"]["code"] == "insufficient_compute"
+    assert response.headers["Retry-After"]
+
+
+def _completed(state, **extra):
+    return state["view"](
+        "mod_video_1",
+        state="completed",
+        moderation_status="approved",
+        output={"url": "https://media.example/out.mp4"},
+        **extra,
+    )
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_query_and_list_carry_updated_at_from_the_platform_view_when_it_has_one(stack, prefix):
+    client, _, state = stack
+    state["reply"] = lambda request, data: httpx.Response(
+        200,
+        json={"items": [_completed(state, updated_at=1234)], "total": 1}
+        if request.url.path.endswith("/list")
+        else _completed(state, updated_at=1234),
+    )
+    queried = client.get(prefix + "/v2/query/video_generation/mod_video_1", headers=HEADERS).json()["task"]
+    listed = client.get(prefix + "/v2/query/video_generation", headers=HEADERS).json()["items"][0]
+    assert queried["updated_at"] == listed["updated_at"] == 1234
+    assert queried["created_at"] == 1
+
+
+def test_updated_at_falls_back_to_the_only_real_timestamp_the_view_has(stack):
+    client, _, state = stack
+    state["reply"] = lambda request, data: httpx.Response(200, json=_completed(state))
+    task = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS).json()["task"]
+    assert task["updated_at"] == task["created_at"] == 1
+
+
+def test_updated_at_is_an_int_unix_second_even_if_the_platform_sends_a_float(stack):
+    client, _, state = stack
+    state["reply"] = lambda request, data: httpx.Response(200, json=_completed(state, updated_at=1234.9))
+    task = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS).json()["task"]
+    assert task["updated_at"] == 1234 and isinstance(task["updated_at"], int)
+
+
+def test_usage_adds_official_input_seconds_only_from_facts(stack):
+    client, _, state = stack
+    usage = {
+        "total_seconds": 5,
+        "output_seconds": 5,
+        "input_image_count": 2,
+        "input_video_count": 0,
+        "input_audio_count": 0,
+    }
+    state["reply"] = lambda request, data: httpx.Response(200, json=_completed(state, usage=usage))
+    task = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS).json()["task"]
+    # No reference video was submitted, so zero input seconds is a fact; no audio, so the audio field is absent.
+    assert task["usage"] == {**usage, "input_seconds": 0}
+    assert "input_audio_seconds" not in task["usage"]
+
+
+def test_usage_never_fabricates_reference_seconds_when_the_platform_did_not_measure_them(stack):
+    client, _, state = stack
+    usage = {
+        "total_seconds": 5,
+        "output_seconds": 5,
+        "input_image_count": 0,
+        "input_video_count": 1,
+        "input_audio_count": 1,
+    }
+    state["reply"] = lambda request, data: httpx.Response(200, json=_completed(state, usage=usage))
+    task = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS).json()["task"]
+    assert task["usage"] == usage
+    assert "input_seconds" not in task["usage"] and "input_audio_seconds" not in task["usage"]
+
+
+def test_usage_passes_measured_reference_seconds_through(stack):
+    client, _, state = stack
+    usage = {
+        "total_seconds": 11,
+        "output_seconds": 5,
+        "input_seconds": 6,
+        "input_audio_seconds": 4,
+        "input_image_count": 1,
+        "input_video_count": 1,
+        "input_audio_count": 1,
+    }
+    state["reply"] = lambda request, data: httpx.Response(200, json=_completed(state, usage=usage))
+    task = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS).json()["task"]
+    assert task["usage"] == usage
+
+
+def test_usage_is_only_reported_for_succeeded_tasks(stack):
+    client, _, state = stack
+    state["reply"] = lambda request, data: httpx.Response(
+        200, json=state["view"]("mod_video_1", usage={"total_seconds": 5, "output_seconds": 5})
+    )
+    assert (
+        "usage"
+        not in client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS).json()["task"]
+    )
+
+
+def test_context_ir_task_reports_prompt_and_token_usage_without_a_video_url(stack):
+    client, _, state = stack
+    tokens = {"total_tokens": 30, "prompt_tokens": 10, "completion_tokens": 20}
+    view = state["view"](
+        "mod_video_1",
+        state="completed",
+        moderation_status="bypassed",
+        output={"content": {"prompt": "A structured prompt"}},
+        usage=tokens,
+        parameters={"modality": "text", "task_type": "h3_context_ir", "model": "MiniMax-H3", "duration": 5},
+    )
+    state["reply"] = lambda request, data: httpx.Response(200, json=view)
+    task = client.get("/video/minimax-h3/v2/query/video_generation/mod_video_1", headers=HEADERS).json()["task"]
+    assert task["task_type"] == "h3_context_ir" and task["model"] == "MiniMax-H3"
+    assert task["content"] == {"prompt": "A structured prompt"}
+    assert task["usage"] == tokens
+    assert task["updated_at"] == 1
+
+
+def test_bridge_view_accepts_a_platform_that_predates_updated_at():
+    view = bridge.View(
+        id="mod_video_old",
+        state="queued",
+        model="causyn-1.1",
+        moderation_status="pending",
+        policy_source="model",
+        created_at=7,
+    )
+    assert view.updated_at is None
+    assert bridge.v2_task(bridge.video(view), h3=True)["updated_at"] == 7

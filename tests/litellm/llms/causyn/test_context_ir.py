@@ -103,6 +103,12 @@ async def test_result_reused_after_settlement_failure_and_duplicate_delivery(red
     assert payload["response_cost"] == 4
     assert payload["task_type"] == "h3_context_ir"
     assert "cost" not in ready.public()["usage"]
+    public = ready.public()
+    # Official task object: model name, last-update timestamp, enhanced prompt and token usage.
+    assert public["model"] == "MiniMax-H3" and public["task_type"] == "h3_context_ir"
+    assert isinstance(public["updated_at"], int) and public["updated_at"] >= public["created_at"]
+    assert public["content"] == {"prompt": PROMPT}
+    assert public["usage"] == {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}
 
 
 @pytest.mark.asyncio

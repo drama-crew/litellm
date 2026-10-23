@@ -37,7 +37,7 @@ class ListParams(BaseModel):
         default=None, alias="filter.status"
     )
     task_ids: tuple[str, ...] = Field(default=(), alias="filter.task_ids")
-    model: Literal["minimax-h3"] | None = Field(default=None, alias="filter.model")
+    model: Literal["MiniMax-H3", "minimax-h3"] | None = Field(default=None, alias="filter.model")
     task_type: Literal["generation", "h3_context_ir", "regeneration"] | None = Field(
         default=None, alias="filter.task_type"
     )

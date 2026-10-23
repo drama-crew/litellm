@@ -15,6 +15,7 @@ from litellm.proxy.video_endpoints import context_ir_endpoints
 from litellm.proxy.video_endpoints import minimax_h3_endpoints as h3
 from litellm.proxy.video_endpoints import moderation_bridge as bridge
 from litellm.proxy.video_endpoints.minimax_h3_models import (
+    DURATION_MESSAGE,
     MiniMaxH3Content,
     MiniMaxH3Create,
     MiniMaxTask,
@@ -113,7 +114,7 @@ def test_durable_intake_query_list_cancel_and_namespace_owner_binding(api, prefi
     queried = client.get(path, headers=headers)
     assert queried.status_code == 200, queried.text
     task = queried.json()["task"]
-    assert (task["id"], task["model"], task["status"], task["resolution"]) == (task_id, "minimax-h3", "running", "768P")
+    assert (task["id"], task["model"], task["status"], task["resolution"]) == (task_id, "MiniMax-H3", "running", "768P")
     assert task["moderation_status"] == "pending"
     assert "content" not in task and "private.invalid" not in queried.text
     listed = client.get(prefix + "/v2/query/video_generation?filter.model=minimax-h3", headers=headers)
@@ -136,7 +137,7 @@ def test_durable_intake_query_list_cancel_and_namespace_owner_binding(api, prefi
         {"duration": 3},
         {"duration": 16},
         {"ratio": "adaptive"},
-        {"model": "MiniMax-H3"},
+        {"model": "MiniMax-H3-Max"},
         {"model": "causyn-1.1"},
         {"resolution": "2K"},
         {"resolution": "480P"},
@@ -258,8 +259,9 @@ def test_approved_projection_has_public_model_and_usage():
         usage={"total_seconds": 5, "output_seconds": 5, "input_image_count": 2},
     )
     result = bridge.v2_task(bridge.video(view), h3=True)
-    assert result["model"] == "minimax-h3"
+    assert result["model"] == "MiniMax-H3"
     assert result["usage"]["input_image_count"] == 2
+    assert result["updated_at"] == 1
     assert result["content"]["url"].endswith("result.mp4")
 
 
@@ -412,3 +414,176 @@ def test_test_prefix_mirrors_every_v2_route_of_the_production_facade():
     assert suffixes("/video/minimax-h3-test/direct") == suffixes("/video/minimax-h3/direct")
     assert ("POST", "/v2/h3_context_ir") in suffixes("/video/minimax-h3-test")
     assert len(suffixes("/video/minimax-h3-test")) >= 4
+
+
+# --- MiniMax official V2 parity (model alias, extra, duration, error types) ----------------------------------
+
+HEADERS = {"Authorization": "Bearer allowed"}
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+@pytest.mark.parametrize("model", ["MiniMax-H3", "minimax-h3"])
+def test_official_and_legacy_model_names_submit_the_same_internal_request(api, prefix, model):
+    client, calls, normalized, _ = api
+    created = client.post(prefix + "/v2/video_generation", json=body(model=model), headers=HEADERS)
+    assert created.status_code == 200, created.text
+    assert normalized[0]["model"] == "causyn-1.1"
+    payload = calls[0][1]["payload"]
+    assert payload["model"] == "causyn-1.1" and "extra" not in payload
+    assert calls[0][1]["namespace"] == TEST_NAMESPACES[prefix]
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_h3_max_is_rejected_with_a_clear_message_before_admission(api, prefix):
+    client, calls, _, _ = api
+    response = client.post(prefix + "/v2/video_generation", json=body(model="MiniMax-H3-Max"), headers=HEADERS)
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["type"] == "bad_request_error"
+    assert "MiniMax-H3-Max" in error["message"] and "not available" in error["message"]
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_query_and_list_report_the_official_model_name_and_filter_accepts_both(api, prefix):
+    client, calls, _, _ = api
+    task_id = client.post(prefix + "/v2/video_generation", json=body(model="minimax-h3"), headers=HEADERS).json()[
+        "task_id"
+    ]
+    assert client.get(prefix + "/v2/query/video_generation/" + task_id, headers=HEADERS).json()["task"]["model"] == (
+        "MiniMax-H3"
+    )
+    for spelling in ("MiniMax-H3", "minimax-h3"):
+        listed = client.get(prefix + "/v2/query/video_generation?filter.model=" + spelling, headers=HEADERS)
+        assert listed.status_code == 200, listed.text
+        assert [item["model"] for item in listed.json()["items"]] == ["MiniMax-H3"]
+        assert calls[-1][1]["model"] == "causyn-1.1"
+    rejected = client.get(prefix + "/v2/query/video_generation?filter.model=MiniMax-H3-Max", headers=HEADERS)
+    assert rejected.status_code == 400
+
+
+@pytest.mark.parametrize("prefix", ["/video/minimax-h3", "/video/minimax-h3-test"])
+@pytest.mark.parametrize("model", ["MiniMax-H3", "minimax-h3"])
+def test_standalone_context_ir_accepts_both_model_spellings(api, monkeypatch, prefix, model):
+    monkeypatch.setattr(context_ir_endpoints, "get_context_ir_service", lambda: object())
+    client, calls, normalized, _ = api
+    data = {k: v for k, v in body(model=model).items() if k != "resolution"}
+    response = client.post(prefix + "/v2/h3_context_ir", json=data, headers=HEADERS)
+    assert response.status_code == 200, response.text
+    assert calls and calls[0][1]["payload"]["model"] == "MiniMax-H3"
+    assert normalized[0]["model"] == "causyn-1.1"
+
+
+@pytest.mark.parametrize("model", ["MiniMax-H3-Max", "causyn-1.1", "nope"])
+def test_standalone_context_ir_rejects_other_models(api, model):
+    client, calls, _, _ = api
+    data = {k: v for k, v in body(model=model).items() if k != "resolution"}
+    response = client.post("/video/minimax-h3/v2/h3_context_ir", json=data, headers=HEADERS)
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["type"] == "bad_request_error"
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+@pytest.mark.parametrize("duration", [4])
+def test_duration_4_is_rejected_up_front_on_every_flavor_with_one_message(api, prefix, duration):
+    client, calls, _, _ = api
+    response = client.post(prefix + "/v2/video_generation", json=body(duration=duration), headers=HEADERS)
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["type"] == "bad_request_error"
+    assert "5" in error["message"] and "15" in error["message"] and "4" in error["message"]
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", ["/video/minimax-h3", "/video/minimax-h3-test"])
+def test_standalone_context_ir_duration_4_matches_the_generation_message(api, prefix):
+    client, calls, _, _ = api
+    data = {k: v for k, v in body(duration=4).items() if k != "resolution"}
+    generation = client.post(prefix + "/v2/video_generation", json=body(duration=4), headers=HEADERS)
+    response = client.post(prefix + "/v2/h3_context_ir", json=data, headers=HEADERS)
+    assert response.status_code == 400, response.text
+    assert DURATION_MESSAGE in response.json()["error"]["message"]
+    assert DURATION_MESSAGE in generation.json()["error"]["message"]
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", PREFIXES + TEST_PREFIXES)
+@pytest.mark.parametrize("duration", [5, 15])
+def test_duration_bounds_5_and_15_are_accepted(api, prefix, duration):
+    client, _, _, _ = api
+    assert (
+        client.post(prefix + "/v2/video_generation", json=body(duration=duration), headers=HEADERS).status_code == 200
+    )
+
+
+def _flavor(prefix):
+    return "direct" if prefix.endswith("/direct") else "ir"
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+@pytest.mark.parametrize("mode", [None, "disabled", "balanced", "quality"])
+def test_extra_prompt_expansion_mode_semantics_per_flavor(api, prefix, mode):
+    client, calls, _, _ = api
+    extra = {} if mode is None else {"extra": {"prompt_expansion_mode": mode}}
+    response = client.post(prefix + "/v2/video_generation", json=body(**extra), headers=HEADERS)
+    direct = _flavor(prefix) == "direct"
+    acceptable = {None, "disabled"} if direct else {None, "balanced", "quality"}
+    if mode in acceptable:
+        assert response.status_code == 200, response.text
+        assert "extra" not in calls[0][1]["payload"]
+        return
+    assert response.status_code == 422, response.text
+    error = response.json()["error"]
+    assert error["type"] == "unprocessable_entity_error" and error["code"] == "unsupported_parameter"
+    pointer = prefix.removesuffix("/direct") if direct else prefix + "/direct"
+    assert pointer in error["message"]
+    assert not calls
+
+
+def test_extra_allows_an_empty_object_and_rejects_everything_else(api):
+    client, calls, _, _ = api
+    assert client.post("/video/minimax-h3/v2/video_generation", json=body(extra={}), headers=HEADERS).status_code == 200
+    calls.clear()
+    for bad in (
+        {"prompt_expansion_mode": "balance"},
+        {"prompt_expansion_mode": ""},
+        {"prompt_expansion_mode": True},
+        {"prompt_expansion_mode": None},
+        {"other": 1},
+        {"prompt_expansion_mode": "quality", "other": 1},
+        "balanced",
+        ["quality"],
+    ):
+        response = client.post("/video/minimax-h3/v2/video_generation", json=body(extra=bad), headers=HEADERS)
+        assert response.status_code == 400, (bad, response.text)
+        assert response.json()["error"]["type"] == "bad_request_error"
+    assert not calls
+
+
+def test_extra_is_not_a_context_ir_field(api):
+    client, calls, _, _ = api
+    data = {k: v for k, v in body(extra={"prompt_expansion_mode": "quality"}).items() if k != "resolution"}
+    assert client.post("/video/minimax-h3/v2/h3_context_ir", json=data, headers=HEADERS).status_code == 400
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", PREFIXES)
+@pytest.mark.parametrize("resolution", ["2K", "480P"])
+def test_unavailable_resolutions_keep_an_explicit_400(api, prefix, resolution):
+    client, calls, _, _ = api
+    response = client.post(prefix + "/v2/video_generation", json=body(resolution=resolution), headers=HEADERS)
+    assert response.status_code == 400
+    assert resolution in response.json()["error"]["message"] and "768P" in response.json()["error"]["message"]
+    assert not calls
+
+
+def test_mm_file_urls_get_an_explicit_message(api):
+    client, calls, _, _ = api
+    content = body()["content"] + [
+        {"type": "image_url", "image_url": {"url": "mm_file://abc"}, "role": "reference_image"}
+    ]
+    response = client.post("/video/minimax-h3/v2/video_generation", json=body(content=content), headers=HEADERS)
+    assert response.status_code == 400
+    assert "mm_file" in response.json()["error"]["message"]
+    assert not calls

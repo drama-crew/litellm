@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from typing_extensions import Self
 
 from litellm.litellm_core_utils.causyn_reference_limits import reference_count_limit_violation
+from litellm.proxy.video_endpoints.minimax_h3_paths import LEGACY_PUBLIC_MODEL, PUBLIC_MODEL, UNAVAILABLE_PUBLIC_MODEL
 
 ModelName = Literal["MiniMax-H3", "MiniMax-H3-Max", "causyn-1.1"]
 ContentModel = TypeVar("ContentModel", bound=str)
@@ -25,6 +26,27 @@ MODEL_ROUTES: dict[str, str] = {
 }
 TASK_PREFIX = "h3_task_"
 TASK_TTL = 7 * 24 * 3600
+PromptExpansionMode = Literal["disabled", "balanced", "quality"]
+# Public duration window. The official API also lists 4 s for MiniMax-H3, which this deployment does not offer yet.
+MIN_PUBLIC_DURATION = 5
+MAX_PUBLIC_DURATION = 15
+DURATION_MESSAGE = (
+    f"duration must be an integer from {MIN_PUBLIC_DURATION} through {MAX_PUBLIC_DURATION} seconds "
+    "(4 s is not offered yet)"
+)
+
+
+def canonical_public_model(value: object) -> str:
+    """Official ``MiniMax-H3`` (canonical) or its legacy ``minimax-h3`` alias; anything else is a clear 400."""
+    if value in (PUBLIC_MODEL, LEGACY_PUBLIC_MODEL):
+        return PUBLIC_MODEL
+    if value == UNAVAILABLE_PUBLIC_MODEL:
+        raise ValueError(f"model {UNAVAILABLE_PUBLIC_MODEL} is not available on this service; use {PUBLIC_MODEL}")
+    raise ValueError(f"model must be {PUBLIC_MODEL}")
+
+
+def resolution_unavailable(resolution: str) -> str:
+    return f"resolution {resolution} is not available on this service; only 768P is supported"
 
 
 class StrictModel(BaseModel):
@@ -46,6 +68,11 @@ class MediaURL(StrictModel):
             except ValueError as exc:
                 raise ValueError("invalid Base64 media") from exc
             return value
+        if value.startswith("mm_file://"):
+            raise ValueError(
+                "mm_file:// references are not supported (no file-upload API here); "
+                "provide a public HTTP(S) URL or a Base64 data URL"
+            )
         raise ValueError("media must be a public HTTP(S) URL or Base64 data URL")
 
 
@@ -112,7 +139,7 @@ class H3Content(StrictModel, Generic[ContentModel]):
             if self.duration < 5 or self.resolution == "2K":
                 raise ValueError("MiniMax-H3-Max supports 5-15 seconds and 480P/768P")
         elif self.resolution == "480P":
-            raise ValueError("MiniMax-H3 supports 768P/2K")
+            raise ValueError(resolution_unavailable("480P"))
         keyframes = [item for item in images if item.role != "reference_image"]
         references = [item for item in images if item.role == "reference_image"]
         if self.model == "causyn-1.1":
@@ -190,11 +217,43 @@ class MiniMaxH3Content(H3Content[ModelName]):
 MAX_REFERENCE_ITEMS = 12
 
 
-class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
+class ExtraOptions(StrictModel):
+    """Official ``extra`` object: ``prompt_expansion_mode`` is its only key."""
+
+    prompt_expansion_mode: PromptExpansionMode | None = None
+
+    @field_validator("prompt_expansion_mode", mode="before")
+    @classmethod
+    def reject_explicit_null(cls, value: object) -> object:
+        if value is None:
+            raise ValueError("prompt_expansion_mode must be one of disabled, balanced, quality")
+        return value
+
+
+class MiniMaxH3Create(H3Content[Literal["MiniMax-H3"]]):
+    duration: int = Field(strict=True)
+    extra: ExtraOptions | None = None
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def accept_official_and_legacy_name(cls, value: object) -> str:
+        return canonical_public_model(value)
+
+    @field_validator("duration")
+    @classmethod
+    def supported_duration(cls, value: int) -> int:
+        if not MIN_PUBLIC_DURATION <= value <= MAX_PUBLIC_DURATION:
+            raise ValueError(DURATION_MESSAGE)
+        return value
+
+    @property
+    def prompt_expansion_mode(self) -> PromptExpansionMode | None:
+        return self.extra.prompt_expansion_mode if self.extra else None
+
     @model_validator(mode="after")
     def validate_hyperflow(self) -> Self:
         if self.resolution != "768P":
-            raise ValueError("minimax-h3 supports 768P resolution")
+            raise ValueError(resolution_unavailable(self.resolution))
         videos = [item for item in self.content if isinstance(item, VideoItem)]
         audios = [item for item in self.content if isinstance(item, AudioItem)]
         images = [item for item in self.content if isinstance(item, ImageItem) and item.role == "reference_image"]
@@ -230,8 +289,6 @@ class MiniMaxH3Create(H3Content[Literal["minimax-h3"]]):
 
 class MiniMaxH3DirectCreate(MiniMaxH3Create):
     """Direct facade: same limits as the IR prefix; its prompt is passed unchanged instead of being rewritten."""
-
-    duration: int = Field(ge=5, le=15, strict=True)
 
 
 class MiniMaxTask(StrictModel):

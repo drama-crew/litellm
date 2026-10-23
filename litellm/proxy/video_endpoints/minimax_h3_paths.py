@@ -11,7 +11,10 @@ TEST_IR_PREFIX = "/video/minimax-h3-test"
 TEST_DIRECT_PREFIX = TEST_IR_PREFIX + "/direct"
 TEST_PREFIXES = (TEST_IR_PREFIX, TEST_DIRECT_PREFIX)
 ALL_PREFIXES = PREFIXES + TEST_PREFIXES
-PUBLIC_MODEL = "minimax-h3"
+# Official MiniMax V2 model name; the lower-case spelling is the legacy alias still accepted on input.
+PUBLIC_MODEL = "MiniMax-H3"
+LEGACY_PUBLIC_MODEL = "minimax-h3"
+UNAVAILABLE_PUBLIC_MODEL = "MiniMax-H3-Max"
 INTERNAL_MODEL = "causyn-1.1"
 Namespace = Literal["minimax-h3", "minimax-h3-direct", "minimax-h3-test", "minimax-h3-direct-test"]
 WORKER_POOL_TEST = "test"

@@ -15,7 +15,14 @@ from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from litellm.proxy._types import UserAPIKeyAuth
-from litellm.proxy.video_endpoints.minimax_h3_paths import DIRECT_PREFIX, IR_PREFIX, TEST_DIRECT_PREFIX, TEST_IR_PREFIX
+from litellm.proxy.video_endpoints.minimax_h3_paths import (
+    DIRECT_PREFIX,
+    IR_PREFIX,
+    LEGACY_PUBLIC_MODEL,
+    PUBLIC_MODEL,
+    TEST_DIRECT_PREFIX,
+    TEST_IR_PREFIX,
+)
 from litellm.types.videos.main import CharacterObject, VideoObject
 
 PREFIX = "mod_video_"
@@ -58,6 +65,9 @@ class View(BaseModel):
     # Optional so a platform that predates the field still parses.
     error_message: str | None = None
     error: dict[str, JsonValue] | None = None
+    # Unix seconds of the task's last status change. Optional so a platform that predates the field still parses;
+    # without it the public task falls back to ``created_at`` (the only real timestamp the view carries).
+    updated_at: float | None = None
 
 
 # Seconds a client should wait after a saturated media-validation 503 (Retry-After).
@@ -258,7 +268,11 @@ def video(view: View) -> VideoObject:
         error=view.error
         or ({"code": "input_media_rejected", "message": view.error_message} if view.error_message else None),
     )
-    result._hidden_params = {"moderation_public_parameters": view.parameters, "moderation_public_usage": view.usage}
+    result._hidden_params = {
+        "moderation_public_parameters": view.parameters,
+        "moderation_public_usage": view.usage,
+        "moderation_public_updated_at": None if view.updated_at is None else int(view.updated_at),
+    }
     if view.state == "completed" and isinstance(output.get("url"), str):
         result._hidden_params = {**result._hidden_params, "url": output["url"]}
     if view.state == "completed" and isinstance(output.get("content"), dict):
@@ -277,13 +291,28 @@ def character(result: VideoObject) -> CharacterObject:
     )
 
 
+def public_usage(usage: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    """Official usage fields from the platform's facts; our extra counters stay as extensions.
+
+    ``input_seconds`` is only derived where it is a fact: an explicit zero reference-video count means zero
+    reference-video seconds. A task that did have reference video/audio is reported with whatever seconds the
+    platform measured; unmeasured seconds are left out rather than guessed.
+    """
+    reported = dict(usage)
+    if "output_seconds" in reported and "input_seconds" not in reported and reported.get("input_video_count") == 0:
+        reported["input_seconds"] = 0
+    return reported
+
+
 def v2_task(result: VideoObject, *, h3: bool = False) -> dict[str, JsonValue]:
     params = JSON_OBJECT.validate_python(result._hidden_params.get("moderation_public_parameters") or {})
+    updated_at = result._hidden_params.get("moderation_public_updated_at")
     public = {
         "id": result.id,
         "model": {"hailuo-h3": "MiniMax-H3", "hailuo-h3-max": "MiniMax-H3-Max"}.get(result.model or "", result.model),
         "status": {"completed": "succeeded", "in_progress": "running"}.get(result.status, result.status),
         "created_at": result.created_at,
+        "updated_at": result.created_at if updated_at is None else updated_at,
         "moderation_status": result.moderation_status,
         "generation_status": result.generation_status,
         "modality": "video",
@@ -293,20 +322,16 @@ def v2_task(result: VideoObject, *, h3: bool = False) -> dict[str, JsonValue]:
     if result.error and result.status == "failed":
         public["error"] = result.error
     if h3:
-        public["model"] = "minimax-h3"
+        public["model"] = PUBLIC_MODEL
         if "resolution" in public:
             public["resolution"] = str(public["resolution"]).upper()
         if result.status == "completed" and result._hidden_params.get("moderation_public_usage"):
-            public["usage"] = result._hidden_params["moderation_public_usage"]
+            public["usage"] = public_usage(result._hidden_params["moderation_public_usage"])
+    content = result._hidden_params.get("content") or (
+        {"url": result._hidden_params["url"]} if result._hidden_params.get("url") else None
+    )
     return JSON_OBJECT.validate_python(
-        {
-            **public,
-            **(
-                {"content": result._hidden_params.get("content") or {"url": result._hidden_params.get("url")}}
-                if result.status == "completed"
-                else {}
-            ),
-        }
+        {**public, **({"content": content} if result.status == "completed" and content else {})}
     )
 
 
@@ -326,7 +351,7 @@ async def list_tasks(request: Request, auth: UserAPIKeyAuth, *, v2: bool = False
             "limit": params.page_size,
             "offset": (params.page_num - 1) * params.page_size,
             "status": params.status,
-            "model": "causyn-1.1" if params.model == "minimax-h3" else params.model,
+            "model": "causyn-1.1" if params.model in (PUBLIC_MODEL, LEGACY_PUBLIC_MODEL) else params.model,
             "namespace": request.scope.get("h3_namespace"),
             "task_type": params.task_type,
             "task_ids": list(params.task_ids),

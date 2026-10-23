@@ -32,14 +32,19 @@ from litellm.proxy.common_utils.http_parsing_utils import _safe_set_request_pars
 from litellm.proxy.spend_tracking.budget_reservation import release_budget_reservation
 from litellm.proxy.video_endpoints import endpoints, moderation_bridge
 from litellm.proxy.video_endpoints.minimax_h3_models import (
+    DURATION_MESSAGE,
+    MAX_PUBLIC_DURATION,
+    MIN_PUBLIC_DURATION,
     AudioItem,
     MiniMaxH3Create,
     MiniMaxH3DirectCreate,
+    canonical_public_model,
 )
 from litellm.proxy.video_endpoints.minimax_h3_paths import (
     DIRECT_PREFIX,
     INTERNAL_MODEL,
     IR_PREFIX,
+    PUBLIC_MODEL,
     TEST_DIRECT_PREFIX,
     TEST_IR_PREFIX,
     WORKER_POOL_TEST,
@@ -60,7 +65,8 @@ ERROR_TYPES = {
     422: "unprocessable_entity_error",
     429: "rate_limit_error",
     500: "server_error",
-    503: "service_unavailable_error",
+    # The official name for a saturated/unavailable backend; the HTTP status stays 503.
+    503: "overloaded_error",
 }
 INVALID_KEY_MESSAGE = "Invalid or missing API key"
 # Key material that an upstream auth message may carry: virtual keys and 64-hex key hashes.
@@ -131,9 +137,7 @@ def error_response(code: int, message: str, *, error_code: str | None = None) ->
         ),
         content=ErrorEnvelope(
             error=PublicError(
-                type="insufficient_compute_error"
-                if public_code == "insufficient_compute"
-                else ERROR_TYPES.get(code, "server_error"),
+                type=ERROR_TYPES.get(code, "server_error"),
                 code=public_code,
                 message=message,
                 http_code=str(code),
@@ -220,6 +224,29 @@ async def read_json_body(request: Request) -> bytearray:
     return raw
 
 
+def reject_mismatched_prompt_expansion(spec: MiniMaxH3Create, path: str, is_direct: bool) -> None:
+    """``extra.prompt_expansion_mode`` picks the flavor: the IR prefix rewrites, the direct prefix never does.
+
+    The mode itself is not forwarded; it only has to agree with the base URL the caller chose.
+    """
+    mode = spec.prompt_expansion_mode
+    if mode is None:
+        return
+    testing = is_test_path(path)
+    if is_direct and mode != "disabled":
+        raise H3Error(
+            422,
+            f"prompt_expansion_mode={mode} needs prompt rewriting, which the direct endpoint never does; "
+            f"use the {TEST_IR_PREFIX if testing else IR_PREFIX} base URL",
+        )
+    if not is_direct and mode == "disabled":
+        raise H3Error(
+            422,
+            "prompt_expansion_mode=disabled means the prompt is used unchanged; "
+            f"use the {TEST_DIRECT_PREFIX if testing else DIRECT_PREFIX} base URL",
+        )
+
+
 async def prepare_request(request: Request) -> None:
     is_ir_create = request.url.path in IR_CREATE_PATHS
     is_ir_list = request.url.path in LIST_PATHS
@@ -244,13 +271,17 @@ async def prepare_request(request: Request) -> None:
         raw = await read_json_body(request)
         if is_ir_create:
             public_ir = json.loads(raw)
-            if not isinstance(public_ir, dict) or public_ir.get("model") != "minimax-h3":
-                raise H3Error(400, "model must be minimax-h3")
-            spec_ir = ContextIRRequest.model_validate({**public_ir, "model": "MiniMax-H3"})
+            if not isinstance(public_ir, dict):
+                raise H3Error(400, "Request body must be a JSON object")
+            try:
+                canonical_public_model(public_ir.get("model"))
+            except ValueError as exc:
+                raise H3Error(400, str(exc)) from exc
+            spec_ir = ContextIRRequest.model_validate({**public_ir, "model": PUBLIC_MODEL})
             if any(isinstance(item, AudioItem) for item in spec_ir.content):
                 raise H3Error(422, "Reference audio is not supported by this Context IR service")
-            if spec_ir.duration < 5:
-                raise H3Error(400, "duration must be from 5 through 15 seconds for minimax-h3")
+            if not MIN_PUBLIC_DURATION <= spec_ir.duration <= MAX_PUBLIC_DURATION:
+                raise H3Error(400, DURATION_MESSAGE)
             violation = causyn_reference_limit_violation(spec_ir)
             if violation is not None:
                 raise H3Error(400, violation)
@@ -260,6 +291,7 @@ async def prepare_request(request: Request) -> None:
             is_direct = request.url.path in DIRECT_CREATE_PATHS
             spec = (MiniMaxH3DirectCreate if is_direct else MiniMaxH3Create).model_validate_json(raw)
             request.scope["minimax_h3_spec"] = spec
+            reject_mismatched_prompt_expansion(spec, request.url.path, is_direct)
             body = spec.internal_body()
             if is_direct:
                 request.scope["causyn_direct_prompt"] = True

@@ -296,5 +296,5 @@ def test_saturated_media_validation_is_a_retryable_503(stack, monkeypatch):
     assert response.status_code == 503
     assert response.headers["retry-after"] == "10"
     assert response.json()["error"]["message"] == "media validation is busy, retry later"
-    assert response.json()["error"]["type"] == "service_unavailable_error"
+    assert response.json()["error"]["type"] == "overloaded_error"
     assert not state["platform"]
