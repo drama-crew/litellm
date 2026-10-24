@@ -131,3 +131,111 @@ def test_causyn_poll_timestamp_is_not_an_authoritative_finish_time():
     video = VideoSnapshot(id=encode_video_id_with_provider("native-task", "causyn"), completed_at=1700000000)
     assert completion_time(video) is None
     assert completion_time(VideoSnapshot(id="other-task", completed_at=1700000000)) == 1700000000
+
+
+# --- per-key filter (developer platform): key_id param + key_id on every row ---
+
+
+def _http_client(db, role=None):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from litellm.proxy._types import LitellmUserRoles, UserAPIKeyAuth
+    from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
+    from litellm.proxy.video_endpoints.openapi_log_capture import database
+    from litellm.proxy.video_endpoints.openapi_log_query import router
+
+    app = FastAPI()
+    app.include_router(router)
+    app.dependency_overrides[database] = lambda: db
+    app.dependency_overrides[user_api_key_auth] = lambda: UserAPIKeyAuth(user_role=role or LitellmUserRoles.PROXY_ADMIN)
+    return TestClient(app)
+
+
+def test_internal_logs_filters_by_key_id_metadata():
+    now = datetime.now(timezone.utc)
+    sql, args = query_conditions("alice", LogFilters(key_id="key-1"), now)
+    # Matches the originating virtual key's metadata (live or already-revoked keys), bound as a parameter.
+    assert "metadata->>'openapi_key_id' = $4" in sql
+    assert '"LiteLLM_VerificationToken"' in sql and '"LiteLLM_DeletedVerificationToken"' in sql
+    assert args == ("alice", args[1], args[2], "key-1") and "key-1" not in sql
+    # The key filter resolves to the log's owner column (hashed token), which is how a log row is tied to a key.
+    assert "owner IN (" in sql
+
+
+def test_internal_logs_filters_by_key_alias_fallback():
+    now = datetime.now(timezone.utc)
+    sql, args = query_conditions("alice", LogFilters(key_id="key-1", status="failed"), now)
+    # Keys created before the metadata existed are only identifiable by the "openapi-<key_id>" alias convention.
+    assert "key_alias = 'openapi-' || $4::text" in sql
+    assert " OR " in sql.split("owner IN (")[1]
+    # key_id is positioned right after the time window, followed by later optional filters; no inlined values.
+    assert args[3] == "key-1" and args[-1] == "failed"
+    assert "$5" in sql and "'openapi-key-1'" not in sql
+
+
+@pytest.mark.asyncio
+async def test_rows_include_key_id():
+    row = {
+        "id": "r1",
+        "task_id": "t",
+        "endpoint": "minimax_h3",
+        "model": "causyn-1.1",
+        "status": "succeeded",
+        "started_at": "2026-10-01T00:00:00+00:00",
+        "observed_at": "2026-10-01T00:00:01+00:00",
+        "finished_at": None,
+        "elapsed_estimated": False,
+        "historical": False,
+        "key_id": "key-1",
+    }
+    legacy = {**row, "id": "r2", "key_id": None}
+    db = FakeDB([{"total": 2, "items": [row, legacy]}])
+    page = await list_logs(db, "alice", LogFilters(), datetime.now(timezone.utc))
+    assert [r.key_id for r in page.items] == ["key-1", None]
+    # A single round trip: key_id is derived inside the paginated lateral join, not looked up per row.
+    assert len(db.calls) == 1
+    query = db.calls[0][0]
+    assert "AS key_id" in query and "metadata->>'openapi_key_id'" in query
+    assert "substr(" in query and "'openapi-%'" in query  # alias fallback when metadata is absent
+    assert "token=l.owner" in query
+
+
+@pytest.mark.asyncio
+async def test_user_scope_still_enforced():
+    db = FakeDB([{"total": 0, "items": []}])
+    await list_logs(db, "alice", LogFilters(key_id="someone-elses-key"), datetime.now(timezone.utc))
+    query, args = db.calls[0]
+    # user_id is always the first, ANDed condition in both the page query and the count, key_id only narrows it.
+    assert query.count("user_id=$1 AND started_at") == 2
+    assert args[0] == "alice"
+    client = _http_client(FakeDB([{"items": [], "total": 0}]))
+    assert client.get("/internal/openapi-logs?key_id=k").status_code == 422  # user_id still required
+    from litellm.proxy._types import LitellmUserRoles
+
+    denied = _http_client(FakeDB([{"items": [], "total": 0}]), LitellmUserRoles.INTERNAL_USER)
+    assert denied.get("/internal/openapi-logs?user_id=alice&key_id=k").status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_key_filter_pagination_and_total_use_same_filter():
+    db = FakeDB([{"total": 7, "items": []}])
+    page = await list_logs(db, "alice", LogFilters(key_id="key-1", page=2, page_size=5), datetime.now(timezone.utc))
+    query, args = db.calls[0]
+    assert page.total == 7 and page.page == 2
+    assert args[3] == "key-1" and args[-2:] == (5, 5)
+    # Page selection and total count share the identical filtered WHERE clause.
+    assert query.count("openapi_key_id") >= 4  # 2 branches x (selected + total) + row key_id derivation
+    assert query.count("owner IN (") == 2
+    assert f"LIMIT ${len(args) - 1} OFFSET ${len(args)}" in query
+
+
+def test_http_key_id_query_param_reaches_database_and_is_optional():
+    db = FakeDB([{"items": [], "total": 0}])
+    client = _http_client(db)
+    assert client.get("/internal/openapi-logs?user_id=alice&key_id=abc").status_code == 200
+    assert "abc" in db.calls[-1][1] and "owner IN (" in db.calls[-1][0]
+    db2 = FakeDB([{"items": [], "total": 0}])
+    assert _http_client(db2).get("/internal/openapi-logs?user_id=alice").status_code == 200
+    assert "owner IN (" not in db2.calls[-1][0]
+    assert _http_client(db2).get("/internal/openapi-logs?user_id=alice&key_id=").status_code == 422

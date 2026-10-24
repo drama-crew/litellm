@@ -21,6 +21,9 @@ class LogFilters(BaseModel):
     status: Status | None = None
     model: str | None = Field(default=None, max_length=200)
     task_id: str | None = Field(default=None, max_length=16384)
+    # Platform API-key id: matches the originating virtual key's metadata.openapi_key_id,
+    # or (legacy keys) its key_alias "openapi-<key_id>".
+    key_id: str | None = Field(default=None, min_length=1, max_length=200)
     start: datetime | None = None
     end: datetime | None = None
 
@@ -40,6 +43,7 @@ class LogRow(BaseModel):
     result: JsonValue = None
     error: str | None = None
     cost_usd: float | None = None
+    key_id: str | None = None
 
 
 class LogPage(BaseModel):
@@ -49,11 +53,25 @@ class LogPage(BaseModel):
     page_size: int
 
 
+# Virtual keys that belong to a platform API key. Revoked keys move to the deleted table (indexed on token),
+# so their history stays reachable. Log rows reference the key by owner = hashed token.
+KEY_OWNERS_SQL = (
+    'SELECT token FROM "LiteLLM_VerificationToken" '
+    "WHERE metadata->>'openapi_key_id' = {p}::text OR key_alias = 'openapi-' || {p}::text "
+    'UNION ALL SELECT token FROM "LiteLLM_DeletedVerificationToken" '
+    "WHERE metadata->>'openapi_key_id' = {p}::text OR key_alias = 'openapi-' || {p}::text"
+)
+
+
 def query_conditions(user_id: str, filters: LogFilters, now: datetime) -> tuple[str, tuple[object, ...]]:
     end = filters.end or now
     start = filters.start or end - timedelta(days=30)
     if start.tzinfo is None or end.tzinfo is None or start >= end or end - start > timedelta(days=90):
         raise HTTPException(422, "Use a timezone-aware time range of at most 90 days")
+    # key_id is always the first optional parameter ($4) so its SQL can reference it twice.
+    key_clauses = (f'AND owner IN ({KEY_OWNERS_SQL.format(p="$4")})',) if filters.key_id is not None else ()
+    key_args = (filters.key_id,) if filters.key_id is not None else ()
+    base = 3 + len(key_args)
     optional = tuple(
         (column, value)
         for column, value in (
@@ -64,11 +82,12 @@ def query_conditions(user_id: str, filters: LogFilters, now: datetime) -> tuple[
         )
         if value is not None
     )
-    clauses = tuple(f'AND "{column}" = ${i + 4}' for i, (column, _) in enumerate(optional))
+    clauses = (*key_clauses, *(f'AND "{column}" = ${i + 1 + base}' for i, (column, _) in enumerate(optional)))
     return "user_id=$1 AND started_at >= $2::timestamptz AND started_at < $3::timestamptz " + " ".join(clauses), (
         user_id,
         start,
         end,
+        *key_args,
         *(value for _, value in optional),
     )
 
@@ -86,6 +105,11 @@ async def list_logs(db: Database, user_id: str, filters: LogFilters, now: dateti
     FROM total LEFT JOIN LATERAL (
         SELECT l.id, coalesce(l.public_task_id,l.task_id) AS task_id, l.endpoint,l.model,l.status,
         l.started_at,l.observed_at,l.finished_at,l.elapsed_estimated,l.historical,l.input,l.result,l.error,
+        (SELECT coalesce(k.metadata->>'openapi_key_id',
+            CASE WHEN k.key_alias LIKE 'openapi-%' THEN substr(k.key_alias, 9) END)
+         FROM (SELECT metadata, key_alias FROM "LiteLLM_VerificationToken" WHERE token=l.owner
+               UNION ALL SELECT metadata, key_alias FROM "LiteLLM_DeletedVerificationToken" WHERE token=l.owner
+               LIMIT 1) k) AS key_id,
         coalesce((SELECT spend FROM "LiteLLM_SpendLogs" b WHERE b.request_id=l.billing_request_id AND b.api_key=l.owner),
         (SELECT sum(s.amount) FROM "LiteLLM_OpenApiLogSpend" s WHERE s.owner=l.owner AND s.task_id=l.task_id)) AS cost_usd
         FROM selected JOIN "LiteLLM_OpenApiLog" l ON l.id=selected.id
