@@ -109,13 +109,16 @@ async def create_log(
     payload: JsonValue,
     started_at: datetime,
     attribution: RequestAttribution | None = None,
+    internal_dispatch: bool = False,
 ) -> None:
+    # internal_dispatch marks the platform's own continuation of an already-admitted public task. The row is kept
+    # (the failure monitor probes the provider task through it) but is never shown in the customer task log.
     context = attribution or RequestAttribution()
     await db.execute_raw(
         """INSERT INTO "LiteLLM_OpenApiLog"
         (id, owner, user_id, endpoint, model, status, started_at, observed_at,
-        call_source,project_id,generation_id,artifact_id,input,historical,elapsed_estimated)
-        VALUES ($1,$2,$3,$4,$5,'queued',$6::timestamptz,$6::timestamptz,$7,$8,$9,$10,$11::jsonb,false,false)
+        call_source,project_id,generation_id,artifact_id,internal_dispatch,input,historical,elapsed_estimated)
+        VALUES ($1,$2,$3,$4,$5,'queued',$6::timestamptz,$6::timestamptz,$7,$8,$9,$10,$11,$12::jsonb,false,false)
         ON CONFLICT (id) DO NOTHING""",
         log_id,
         owner,
@@ -127,6 +130,7 @@ async def create_log(
         context.project_id,
         context.generation_id,
         context.artifact_id,
+        internal_dispatch,
         encode_payload(payload),
     )
 

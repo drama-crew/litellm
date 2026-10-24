@@ -71,6 +71,26 @@ KEY_OWNERS_SQL = (
 )
 
 
+# The platform's internal continuation of a public task is logged as a separate row (the failure monitor reads it) but
+# must not reach the customer task log. Rows written since ``internal_dispatch`` exists carry the explicit marker.
+# Rows written before it have none; they are recognised structurally: a ``videos`` row whose id is not a public task id,
+# for an owner that also has a public (``mod_video_``) task submitted before it. Every call on a moderated key is
+# admitted first, so such a row can only be the internal dispatch of that earlier public task. The window only bounds
+# the lookup (admission can queue before dispatch); it is not what identifies the row.
+LEGACY_DISPATCH_WINDOW = "interval '1 hour'"
+PUBLIC_TASK_PREFIX = "mod_video_"
+VISIBLE_SQL = (
+    "AND internal_dispatch = false "
+    "AND NOT (endpoint = 'videos' "
+    "AND left(coalesce(public_task_id, task_id, ''), {n}) <> '{prefix}' "
+    "AND EXISTS (SELECT 1 FROM \"LiteLLM_OpenApiLog\" pub "
+    "WHERE pub.owner = \"LiteLLM_OpenApiLog\".owner AND pub.user_id = \"LiteLLM_OpenApiLog\".user_id "
+    "AND pub.started_at <= \"LiteLLM_OpenApiLog\".started_at "
+    "AND pub.started_at >= \"LiteLLM_OpenApiLog\".started_at - {window} "
+    "AND left(pub.task_id, {n}) = '{prefix}'))"
+).format(n=len(PUBLIC_TASK_PREFIX), prefix=PUBLIC_TASK_PREFIX, window=LEGACY_DISPATCH_WINDOW)
+
+
 def query_conditions(user_id: str, filters: LogFilters, now: datetime) -> tuple[str, tuple[object, ...]]:
     end = filters.end or now
     start = filters.start or end - timedelta(days=30)
@@ -91,7 +111,9 @@ def query_conditions(user_id: str, filters: LogFilters, now: datetime) -> tuple[
         if value is not None
     )
     clauses = (*key_clauses, *(f'AND "{column}" = ${i + 1 + base}' for i, (column, _) in enumerate(optional)))
-    return "user_id=$1 AND started_at >= $2::timestamptz AND started_at < $3::timestamptz " + " ".join(clauses), (
+    return "user_id=$1 AND started_at >= $2::timestamptz AND started_at < $3::timestamptz " + " ".join(
+        (VISIBLE_SQL, *clauses)
+    ), (
         user_id,
         start,
         end,

@@ -77,8 +77,22 @@ def request_attribution(request: Request, auth: UserAPIKeyAuth) -> logs.RequestA
         return default
 
 
+def is_internal_dispatch(request: Request) -> bool:
+    """True when this request is the platform's continuation of a task it already admitted and logged.
+
+    ``moderation_admission is ADMITTED`` is set only server-side: by ``moderation_execution.execution_request``
+    (the trusted ``/internal/moderation/submit`` continuation) or by ``moderation_bridge.submit`` after the platform
+    verified a producer ticket. A customer cannot set it, and the customer's own call (the public ``mod_video_`` task)
+    is logged separately by ``moderation_bridge.submit`` before this dispatch happens.
+    """
+    from litellm.proxy.video_endpoints.moderation_bridge import ADMITTED
+
+    return request.scope.get("moderation_admission") is ADMITTED
+
+
 async def start(request: Request, auth: UserAPIKeyAuth, body: object) -> str | None:
     log_id = str(uuid.uuid4())
+    internal = is_internal_dispatch(request)
     request.scope["openapi_log_id"] = log_id
 
     async def operation() -> None:
@@ -104,6 +118,7 @@ async def start(request: Request, auth: UserAPIKeyAuth, body: object) -> str | N
             payload=payload if auth.user_id else {},
             started_at=datetime.now(timezone.utc),
             attribution=request_attribution(request, auth),
+            internal_dispatch=internal,
         )
 
     await persist(operation())

@@ -284,3 +284,96 @@ async def test_row_key_id_strips_rotation_suffix_from_alias():
     query = db.calls[0][0]
     assert "regexp_replace(substr(k.key_alias, 9), '-r[0-9a-f]{8}$', '')" in query
     assert "nullif(CASE WHEN k.key_alias LIKE 'openapi-%' THEN regexp_replace(" in query
+
+
+# --- Internal moderation dispatch must not appear as a customer-visible task -------------------------------------
+
+
+def _capture_request(admitted: bool):
+    from starlette.requests import Request
+
+    from litellm.proxy.video_endpoints.moderation_bridge import ADMITTED
+
+    scope = {"type": "http", "method": "POST", "path": "/v1/videos", "headers": []}
+    if admitted:
+        scope["moderation_admission"] = ADMITTED
+    return Request(scope)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("admitted", [True, False])
+async def test_only_admitted_continuation_is_marked_internal_dispatch(monkeypatch, admitted):
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.video_endpoints import openapi_log_capture as capture
+
+    db = FakeDB()
+    monkeypatch.setattr(capture, "database", lambda: db)
+    auth = UserAPIKeyAuth(api_key="key", user_id="u1")
+    await capture.start(_capture_request(admitted), auth, {"model": "causyn-1.1", "prompt": "p"})
+    query, args = db.calls[0]
+    # The row is still written (the failure monitor probes the provider task through it); only its marker differs.
+    assert 'INSERT INTO "LiteLLM_OpenApiLog"' in query and "internal_dispatch" in query
+    assert args[10] is admitted
+    assert args[-1] != admitted  # the payload stays last
+
+
+@pytest.mark.asyncio
+async def test_customer_forged_headers_cannot_mark_a_row_internal(monkeypatch):
+    from starlette.requests import Request
+
+    from litellm.proxy._types import UserAPIKeyAuth
+    from litellm.proxy.video_endpoints import openapi_log_capture as capture
+
+    db = FakeDB()
+    monkeypatch.setattr(capture, "database", lambda: db)
+    forged = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/videos",
+            "headers": [(b"x-drama-moderation-admission", b"forged"), (b"x-litellm-call-id", b"public-video:i:submit")],
+        }
+    )
+    await capture.start(forged, UserAPIKeyAuth(api_key="key", user_id="u1"), {"model": "m"})
+    assert db.calls[0][1][10] is False
+
+
+def test_legacy_and_marked_dispatch_rows_are_excluded_from_the_customer_query():
+    sql, args = query_conditions("alice", LogFilters(), datetime.now(timezone.utc))
+    assert "internal_dispatch = false" in sql
+    # Legacy rows: a "videos" row with a non-public id that follows a public mod_video_ task of the same owner.
+    assert "endpoint = 'videos'" in sql and "'mod_video_'" in sql and "pub.owner" in sql
+    assert "pub.started_at <= " in sql
+    assert len(args) == 3  # the exclusion is static SQL, never a bound/user-controlled value
+    sql2, args2 = query_conditions("alice", LogFilters(key_id="k", status="failed"), datetime.now(timezone.utc))
+    assert args2[3] == "k" and args2[-1] == "failed" and "internal_dispatch = false" in sql2
+
+
+@pytest.mark.asyncio
+async def test_page_and_total_share_the_dispatch_exclusion():
+    db = FakeDB([{"total": 0, "items": []}])
+    await list_logs(db, "alice", LogFilters(), datetime.now(timezone.utc))
+    assert db.calls[0][0].count("internal_dispatch = false") == 2
+
+
+@pytest.mark.asyncio
+async def test_customer_visible_row_cost_and_status_projection_is_unchanged():
+    db = FakeDB([{"total": 0, "items": []}])
+    await list_logs(db, "alice", LogFilters(), datetime.now(timezone.utc))
+    query = db.calls[0][0]
+    assert "b.request_id=l.billing_request_id AND b.api_key=l.owner" in query
+    assert 's.owner=l.owner AND s.task_id=l.task_id' in query
+    assert "coalesce(l.public_task_id,l.task_id) AS task_id" in query
+    assert "l.status" in query
+
+
+def test_failure_monitor_still_sees_internal_dispatch_rows():
+    from litellm.proxy.video_endpoints import monitor
+
+    # The monitor probes the provider task through the internal row (the public mod_video_ id is not probeable),
+    # so hiding it from customers must not hide it from the monitor.
+    assert "internal_dispatch" not in monitor.COLUMNS
+    import inspect
+
+    assert "internal_dispatch" not in inspect.getsource(monitor.list_pending)
+    assert "internal_dispatch" not in inspect.getsource(monitor.probe)

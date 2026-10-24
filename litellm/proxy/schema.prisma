@@ -1431,6 +1431,7 @@ model LiteLLM_OpenApiLog {
   finished_at DateTime? @client.Timestamptz(3)
   elapsed_estimated Boolean @default(false)
   historical Boolean @default(false)
+  internal_dispatch Boolean @default(false)
   input Json?
   result Json?
   error String?
