@@ -261,4 +261,26 @@ async def test_row_key_id_ignores_empty_metadata_and_bare_alias_prefix():
     query = db.calls[0][0]
     # Empty metadata falls back to the alias; an alias of exactly "openapi-" yields NULL, never ''.
     assert "nullif(k.metadata->>'openapi_key_id', '')" in query
-    assert "nullif(CASE WHEN k.key_alias LIKE 'openapi-%' THEN substr(k.key_alias, 9) END, '')" in query
+    assert "nullif(CASE WHEN k.key_alias LIKE 'openapi-%' THEN regexp_replace(" in query
+
+
+def test_alias_filter_accepts_rotation_suffix_without_like_wildcards():
+    now = datetime.now(timezone.utc)
+    sql, args = query_conditions("alice", LogFilters(key_id="100%_x"), now)
+    # Rotated keys are aliased openapi-<id>-r<8 hex>; matched by a fixed-length prefix comparison on the bound value,
+    # so '%' / '_' in key_id can never act as LIKE wildcards.
+    assert "left(key_alias, char_length($4::text) + 10) = 'openapi-' || $4::text || '-r'" in sql
+    assert "char_length(key_alias) = char_length($4::text) + 18" in sql
+    assert "substr(key_alias, char_length($4::text) + 11) ~ '^[0-9a-f]{8}$'" in sql
+    assert "LIKE" not in sql and args[3] == "100%_x"
+    # Applied to both the live and the revoked token tables.
+    assert sql.count("char_length(key_alias) = char_length($4::text) + 18") == 2
+
+
+@pytest.mark.asyncio
+async def test_row_key_id_strips_rotation_suffix_from_alias():
+    db = FakeDB([{"total": 0, "items": []}])
+    await list_logs(db, "alice", LogFilters(), datetime.now(timezone.utc))
+    query = db.calls[0][0]
+    assert "regexp_replace(substr(k.key_alias, 9), '-r[0-9a-f]{8}$', '')" in query
+    assert "nullif(CASE WHEN k.key_alias LIKE 'openapi-%' THEN regexp_replace(" in query

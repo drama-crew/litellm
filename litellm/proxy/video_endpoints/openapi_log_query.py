@@ -55,11 +55,19 @@ class LogPage(BaseModel):
 
 # Virtual keys that belong to a platform API key. Revoked keys move to the deleted table (indexed on token),
 # so their history stays reachable. Log rows reference the key by owner = hashed token.
+# Rotated keys are aliased "openapi-<id>-r<8 hex>": compared with a fixed-length prefix (no LIKE), so wildcard
+# characters in the bound value are inert.
+ALIAS_MATCH_SQL = (
+    "(key_alias = 'openapi-' || {p}::text OR ("
+    "left(key_alias, char_length({p}::text) + 10) = 'openapi-' || {p}::text || '-r' "
+    "AND char_length(key_alias) = char_length({p}::text) + 18 "
+    "AND substr(key_alias, char_length({p}::text) + 11) ~ '^[0-9a-f]{{8}}$'))"
+)
 KEY_OWNERS_SQL = (
     'SELECT token FROM "LiteLLM_VerificationToken" '
-    "WHERE metadata->>'openapi_key_id' = {p}::text OR key_alias = 'openapi-' || {p}::text "
+    "WHERE metadata->>'openapi_key_id' = {p}::text OR " + ALIAS_MATCH_SQL + " "
     'UNION ALL SELECT token FROM "LiteLLM_DeletedVerificationToken" '
-    "WHERE metadata->>'openapi_key_id' = {p}::text OR key_alias = 'openapi-' || {p}::text"
+    "WHERE metadata->>'openapi_key_id' = {p}::text OR " + ALIAS_MATCH_SQL
 )
 
 
@@ -106,7 +114,7 @@ async def list_logs(db: Database, user_id: str, filters: LogFilters, now: dateti
         SELECT l.id, coalesce(l.public_task_id,l.task_id) AS task_id, l.endpoint,l.model,l.status,
         l.started_at,l.observed_at,l.finished_at,l.elapsed_estimated,l.historical,l.input,l.result,l.error,
         (SELECT coalesce(nullif(k.metadata->>'openapi_key_id', ''),
-            nullif(CASE WHEN k.key_alias LIKE 'openapi-%' THEN substr(k.key_alias, 9) END, ''))
+            nullif(CASE WHEN k.key_alias LIKE 'openapi-%' THEN regexp_replace(substr(k.key_alias, 9), '-r[0-9a-f]{{8}}$', '') END, ''))
          FROM (SELECT 0 AS src, metadata, key_alias FROM "LiteLLM_VerificationToken" WHERE token=l.owner
                UNION ALL SELECT 1 AS src, metadata, key_alias FROM "LiteLLM_DeletedVerificationToken" WHERE token=l.owner
                ORDER BY src LIMIT 1) k) AS key_id,
