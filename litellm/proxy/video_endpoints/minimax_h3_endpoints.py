@@ -156,6 +156,8 @@ def http_error_response(exc: HTTPException) -> JSONResponse:
     public_code = (
         "insufficient_compute"
         if fields.code == "insufficient_compute"
+        else "key_budget_exceeded"
+        if exc.status_code == 402 and fields.code == "key_budget_exceeded"
         else "idempotency_conflict"
         if exc.status_code == 409 and "idempotency" in str(detail).lower()
         else None

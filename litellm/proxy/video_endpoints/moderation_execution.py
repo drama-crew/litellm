@@ -279,10 +279,16 @@ async def submit(body: Ticket, request: Request, authorization: Annotated[str | 
     try:
         payload = bridge.JSON_OBJECT.validate_python(begin["request"])
         route = TypeAdapter(str).validate_python(begin["route"])
+        from litellm.proxy.video_endpoints.minimax_h3_paths import Namespace, continuation_path
+
+        # Authenticate and execute as the original public request: an H3 task entered through its namespaced
+        # route, which is what the key's allowed_routes grant (an h3_only key has no /v1/videos).
+        h3_path = continuation_path(TypeAdapter(Namespace | None).validate_python(begin.get("namespace")), route)
         execution = execution_request(
             request,
             payload,
-            {
+            h3_path
+            or {
                 "context_ir": "/video/minimax-h3/v2/h3_context_ir",
                 "avideo_remix": "/v1/videos/" + str(payload.get("source_video_id", "")) + "/remix",
                 "avideo_edit": "/v1/videos/edits",

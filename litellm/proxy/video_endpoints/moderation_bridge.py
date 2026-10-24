@@ -72,6 +72,7 @@ class View(BaseModel):
 
 # Seconds a client should wait after a saturated media-validation 503 (Retry-After).
 MEDIA_BUSY_RETRY_AFTER_S = 10
+KEY_BUDGET_EXCEEDED = "key_budget_exceeded"
 IDEMPOTENCY_CONFLICT = "Idempotency-Key was already used for a different request"
 CANCEL_TOO_LATE = "Task can no longer be cancelled; generation has already started"
 CANCEL_PENDING = (
@@ -107,9 +108,7 @@ def _queue_full_retry_after(detail: object, headers: httpx.Headers | None) -> st
     return str(QUEUE_FULL_RETRY_AFTER_DEFAULT_S)
 
 
-def platform_rejection(
-    status: int, detail: object, path: str, headers: httpx.Headers | None = None
-) -> HTTPException:
+def platform_rejection(status: int, detail: object, path: str, headers: httpx.Headers | None = None) -> HTTPException:
     """Map a moderation-platform error to the public status.
 
     5xx is a genuine platform failure (503). A 409 is a client conflict and must never look retryable:
@@ -134,6 +133,13 @@ def platform_rejection(
             headers=httpx.Headers(
                 (("Retry-After", _queue_full_retry_after(detail, headers)), ("x-drama-submission", "not_sent"))
             ),
+        )
+    if status == 402 and code == KEY_BUDGET_EXCEEDED:
+        # The platform's hard per-key credit cap: nothing was created or charged.
+        return HTTPException(
+            402,
+            detail={"code": KEY_BUDGET_EXCEEDED, "message": text or "The API key credit budget is exhausted"},
+            headers=httpx.Headers((("x-drama-submission", "not_sent"),)),
         )
     if status == 409:
         if code == "idempotency_conflict" or "idempotency" in text.lower():

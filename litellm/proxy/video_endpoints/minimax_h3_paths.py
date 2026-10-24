@@ -34,3 +34,29 @@ def namespace(path: str) -> Namespace | None:
 
 def is_test_path(path: str) -> bool:
     return path == TEST_IR_PREFIX or path.startswith(TEST_IR_PREFIX + "/")
+
+
+_NAMESPACE_PREFIX: dict[str, str] = {
+    "minimax-h3": IR_PREFIX,
+    "minimax-h3-direct": DIRECT_PREFIX,
+    "minimax-h3-test": TEST_IR_PREFIX,
+    "minimax-h3-direct-test": TEST_DIRECT_PREFIX,
+}
+
+
+def continuation_path(ns: str | None, route: str) -> str | None:
+    """The public route an admitted H3 task entered through, or None when it is not an H3 namespace.
+
+    The moderation continuation re-authenticates the owner's stored key; that check must be made against the
+    route the task was admitted through (the key's ``allowed_routes`` grant namespaced routes, never the generic
+    ``/v1/videos``). ``None`` keeps the caller's generic default (non-H3 tasks, or an older platform that does
+    not report the namespace).
+    """
+    prefix = _NAMESPACE_PREFIX.get(ns or "")
+    if prefix is None:
+        return None
+    if route == "avideo_generation":
+        return prefix + "/v2/video_generation"
+    if route == "context_ir" and prefix in (IR_PREFIX, TEST_IR_PREFIX):
+        return prefix + "/v2/h3_context_ir"
+    return None
