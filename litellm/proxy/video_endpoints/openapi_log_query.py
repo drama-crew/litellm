@@ -71,24 +71,10 @@ KEY_OWNERS_SQL = (
 )
 
 
-# The platform's internal continuation of a public task is logged as a separate row (the failure monitor reads it) but
-# must not reach the customer task log. Rows written since ``internal_dispatch`` exists carry the explicit marker.
-# Rows written before it have none; they are recognised structurally: a ``videos`` row whose id is not a public task id,
-# for an owner that also has a public (``mod_video_``) task submitted before it. Every call on a moderated key is
-# admitted first, so such a row can only be the internal dispatch of that earlier public task. The window only bounds
-# the lookup (admission can queue before dispatch); it is not what identifies the row.
-LEGACY_DISPATCH_WINDOW = "interval '1 hour'"
-PUBLIC_TASK_PREFIX = "mod_video_"
-VISIBLE_SQL = (
-    "AND internal_dispatch = false "
-    "AND NOT (endpoint = 'videos' "
-    "AND left(coalesce(public_task_id, task_id, ''), {n}) <> '{prefix}' "
-    "AND EXISTS (SELECT 1 FROM \"LiteLLM_OpenApiLog\" pub "
-    "WHERE pub.owner = \"LiteLLM_OpenApiLog\".owner AND pub.user_id = \"LiteLLM_OpenApiLog\".user_id "
-    "AND pub.started_at <= \"LiteLLM_OpenApiLog\".started_at "
-    "AND pub.started_at >= \"LiteLLM_OpenApiLog\".started_at - {window} "
-    "AND left(pub.task_id, {n}) = '{prefix}'))"
-).format(n=len(PUBLIC_TASK_PREFIX), prefix=PUBLIC_TASK_PREFIX, window=LEGACY_DISPATCH_WINDOW)
+# internal_dispatch rows (internal moderation continuations, Studio ticket dispatches) are kept for the failure monitor
+# but are not customer open-API calls. They are marked at write time; rows that predate the column were marked once by
+# its migration, so no runtime heuristic is needed here.
+VISIBLE_SQL = "AND internal_dispatch = false"
 
 
 def query_conditions(user_id: str, filters: LogFilters, now: datetime) -> tuple[str, tuple[object, ...]]:

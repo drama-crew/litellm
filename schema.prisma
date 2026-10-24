@@ -1431,6 +1431,7 @@ model LiteLLM_OpenApiLog {
   finished_at DateTime? @client.Timestamptz(3)
   elapsed_estimated Boolean @default(false)
   historical Boolean @default(false)
+  internal_dispatch Boolean @default(false)
   input Json?
   result Json?
   error String?
@@ -1447,6 +1448,7 @@ model LiteLLM_ModerationMeteringTask {
   intent_id String @id
   binding Json
   reservations Json
+  submission_failure Json?
   created_at DateTime @default(now()) @client.Timestamptz
   phases LiteLLM_ModerationMeteringPhase[]
 }
@@ -1477,6 +1479,7 @@ model LiteLLM_ModerationMeteringPhase {
   attempts Int @default(0)
   available_at DateTime @default(now()) @client.Timestamptz
   receipt Json?
+  failure_reason String?
   created_at DateTime @default(now()) @client.Timestamptz
   task LiteLLM_ModerationMeteringTask @relation(fields: [intent_id], references: [intent_id])
   @@unique([intent_id, phase])

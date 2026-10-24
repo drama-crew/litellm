@@ -851,3 +851,22 @@ def test_dispatch_key_budget_task_error_reaches_the_public_task_view():
     )
     task = bridge.v2_task(result, h3=True)
     assert task["error"] == {"code": "key_budget_exceeded", "message": message}
+
+
+@pytest.mark.asyncio
+async def test_studio_ticket_dispatch_is_logged_as_internal_not_as_a_customer_call(monkeypatch):
+    from litellm.proxy.video_endpoints import openapi_log_capture as capture
+
+    request, _ = await _admit(monkeypatch, {"acquired": True, "metering": {"intent_id": "intent-1"}})
+    writes = []
+
+    class DB:
+        async def execute_raw(self, sql, *args):
+            writes.append((sql, args))
+            return 1
+
+    monkeypatch.setattr(capture, "database", lambda: DB())
+    auth = UserAPIKeyAuth(api_key="a" * 64, user_id="owner", team_id="owner", metadata={"openapi_key_id": "key-id"})
+    await capture.start(request, auth, {"model": "hailuo-h3", "prompt": "p"})
+    assert writes and 'INSERT INTO "LiteLLM_OpenApiLog"' in writes[0][0]
+    assert writes[0][1][10] is True

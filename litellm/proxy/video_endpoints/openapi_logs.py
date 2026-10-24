@@ -111,8 +111,8 @@ async def create_log(
     attribution: RequestAttribution | None = None,
     internal_dispatch: bool = False,
 ) -> None:
-    # internal_dispatch marks the platform's own continuation of an already-admitted public task. The row is kept
-    # (the failure monitor probes the provider task through it) but is never shown in the customer task log.
+    # internal_dispatch = "not a customer open-API call" (internal moderation continuation or Studio ticket dispatch).
+    # The row is kept (the failure monitor probes the provider task through it) but is hidden from the customer log.
     context = attribution or RequestAttribution()
     await db.execute_raw(
         """INSERT INTO "LiteLLM_OpenApiLog"

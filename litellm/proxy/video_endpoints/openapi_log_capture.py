@@ -78,12 +78,13 @@ def request_attribution(request: Request, auth: UserAPIKeyAuth) -> logs.RequestA
 
 
 def is_internal_dispatch(request: Request) -> bool:
-    """True when this request is the platform's continuation of a task it already admitted and logged.
+    """True when this request is not a customer open-API call, so its row must stay out of the customer task log.
 
-    ``moderation_admission is ADMITTED`` is set only server-side: by ``moderation_execution.execution_request``
-    (the trusted ``/internal/moderation/submit`` continuation) or by ``moderation_bridge.submit`` after the platform
-    verified a producer ticket. A customer cannot set it, and the customer's own call (the public ``mod_video_`` task)
-    is logged separately by ``moderation_bridge.submit`` before this dispatch happens.
+    ``moderation_admission is ADMITTED`` is set only server-side, in two places: ``moderation_execution.execution_request``
+    (the trusted ``/internal/moderation/submit`` continuation of a task whose public ``mod_video_`` row was already
+    written by ``moderation_bridge.submit``) and ``moderation_bridge.submit`` once the platform has verified an
+    ``X-Drama-Moderation-Admission`` ticket (a Studio generation, which has no public row at all). A customer cannot
+    set it: a forged ticket header fails platform verification and never reaches this scope key.
     """
     from litellm.proxy.video_endpoints.moderation_bridge import ADMITTED
 

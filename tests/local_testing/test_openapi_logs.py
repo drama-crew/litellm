@@ -338,12 +338,9 @@ async def test_customer_forged_headers_cannot_mark_a_row_internal(monkeypatch):
     assert db.calls[0][1][10] is False
 
 
-def test_legacy_and_marked_dispatch_rows_are_excluded_from_the_customer_query():
+def test_marked_dispatch_rows_are_excluded_from_the_customer_query():
     sql, args = query_conditions("alice", LogFilters(), datetime.now(timezone.utc))
     assert "internal_dispatch = false" in sql
-    # Legacy rows: a "videos" row with a non-public id that follows a public mod_video_ task of the same owner.
-    assert "endpoint = 'videos'" in sql and "'mod_video_'" in sql and "pub.owner" in sql
-    assert "pub.started_at <= " in sql
     assert len(args) == 3  # the exclusion is static SQL, never a bound/user-controlled value
     sql2, args2 = query_conditions("alice", LogFilters(key_id="k", status="failed"), datetime.now(timezone.utc))
     assert args2[3] == "k" and args2[-1] == "failed" and "internal_dispatch = false" in sql2
