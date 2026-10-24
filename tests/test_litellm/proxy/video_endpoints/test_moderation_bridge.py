@@ -816,3 +816,38 @@ async def test_worker_pool_other_than_test_is_rejected_even_when_trusted():
         endpoints.check_worker_pool(request, {"model": "sora-2", "worker_pool": "test"})
     endpoints.check_worker_pool(request, {"model": "causyn-1.1", "worker_pool": "test"})
     endpoints.check_worker_pool(request, {"model": "causyn-1.1"})
+
+
+def test_key_budget_402_carries_the_platform_message_through_the_public_envelope():
+    """The facade must not substitute its own copy for the platform's key-budget message."""
+    from litellm.proxy.video_endpoints.minimax_h3_endpoints import http_error_response
+
+    message = "该 API Key 的预算已用完，请联系管理员调整预算或使用其他密钥。"
+    rejection = bridge.platform_rejection(
+        402, {"code": "key_budget_exceeded", "message": message}, "/intents"
+    )
+    response = http_error_response(rejection)
+    body = json.loads(response.body)
+    assert response.status_code == 402
+    assert response.headers["x-drama-submission"] == "not_sent"
+    assert body["error"]["code"] == "key_budget_exceeded"
+    assert body["error"]["type"] == "insufficient_balance_error"
+    assert body["error"]["message"] == message
+    assert body["error"]["retryable"] is False
+
+
+def test_dispatch_key_budget_task_error_reaches_the_public_task_view():
+    message = "该 API Key 的预算已用完，请联系管理员调整预算或使用其他密钥。"
+    result = bridge.video(
+        bridge.View(
+            id="mod_video_1",
+            model="hailuo-h3",
+            state="failed",
+            moderation_status="not_started",
+            policy_source="model",
+            created_at=1,
+            error={"code": "key_budget_exceeded", "message": message},
+        )
+    )
+    task = bridge.v2_task(result, h3=True)
+    assert task["error"] == {"code": "key_budget_exceeded", "message": message}
