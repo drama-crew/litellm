@@ -239,3 +239,26 @@ def test_http_key_id_query_param_reaches_database_and_is_optional():
     assert _http_client(db2).get("/internal/openapi-logs?user_id=alice").status_code == 200
     assert "owner IN (" not in db2.calls[-1][0]
     assert _http_client(db2).get("/internal/openapi-logs?user_id=alice&key_id=").status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_row_key_id_lookup_prefers_live_token_deterministically():
+    db = FakeDB([{"total": 0, "items": []}])
+    await list_logs(db, "alice", LogFilters(), datetime.now(timezone.utc))
+    query = db.calls[0][0]
+    lookup = query[query.index("AS key_id") - 700 : query.index("AS key_id")]
+    live = lookup.index('"LiteLLM_VerificationToken" WHERE token=l.owner')
+    deleted = lookup.index('"LiteLLM_DeletedVerificationToken" WHERE token=l.owner')
+    # Live key is source 0, revoked key source 1, and the UNION is explicitly ordered by source before LIMIT 1.
+    assert "0 AS src" in lookup and "1 AS src" in lookup and live < deleted
+    assert lookup.index("ORDER BY src") < lookup.index("LIMIT 1")
+
+
+@pytest.mark.asyncio
+async def test_row_key_id_ignores_empty_metadata_and_bare_alias_prefix():
+    db = FakeDB([{"total": 0, "items": []}])
+    await list_logs(db, "alice", LogFilters(), datetime.now(timezone.utc))
+    query = db.calls[0][0]
+    # Empty metadata falls back to the alias; an alias of exactly "openapi-" yields NULL, never ''.
+    assert "nullif(k.metadata->>'openapi_key_id', '')" in query
+    assert "nullif(CASE WHEN k.key_alias LIKE 'openapi-%' THEN substr(k.key_alias, 9) END, '')" in query

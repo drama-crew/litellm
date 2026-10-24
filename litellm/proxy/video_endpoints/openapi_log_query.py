@@ -105,11 +105,11 @@ async def list_logs(db: Database, user_id: str, filters: LogFilters, now: dateti
     FROM total LEFT JOIN LATERAL (
         SELECT l.id, coalesce(l.public_task_id,l.task_id) AS task_id, l.endpoint,l.model,l.status,
         l.started_at,l.observed_at,l.finished_at,l.elapsed_estimated,l.historical,l.input,l.result,l.error,
-        (SELECT coalesce(k.metadata->>'openapi_key_id',
-            CASE WHEN k.key_alias LIKE 'openapi-%' THEN substr(k.key_alias, 9) END)
-         FROM (SELECT metadata, key_alias FROM "LiteLLM_VerificationToken" WHERE token=l.owner
-               UNION ALL SELECT metadata, key_alias FROM "LiteLLM_DeletedVerificationToken" WHERE token=l.owner
-               LIMIT 1) k) AS key_id,
+        (SELECT coalesce(nullif(k.metadata->>'openapi_key_id', ''),
+            nullif(CASE WHEN k.key_alias LIKE 'openapi-%' THEN substr(k.key_alias, 9) END, ''))
+         FROM (SELECT 0 AS src, metadata, key_alias FROM "LiteLLM_VerificationToken" WHERE token=l.owner
+               UNION ALL SELECT 1 AS src, metadata, key_alias FROM "LiteLLM_DeletedVerificationToken" WHERE token=l.owner
+               ORDER BY src LIMIT 1) k) AS key_id,
         coalesce((SELECT spend FROM "LiteLLM_SpendLogs" b WHERE b.request_id=l.billing_request_id AND b.api_key=l.owner),
         (SELECT sum(s.amount) FROM "LiteLLM_OpenApiLogSpend" s WHERE s.owner=l.owner AND s.task_id=l.task_id)) AS cost_usd
         FROM selected JOIN "LiteLLM_OpenApiLog" l ON l.id=selected.id
