@@ -109,7 +109,7 @@ def _queue_full_retry_after(detail: object, headers: httpx.Headers | None) -> st
 
 
 FILE_ERROR_CODES = frozenset(
-    {"file_not_found", "file_not_ready", "file_expired", "file_rejected", "invalid_upload", "quota_exceeded"}
+    {"file_not_found", "file_not_ready", "file_expired", "file_rejected", "invalid_upload", "quota_exceeded", "upload_check_unavailable"}
 )
 FILE_QUOTA_LIMITS = frozenset({"files", "bytes", "pending", "rate"})
 
@@ -127,7 +127,7 @@ def file_rejection(status: int, detail: object, path: str) -> HTTPException | No
         limit = detail.get("limit") if isinstance(detail, dict) else None
         name = limit if limit in FILE_QUOTA_LIMITS else "unknown"
         return HTTPException(
-            429, detail={"code": "quota_exceeded", "message": f"File quota exceeded (limit: {name})"}
+            429, detail={"code": "quota_exceeded", "limit": name, "message": f"File quota exceeded (limit: {name})"}
         )
     if status == 400 and code in FILE_ERROR_CODES:
         reason = detail.get("reason") if isinstance(detail, dict) else None
@@ -145,6 +145,14 @@ def platform_rejection(status: int, detail: object, path: str, headers: httpx.He
     cancel that arrives after submission started says so. Everything else keeps its 4xx status.
     """
     if status >= 500:
+        if path.startswith("/files/") and isinstance(detail, dict) and detail.get("code") == "upload_check_unavailable":
+            return HTTPException(
+                503,
+                detail={
+                    "code": "upload_check_unavailable",
+                    "message": "File check is temporarily unavailable; retry complete later",
+                },
+            )
         return HTTPException(503, "Moderation control request was rejected")
     if path.startswith("/files/") and (mapped := file_rejection(status, detail, path)) is not None:
         return mapped
@@ -652,6 +660,7 @@ async def upload_media(request: Request, owner: dict[str, JsonValue], upload: St
 
 
 CAUSYN_FILE_PREFIX = "causyn_file://"
+MAX_FILE_REFERENCES = 16  # the platform's /files/resolve cap on distinct ids
 CAUSYN_FILE_REF = re.compile(r"causyn_file://(cf_[0-9a-z]{26})")
 # Free text is never a media reference, whatever it happens to contain.
 _TEXT_KEYS = frozenset({"prompt", "text"})
@@ -699,6 +708,14 @@ async def resolve_file_references(
     if not found:
         return payload, {}
     ids = list(found)
+    if len(ids) > MAX_FILE_REFERENCES:
+        raise HTTPException(
+            400,
+            detail={
+                "code": "invalid_upload",
+                "message": f"too many causyn_file references (max {MAX_FILE_REFERENCES})",
+            },
+        )
     result = await platform(request, "POST", "/files/resolve", {"principal": owner, "file_ids": ids})
     refs = TypeAdapter(dict[str, JsonValue]).validate_python(result.get("refs") or {})
     forward: dict[str, str] = {}

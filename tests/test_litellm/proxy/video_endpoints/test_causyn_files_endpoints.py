@@ -175,7 +175,46 @@ def test_quota_429_maps_with_limit(api, limit):
     response = client.post(IR_PREFIX + "/v1/causyn_files/uploads", json=body, headers=HEADERS)
     assert response.status_code == 429
     error = response.json()["error"]
-    assert error["code"] == "quota_exceeded" and limit in error["message"]
+    assert error["code"] == "quota_exceeded" and error["limit"] == limit and limit in error["message"]
+    # Only transient limits are worth retrying; a full library / byte quota needs a delete first.
+    transient = limit in ("rate", "pending")
+    assert error["retryable"] is transient
+    assert ("retry-after" in response.headers) is transient
+
+
+def test_non_quota_errors_have_no_limit_field(api):
+    client, platform, _, _ = api
+    platform.reply = (404, {"detail": {"code": "file_not_found"}})
+    assert "limit" not in client.get(IR_PREFIX + f"/v1/causyn_files/{FILE_ID}", headers=HEADERS).json()["error"]
+
+
+def test_check_unavailable_503_is_public_and_retryable(api):
+    client, platform, _, _ = api
+    platform.reply = (503, {"detail": {"code": "upload_check_unavailable"}})
+    response = client.post(IR_PREFIX + f"/v1/causyn_files/{FILE_ID}/complete", json={}, headers=HEADERS)
+    assert response.status_code == 503
+    error = response.json()["error"]
+    assert error["code"] == "upload_check_unavailable" and error["retryable"] is True
+    assert error["message"] == "File check is temporarily unavailable; retry complete later"
+    assert "retry-after" in response.headers
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"content_type": "x" * 65}, {"filename": "f" * 256}, {"filename": ""}, {"kind": "pdf"}, {"size": 0}],
+)
+def test_upload_validation_failures_are_400_invalid_upload(api, changes):
+    client, platform, _, _ = api
+    body = {"kind": "image", "filename": "a.png", "size": 10, "content_type": "image/png", **changes}
+    response = client.post(IR_PREFIX + "/v1/causyn_files/uploads", json=body, headers=HEADERS)
+    assert response.status_code == 400 and response.json()["error"]["code"] == "invalid_upload", response.text
+    assert platform.calls == []
+
+
+def test_upload_accepts_boundary_lengths(api):
+    client, _, _, _ = api
+    body = {"kind": "image", "filename": "f" * 255, "size": 10, "content_type": "x" * 64}
+    assert client.post(IR_PREFIX + "/v1/causyn_files/uploads", json=body, headers=HEADERS).status_code == 200
 
 
 def test_platform_5xx_is_503(api):

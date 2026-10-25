@@ -269,3 +269,26 @@ def test_log_capture_keeps_causyn_file_not_oss(stack, real_capture, monkeypatch,
     stored = json.dumps(call.kwargs["payload"])
     assert REF1 in stored and "oss://" not in stored
     assert OSS1 in json.dumps(intents(stack)["payload"])  # the platform still receives the internal reference
+
+
+def _ids(count: int) -> list[str]:
+    return ["cf_" + format(i, "x").rjust(26, "0") for i in range(count)]
+
+
+def test_sixteen_distinct_references_are_allowed_and_seventeen_are_not(stack):
+    # 16 is the platform's resolve cap. The public content list is also capped at 16 items (one is the text), so
+    # exercise the cap on the bridge helper directly.
+    import asyncio
+
+    from fastapi import HTTPException
+
+    request = type("R", (), {"app": stack["client"].app})()
+    ok = {"references": [{"url": "causyn_file://" + i} for i in _ids(16)]}
+    asyncio.run(bridge.resolve_file_references(request, {"user_id": "user"}, ok))
+    too_many = {"references": [{"url": "causyn_file://" + i} for i in _ids(17)]}
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(bridge.resolve_file_references(request, {"user_id": "user"}, too_many))
+    assert caught.value.status_code == 400
+    assert caught.value.detail == {"code": "invalid_upload", "message": "too many causyn_file references (max 16)"}
+    duplicates = {"references": [{"url": "causyn_file://" + _ids(1)[0]}] * 20}
+    asyncio.run(bridge.resolve_file_references(request, {"user_id": "user"}, duplicates))  # distinct count is 1

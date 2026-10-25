@@ -100,6 +100,7 @@ class PublicError(BaseModel):
     message: str
     http_code: str
     retryable: bool
+    limit: str | None = None  # quota errors only: which file quota was hit
 
 
 class ErrorEnvelope(BaseModel):
@@ -113,6 +114,7 @@ class HTTPErrorDetail(BaseModel):
     model_config = ConfigDict(frozen=True)
     code: str | None = None
     message: str | None = None
+    limit: str | None = None
 
 
 PUBLIC_ERROR_CODES = (
@@ -129,13 +131,19 @@ PUBLIC_ERROR_CODES = (
 )
 
 
-def error_response(code: int, message: str, *, error_code: str | None = None) -> JSONResponse:
+TRANSIENT_FILE_LIMITS = frozenset({"rate", "pending"})
+
+
+def error_response(
+    code: int, message: str, *, error_code: str | None = None, limit: str | None = None, retryable: bool | None = None
+) -> JSONResponse:
     request_id = uuid.uuid4().hex
+    retry = code in (429, 500, 503, 504) if retryable is None else retryable
     public_code = error_code or next((name for status, name in PUBLIC_ERROR_CODES if status == code), "internal_error")
     return JSONResponse(
         status_code=code,
         headers=httpx.Headers(
-            (("X-Request-ID", request_id), *((("Retry-After", "10"),) if code in (429, 503) else ()))
+            (("X-Request-ID", request_id), *((("Retry-After", "10"),) if code in (429, 503) and retry else ()))
         ),
         content=ErrorEnvelope(
             error=PublicError(
@@ -143,10 +151,11 @@ def error_response(code: int, message: str, *, error_code: str | None = None) ->
                 code=public_code,
                 message=message,
                 http_code=str(code),
-                retryable=code in (429, 500, 503, 504),
+                retryable=retry,
+                limit=limit,
             ),
             request_id=request_id,
-        ).model_dump(),
+        ).model_dump(exclude_none=True),
     )
 
 
@@ -167,8 +176,13 @@ def http_error_response(exc: HTTPException) -> JSONResponse:
         else None
     )
     message = fields.message
+    quota = exc.status_code == 429 and fields.code == "quota_exceeded"
     response = error_response(
-        exc.status_code, message if isinstance(message, str) else str(detail), error_code=public_code
+        exc.status_code,
+        message if isinstance(message, str) else str(detail),
+        error_code=public_code,
+        limit=fields.limit if quota else None,
+        retryable=(fields.limit in TRANSIENT_FILE_LIMITS) if quota else None,
     )
     for name, value in () if exc.headers is None else exc.headers.items():
         if name.lower() in ("retry-after", "x-drama-submission"):

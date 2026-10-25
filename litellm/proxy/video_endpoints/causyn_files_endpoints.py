@@ -10,8 +10,8 @@ from __future__ import annotations
 import re
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.proxy.auth.user_api_key_auth import user_api_key_auth
@@ -31,7 +31,7 @@ class UploadRequest(BaseModel):
     kind: Literal["image", "video", "audio"]
     filename: str = Field(min_length=1, max_length=255)
     size: int = Field(gt=0, strict=True)
-    content_type: str = Field(min_length=1, max_length=255)
+    content_type: str = Field(min_length=1, max_length=64)
 
 
 class ListQuery(BaseModel):
@@ -62,7 +62,14 @@ async def create_upload(request: Request, auth: Auth) -> dict[str, JsonValue]:
     raw = request.scope.get("causyn_files_body")
     if not isinstance(raw, (bytes, bytearray)):
         raise H3Error(400, "Invalid upload request")
-    spec = UploadRequest.model_validate_json(bytes(raw))
+    try:
+        spec = UploadRequest.model_validate_json(bytes(raw))
+    except ValidationError as exc:
+        reason = "; ".join(
+            f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
+            for item in exc.errors(include_input=False, include_url=False)
+        )
+        raise HTTPException(400, detail={"code": "invalid_upload", "message": reason}) from None
     return await forward(request, auth, "/files/uploads", spec.model_dump(mode="json"))
 
 
