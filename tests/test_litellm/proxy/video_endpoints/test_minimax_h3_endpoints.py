@@ -677,6 +677,26 @@ def test_hidden_content_moderation_on_standalone_context_ir(api, monkeypatch, pr
     assert intake["route"] == "context_ir" and normalized[3] == normalized[1]
 
 
+@pytest.mark.parametrize("prefix", ["/video/minimax-h3", "/video/minimax-h3-test"])
+def test_context_ir_empty_extra_object_is_accepted_and_stripped(api, monkeypatch, prefix):
+    """Intended: ``extra: {}`` is as harmless here as on the generation endpoints (which accept it).
+
+    It is lifted out before ContextIRRequest, so the stored payload and the intake equal the no-``extra`` request
+    and no moderation flag is raised.
+    """
+    monkeypatch.setattr(context_ir_endpoints, "get_context_ir_service", lambda: object())
+    client, calls, _, _ = api
+    assert client.post(prefix + "/v2/h3_context_ir", json=_context_ir_data(), headers=HEADERS).status_code == 200
+    empty = client.post(prefix + "/v2/h3_context_ir", json=_context_ir_data(extra={}), headers=HEADERS)
+    assert empty.status_code == 200, empty.text
+    (_, legacy), (_, intake) = calls
+    assert "request_moderation" not in intake
+    assert intake["payload"] == legacy["payload"] and "extra" not in intake["payload"]
+    assert {k: v for k, v in intake.items() if k != "idempotency_key"} == {
+        k: v for k, v in legacy.items() if k != "idempotency_key"
+    }
+
+
 @pytest.mark.parametrize(
     "extra",
     [
