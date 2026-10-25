@@ -5063,6 +5063,26 @@ class TestOpenTelemetryFailureHookStampsServerSpan(unittest.TestCase):
         assert span.attributes["error.code"] == "500"  # legacy, string
         assert span.status.status_code == trace.StatusCode.ERROR
 
+    def test_client_4xx_is_not_a_server_error_span(self):
+        class _AuthFail(Exception):
+            code = "401"
+
+        span = self._run_hook(_AuthFail("Malformed API Key"))
+        assert span.attributes["http.response.status_code"] == 401
+        assert span.status.status_code != trace.StatusCode.ERROR
+
+    def test_http_exception_4xx_status_code_attr_is_not_error(self):
+        from fastapi import HTTPException
+
+        span = self._run_hook(HTTPException(status_code=403, detail="nope"))
+        assert span.attributes["http.response.status_code"] == 403
+        assert span.status.status_code != trace.StatusCode.ERROR
+
+    def test_status_less_exception_still_errors_with_500(self):
+        span = self._run_hook(ValueError("boom"))
+        assert span.attributes["http.response.status_code"] == 500
+        assert span.status.status_code == trace.StatusCode.ERROR
+
     def test_non_numeric_code_omits_status_code_no_crash(self):
         class _Boom(Exception):
             code = "ContextWindowExceeded"

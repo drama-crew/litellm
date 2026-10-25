@@ -133,9 +133,22 @@ class UserAPIKeyAuthExceptionHandler:
                 _, e.llm_provider = resolve_llm_provider_for_rate_limit(request_data.get("model"))
 
             # Allow callbacks to transform the error response
+            # A bare Exception raised by auth (e.g. "Malformed API Key") is answered
+            # with a 401 below; give the failure hooks that status so observability
+            # does not record it as a status-less server error (OTel span 500).
+            hook_exception: Exception = e
+            if not isinstance(e, (litellm.BudgetExceededError, HTTPException, ProxyException)) and not (
+                PrismaDBExceptionHandler.is_database_service_unavailable_error(e)
+            ):
+                hook_exception = ProxyException(
+                    message="Authentication Error, " + str(e),
+                    type=ProxyErrorTypes.auth_error,
+                    param=getattr(e, "param", "None"),
+                    code=status.HTTP_401_UNAUTHORIZED,
+                )
             transformed_exception = await proxy_logging_obj.post_call_failure_hook(
                 request_data=request_data,
-                original_exception=e,
+                original_exception=hook_exception,
                 user_api_key_dict=user_api_key_dict,
                 error_type=ProxyErrorTypes.auth_error,
                 route=route,

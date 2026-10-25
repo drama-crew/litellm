@@ -458,3 +458,31 @@ async def test_auth_failure_without_resolved_identity_still_logs():
     assert logged.api_key != "sk-unknown"
     assert logged.api_key == UserAPIKeyAuth(api_key="sk-unknown").api_key
     assert logged.request_route == "/v1/chat/completions"
+
+
+@pytest.mark.asyncio
+async def test_bare_auth_exception_reaches_failure_hook_with_401():
+    """A status-less auth Exception (e.g. Malformed API Key) is answered with 401, so
+    the failure hooks (OTel span status) must see 401, not a status-less exception."""
+    handler = UserAPIKeyAuthExceptionHandler()
+    with patch(
+        "litellm.proxy.proxy_server.proxy_logging_obj.post_call_failure_hook",
+        new_callable=AsyncMock,
+        return_value=None,
+    ) as hook, patch(
+        "litellm.proxy.proxy_server.general_settings",
+        {"allow_requests_on_db_unavailable": False},
+    ):
+        with pytest.raises(ProxyException) as exc_info:
+            await handler._handle_authentication_error(
+                Exception("Malformed API Key passed in."),
+                MagicMock(),
+                {},
+                "/v1/videos",
+                None,
+                "",
+            )
+    sent = hook.call_args[1]["original_exception"]
+    assert int(sent.code) == status.HTTP_401_UNAUTHORIZED
+    assert int(exc_info.value.code) == status.HTTP_401_UNAUTHORIZED
+    assert "Malformed API Key" in exc_info.value.message

@@ -789,6 +789,20 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             service_logging_span.set_status(Status(StatusCode.ERROR))
             service_logging_span.end(end_time=_end_time_ns)
 
+    @staticmethod
+    def _is_client_error_exception(exception: Optional[BaseException]) -> bool:
+        """True when the exception carries an HTTP 4xx status (ProxyException.code,
+        .status_code, or an httpx response status)."""
+        raw = getattr(exception, "code", None)
+        if raw is None or str(raw) in ("", "None"):
+            raw = getattr(exception, "status_code", None)
+        if raw is None:
+            raw = getattr(getattr(exception, "response", None), "status_code", None)
+        try:
+            return 400 <= int(raw) < 500  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return False
+
     async def async_post_call_failure_hook(
         self,
         request_data: dict,
@@ -801,7 +815,11 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
 
         parent_otel_span = user_api_key_dict.parent_otel_span
         if parent_otel_span is not None:
-            parent_otel_span.set_status(Status(StatusCode.ERROR))
+            # OTel HTTP semconv: a 4xx on a SERVER span is the client's error, not the
+            # server's, so only 5xx / unknown failures mark the span (and its child) ERROR.
+            _is_client_error = self._is_client_error_exception(original_exception)
+            if not _is_client_error:
+                parent_otel_span.set_status(Status(StatusCode.ERROR))
 
             # Stamp team attributes onto the SERVER (root) span too, so the
             # trace root is team-filterable on the failure path like the
@@ -859,7 +877,8 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
                 team_id=user_api_key_dict.team_id,
                 team_alias=user_api_key_dict.team_alias,
             )
-            exception_logging_span.set_status(Status(StatusCode.ERROR))
+            if not _is_client_error:
+                exception_logging_span.set_status(Status(StatusCode.ERROR))
             exception_logging_span.end(end_time=self._to_ns(datetime.now()))
 
             # Emit guardrail spans for any guardrail invocations that
