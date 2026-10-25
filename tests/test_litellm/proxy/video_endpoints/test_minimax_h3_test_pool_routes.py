@@ -49,7 +49,7 @@ def test_status_list_and_cancel_routes_reserve_no_budget(prefix):
 
 def test_context_ir_reservation_matches_on_both_prefixes():
     for prefix in ("/video/minimax-h3", "/video/minimax-h3-test"):
-        assert estimate_request_max_cost({}, prefix + "/v2/h3_context_ir", None) == 4.0
+        assert estimate_request_max_cost({}, prefix + "/v2/h3_context_ir", None) == 2.5  # CNY 0.05 per call
 
 
 def test_namespaces_are_distinct_per_prefix():

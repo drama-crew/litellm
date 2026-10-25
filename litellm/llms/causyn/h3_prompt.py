@@ -105,7 +105,9 @@ REWRITE_INVALID_PREFIX = "prompt rewrite could not produce a valid structured pr
 # guard (--max-ref-video-total-seconds 15) and returns its own 400 for over-budget combinations.
 CAUSYN_VIDEO_REF_MAX_SECONDS = 15.0
 CAUSYN_VIDEO_REF_TOTAL_MAX_SECONDS = 15.0
-PRICE_CREDITS = 4.0
+# Standalone Context IR call: CNY 0.05 per call = 2.5 credits at 1 credit = CNY 0.02 (2026-10-25). The IR rewrite inside
+# the IR video path is not billed here (task price 0); only the video seconds are charged.
+PRICE_CREDITS = 2.5
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 BASE_FIELDS = ("integrated_multimodal_description", "overall_soundscape", "non_diegetic_music")
 REFERENCE_FIELDS = (

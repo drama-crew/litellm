@@ -78,7 +78,7 @@ async def test_result_reused_after_settlement_failure_and_duplicate_delivery(red
         await enqueue_causyn_billing(
             redis,
             CausynBillingEvent(
-                provider_task_id=task.id, response_cost=4, model="causyn-h3-context-ir", task_type="h3_context_ir"
+                provider_task_id=task.id, response_cost=2.5, model="causyn-h3-context-ir", task_type="h3_context_ir"
             ),
         )
         if calls["settle"] == 1:
@@ -90,7 +90,7 @@ async def test_result_reused_after_settlement_failure_and_duplicate_delivery(red
     persisted = await service.store.get(task.id)
     assert persisted.result == RESULT
     assert persisted.status == "running"
-    assert persisted.financial_actual == 4
+    assert persisted.financial_actual == 2.5
     assert persisted.financial_facts_json is not None
     restarted = ContextIRService(ContextIRStore(redis), rewrite=counted_rewrite, settle=settle)
     await asyncio.gather(restarted.process(task.id), restarted.process(task.id))
@@ -100,7 +100,7 @@ async def test_result_reused_after_settlement_failure_and_duplicate_delivery(red
     assert calls["rewrite"] == 1
     assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 1
     payload = json.loads((await redis.xrange(CAUSYN_BILLING_STREAM_KEY))[0][1][b"payload"])
-    assert payload["response_cost"] == 4
+    assert payload["response_cost"] == 2.5
     assert payload["task_type"] == "h3_context_ir"
     assert "cost" not in ready.public()["usage"]
     public = ready.public()
@@ -224,12 +224,24 @@ async def test_budget_refund_is_atomic_and_idempotent(redis):
     assert float(await redis.get("missing-marker-counter")) == 2
 
 
+def test_standalone_context_ir_price_is_cny_0p05_in_credits():
+    # 2026-10-25 product pricing: CNY 0.05 per standalone call; 1 credit = CNY 0.02 -> 2.5 credits.
+    from decimal import Decimal
+
+    from litellm.llms.causyn.h3_prompt import PRICE_CREDITS
+
+    assert PRICE_CREDITS == 2.5
+    assert Decimal("0.05") / Decimal("0.02") == Decimal(str(PRICE_CREDITS))
+    for route in ("/video/minimax-h3/v2/h3_context_ir", "/video/minimax-h3-test/v2/h3_context_ir"):
+        assert estimate_request_max_cost({}, route, None) == PRICE_CREDITS
+
+
 def test_fixed_price_and_poll_has_no_reservation():
     assert (
         estimate_request_max_cost(
             {"model": "causyn-h3-context-ir", "price": 0}, "/video/minimax-h3/v2/h3_context_ir", None
         )
-        == 4
+        == 2.5
     )
     assert (
         estimate_request_max_cost(
@@ -273,13 +285,13 @@ async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, 
 
     standalone = await service.create(spec(), owner="owner", billing=BillingIdentity())
     await service.process(standalone.id)
-    assert (await service.store.get(standalone.id)).price == 4
+    assert (await service.store.get(standalone.id)).price == 2.5  # CNY 0.05 per standalone call at 0.02 CNY/credit
     assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 1
     await service.process(standalone.id)
     await context_ir.settle_task(await service.store.get(standalone.id))
     assert await redis.xlen(CAUSYN_BILLING_STREAM_KEY) == 1
     payload = json.loads((await redis.xrange(CAUSYN_BILLING_STREAM_KEY))[0][1][b"payload"])
-    assert payload["response_cost"] == 4
+    assert payload["response_cost"] == 2.5
     assert payload["moderation_intent_id"] is None
 
 
@@ -572,7 +584,7 @@ async def test_video_bridge_survives_process_loss_without_rewrite_or_duplicate_e
             redis,
             CausynBillingEvent(
                 provider_task_id=task.id,
-                response_cost=4,
+                response_cost=2.5,
                 model="causyn-h3-context-ir",
                 task_type="h3_context_ir",
             ),

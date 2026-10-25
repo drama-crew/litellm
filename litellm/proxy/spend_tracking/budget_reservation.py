@@ -926,7 +926,7 @@ def estimate_request_max_cost(
     llm_router: Optional[Router],
 ) -> Optional[float]:
     if route in ("/video/minimax-h3/v2/h3_context_ir", "/video/minimax-h3-test/v2/h3_context_ir"):
-        return 4.0
+        return 2.5  # CNY 0.05 per call at 1 credit = CNY 0.02; keep in sync with h3_prompt.PRICE_CREDITS
     for prefix in (
         "/video/minimax-h3",
         "/video/minimax-h3/direct",
