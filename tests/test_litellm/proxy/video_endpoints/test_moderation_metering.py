@@ -1996,9 +1996,9 @@ async def test_context_ir_internal_execution_rewrite_outbox_production_schema_on
     await service.process(task_id)
     await service.process(task_id)
     task = await service.store.get(task_id)
-    assert task.status == "succeeded" and task.settled and task.price == 4
-    assert context_ir.financial_facts(task).raw_cost_credit == Decimal(4)
-    assert context_ir.actual_cost(task) == 4
+    assert task.status == "succeeded" and task.settled and task.price == 2.5
+    assert context_ir.financial_facts(task).raw_cost_credit == Decimal("2.5")
+    assert context_ir.actual_cost(task) == 2.5
     assert (
         context_ir.freeze_financial(task.model_copy(update={"price": 999})).financial_facts_json
         == task.financial_facts_json

@@ -1388,3 +1388,12 @@ async def test_production_direct_deadline_ignores_test_pool_env(enqueued, monkey
         optional_params=_params(prompt_processing="direct"),
     )
     assert enqueued.payloads[0]["deadline_ts"] == 2_000_003_120.0
+
+
+def test_h3_video_completion_cost_is_per_output_second_only():
+    # 2026-10-25 product pricing: CNY 0.20 per output second = 10 credits/s at 1 credit = CNY 0.02,
+    # identical for Direct and IR (the IR rewrite adds no charge; only the video seconds are billed).
+    pricing = mod._Pricing(model="causyn-1.1", id="causyn-1-1", output_cost_per_second_768p=10.0)
+    assert mod._completion_cost(pricing, 5.0, "768p") == 50.0
+    # billed on min(ordered, rendered): a 15 s order that renders 14.375 s is billed 14.375 s
+    assert mod._completion_cost(pricing, 14.375, "768p") == 143.75
