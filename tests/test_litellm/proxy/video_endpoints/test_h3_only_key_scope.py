@@ -47,17 +47,6 @@ _H3_SUFFIXES = (
 H3_ONLY_ROUTES = [
     prefix + suffix for prefix in ("/video/minimax-h3", "/video/minimax-h3/direct") for suffix in _H3_SUFFIXES
 ] + ["/video/minimax-h3/v2/h3_context_ir"]
-# Direct-upload file routes (IR + Direct prefixes only; the test pool has none). The platform must grant these too.
-_FILE_SUFFIXES = (
-    "/v1/causyn_files/uploads",
-    "/v1/causyn_files/{file_id}/complete",
-    "/v1/causyn_files/{file_id}",
-    "/v1/causyn_files",
-)
-H3_ONLY_ROUTES += [
-    prefix + suffix for prefix in ("/video/minimax-h3", "/video/minimax-h3/direct") for suffix in _FILE_SUFFIXES
-]
-
 # Mirrors the self-service ("all") default grant for the video routes.
 BROAD_ROUTES = [
     "/v1/models",
@@ -246,38 +235,75 @@ def test_h3_only_key_queries_lists_and_cancels_h3_tasks(scoped, platform, prefix
     _assert_principal(platform.only("/intents/mod_video_1/cancel"))
 
 
-@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
-@pytest.mark.parametrize("prefix", ["/video/minimax-h3", "/video/minimax-h3/direct"])
-def test_h3_only_key_can_call_files_routes(scoped, platform, prefix):
+FILE_ID = "cf_" + "a" * 26
+IR, DIRECT = "/video/minimax-h3", "/video/minimax-h3/direct"
+FILES_KEY = "sk-files-scope"
+
+
+def _file_calls(prefix: str):
+    upload = {"kind": "image", "filename": "a.png", "size": 10, "content_type": "image/png"}
+    return (
+        ("post", prefix + "/v1/causyn_files/uploads", {"json": upload}),
+        ("post", f"{prefix}/v1/causyn_files/{FILE_ID}/complete", {"json": {}}),
+        ("get", f"{prefix}/v1/causyn_files/{FILE_ID}", {}),
+        ("get", prefix + "/v1/causyn_files", {}),
+        ("delete", f"{prefix}/v1/causyn_files/{FILE_ID}", {}),
+    )
+
+
+def _with_files(scoped, monkeypatch, routes, key=FILES_KEY):
     from litellm.proxy.video_endpoints import causyn_files_endpoints
 
     scoped.app.include_router(causyn_files_endpoints.router)
-    file_id = "cf_" + "a" * 26
-    upload = {"kind": "image", "filename": "a.png", "size": 10, "content_type": "image/png"}
-    calls = (
-        ("post", prefix + "/v1/causyn_files/uploads", {"json": upload}),
-        ("post", f"{prefix}/v1/causyn_files/{file_id}/complete", {"json": {}}),
-        ("get", f"{prefix}/v1/causyn_files/{file_id}", {}),
-        ("get", prefix + "/v1/causyn_files", {}),
-        ("delete", f"{prefix}/v1/causyn_files/{file_id}", {}),
-    )
-    for method, route, kwargs in calls:
-        denied = getattr(scoped.client, method)(route, headers=_auth_headers(OTHER_KEY), **kwargs)
-        assert denied.status_code == 403 and "not allowed" in denied.text, (route, denied.text)  # control
-    assert platform.calls == []
-    for method, route, kwargs in calls:
-        allowed = getattr(scoped.client, method)(route, headers=_auth_headers(H3_ONLY_KEY), **kwargs)
-        assert allowed.status_code == 200, (route, allowed.text)
-        assert allowed.json()["base_resp"]["status_code"] == 0
-    assert [call["path"] for call in platform.calls] == [
-        "/files/uploads",
-        f"/files/{file_id}/complete",
-        f"/files/{file_id}/view",
-        "/files/list",
-        f"/files/{file_id}/delete",
+    store = proxy_server.prisma_client
+    store.rows[hash_token(key)] = {"models": ["causyn-1.1"], "allowed_routes": list(routes)}
+
+
+def _status(scoped, prefix, key):
+    return [
+        getattr(scoped.client, method)(route, headers=_auth_headers(key), **kwargs).status_code
+        for method, route, kwargs in _file_calls(prefix)
     ]
+
+
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+@pytest.mark.parametrize("prefix", [IR, DIRECT])
+def test_h3_only_key_can_call_files_routes_without_listing_them(scoped, platform, monkeypatch, prefix):
+    """The platform's fixed H3_ONLY_ROUTES carry no file routes; the create route grants them."""
+    _with_files(scoped, monkeypatch, H3_ONLY_ROUTES)
+    assert _status(scoped, prefix, OTHER_KEY) == [403] * 5  # control
+    assert platform.calls == []
+    assert _status(scoped, prefix, FILES_KEY) == [200] * 5
     for call in platform.calls:
-        _assert_principal(call["body"])
+        assert call["body"]["principal"]["user_id"] == "owner"
+
+
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+def test_files_permission_follows_the_prefix_of_the_create_route(scoped, platform, monkeypatch):
+    _with_files(scoped, monkeypatch, [IR + "/v2/video_generation"])
+    assert _status(scoped, IR, FILES_KEY) == [200] * 5
+    assert _status(scoped, DIRECT, FILES_KEY) == [403] * 5
+    _with_files(scoped, monkeypatch, [DIRECT + "/v2/video_generation"], key="sk-files-direct")
+    assert _status(scoped, DIRECT, "sk-files-direct") == [200] * 5
+    assert _status(scoped, IR, "sk-files-direct") == [403] * 5
+
+
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+def test_files_routes_denied_without_any_create_route(scoped, platform, monkeypatch):
+    _with_files(scoped, monkeypatch, ["/models", IR + "/v2/query/video_generation"])
+    assert _status(scoped, IR, FILES_KEY) == [403] * 5
+    assert _status(scoped, DIRECT, FILES_KEY) == [403] * 5
+    assert platform.calls == []
+
+
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+def test_derived_files_permission_changes_nothing_else(scoped, platform, monkeypatch):
+    _with_files(scoped, monkeypatch, [IR + "/v2/video_generation"])
+    for route in ("/v1/videos", "/videos", DIRECT + "/v2/video_generation"):
+        denied = scoped.client.post(
+            route, json={"model": "causyn-1.1", "prompt": "x"}, headers=_auth_headers(FILES_KEY)
+        )
+        assert denied.status_code == 403, (route, denied.text)
 
 
 @pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)

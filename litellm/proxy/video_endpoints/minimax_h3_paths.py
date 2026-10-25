@@ -68,3 +68,15 @@ FILES_SEGMENT = "/v1/causyn_files"
 def is_files_path(path: str) -> bool:
     """Direct-upload file routes exist on the production IR and Direct prefixes only (never the test pool)."""
     return any(path == prefix + FILES_SEGMENT or path.startswith(prefix + FILES_SEGMENT + "/") for prefix in PREFIXES)
+
+
+def files_grant_route(path: str) -> str | None:
+    """The create route whose grant also covers the direct-upload file routes of the same prefix.
+
+    Keys are provisioned with fixed ``allowed_routes`` that predate the file routes, so a key may use a prefix's file
+    routes exactly when it may create generations on that prefix. ``None`` for any non-file path (and the test pool).
+    """
+    if not is_files_path(path):
+        return None
+    prefix = DIRECT_PREFIX if path.startswith(DIRECT_PREFIX + FILES_SEGMENT) else IR_PREFIX
+    return prefix + "/v2/video_generation"

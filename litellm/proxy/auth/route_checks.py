@@ -13,6 +13,8 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 
+from litellm.proxy.video_endpoints.minimax_h3_paths import files_grant_route
+
 from .auth_checks_organization import _user_is_org_admin
 
 # Management write routes denied to PROXY_ADMIN_VIEW_ONLY. Adding a new write
@@ -148,6 +150,11 @@ class RouteChecks:
         for allowed_route in valid_token.allowed_routes:
             if RouteChecks._route_matches_allowed_route(route=route, allowed_route=allowed_route):
                 return True
+
+        # Direct-upload file routes are granted by the same prefix's H3 create route (provisioned keys predate them).
+        grant = files_grant_route(route)
+        if grant is not None and grant in valid_token.allowed_routes:
+            return True
 
         ## check if 'allowed_route' is a field name in LiteLLMRoutes
         if any(allowed_route in LiteLLMRoutes._member_names_ for allowed_route in valid_token.allowed_routes):
