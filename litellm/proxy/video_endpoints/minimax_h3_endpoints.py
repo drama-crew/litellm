@@ -49,6 +49,7 @@ from litellm.proxy.video_endpoints.minimax_h3_paths import (
     TEST_DIRECT_PREFIX,
     TEST_IR_PREFIX,
     WORKER_POOL_TEST,
+    is_files_path,
     is_test_path,
     namespace,
 )
@@ -157,6 +158,8 @@ def http_error_response(exc: HTTPException) -> JSONResponse:
     public_code = (
         "insufficient_compute"
         if fields.code == "insufficient_compute"
+        else fields.code
+        if fields.code in moderation_bridge.FILE_ERROR_CODES
         else "key_budget_exceeded"
         if exc.status_code == 402 and fields.code == "key_budget_exceeded"
         else "idempotency_conflict"
@@ -250,7 +253,31 @@ def reject_mismatched_prompt_expansion(spec: MiniMaxH3Create, path: str, is_dire
         )
 
 
+FILES_BODY_LIMIT = 16 * 1024
+
+
+async def prepare_files_request(request: Request) -> None:
+    """Direct-upload file routes: body-free auth placeholder, tiny JSON body only on ``/uploads``, query only on list."""
+    request.scope["h3_namespace"] = namespace(request.url.path)
+    is_list = request.url.path.endswith("/v1/causyn_files")
+    if (request.query_params and not is_list) or any(
+        request.headers.get(name)
+        for name in ("x-litellm-model", "custom-llm-provider", "x-litellm-custom-llm-provider")
+    ):
+        raise H3Error(400, "Provider routing overrides are not supported on this endpoint")
+    _safe_set_request_parsed_body(request, {"model": INTERNAL_MODEL})
+    if request.method == "POST" and request.url.path.endswith("/uploads"):
+        if request.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise H3Error(400, "Content-Type must be application/json")
+        raw = await read_json_body(request)
+        if len(raw) > FILES_BODY_LIMIT:
+            raise H3Error(400, "Request body is too large")
+        request.scope["causyn_files_body"] = bytes(raw)
+
+
 async def prepare_request(request: Request) -> None:
+    if is_files_path(request.url.path):
+        return await prepare_files_request(request)
     is_ir_create = request.url.path in IR_CREATE_PATHS
     is_ir_list = request.url.path in LIST_PATHS
     public_id = TypeAdapter(str).validate_python(request.path_params.get("video_id", ""))

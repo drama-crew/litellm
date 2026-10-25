@@ -60,3 +60,11 @@ def continuation_path(ns: str | None, route: str) -> str | None:
     if route == "context_ir" and prefix in (IR_PREFIX, TEST_IR_PREFIX):
         return prefix + "/v2/h3_context_ir"
     return None
+
+
+FILES_SEGMENT = "/v1/causyn_files"
+
+
+def is_files_path(path: str) -> bool:
+    """Direct-upload file routes exist on the production IR and Direct prefixes only (never the test pool)."""
+    return any(path == prefix + FILES_SEGMENT or path.startswith(prefix + FILES_SEGMENT + "/") for prefix in PREFIXES)

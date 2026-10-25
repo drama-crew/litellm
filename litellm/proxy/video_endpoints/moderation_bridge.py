@@ -108,6 +108,34 @@ def _queue_full_retry_after(detail: object, headers: httpx.Headers | None) -> st
     return str(QUEUE_FULL_RETRY_AFTER_DEFAULT_S)
 
 
+FILE_ERROR_CODES = frozenset(
+    {"file_not_found", "file_not_ready", "file_expired", "file_rejected", "invalid_upload", "quota_exceeded"}
+)
+FILE_QUOTA_LIMITS = frozenset({"files", "bytes", "pending", "rate"})
+
+
+def file_not_found(message: str = "File not found") -> HTTPException:
+    return HTTPException(404, detail={"code": "file_not_found", "message": message})
+
+
+def file_rejection(status: int, detail: object, path: str) -> HTTPException | None:
+    """Public mapping of the platform's ``/files/*`` errors; ``None`` leaves the generic mapping in charge."""
+    code = detail.get("code") if isinstance(detail, dict) else None
+    if status == 404:
+        return file_not_found("Referenced causyn_file not found" if path == "/files/resolve" else "File not found")
+    if status == 429 and code == "quota_exceeded":
+        limit = detail.get("limit") if isinstance(detail, dict) else None
+        name = limit if limit in FILE_QUOTA_LIMITS else "unknown"
+        return HTTPException(
+            429, detail={"code": "quota_exceeded", "message": f"File quota exceeded (limit: {name})"}
+        )
+    if status == 400 and code in FILE_ERROR_CODES:
+        reason = detail.get("reason") if isinstance(detail, dict) else None
+        text = reason if isinstance(reason, str) and reason else "The file request was rejected"
+        return HTTPException(400, detail={"code": code, "message": text})
+    return None
+
+
 def platform_rejection(status: int, detail: object, path: str, headers: httpx.Headers | None = None) -> HTTPException:
     """Map a moderation-platform error to the public status.
 
@@ -118,6 +146,8 @@ def platform_rejection(status: int, detail: object, path: str, headers: httpx.He
     """
     if status >= 500:
         return HTTPException(503, "Moderation control request was rejected")
+    if path.startswith("/files/") and (mapped := file_rejection(status, detail, path)) is not None:
+        return mapped
     if status == 404 and re.fullmatch(r"/intents/[^/]+/(?:view|cancel)", path):
         return HTTPException(404, "Task not found")
     code = detail.get("code") if isinstance(detail, dict) else None

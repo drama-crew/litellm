@@ -310,6 +310,15 @@ class LiteLLMRoutes(enum.Enum):
         "/video/minimax-h3/direct/v2/query/video_generation",
         "/video/minimax-h3/v2/video_generation/{video_id}",
         "/video/minimax-h3/direct/v2/video_generation/{video_id}",
+        # direct-upload files (no test-pool mirror: test-namespace requests only reference these files)
+        "/video/minimax-h3/v1/causyn_files/uploads",
+        "/video/minimax-h3/v1/causyn_files/{file_id}/complete",
+        "/video/minimax-h3/v1/causyn_files/{file_id}",
+        "/video/minimax-h3/v1/causyn_files",
+        "/video/minimax-h3/direct/v1/causyn_files/uploads",
+        "/video/minimax-h3/direct/v1/causyn_files/{file_id}/complete",
+        "/video/minimax-h3/direct/v1/causyn_files/{file_id}",
+        "/video/minimax-h3/direct/v1/causyn_files",
         # test worker pool facade (mirror of the routes above)
         "/video/minimax-h3-test/v2/video_generation",
         "/video/minimax-h3-test/direct/v2/video_generation",

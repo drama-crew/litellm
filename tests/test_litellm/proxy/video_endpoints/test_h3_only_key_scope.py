@@ -47,6 +47,16 @@ _H3_SUFFIXES = (
 H3_ONLY_ROUTES = [
     prefix + suffix for prefix in ("/video/minimax-h3", "/video/minimax-h3/direct") for suffix in _H3_SUFFIXES
 ] + ["/video/minimax-h3/v2/h3_context_ir"]
+# Direct-upload file routes (IR + Direct prefixes only; the test pool has none). The platform must grant these too.
+_FILE_SUFFIXES = (
+    "/v1/causyn_files/uploads",
+    "/v1/causyn_files/{file_id}/complete",
+    "/v1/causyn_files/{file_id}",
+    "/v1/causyn_files",
+)
+H3_ONLY_ROUTES += [
+    prefix + suffix for prefix in ("/video/minimax-h3", "/video/minimax-h3/direct") for suffix in _FILE_SUFFIXES
+]
 
 # Mirrors the self-service ("all") default grant for the video routes.
 BROAD_ROUTES = [
@@ -234,6 +244,40 @@ def test_h3_only_key_queries_lists_and_cancels_h3_tasks(scoped, platform, prefix
     assert cancelled.status_code == 200, cancelled.text
     assert cancelled.json() == {"task_id": "mod_video_1", "action": "cancelled", "status": "cancelled"}
     _assert_principal(platform.only("/intents/mod_video_1/cancel"))
+
+
+@pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
+@pytest.mark.parametrize("prefix", ["/video/minimax-h3", "/video/minimax-h3/direct"])
+def test_h3_only_key_can_call_files_routes(scoped, platform, prefix):
+    from litellm.proxy.video_endpoints import causyn_files_endpoints
+
+    scoped.app.include_router(causyn_files_endpoints.router)
+    file_id = "cf_" + "a" * 26
+    upload = {"kind": "image", "filename": "a.png", "size": 10, "content_type": "image/png"}
+    calls = (
+        ("post", prefix + "/v1/causyn_files/uploads", {"json": upload}),
+        ("post", f"{prefix}/v1/causyn_files/{file_id}/complete", {"json": {}}),
+        ("get", f"{prefix}/v1/causyn_files/{file_id}", {}),
+        ("get", prefix + "/v1/causyn_files", {}),
+        ("delete", f"{prefix}/v1/causyn_files/{file_id}", {}),
+    )
+    for method, route, kwargs in calls:
+        denied = getattr(scoped.client, method)(route, headers=_auth_headers(OTHER_KEY), **kwargs)
+        assert denied.status_code == 403 and "not allowed" in denied.text, (route, denied.text)  # control
+    assert platform.calls == []
+    for method, route, kwargs in calls:
+        allowed = getattr(scoped.client, method)(route, headers=_auth_headers(H3_ONLY_KEY), **kwargs)
+        assert allowed.status_code == 200, (route, allowed.text)
+        assert allowed.json()["base_resp"]["status_code"] == 0
+    assert [call["path"] for call in platform.calls] == [
+        "/files/uploads",
+        f"/files/{file_id}/complete",
+        f"/files/{file_id}/view",
+        "/files/list",
+        f"/files/{file_id}/delete",
+    ]
+    for call in platform.calls:
+        _assert_principal(call["body"])
 
 
 @pytest.mark.parametrize("stack", ["causyn-1.1"], indirect=True)
