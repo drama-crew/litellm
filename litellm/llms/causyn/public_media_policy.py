@@ -462,6 +462,9 @@ async def _check_public_url(url: str, lookups: dict[tuple[str, int], asyncio.Fut
 # ------------------------------------------------------------------ entry points
 
 
+CAUSYN_FILE_PREFIX = "causyn_file://"
+
+
 async def _check_one(ref: MediaRef, lookups: dict[tuple[str, int], asyncio.Future]) -> float:
     try:
         if ref.url.startswith("data:"):
@@ -469,6 +472,9 @@ async def _check_one(ref: MediaRef, lookups: dict[tuple[str, int], asyncio.Futur
                 return await _gate("decode").run(functools.partial(_validate_data_url, ref), DECODE_TIMEOUT_S)
             except (TimeoutError, asyncio.TimeoutError):
                 raise MediaPolicyError(f"{ref.kind} could not be validated in time") from None
+        if ref.url.startswith(CAUSYN_FILE_PREFIX):
+            # A direct-upload reference: validated by the platform when the file is confirmed and again when frozen.
+            return 0.0
         await _check_public_url(ref.url, lookups)
         return 0.0
     except MediaPolicyError as exc:

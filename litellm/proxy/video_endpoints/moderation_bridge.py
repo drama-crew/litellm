@@ -496,6 +496,7 @@ async def submit(
     if model == "causyn-1.1":
         await enforce_public_media(payload)
     source = await source_descriptor(request, auth, payload)
+    payload, file_originals = await resolve_file_references(request, owner, payload)
     normalized = await inline_media(request, owner, payload)
     prepared = {
         **JSON_OBJECT.validate_python(normalized),
@@ -529,7 +530,8 @@ async def submit(
     projected = video(View.model_validate(result))
     from litellm.proxy.video_endpoints import openapi_log_capture
 
-    history_id = await openapi_log_capture.start(request, auth, prepared)
+    # The history keeps what the caller wrote: ``causyn_file://`` text, never the internal ``oss://`` reference.
+    history_id = await openapi_log_capture.start(request, auth, restore_file_references(prepared, file_originals))
     await openapi_log_capture.submitted(history_id, projected)
     return projected
 
@@ -647,6 +649,72 @@ async def upload_media(request: Request, owner: dict[str, JsonValue], upload: St
         if response.status_code != 409:
             response.raise_for_status()
     return TypeAdapter(str).validate_python(target["reference"])
+
+
+CAUSYN_FILE_PREFIX = "causyn_file://"
+CAUSYN_FILE_REF = re.compile(r"causyn_file://(cf_[0-9a-z]{26})")
+# Free text is never a media reference, whatever it happens to contain.
+_TEXT_KEYS = frozenset({"prompt", "text"})
+
+
+def _file_ids(value: JsonValue, found: dict[str, None]) -> None:
+    if isinstance(value, str):
+        if value.startswith(CAUSYN_FILE_PREFIX):
+            match = CAUSYN_FILE_REF.fullmatch(value)
+            if match is None:
+                raise HTTPException(400, detail={"code": "invalid_upload", "message": "Invalid causyn_file reference"})
+            found.setdefault(match.group(1))
+    elif isinstance(value, dict):
+        for key, child in value.items():
+            if key not in _TEXT_KEYS:
+                _file_ids(child, found)
+    elif isinstance(value, list):
+        for child in value:
+            _file_ids(child, found)
+
+
+def _replace_strings(value: JsonValue, mapping: dict[str, str]) -> JsonValue:
+    if isinstance(value, str):
+        return mapping.get(value, value)
+    if isinstance(value, dict):
+        return {
+            key: child if key in _TEXT_KEYS else _replace_strings(child, mapping) for key, child in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_strings(child, mapping) for child in value]
+    return value
+
+
+async def resolve_file_references(
+    request: Request, owner: dict[str, JsonValue], payload: dict[str, JsonValue]
+) -> tuple[dict[str, JsonValue], dict[str, str]]:
+    """Swap every ``causyn_file://`` media reference for the internal ``oss://`` one, in ONE platform call.
+
+    Returns the payload to send on plus ``{oss reference: original text}`` so the caller can log what the client wrote.
+    The platform decides ownership, readiness and expiry; this side only insists on a well-formed ``oss://`` answer
+    for exactly the ids it asked about.
+    """
+    found: dict[str, None] = {}
+    _file_ids(payload, found)
+    if not found:
+        return payload, {}
+    ids = list(found)
+    result = await platform(request, "POST", "/files/resolve", {"principal": owner, "file_ids": ids})
+    refs = TypeAdapter(dict[str, JsonValue]).validate_python(result.get("refs") or {})
+    forward: dict[str, str] = {}
+    for file_id in ids:
+        reference = refs.get(file_id)
+        if reference is None:
+            raise file_not_found("Referenced causyn_file not found")
+        if not isinstance(reference, str) or not reference.startswith("oss://"):
+            raise HTTPException(503, "Moderation control request was rejected")
+        forward[CAUSYN_FILE_PREFIX + file_id] = reference
+    resolved = JSON_OBJECT.validate_python(_replace_strings(payload, forward))
+    return resolved, {oss: original for original, oss in forward.items()}
+
+
+def restore_file_references(value: JsonValue, originals: dict[str, str]) -> JsonValue:
+    return _replace_strings(value, originals) if originals else value
 
 
 async def inline_media(request: Request, owner: dict[str, JsonValue], value: JsonValue) -> JsonValue:

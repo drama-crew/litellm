@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import time
 from typing import Annotated, Generic, Literal, TypeVar
 from urllib.parse import urlsplit
@@ -15,6 +16,7 @@ from typing_extensions import Self
 from litellm.litellm_core_utils.causyn_reference_limits import reference_count_limit_violation
 from litellm.proxy.video_endpoints.minimax_h3_paths import LEGACY_PUBLIC_MODEL, PUBLIC_MODEL, UNAVAILABLE_PUBLIC_MODEL
 
+CAUSYN_FILE_REF = re.compile(r"causyn_file://cf_[0-9a-z]{26}")
 ModelName = Literal["MiniMax-H3", "MiniMax-H3-Max", "causyn-1.1"]
 ContentModel = TypeVar("ContentModel", bound=str)
 Ratio = Literal["adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"]
@@ -68,10 +70,14 @@ class MediaURL(StrictModel):
             except ValueError as exc:
                 raise ValueError("invalid Base64 media") from exc
             return value
+        if value.startswith("causyn_file://"):
+            if CAUSYN_FILE_REF.fullmatch(value) is None:
+                raise ValueError("invalid causyn_file reference; expected causyn_file://cf_ plus 26 characters [0-9a-z]")
+            return value
         if value.startswith("mm_file://"):
             raise ValueError(
-                "mm_file:// references are not supported (no file-upload API here); "
-                "provide a public HTTP(S) URL or a Base64 data URL"
+                "mm_file:// references are not supported; upload the file and use causyn_file://, "
+                "or provide a public HTTP(S) URL or a Base64 data URL"
             )
         raise ValueError("media must be a public HTTP(S) URL or Base64 data URL")
 

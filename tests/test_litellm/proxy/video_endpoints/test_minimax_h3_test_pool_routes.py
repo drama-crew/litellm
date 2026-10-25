@@ -17,7 +17,8 @@ def _h3_routes(routes, marker):
 
 def test_route_allowlist_has_a_test_mirror_of_every_production_h3_route():
     routes = set(LiteLLMRoutes.openai_routes.value)
-    production = _h3_routes(routes, "minimax-h3/")
+    # Direct-upload file routes are production-only by design: test-pool requests merely reference those files.
+    production = {route for route in _h3_routes(routes, "minimax-h3/") if "/v1/causyn_files" not in route}
     mirrored = {route.replace("/video/minimax-h3/", "/video/minimax-h3-test/", 1) for route in production}
     assert production and mirrored == _h3_routes(routes, "minimax-h3-test/")
 
