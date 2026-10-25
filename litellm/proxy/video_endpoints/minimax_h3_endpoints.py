@@ -12,6 +12,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
+from starlette.requests import ClientDisconnect
 from starlette.routing import Match
 from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
@@ -237,10 +238,15 @@ async def preauthenticate(request: Request) -> None:
 
 async def read_json_body(request: Request) -> bytearray:
     raw = bytearray()
-    async for chunk in request.stream():
-        if len(raw) + len(chunk) > BODY_LIMIT:
-            raise H3Error(400, "Request body exceeds 64 MB")
-        raw.extend(chunk)
+    try:
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > BODY_LIMIT:
+                raise H3Error(400, "Request body exceeds 64 MB")
+            raw.extend(chunk)
+    except ClientDisconnect as exc:
+        # The caller (or the gateway answering 413 for it) dropped the connection mid-body:
+        # a client-side abort, not a server failure.
+        raise H3Error(400, "Request body was not fully received") from exc
     return raw
 
 
@@ -378,6 +384,8 @@ class MiniMaxH3Route(APIRoute):
                 return error_response(exc.status_code, str(exc))
             except H3Error as exc:
                 return error_response(exc.code, str(exc))
+            except ClientDisconnect:
+                return error_response(400, "Request body was not fully received")
             except json.JSONDecodeError:
                 return error_response(400, "Invalid JSON body")
             except ValidationError as exc:

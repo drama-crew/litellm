@@ -5890,3 +5890,128 @@ class TestOpenTelemetryMetricAttributeFiltering(unittest.TestCase):
                         exporter="console", attributes=attributes
                     )
                 )
+
+
+_KEY_HASH = "0123456789abcdef" * 4
+_LEAKY_AUTH_MESSAGE = (
+    f"Authentication Error, Invalid proxy server token passed. Received API Key = sk-...abcd, "
+    f"Key Hash (Token) ={_KEY_HASH}. Unable to find token in cache"
+)
+
+
+def _span_text(span) -> str:
+    parts = [str(dict(span.attributes or {})), str(span.status.description or "")]
+    parts += [str(dict(event.attributes or {})) + event.name for event in span.events]
+    return " ".join(parts)
+
+
+class TestProxyAuthFailureSpanHygiene(unittest.TestCase):
+    """Proxy 401/403 are the client's error: never span ERROR, and the span never
+    carries key hashes (the proxy's auth message embeds the presented key's hash)."""
+
+    def _setup(self):
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        tracer = provider.get_tracer(__name__)
+        otel = OpenTelemetry()
+        otel.tracer = tracer
+        return exporter, tracer, otel
+
+    def _auth_exception(self):
+        from litellm.proxy._types import ProxyException
+
+        return ProxyException(message=_LEAKY_AUTH_MESSAGE, type="auth_error", param=None, code=401)
+
+    def _error_info(self, exc):
+        return {"error_code": "401", "error_class": "ProxyException", "error_message": str(exc), "traceback": str(exc)}
+
+    def test_handle_failure_on_server_span_keeps_proxy_auth_401_non_error_and_redacted(self):
+        exporter, tracer, otel = self._setup()
+        server_span = tracer.start_span("Received Proxy Server Request")
+        exc = self._auth_exception()
+        kwargs = {
+            "exception": exc,
+            "standard_logging_object": {"error_information": self._error_info(exc)},
+            "litellm_params": {"metadata": {}},
+        }
+        with patch.object(otel, "_get_span_context", return_value=(None, server_span)), patch.object(
+            otel, "set_attributes"
+        ), patch.object(otel, "_emit_once", return_value=True), patch.dict(
+            os.environ, {"USE_OTEL_LITELLM_REQUEST_SPAN": "false"}
+        ):
+            otel._handle_failure(kwargs, None, datetime.utcnow(), datetime.utcnow())
+        assert server_span.status.status_code != trace.StatusCode.ERROR
+        text = _span_text(server_span)
+        assert _KEY_HASH not in text
+        assert "[redacted]" in text
+
+    def test_handle_failure_provider_401_stays_error(self):
+        exporter, tracer, otel = self._setup()
+        server_span = tracer.start_span("Received Proxy Server Request")
+
+        class _Provider(Exception):
+            status_code = 401
+
+        kwargs = {"exception": _Provider("bad provider key"), "litellm_params": {"metadata": {}}}
+        with patch.object(otel, "_get_span_context", return_value=(None, server_span)), patch.object(
+            otel, "set_attributes"
+        ), patch.object(otel, "_emit_once", return_value=True), patch.dict(
+            os.environ, {"USE_OTEL_LITELLM_REQUEST_SPAN": "false"}
+        ):
+            otel._handle_failure(kwargs, None, datetime.utcnow(), datetime.utcnow())
+        assert server_span.status.status_code == trace.StatusCode.ERROR
+
+    def test_failure_hook_never_writes_a_key_hash_to_any_span(self):
+        exporter, tracer, otel = self._setup()
+        server_span = tracer.start_span("Received Proxy Server Request")
+        user_api_key_dict = MagicMock()
+        user_api_key_dict.parent_otel_span = server_span
+        asyncio.run(
+            otel.async_post_call_failure_hook(
+                request_data={},
+                original_exception=self._auth_exception(),
+                user_api_key_dict=user_api_key_dict,
+                traceback_str=_LEAKY_AUTH_MESSAGE,
+            )
+        )
+        spans = exporter.get_finished_spans()
+        assert {s.name for s in spans} >= {"Received Proxy Server Request", "Failed Proxy Server Request"}
+        for span in spans:
+            assert _KEY_HASH not in _span_text(span), span.name
+            assert span.status.status_code != trace.StatusCode.ERROR
+
+    def test_dangling_server_span_closer_exempts_proxy_auth_only(self):
+        import litellm.proxy.proxy_server as ps
+        from litellm.proxy._types import ProxyException
+
+        for exc, expected_error in (
+            (self._auth_exception(), False),
+            (ProxyException(message="rate limited", type="None", param=None, code=429), True),
+            (ValueError("boom"), True),
+        ):
+            exporter, tracer, otel = self._setup()
+            span = tracer.start_span("Received Proxy Server Request")
+            request = MagicMock()
+            request.state.parent_otel_span = span
+            with patch.object(ps, "open_telemetry_logger", otel):
+                code = otel._http_status_from_exception(exc) or 500
+                ps._close_dangling_otel_server_span(request, code, exc=exc)
+            finished = exporter.get_finished_spans()[0]
+            assert (finished.status.status_code == trace.StatusCode.ERROR) is expected_error, exc
+            assert finished.attributes["http.response.status_code"] == code
+            assert _KEY_HASH not in _span_text(finished)
+
+    def test_client_disconnect_is_not_an_error_span(self):
+        import litellm.proxy.proxy_server as ps
+        from starlette.requests import ClientDisconnect
+
+        exporter, tracer, otel = self._setup()
+        span = tracer.start_span("Received Proxy Server Request")
+        request = MagicMock()
+        request.state.parent_otel_span = span
+        with patch.object(ps, "open_telemetry_logger", otel):
+            ps._close_dangling_otel_server_span(request, 400, exc=ClientDisconnect())
+        finished = exporter.get_finished_spans()[0]
+        assert finished.status.status_code != trace.StatusCode.ERROR
+        assert finished.attributes["http.response.status_code"] == 400

@@ -588,6 +588,7 @@ litellm.suppress_debug_info = True
 import json
 from typing import Union
 
+from starlette.requests import ClientDisconnect
 from fastapi import (
     Depends,
     FastAPI,
@@ -1461,7 +1462,15 @@ def _close_dangling_otel_server_span(request: Request, status_code: int, exc: Op
         open_telemetry_logger.set_response_status_code_attribute(parent_otel_span, status_code)
         if status_code >= 400:
             open_telemetry_logger.record_error_attributes_on_span(parent_otel_span, exc, status_code)
-        parent_otel_span.set_status(Status(StatusCode.ERROR if status_code >= 400 else StatusCode.OK))
+        # The proxy's own 401/403 are the client's error (OTel HTTP semconv): keep the
+        # real status code and error attributes, but never mark the span ERROR.
+        if status_code < 400:
+            parent_otel_span.set_status(Status(StatusCode.OK))
+        else:
+            from litellm.integrations.opentelemetry import OpenTelemetry
+
+            if not (OpenTelemetry._is_proxy_auth_client_error(exc) or isinstance(exc, ClientDisconnect)):
+                parent_otel_span.set_status(Status(StatusCode.ERROR))
         parent_otel_span.end()
     except Exception as e:
         verbose_proxy_logger.debug("Error closing dangling OTEL SERVER span: %s", str(e))
@@ -1475,6 +1484,24 @@ async def otel_request_validation_exception_handler(request: Request, exc: Reque
     return JSONResponse(
         status_code=422,
         content={"detail": jsonable_encoder(exc.errors())},
+    )
+
+
+@app.exception_handler(ClientDisconnect)
+async def client_disconnect_exception_handler(request: Request, exc: ClientDisconnect):
+    """The caller aborted while the body was being read (e.g. the gateway answered 413
+    and dropped the upstream connection): a client error, never a 500."""
+    _close_dangling_otel_server_span(request, 400, exc=exc)
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error": {
+                "message": "Request body was not fully received",
+                "type": "invalid_request_error",
+                "param": None,
+                "code": "400",
+            }
+        },
     )
 
 

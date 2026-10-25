@@ -1,4 +1,5 @@
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import (
@@ -817,6 +818,33 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             return False
         return OpenTelemetry._http_status_from_exception(exception) in (401, 403)
 
+    _KEY_MATERIAL_RE = re.compile(r"\b[0-9a-fA-F]{64}\b|\bsk-[A-Za-z0-9_\-]{8,}")
+
+    @classmethod
+    def _redact_key_material(cls, value: Any) -> Any:
+        """Strip API-key hashes (64-hex) and ``sk-`` secrets from text bound for a
+        span: proxy auth errors embed the presented key's hash in their message."""
+        if isinstance(value, str):
+            return cls._KEY_MATERIAL_RE.sub("[redacted]", value)
+        return value
+
+    def _add_redacted_exception_event(self, span: Any, exception: BaseException) -> None:
+        """``span.record_exception`` without leaking key material: same ``exception``
+        event, with message and stacktrace redacted."""
+        import traceback as _traceback
+
+        span.add_event(
+            "exception",
+            attributes={
+                "exception.type": type(exception).__qualname__,
+                "exception.message": self._redact_key_material(str(exception)),
+                "exception.stacktrace": self._redact_key_material(
+                    "".join(_traceback.format_exception(type(exception), exception, exception.__traceback__))
+                ),
+                "exception.escaped": False,
+            },
+        )
+
     async def async_post_call_failure_hook(
         self,
         request_data: dict,
@@ -890,7 +918,7 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             self.safe_set_attribute(
                 span=exception_logging_span,
                 key="exception",
-                value=str(original_exception),
+                value=self._redact_key_material(str(original_exception)),
             )
             self._set_team_attributes_on_span(
                 span=exception_logging_span,
@@ -1914,6 +1942,10 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             parent_otel_span = None  # Ignore parent spans from other providers
             _parent_context = None
 
+        # The proxy's own 401/403 are the client's error (OTel HTTP semconv): they
+        # are recorded, but never mark a span ERROR. Provider failures stay ERROR.
+        _is_client_error = self._is_proxy_auth_client_error(kwargs.get("exception"))
+
         # Decide whether to create a primary span
         # Always create if no parent span exists (backward compatibility)
         # OR if USE_OTEL_LITELLM_REQUEST_SPAN is explicitly enabled
@@ -1931,7 +1963,8 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             if self._gen_ai_semconv_latest_experimental:
                 span_kwargs["kind"] = self.span_kind.CLIENT
             span = otel_tracer.start_span(**span_kwargs)
-            span.set_status(Status(StatusCode.ERROR))
+            if not _is_client_error:
+                span.set_status(Status(StatusCode.ERROR))
             self.set_attributes(span, kwargs, response_obj)
 
             # Record exception information using OTEL standard method
@@ -1944,7 +1977,8 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             # Only set attributes if the span is still recording (not closed)
             # Note: parent_otel_span is guaranteed to be not None here
             if parent_otel_span.is_recording():
-                parent_otel_span.set_status(Status(StatusCode.ERROR))
+                if not _is_client_error:
+                    parent_otel_span.set_status(Status(StatusCode.ERROR))
                 self.set_attributes(parent_otel_span, kwargs, response_obj)
                 self._record_exception_on_span(span=parent_otel_span, kwargs=kwargs)
 
@@ -1982,7 +2016,7 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
 
             # Record the exception using OTEL's standard method
             if exception is not None:
-                span.record_exception(exception)
+                self._add_redacted_exception_event(span, exception)
 
             # Get StandardLoggingPayload for structured error information
             standard_logging_payload: Optional[StandardLoggingPayload] = kwargs.get("standard_logging_object")
@@ -2000,7 +2034,7 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
                     self.safe_set_attribute(
                         span=span,
                         key=ErrorAttributes.ERROR_MESSAGE,
-                        value=error_str,
+                        value=self._redact_key_material(error_str),
                     )
                 return
 
@@ -2036,7 +2070,7 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
                 self.safe_set_attribute(
                     span=span,
                     key=ErrorAttributes.ERROR_MESSAGE,
-                    value=error_information["error_message"],
+                    value=self._redact_key_material(error_information["error_message"]),
                 )
 
             if error_information.get("llm_provider"):
@@ -2050,7 +2084,7 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
                 self.safe_set_attribute(
                     span=span,
                     key=ErrorAttributes.ERROR_STACK_TRACE,
-                    value=error_information["traceback"],
+                    value=self._redact_key_material(error_information["traceback"]),
                 )
 
         except Exception as e:

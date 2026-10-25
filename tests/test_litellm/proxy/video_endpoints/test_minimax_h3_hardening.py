@@ -122,7 +122,7 @@ def test_direct_rejects_duration_below_native_limit_before_admission(stack):
 # ------------------------------------------------------------------ F2: auth before body
 
 
-async def asgi(app, method: str, path: str, headers: dict[str, str], chunks: list[bytes]):
+async def asgi(app, method: str, path: str, headers: dict[str, str], chunks: list[bytes], *, truncated: bool = False):
     reads = {"count": 0}
     queue = list(chunks)
     sent: list[dict] = []
@@ -130,7 +130,7 @@ async def asgi(app, method: str, path: str, headers: dict[str, str], chunks: lis
     async def receive():
         reads["count"] += 1
         if queue:
-            return {"type": "http.request", "body": queue.pop(0), "more_body": bool(queue)}
+            return {"type": "http.request", "body": queue.pop(0), "more_body": truncated or bool(queue)}
         return {"type": "http.disconnect"}
 
     async def send(message):
@@ -721,3 +721,33 @@ def test_bridge_view_accepts_a_platform_that_predates_updated_at():
     )
     assert view.updated_at is None
     assert bridge.v2_task(bridge.video(view), h3=True)["updated_at"] == 7
+
+
+# ------------------------------------------------------------------ truncated body is a client error
+
+
+@pytest.mark.parametrize("prefix", PREFIXES)
+async def test_truncated_create_body_is_a_client_error_not_a_500(stack, prefix):
+    """The gateway answers an oversized create with 413 and drops the upstream
+    connection mid-body; LiteLLM sees a disconnect while reading and must answer 4xx."""
+    _, app, state = stack
+    headers = {"content-type": "application/json", "authorization": "Bearer allowed"}
+    status, payload, _ = await asgi(
+        app, "POST", prefix + "/v2/video_generation", headers, [b'{"model": "minimax-h3", "prompt": "' + b"a" * 1000],
+        truncated=True,
+    )
+    assert 400 <= status < 500, (status, payload)
+    assert payload["type"] == "error"
+    assert not state["platform"]
+
+
+@pytest.mark.parametrize("prefix", PREFIXES)
+def test_delete_of_a_running_task_is_409_task_state_conflict_on_every_namespace(stack, prefix):
+    """Direct and Context IR share one cancel contract: a rejected cancel is a 409 with the same
+    envelope, and LiteLLM never goes on to ask the executor to cancel (no /cancellation hop)."""
+    client, _, state = stack
+    state["reply"] = lambda request, data: httpx.Response(409, json={"detail": "generation submission has already started"})
+    response = client.delete(prefix + "/v2/video_generation/mod_video_1", headers=HEADERS)
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "task_state_conflict"
+    assert [path.rsplit("/", 1)[-1] for path, _ in state["platform"]] == ["cancel"]
