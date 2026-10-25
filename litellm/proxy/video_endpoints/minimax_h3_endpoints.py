@@ -38,6 +38,7 @@ from litellm.proxy.video_endpoints.minimax_h3_models import (
     AudioItem,
     MiniMaxH3Create,
     MiniMaxH3DirectCreate,
+    ModerationOptIn,
     canonical_public_model,
 )
 from litellm.proxy.video_endpoints.minimax_h3_paths import (
@@ -279,6 +280,13 @@ async def prepare_request(request: Request) -> None:
                 canonical_public_model(public_ir.get("model"))
             except ValueError as exc:
                 raise H3Error(400, str(exc)) from exc
+            # Hidden ``extra.content_moderation``: lifted out so ContextIRRequest (and everything built from it)
+            # is untouched. Any other shape of ``extra`` is left in place for ContextIRRequest to reject.
+            extra_ir = public_ir.get("extra")
+            if isinstance(extra_ir, dict):
+                if ModerationOptIn.model_validate(extra_ir).content_moderation:
+                    request.scope["h3_content_moderation"] = True
+                public_ir = {key: value for key, value in public_ir.items() if key != "extra"}
             spec_ir = ContextIRRequest.model_validate({**public_ir, "model": PUBLIC_MODEL})
             if any(isinstance(item, AudioItem) for item in spec_ir.content):
                 raise H3Error(422, "Reference audio is not supported by this Context IR service")
@@ -293,6 +301,9 @@ async def prepare_request(request: Request) -> None:
             is_direct = request.url.path in DIRECT_CREATE_PATHS
             spec = (MiniMaxH3DirectCreate if is_direct else MiniMaxH3Create).model_validate_json(raw)
             request.scope["minimax_h3_spec"] = spec
+            if spec.content_moderation:
+                # Server-set from the validated body only; the intake carries it, the provider body never does.
+                request.scope["h3_content_moderation"] = True
             reject_mismatched_prompt_expansion(spec, request.url.path, is_direct)
             body = spec.internal_body()
             if is_direct:

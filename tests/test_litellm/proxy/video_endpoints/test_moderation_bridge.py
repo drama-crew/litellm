@@ -870,3 +870,75 @@ async def test_studio_ticket_dispatch_is_logged_as_internal_not_as_a_customer_ca
     await capture.start(request, auth, {"model": "hailuo-h3", "prompt": "p"})
     assert writes and 'INSERT INTO "LiteLLM_OpenApiLog"' in writes[0][0]
     assert writes[0][1][10] is True
+
+
+def _intake_request(scope_extra=None):
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/video/minimax-h3/v2/video_generation",
+            "headers": [],
+            "query_string": b"",
+            **(scope_extra or {}),
+        }
+    )
+
+
+async def _submit_intake(monkeypatch, data, scope_extra=None):
+    from litellm.proxy.video_endpoints import openapi_log_capture
+
+    monkeypatch.setenv("DRAMA_MODERATION_PLATFORM_URL", "http://platform.test")
+    monkeypatch.setenv("DRAMA_MODERATION_SERVICE_TOKEN", "test-token")
+    sent = []
+
+    async def platform(request, method, path, payload, **kwargs):
+        sent.append(payload)
+        return {
+            "id": "mod_video_1",
+            "state": "queued",
+            "model": "causyn-1.1",
+            "moderation_status": "pending",
+            "policy_source": "request",
+            "created_at": 1,
+        }
+
+    monkeypatch.setattr(bridge, "platform", platform)
+    monkeypatch.setattr(bridge, "source_descriptor", AsyncMock(return_value=None))
+    monkeypatch.setattr(bridge, "model_access", AsyncMock())
+    monkeypatch.setattr(bridge, "enforce_public_media", AsyncMock())
+    monkeypatch.setattr(openapi_log_capture, "start", AsyncMock(return_value=None))
+    monkeypatch.setattr(openapi_log_capture, "submitted", AsyncMock())
+    auth = UserAPIKeyAuth(api_key="a" * 64, user_id="owner", team_id="owner", metadata={"openapi_key_id": "key-id"})
+    await bridge.submit(_intake_request(scope_extra), auth, data, "avideo_generation", policy_model="causyn-1.1")
+    return sent[0]
+
+
+@pytest.mark.asyncio
+async def test_intake_carries_request_moderation_only_for_the_server_set_flag(monkeypatch):
+    data = {"model": "causyn-1.1", "prompt": "p"}
+    assert "request_moderation" not in await _submit_intake(monkeypatch, data)
+    assert (await _submit_intake(monkeypatch, data, {"h3_content_moderation": True}))["request_moderation"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("truthy", [1, "true", "1", [True], {"x": 1}])
+async def test_only_a_strict_true_scope_flag_counts(monkeypatch, truthy):
+    data = {"model": "causyn-1.1", "prompt": "p"}
+    intake = await _submit_intake(monkeypatch, data, {"h3_content_moderation": truthy})
+    assert "request_moderation" not in intake
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "data",
+    [
+        {"model": "causyn-1.1", "prompt": "p", "content_moderation": True},
+        {"model": "causyn-1.1", "prompt": "p", "request_moderation": True},
+        {"model": "causyn-1.1", "prompt": "p", "extra": {"content_moderation": True}},
+    ],
+)
+async def test_payload_keys_never_become_the_flag_for_other_callers(monkeypatch, data):
+    """Studio and every other moderated caller keep their behaviour: only H3 validation sets the flag."""
+    intake = await _submit_intake(monkeypatch, data)
+    assert "request_moderation" not in intake

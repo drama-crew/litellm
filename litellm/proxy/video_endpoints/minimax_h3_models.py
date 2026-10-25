@@ -217,8 +217,28 @@ class MiniMaxH3Content(H3Content[ModelName]):
 MAX_REFERENCE_ITEMS = 12
 
 
-class ExtraOptions(StrictModel):
-    """Official ``extra`` object: ``prompt_expansion_mode`` is its only key."""
+CONTENT_MODERATION_MESSAGE = "content_moderation can only be enabled (true); omit it to keep the default behavior"
+
+
+class ModerationOptIn(StrictModel):
+    """Hidden (undocumented) ``extra.content_moderation`` opt-in.
+
+    One-way: only the literal JSON boolean ``true`` is accepted. ``false``, ``null`` and every other
+    type are a clear 400, so no request can ever switch moderation off through this field.
+    """
+
+    content_moderation: bool | None = None
+
+    @field_validator("content_moderation", mode="before")
+    @classmethod
+    def only_literal_true(cls, value: object) -> object:
+        if value is not True:
+            raise ValueError(CONTENT_MODERATION_MESSAGE)
+        return value
+
+
+class ExtraOptions(ModerationOptIn):
+    """Official ``extra`` object: ``prompt_expansion_mode`` is its only documented key."""
 
     prompt_expansion_mode: PromptExpansionMode | None = None
 
@@ -249,6 +269,11 @@ class MiniMaxH3Create(H3Content[Literal["MiniMax-H3"]]):
     @property
     def prompt_expansion_mode(self) -> PromptExpansionMode | None:
         return self.extra.prompt_expansion_mode if self.extra else None
+
+    @property
+    def content_moderation(self) -> bool:
+        """The hidden per-request moderation opt-in (never forwarded to the provider)."""
+        return bool(self.extra and self.extra.content_moderation)
 
     @model_validator(mode="after")
     def validate_hyperflow(self) -> Self:

@@ -568,6 +568,149 @@ def test_extra_is_not_a_context_ir_field(api):
     assert not calls
 
 
+HIDDEN_FLAG_MESSAGE = "content_moderation can only be enabled"
+
+
+def _context_ir_data(**extra):
+    return {k: v for k, v in body(**extra).items() if k != "resolution"}
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_hidden_content_moderation_true_is_carried_to_the_platform_intake_only(api, prefix):
+    client, calls, normalized, _ = api
+    plain = client.post(prefix + "/v2/video_generation", json=body(), headers=HEADERS)
+    flagged = client.post(
+        prefix + "/v2/video_generation", json=body(extra={"content_moderation": True}), headers=HEADERS
+    )
+    assert plain.status_code == 200 and flagged.status_code == 200, flagged.text
+    (_, legacy), (_, intake) = calls
+    # absent = the legacy intake exactly
+    assert "request_moderation" not in legacy
+    # present = same intake plus the one server-set flag; the provider payload is byte-identical
+    assert intake["request_moderation"] is True
+    assert {k: v for k, v in intake.items() if k != "request_moderation"} == {
+        **legacy,
+        "idempotency_key": intake["idempotency_key"],
+    }
+    assert intake["payload"] == legacy["payload"]
+    assert "extra" not in intake["payload"] and "content_moderation" not in json.dumps(intake["payload"])
+    assert normalized[3] == normalized[1]
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_hidden_content_moderation_composes_with_prompt_expansion_mode(api, prefix):
+    client, calls, _, _ = api
+    mode = "disabled" if _flavor(prefix) == "direct" else "quality"
+    ok = client.post(
+        prefix + "/v2/video_generation",
+        json=body(extra={"prompt_expansion_mode": mode, "content_moderation": True}),
+        headers=HEADERS,
+    )
+    assert ok.status_code == 200, ok.text
+    assert calls[0][1]["request_moderation"] is True
+    calls.clear()
+    wrong = "quality" if _flavor(prefix) == "direct" else "disabled"
+    mismatch = client.post(
+        prefix + "/v2/video_generation",
+        json=body(extra={"prompt_expansion_mode": wrong, "content_moderation": True}),
+        headers=HEADERS,
+    )
+    assert mismatch.status_code == 422
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+@pytest.mark.parametrize("bad", [False, None, "true", "false", 1, 0, [], {}, [True]])
+def test_hidden_content_moderation_only_accepts_the_literal_true(api, prefix, bad):
+    client, calls, _, _ = api
+    response = client.post(
+        prefix + "/v2/video_generation", json=body(extra={"content_moderation": bad}), headers=HEADERS
+    )
+    assert response.status_code == 400, (bad, response.text)
+    assert response.json()["error"]["type"] == "bad_request_error"
+    assert HIDDEN_FLAG_MESSAGE in response.json()["error"]["message"]
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_hidden_content_moderation_never_runs_unmoderated_when_the_service_is_unavailable(api, monkeypatch, prefix):
+    client, calls, _, _ = api
+    monkeypatch.setattr(bridge, "configured", lambda auth: False)
+    response = client.post(
+        prefix + "/v2/video_generation", json=body(extra={"content_moderation": True}), headers=HEADERS
+    )
+    assert response.status_code == 503, response.text
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", ALL_PREFIXES)
+def test_no_other_channel_can_set_or_unset_the_flag(api, prefix):
+    client, calls, _, _ = api
+    headers = {
+        **HEADERS,
+        "x-content-moderation": "true",
+        "x-drama-content-moderation": "true",
+        "x-drama-request-moderation": "true",
+    }
+    top_level = body(content_moderation=True)
+    assert client.post(prefix + "/v2/video_generation", json=top_level, headers=headers).status_code == 400
+    assert not calls
+    assert client.post(prefix + "/v2/video_generation", json=body(), headers=headers).status_code == 200
+    assert "request_moderation" not in calls[0][1]
+
+
+@pytest.mark.parametrize("prefix", ["/video/minimax-h3", "/video/minimax-h3-test"])
+def test_hidden_content_moderation_on_standalone_context_ir(api, monkeypatch, prefix):
+    monkeypatch.setattr(context_ir_endpoints, "get_context_ir_service", lambda: object())
+    client, calls, normalized, _ = api
+    assert client.post(prefix + "/v2/h3_context_ir", json=_context_ir_data(), headers=HEADERS).status_code == 200
+    flagged = client.post(
+        prefix + "/v2/h3_context_ir",
+        json=_context_ir_data(extra={"content_moderation": True}),
+        headers=HEADERS,
+    )
+    assert flagged.status_code == 200, flagged.text
+    (_, legacy), (_, intake) = calls
+    assert "request_moderation" not in legacy
+    assert intake["request_moderation"] is True
+    assert intake["payload"] == legacy["payload"] and "extra" not in intake["payload"]
+    assert intake["route"] == "context_ir" and normalized[3] == normalized[1]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"content_moderation": None},
+        {"content_moderation": "true"},
+        {"content_moderation": 1},
+        {"content_moderation": []},
+        {"prompt_expansion_mode": "quality"},
+        {"content_moderation": True, "other": 1},
+        None,
+        "true",
+        [True],
+    ],
+)
+def test_context_ir_rejects_anything_but_literal_true_and_other_extra_keys(api, extra):
+    client, calls, _, _ = api
+    response = client.post(
+        "/video/minimax-h3/v2/h3_context_ir", json=_context_ir_data(extra=extra), headers=HEADERS
+    )
+    assert response.status_code == 400, (extra, response.text)
+    assert not calls
+
+
+@pytest.mark.parametrize("prefix", ["/video/minimax-h3", "/video/minimax-h3-test"])
+def test_context_ir_rejects_false_with_the_clear_message(api, prefix):
+    client, calls, _, _ = api
+    response = client.post(
+        prefix + "/v2/h3_context_ir", json=_context_ir_data(extra={"content_moderation": False}), headers=HEADERS
+    )
+    assert response.status_code == 400
+    assert HIDDEN_FLAG_MESSAGE in response.json()["error"]["message"]
+    assert not calls
+
+
 @pytest.mark.parametrize("prefix", PREFIXES)
 @pytest.mark.parametrize("resolution", ["2K", "480P"])
 def test_unavailable_resolutions_keep_an_explicit_400(api, prefix, resolution):

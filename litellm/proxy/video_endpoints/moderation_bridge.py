@@ -491,6 +491,9 @@ async def submit(
             "source": source,
             "namespace": request.scope.get("h3_namespace"),
             "idempotency_key": request.headers.get("idempotency-key") or str(uuid.uuid4()),
+            # Hidden one-way opt-in, set only by the H3 request validator (never from a header or payload key).
+            # Sent only when true, so every other request is byte-identical to before.
+            **({"request_moderation": True} if request.scope.get("h3_content_moderation") is True else {}),
         },
     )
     projected = video(View.model_validate(result))
