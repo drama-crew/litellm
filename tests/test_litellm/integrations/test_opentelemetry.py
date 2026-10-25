@@ -5063,20 +5063,38 @@ class TestOpenTelemetryFailureHookStampsServerSpan(unittest.TestCase):
         assert span.attributes["error.code"] == "500"  # legacy, string
         assert span.status.status_code == trace.StatusCode.ERROR
 
-    def test_client_4xx_is_not_a_server_error_span(self):
-        class _AuthFail(Exception):
-            code = "401"
+    def test_proxy_auth_401_is_not_a_server_error_span(self):
+        from litellm.proxy._types import ProxyException
 
-        span = self._run_hook(_AuthFail("Malformed API Key"))
+        span = self._run_hook(
+            ProxyException(message="Malformed API Key", type="auth_error", param="None", code=401)
+        )
         assert span.attributes["http.response.status_code"] == 401
         assert span.status.status_code != trace.StatusCode.ERROR
 
-    def test_http_exception_4xx_status_code_attr_is_not_error(self):
-        from fastapi import HTTPException
+    def test_provider_401_stays_error_with_real_status(self):
+        class _Provider(Exception):
+            status_code = 401
 
-        span = self._run_hook(HTTPException(status_code=403, detail="nope"))
+        span = self._run_hook(_Provider("invalid provider key"))
+        assert span.attributes["http.response.status_code"] == 401
+        assert span.status.status_code == trace.StatusCode.ERROR
+
+    def test_provider_proxy_exception_4xx_stays_error(self):
+        from litellm.proxy._types import ProxyException
+
+        span = self._run_hook(ProxyException(message="rate limited", type="None", param=None, code=429))
+        assert span.attributes["http.response.status_code"] == 429
+        assert span.status.status_code == trace.StatusCode.ERROR
+
+    def test_string_code_falls_back_to_status_code(self):
+        class _OpenAIStyle(Exception):
+            code = "invalid_api_key"
+            status_code = 403
+
+        span = self._run_hook(_OpenAIStyle("bad key"))
         assert span.attributes["http.response.status_code"] == 403
-        assert span.status.status_code != trace.StatusCode.ERROR
+        assert span.status.status_code == trace.StatusCode.ERROR
 
     def test_status_less_exception_still_errors_with_500(self):
         span = self._run_hook(ValueError("boom"))

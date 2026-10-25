@@ -790,18 +790,32 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
             service_logging_span.end(end_time=_end_time_ns)
 
     @staticmethod
-    def _is_client_error_exception(exception: Optional[BaseException]) -> bool:
-        """True when the exception carries an HTTP 4xx status (ProxyException.code,
-        .status_code, or an httpx response status)."""
-        raw = getattr(exception, "code", None)
-        if raw is None or str(raw) in ("", "None"):
-            raw = getattr(exception, "status_code", None)
-        if raw is None:
-            raw = getattr(getattr(exception, "response", None), "status_code", None)
-        try:
-            return 400 <= int(raw) < 500  # type: ignore[arg-type]
-        except (TypeError, ValueError):
+    def _http_status_from_exception(exception: Optional[BaseException]) -> Optional[int]:
+        """Real HTTP status: int-like ``.code``, else ``.status_code``, else ``.response.status_code``."""
+        for candidate in (
+            getattr(exception, "code", None),
+            getattr(exception, "status_code", None),
+            getattr(getattr(exception, "response", None), "status_code", None),
+        ):
+            try:
+                if candidate is not None:
+                    return int(candidate)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    @staticmethod
+    def _is_proxy_auth_client_error(exception: Optional[BaseException]) -> bool:
+        """True only for 401/403 raised by the proxy's own auth layer (a client
+        error per OTel HTTP semconv). Upstream provider 4xx are server-side
+        problems (bad provider key, quota) and must stay ERROR."""
+        from litellm.proxy._types import ProxyErrorTypes, ProxyException
+
+        if not isinstance(exception, ProxyException):
             return False
+        if str(exception.type) != ProxyErrorTypes.auth_error.value:
+            return False
+        return OpenTelemetry._http_status_from_exception(exception) in (401, 403)
 
     async def async_post_call_failure_hook(
         self,
@@ -815,9 +829,10 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
 
         parent_otel_span = user_api_key_dict.parent_otel_span
         if parent_otel_span is not None:
-            # OTel HTTP semconv: a 4xx on a SERVER span is the client's error, not the
-            # server's, so only 5xx / unknown failures mark the span (and its child) ERROR.
-            _is_client_error = self._is_client_error_exception(original_exception)
+            # OTel HTTP semconv: a 4xx on a SERVER span is the client's error. Only the
+            # proxy's own auth failures (401/403) are exempt from ERROR; upstream
+            # provider 4xx remain ERROR.
+            _is_client_error = self._is_proxy_auth_client_error(original_exception)
             if not _is_client_error:
                 parent_otel_span.set_status(Status(StatusCode.ERROR))
 
@@ -852,8 +867,13 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
 
             # _record_exception_on_span only stamps when error_code is set;
             # bare TypeError etc. has none, and the span is about to be ended.
-            error_code = error_information.get("error_code") if error_information else None
-            if not error_code:
+            # Real status from .code (int-like) else .status_code else
+            # .response.status_code; a non-numeric .code (openai "invalid_api_key")
+            # must not hide the actual status.
+            _status = self._http_status_from_exception(original_exception)
+            if _status is not None:
+                self.set_response_status_code_attribute(parent_otel_span, _status)
+            elif not (error_information.get("error_code") if error_information else None):
                 self.set_response_status_code_attribute(parent_otel_span, 500)
 
             # Pre-request latency (request_data carries the propagated
