@@ -412,8 +412,9 @@ async def list_tasks(request: Request, auth: UserAPIKeyAuth, *, v2: bool = False
         request, "POST", "/intents/list", {"principal": principal(auth), **JSON_OBJECT.validate_python(filters)}
     )
     views = TypeAdapter(list[View]).validate_python(result["items"])
-    for view in views:
-        await model_access(auth, view.model)
+    # Authorize once per distinct model (first-seen order): the check is a per-call cache/DB round trip.
+    for model in dict.fromkeys(view.model for view in views):
+        await model_access(auth, model)
     items = [
         v2_task(video(view), h3=bool(request.scope.get("h3_namespace")))
         if v2

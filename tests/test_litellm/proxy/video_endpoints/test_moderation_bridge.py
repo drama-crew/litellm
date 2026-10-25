@@ -942,3 +942,54 @@ async def test_payload_keys_never_become_the_flag_for_other_callers(monkeypatch,
     """Studio and every other moderated caller keep their behaviour: only H3 validation sets the flag."""
     intake = await _submit_intake(monkeypatch, data)
     assert "request_moderation" not in intake
+
+
+def _list_view(i: int, model: str) -> dict:
+    return {
+        "id": f"mod_video_{i}",
+        "model": model,
+        "state": "queued",
+        "moderation_status": "pending",
+        "policy_source": "model",
+        "created_at": 1,
+        "parameters": {},
+    }
+
+
+_LIST_AUTH = UserAPIKeyAuth(api_key="a" * 64, user_id="owner", team_id="owner", metadata={"openapi_key_id": "key-id"})
+
+
+def _list_request():
+    return Request({"type": "http", "method": "GET", "path": "/v1/videos", "headers": [], "query_string": b""})
+
+
+@pytest.mark.asyncio
+async def test_list_checks_model_access_once_per_distinct_model(monkeypatch):
+    items = [_list_view(i, "hailuo-h3" if i % 2 else "hailuo-h3-max") for i in range(100)]
+    monkeypatch.setattr(bridge, "configured", lambda auth: True)
+    monkeypatch.setattr(bridge, "platform", AsyncMock(return_value={"items": items}))
+    access = AsyncMock()
+    monkeypatch.setattr(bridge, "model_access", access)
+    result = await bridge.list_tasks(_list_request(), _LIST_AUTH)
+    assert len(result["data"]) == 100
+    assert [c.args[1] for c in access.await_args_list] == ["hailuo-h3-max", "hailuo-h3"]
+
+
+@pytest.mark.asyncio
+async def test_list_still_denies_when_any_model_is_inaccessible(monkeypatch):
+    from fastapi import HTTPException
+
+    items = [_list_view(0, "hailuo-h3"), _list_view(1, "secret"), _list_view(2, "secret")]
+    monkeypatch.setattr(bridge, "configured", lambda auth: True)
+    monkeypatch.setattr(bridge, "platform", AsyncMock(return_value={"items": items}))
+
+    async def access(auth, model):
+        if model == "secret":
+            raise HTTPException(401, "denied")
+
+    mock = AsyncMock(side_effect=access)
+    monkeypatch.setattr(bridge, "model_access", mock)
+    with pytest.raises(HTTPException) as exc:
+        await bridge.list_tasks(_list_request(), _LIST_AUTH)
+    assert exc.value.status_code == 401
+    assert mock.await_count == 2
