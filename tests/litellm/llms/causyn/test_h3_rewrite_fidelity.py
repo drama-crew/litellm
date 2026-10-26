@@ -739,3 +739,38 @@ async def test_cached_first_answer_counts_new_plan_usage(monkeypatch):
     result = await run(Provider(), spec)
     assert result.usage.cost == pytest.approx(0.0014)
     assert result.usage.prompt_tokens == 105
+
+
+# --- sung title / chant made only of user-written text is not invented dialogue -------------------------------------
+
+SO_CRAZY_PROMPT = "这位东方20岁女生突然站起来变身《So Crazy》（完全疯了）这首歌的同款女士海军服然后开始唱跳《So Crazy》"
+
+
+def _speech_findings(user: str, line: str, *roles: str) -> list[str]:
+    spec = make_spec(user, *roles)
+    prompt = t2va_prompt(f"[Shot 1] She sings <d>[English] {line}</d> and dances.")
+    return [v for v in literal_violations(prompt, spec) if v.startswith(h3_prompt._V_SPEECH)]
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["So Crazy! So Crazy!", "so crazy so crazy", "SO CRAZY, so crazy, So Crazy!", "So Crazy", "ｓｏ　ｃｒａｚｙ！"],
+)
+def test_sung_user_title_repeated_is_not_invented_dialogue(line):
+    assert _speech_findings(SO_CRAZY_PROMPT, line, "first_frame") == []
+
+
+def test_title_chant_plus_new_words_is_still_invented():
+    assert _speech_findings(SO_CRAZY_PROMPT, "So Crazy, let's go crazy tonight", "first_frame")
+    assert _speech_findings(SO_CRAZY_PROMPT, "Let's go crazy tonight")
+
+
+def test_chinese_title_sung_is_not_invented_but_new_speech_is():
+    assert _speech_findings("她唱《晴天》", "晴天") == []
+    assert _speech_findings("她唱《晴天》", "晴天晴天") == []
+    assert _speech_findings("她唱《晴天》", "我爱你")
+    assert _speech_findings("她说话", "我爱你")
+
+
+def test_no_user_words_still_rejects_added_dialogue():
+    assert _speech_findings("a girl dances in the rain", "I love you")
