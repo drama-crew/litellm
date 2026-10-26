@@ -130,12 +130,36 @@ def _norm_line(text: str) -> str:
     return _NON_WORD.sub("", unicodedata.normalize("NFKC", text).casefold())
 
 
+# Titles / quoted phrases the user marked in their own prompt. A sung or chanted line built only from them
+# ("sing 《So Crazy》" -> "So Crazy! So Crazy!") is the user's text, not new dialogue.
+_TITLE_SPANS = re.compile(r"《([^》\n]{1,100})》|〈([^〉\n]{1,100})〉")
+
+
+def _made_of_user_phrases(text: str, source: str) -> bool:
+    """True when `text`, ignoring case/punctuation/width/spacing, is one or more repetitions of phrases the user marked."""
+    phrases = {
+        _norm_line(next(g for g in m.groups() if g is not None))
+        for pattern in (_TITLE_SPANS, _SHORT_QUOTED)
+        for m in pattern.finditer(source)
+    }
+    phrases.discard("")
+    flat = _norm_line(text)
+    if not phrases or not flat:
+        return False
+    reachable = [True] + [False] * len(flat)  # DP segmentation: no regex backtracking on adversarial input
+    for end in range(1, len(flat) + 1):
+        reachable[end] = any(reachable[end - len(p)] and flat.endswith(p, 0, end) for p in phrases if len(p) <= end)
+    return reachable[-1]
+
+
 def user_line_written(text: str, prompt: str) -> bool:
     normalized = unicodedata.normalize("NFKC", text).casefold()
     words = tuple(_LINE_WORDS.findall(normalized))
     if not words:
         return False
     source = unicodedata.normalize("NFKC", prompt).casefold()
+    if _made_of_user_phrases(text, source):
+        return True
     if any(
         _norm_line(text) == _norm_line(next(g for g in m.groups() if g is not None))
         for m in _SHORT_QUOTED.finditer(source)
