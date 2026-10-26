@@ -1033,11 +1033,30 @@ def _admitted_geometries(metadata: _TaskMetadata, source_resolution: str) -> set
     return admitted
 
 
+def _known_backend_adaptive_geometries(duration: int) -> frozenset[str]:
+    """adaptive 请求下，任一已知后端可能交付的几何。
+
+    hyperflow 后端对 adaptive 请求交付固定 canvas（与 duration 无关，如 1344x768），
+    不遵守 vdn 的像素预算；而后端由部署环境变量选择、LiteLLM 看不到，回滚/灰度
+    顺序也会让记录的 `geometry_profile` 与实际后端不一致（同固定比例的教训）。
+    所以与 profile 无关，接受每个具体 ratio 下所有已知后端的几何。
+    """
+    admitted: set[str] = {
+        f"{LEGACY.width}x{LEGACY.height}",
+        f"{LEGACY.output_width}x{LEGACY.output_height}",
+    }
+    for ratio in GEOMETRIES:
+        admitted |= _known_ark_geometries(ratio, duration)
+    return frozenset(admitted)
+
+
 def _result_geometry_matches(metadata: _TaskMetadata, result: _WorkerResult) -> bool:
     _, source_resolution = _metadata_resolution(metadata)
     if not isinstance(metadata, _DurableTaskMetadataV4) or metadata.ratio != "adaptive":
         return f"{result.width}x{result.height}" in _admitted_geometries(metadata, source_resolution)
     width, height = result.width, result.height
+    if f"{width}x{height}" in _known_backend_adaptive_geometries(round(metadata.duration_seconds)):
+        return True
     frames = int(metadata.duration_seconds) * 24
     frames += (5 - frames) % 17
     budget = pixel_budget(frames)
@@ -1307,8 +1326,19 @@ class CausynVideoHandler(CustomLLM):
                 )
                 raise _service_error()
             if not _result_geometry_matches(durable, result):
-                logger.warning("causyn video billing: task metadata resolution does not match worker result")
-                raise _service_error()
+                # 几何不匹配是永久性错误（重试结果不会变），但 collect 会把它当 503 无限重试。
+                # 用 ERROR 级别 + 稳定的错误码 + task_id 暴露出来，便于告警；不改重试语义。
+                logger.error(
+                    "causyn_geometry_mismatch: task metadata resolution does not match worker result "
+                    "(task_id=%s ratio=%s profile=%s duration=%s result=%sx%s)",
+                    task_id,
+                    getattr(durable, "ratio", None),
+                    getattr(durable, "geometry_profile", None),
+                    durable.duration_seconds,
+                    result.width,
+                    result.height,
+                )
+                raise _service_error("causyn_geometry_mismatch: video service unavailable")
             response.usage = _usage(result.duration_seconds, requested_resolution)
             _set_response_cost(response, 0.0)
             # Never bill above the quote. The two differ by that extra frame on every

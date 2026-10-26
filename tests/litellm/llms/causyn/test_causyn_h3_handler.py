@@ -972,6 +972,55 @@ class TestAdaptiveGeometryWindowMatchesArkRounding:
         assert not _result_geometry_matches(self._metadata("adaptive", duration=13.0), self._result(1280, 480))
 
 
+class TestAdaptiveAcceptsKnownBackendCanvases:
+    """生产事故：adaptive + hyperflow 后端交付固定 canvas 1344x768（10.125s），
+    但 adaptive 分支只认 vdn 像素预算（10s 预算 852,992 < 1,032,192），
+    结算永远 503、任务卡在 in_progress。已知后端的 canvas 必须被接受，
+    与记录的 geometry_profile 无关。"""
+
+    @staticmethod
+    def _metadata(profile: str, duration: float):
+        from litellm.llms.causyn.handler import _DurableTaskMetadataV4
+
+        return _DurableTaskMetadataV4.model_validate(
+            {
+                "version": "causyn-video-billing-v4",
+                "geometry_profile": profile,
+                "model": "causyn-1.1",
+                "duration_seconds": duration,
+                "source_resolution": "adaptive",
+                "requested_resolution": "768p",
+                "ratio": "adaptive",
+                "pricing": {"id": "causyn-1-1", "model": "causyn-1.1", "output_cost_per_second_768p": 5.0},
+                "attribution": {"api_key": None, "user_id": None, "team_id": None, "organization_id": None},
+            }
+        )
+
+    @staticmethod
+    def _result(width: int, height: int):
+        return TestAdaptiveGeometryWindowMatchesArkRounding._result(width, height)
+
+    @pytest.mark.parametrize("profile", ["hyperflow-official-v1", "hyperflow-native-adaptive-v1", "vdn-adaptive-v1"])
+    @pytest.mark.parametrize("duration", [9.0, 10.0, 15.0])
+    @pytest.mark.parametrize("size", [(1344, 768), (768, 1344), (1024, 768), (768, 1024), (768, 768)])
+    def test_known_canvases_settle_at_any_duration(self, profile, duration, size):
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert _result_geometry_matches(self._metadata(profile, duration), self._result(*size))
+
+    @pytest.mark.parametrize("profile", ["hyperflow-official-v1", "vdn-adaptive-v1"])
+    def test_a_random_geometry_is_still_rejected(self, profile):
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        assert not _result_geometry_matches(self._metadata(profile, 10.0), self._result(640, 480))
+
+    def test_vdn_budget_rule_still_applies_to_non_canvas_geometry(self):
+        from litellm.llms.causyn.handler import _result_geometry_matches
+
+        # 1280x480 在 13s 超预算且不是任何已知 canvas
+        assert not _result_geometry_matches(self._metadata("vdn-adaptive-v1", 13.0), self._result(1280, 480))
+
+
 class TestGeometryProfileOnPersistedMetadata:
     """C3: geometry_profile 必须真的接进校验，旧任务与新任务各走各的公式。"""
 
