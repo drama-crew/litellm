@@ -774,3 +774,39 @@ def test_chinese_title_sung_is_not_invented_but_new_speech_is():
 
 def test_no_user_words_still_rejects_added_dialogue():
     assert _speech_findings("a girl dances in the rain", "I love you")
+
+
+# --- unmarked sung song name (after 歌曲：) written by the user is not invented dialogue -----------------------------
+
+CRASY_PROMPT = "图中的女生站起来唱跳韩国女团舞蹈歌曲： so crasy"
+
+
+@pytest.mark.parametrize("line", ["so crasy", "So crasy! So crasy!", "SO CRASY, so crasy, so crasy", "ｓｏ　ｃｒａｓｙ"])
+def test_unmarked_sung_song_name_is_not_invented(line):
+    assert _speech_findings(CRASY_PROMPT, line, "first_frame") == []
+
+
+def test_unmarked_sung_song_name_inside_narration_wrapper():
+    spec = make_spec(CRASY_PROMPT, "first_frame")
+    prompt = t2va_prompt("[Shot 1] 她唱着“<d>[English] so crasy</d>”并跳舞。")
+    assert [v for v in literal_violations(prompt, spec) if v.startswith(h3_prompt._V_SPEECH)] == []
+
+
+@pytest.mark.parametrize("line", ["So Crazy", "so crazy so crazy"])
+def test_one_edit_variant_of_sung_user_word_is_accepted(line):
+    assert _speech_findings(CRASY_PROMPT, line, "first_frame") == []
+
+
+def test_unmarked_sung_still_rejects_invented_lyrics_and_speech():
+    assert _speech_findings(CRASY_PROMPT, "so crazy tonight let's go", "first_frame")
+    assert _speech_findings(CRASY_PROMPT, "我爱你", "first_frame")
+    assert _speech_findings(CRASY_PROMPT, "so cool", "first_frame")  # 2+ edits / different word
+    assert _speech_findings("图中的女生站起来跳舞 so crasy", "so crasy", "first_frame")  # no sing/speech cue
+
+
+@pytest.mark.parametrize(
+    "user",
+    ["She sings so crasy", "a song called so crasy", "lyrics: so crasy", "她哼唱 so crasy", "歌名：so crasy"],
+)
+def test_sing_cues_in_english_and_chinese(user):
+    assert _speech_findings(user, "so crasy", "first_frame") == []

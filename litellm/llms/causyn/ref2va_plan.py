@@ -116,11 +116,12 @@ _SHORT_QUOTED = re.compile(
 _SPEECH_CUE = re.compile(
     r"(?:\b(?:say(?:s|ing)?|said|speak(?:s|ing)?|spoke|ask(?:s|ed|ing)?|repl(?:y|ies|ied|ying)|"
     r"respond(?:s|ed|ing)?|answer(?:s|ed|ing)?|shout(?:s|ed|ing)?|whisper(?:s|ed|ing)?|"
+    r"sing(?:s|ing)?|sang|sung|songs?|lyrics?|chant(?:s|ed|ing)?|hum(?:s|med|ming)?|"
     r"exclaim(?:s|ed|ing)?|call(?:s|ed|ing)?|yell(?:s|ed|ing)?|utter(?:s|ed|ing)?|narrat(?:e|es|ed|ing))\b|"
     r"\b(?:dialogue|narration|voice[ -]?over|v\.?o\.?|spoken line)\s*[:：]|"
-    r"(?:说|喊|问|回答|台词|对白|旁白|朗读)[：:]?)"
+    r"(?:说|喊|问|回答|台词|对白|旁白|朗读|唱|演唱|合唱|哼唱|歌曲|歌名|歌词|歌)[：:]?)"
     r"\s*[:：]?\s*(?:(?:just|exactly|the words?|the phrase|the line|loudly|softly|quietly|aloud|out|"
-    r"in\s+[^\W_]+(?:\s+(?:voice|language))?)\s+)*"
+    r"in\s+[^\W_]+(?:\s+(?:voice|language))?|called|titled|named|entitled)\s+)*"
     r"(?:[\w’ -]+?\s+(?:and|then)\s+)?(?:[\"'“‘「『]\s*)?$",
     re.I,
 )
@@ -152,6 +153,40 @@ def _made_of_user_phrases(text: str, source: str) -> bool:
     return reachable[-1]
 
 
+def _collapse_repetition(words: tuple[str, ...]) -> tuple[str, ...]:
+    """The shortest word sequence whose repetition gives `words` ("so crasy so crasy" -> "so crasy")."""
+    for size in range(1, len(words) // 2 + 1):
+        if len(words) % size == 0 and words == words[:size] * (len(words) // size):
+            return words[:size]
+    return words
+
+
+def _one_edit(a: str, b: str) -> bool:
+    """Equal, or (both ASCII-alphabetic, >= 4 chars) at most one insertion/deletion/substitution apart."""
+    if a == b:
+        return True
+    if len(a) < 4 or len(b) < 4 or not (a.isascii() and b.isascii() and a.isalpha() and b.isalpha()):
+        return False
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) == len(b):
+        return sum(x != y for x, y in zip(a, b)) <= 1
+    short, long_ = sorted((a, b), key=len)
+    return any(long_[:i] + long_[i + 1 :] == short for i in range(len(long_)))
+
+
+def _sung_near_match(words: tuple[str, ...], source: str) -> bool:
+    """`words` is a window of the user's words, each at most one edit off, right after a speech/sing cue."""
+    tokens = [(m.group(), m.start()) for m in _LINE_WORDS.finditer(source)]
+    for i in range(len(tokens) - len(words) + 1):
+        window = tokens[i : i + len(words)]
+        if all(_one_edit(w, t) for w, (t, _) in zip(words, window)) and (
+            _SPEECH_CUE.search(source[: window[0][1]]) is not None
+        ):
+            return True
+    return False
+
+
 def user_line_written(text: str, prompt: str) -> bool:
     normalized = unicodedata.normalize("NFKC", text).casefold()
     words = tuple(_LINE_WORDS.findall(normalized))
@@ -165,10 +200,19 @@ def user_line_written(text: str, prompt: str) -> bool:
         for m in _SHORT_QUOTED.finditer(source)
     ):
         return True
-    start_boundary = "" if re.search(r"[㐀-鿿]", normalized) else r"(?<!\w)"
+    # A chant repeats the user's words ("so crasy so crasy"): judge the unit that is repeated.
+    words = _collapse_repetition(words)
+    if _contiguous_in_source(words, source):
+        return True
+    return _sung_near_match(words, source)
+
+
+def _contiguous_in_source(words: tuple[str, ...], source: str) -> bool:
+    joined = "".join(words)
+    start_boundary = "" if re.search(r"[㐀-鿿]", joined) else r"(?<!\w)"
     pattern = start_boundary + r"[\W_]+".join(re.escape(w) for w in words) + r"(?!\w)"
     matches = tuple(re.finditer(pattern, source))
-    if len(words) >= 3 or len(_norm_line(text)) >= 12:
+    if len(words) >= 3 or len(joined) >= 12:
         return bool(matches)
     return any(_SPEECH_CUE.search(source[: m.start()]) is not None for m in matches)
 
