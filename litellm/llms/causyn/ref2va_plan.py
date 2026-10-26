@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from itertools import islice
 
 PLAN_ENV = "CAUSYN_H3_REF2VA_PLAN"
 PLAN_MODEL_ENV = "CAUSYN_H3_REF2VA_PLAN_MODEL"
@@ -153,37 +154,51 @@ def _made_of_user_phrases(text: str, source: str) -> bool:
     return reachable[-1]
 
 
+_MAX_REPEATS = 8  # a chant repeating the same phrase more often than this gets no collapsing
+_CUE_LOOKBEHIND = 160  # a cue (plus its fillers) sits within this many characters before the line
+_MAX_TOKENS = 2000  # near-match scans look at no more than this many user words
+
+
 def _collapse_repetition(words: tuple[str, ...]) -> tuple[str, ...]:
-    """The shortest word sequence whose repetition gives `words` ("so crasy so crasy" -> "so crasy")."""
+    """The shortest word sequence whose repetition (2..8 times) gives `words` ("so crasy so crasy" -> "so crasy")."""
     for size in range(1, len(words) // 2 + 1):
-        if len(words) % size == 0 and words == words[:size] * (len(words) // size):
+        if len(words) % size == 0 and len(words) // size <= _MAX_REPEATS and words == words[:size] * (len(words) // size):
             return words[:size]
     return words
 
 
-def _one_edit(a: str, b: str) -> bool:
-    """Equal, or (both ASCII-alphabetic, >= 4 chars) at most one insertion/deletion/substitution apart."""
-    if a == b:
-        return True
-    if len(a) < 4 or len(b) < 4 or not (a.isascii() and b.isascii() and a.isalpha() and b.isalpha()):
+def _cue_before(source: str, pos: int) -> bool:
+    return _SPEECH_CUE.search(source[max(0, pos - _CUE_LOOKBEHIND) : pos]) is not None
+
+
+def _near(a: str, b: str) -> bool:
+    """Both ASCII-alphabetic, >= 5 chars, differing by exactly one insertion/deletion/substitution."""
+    if a == b or min(len(a), len(b)) < 5 or abs(len(a) - len(b)) > 1:
         return False
-    if abs(len(a) - len(b)) > 1:
+    if not (a.isascii() and b.isascii() and a.isalpha() and b.isalpha()):
         return False
     if len(a) == len(b):
-        return sum(x != y for x, y in zip(a, b)) <= 1
+        return sum(x != y for x, y in zip(a, b)) == 1
     short, long_ = sorted((a, b), key=len)
     return any(long_[:i] + long_[i + 1 :] == short for i in range(len(long_)))
 
 
 def _sung_near_match(words: tuple[str, ...], source: str) -> bool:
-    """`words` is a window of the user's words, each at most one edit off, right after a speech/sing cue."""
-    tokens = [(m.group(), m.start()) for m in _LINE_WORDS.finditer(source)]
+    """`words` equals a window of the user's words right after a cue, except for one word that is one edit off."""
+    tokens = [(m.group(), m.start()) for m in islice(_LINE_WORDS.finditer(source), _MAX_TOKENS)]
     for i in range(len(tokens) - len(words) + 1):
         window = tokens[i : i + len(words)]
-        if all(_one_edit(w, t) for w, (t, _) in zip(words, window)) and (
-            _SPEECH_CUE.search(source[: window[0][1]]) is not None
-        ):
-            return True
+        near = 0
+        for w, (t, _) in zip(words, window):
+            if w != t:
+                if not _near(w, t):
+                    break
+                near += 1
+                if near > 1:
+                    break
+        else:
+            if near == 1 and _cue_before(source, window[0][1]):
+                return True
     return False
 
 
@@ -214,7 +229,7 @@ def _contiguous_in_source(words: tuple[str, ...], source: str) -> bool:
     matches = tuple(re.finditer(pattern, source))
     if len(words) >= 3 or len(joined) >= 12:
         return bool(matches)
-    return any(_SPEECH_CUE.search(source[: m.start()]) is not None for m in matches)
+    return any(_cue_before(source, m.start()) for m in matches)
 
 
 def user_lines_only(speech, prompt):

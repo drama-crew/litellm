@@ -810,3 +810,32 @@ def test_unmarked_sung_still_rejects_invented_lyrics_and_speech():
 )
 def test_sing_cues_in_english_and_chinese(user):
     assert _speech_findings(user, "so crasy", "first_frame") == []
+
+
+def test_near_match_allows_only_one_long_word_off():
+    assert _speech_findings("sing: i live you", "i love you")  # love/live is only 4 letters
+    # "hello where" vs "hello there" is shape-identical to "so crasy" vs "So Crazy" (one 5-letter word, one edit):
+    # indistinguishable without a dictionary, so it is accepted by design.
+    assert _speech_findings("sing: hello where", "hello there") == []
+    assert _speech_findings("sing: hello where", "hello there friend")
+    assert _speech_findings("sing: crasy crasy night", "crazy crazy night")  # two near words
+    assert _speech_findings(CRASY_PROMPT, "So Crazy", "first_frame") == []
+    assert _speech_findings("sing: hello world", "hello worle") == []  # one near word of 5 letters
+
+
+def test_near_match_scan_is_linear():
+    import time
+
+    from litellm.llms.causyn import ref2va_plan
+
+    user = "sing: " + " ".join(["crasy"] * 6000)
+    start = time.perf_counter()
+    assert ref2va_plan.user_line_written("crazy crazy night", user) is False
+    assert ref2va_plan.user_line_written("crazy", user) is True
+    assert time.perf_counter() - start < 0.5
+
+
+def test_repetition_collapse_is_capped():
+    user = "她唱 so crasy"
+    assert _speech_findings(user, " ".join(["so crasy"] * 8), "first_frame") == []
+    assert _speech_findings(user, " ".join(["so crasy"] * 9), "first_frame")
