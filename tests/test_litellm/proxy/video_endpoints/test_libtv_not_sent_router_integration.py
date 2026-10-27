@@ -245,3 +245,16 @@ async def test_failure_after_a_successful_create_is_ambiguous_not_a_false_not_se
     assert any(url.endswith("/generation/create") for url in SCRIPTS["tok-2"].calls), "create must have been sent"
     assert SCRIPTS["tok-1"].calls, "the failing account must have been attempted first"
     _assert_ambiguous(error, scope)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [NO_CAPACITY, {"code": 10026, "msg": "较频繁"}])
+async def test_libtv_capacity_rejection_is_503_not_sent_with_capacity_reason(monkeypatch, libtv, body):
+    SCRIPTS["tok-2"] = _Script(create=body)
+    error, _ = await _submit(monkeypatch, _router(["tok-2"], num_retries=0))
+    assert isinstance(error, HTTPException) and error.status_code == 503
+    assert error.headers == {"x-drama-submission": "not_sent"}
+    err = error.detail["error"]
+    assert err["code"] == "provider_not_sent" and err["reason"] == "provider_capacity"
+    assert "rate limit" in err["message"] and "算力不足" in err["message"]
+    assert execution.failure_outcome(error) == "not_sent"

@@ -210,7 +210,7 @@ async def execute(
             and route in NOT_SENT_REWRITE_ROUTES
             and provider_proved_not_sent(exc)
         ):
-            raise moderation_bridge.provider_not_sent() from exc
+            raise moderation_bridge.provider_not_sent(exc) from exc
         raise
     finally:
         attempt_outcomes.stop(attempts)

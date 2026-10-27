@@ -246,20 +246,69 @@ def admission_unavailable(reason: str) -> HTTPException:
     )
 
 
-def provider_not_sent() -> HTTPException:
-    """Contract §9: every attempted deployment proved the generation was never created."""
+_CAPACITY_CAUSE_DEPTH = 8
+
+
+def _capacity_cause(cause: BaseException | None) -> BaseException | None:
+    """Return the rate-limit/capacity exception in ``cause``'s chain (bounded, cycle-safe)."""
+    import litellm
+
+    seen: set[int] = set()
+    pending: list[tuple[BaseException, int]] = [(cause, 0)] if cause is not None else []
+    while pending:
+        current, depth = pending.pop()
+        if id(current) in seen or depth > _CAPACITY_CAUSE_DEPTH:
+            continue
+        seen.add(id(current))
+        if isinstance(current, litellm.RateLimitError) or getattr(current, "status_code", None) == 429:
+            return current
+        for link in (current.__cause__, current.__context__):
+            if link is not None:
+                pending.append((link, depth + 1))
+    return None
+
+
+def _exposed_retry_after(exc: BaseException) -> str | None:
+    """A Retry-After the upstream exception really carries (never invented)."""
+    headers = getattr(exc, "headers", None)
+    if headers is None:
+        headers = getattr(getattr(exc, "response", None), "headers", None)
+    try:
+        value = headers.get("retry-after") or headers.get("Retry-After") if headers is not None else None
+    except Exception:  # noqa: BLE001  # exotic header containers must never break the not_sent answer
+        return None
+    text = str(value).strip() if value is not None else ""
+    return text if text.isascii() and text.isdigit() else None
+
+
+def provider_not_sent(cause: BaseException | None = None) -> HTTPException:
+    """Contract §9: every attempted deployment proved the generation was never created.
+
+    When the not-sent failure was an upstream capacity/rate-limit rejection the body says so
+    (``reason: provider_capacity``) so the platform can tell users it is upstream capacity.
+    Status, ``x-drama-submission`` header and ``code`` are identical either way.
+    """
     from litellm.router_utils import attempt_outcomes
 
-    error = HTTPException(
-        503,
-        detail={
-            "error": {
-                "code": "provider_not_sent",
-                "message": "The provider did not create the generation; no submission was sent",
-            }
-        },
-        headers={"x-drama-submission": "not_sent"},
-    )
+    headers = {"x-drama-submission": "not_sent"}
+    error_body = {
+        "code": "provider_not_sent",
+        "message": "The provider did not create the generation; no submission was sent",
+    }
+    capacity = _capacity_cause(cause)
+    if capacity is not None:
+        error_body = {
+            "code": "provider_not_sent",
+            "reason": "provider_capacity",
+            "message": (
+                "The provider did not create the generation: upstream capacity exhausted / rate limited "
+                "(算力不足), no submission was sent; retry later"
+            ),
+        }
+        retry_after = _exposed_retry_after(capacity)
+        if retry_after is not None:
+            headers["Retry-After"] = retry_after
+    error = HTTPException(503, detail={"error": error_body}, headers=headers)
     attempt_outcomes.mark_verdict(error, True)
     return error
 
