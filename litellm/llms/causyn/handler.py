@@ -70,6 +70,7 @@ from litellm.llms.libtv.video_generate import (
     fetch_video_generate_task_metadata,
     validate_video_generate_url,
 )
+from litellm.router_utils import attempt_outcomes
 from litellm.types.utils import all_litellm_params
 from litellm.types.videos.main import VideoObject
 from litellm.types.videos.utils import decode_video_id_with_provider, encode_video_id_with_provider
@@ -145,6 +146,10 @@ _CAUSYN_USER_PARAMS = frozenset(
 )
 _CAUSYN_FRAMEWORK_PARAMS = frozenset(all_litellm_params)
 logger = logging.getLogger(__name__)
+
+
+# VideoGenerateError codes that are raised strictly before the first Redis write (admission cap, no live worker).
+_REFUSED_BEFORE_WRITE_CODES = frozenset({"no_capacity_available", "no_worker_available"})
 
 
 @dataclass(frozen=True)
@@ -1561,6 +1566,11 @@ class CausynVideoHandler(CustomLLM):
         except RewriteError as exc:
             raise CustomLLMError(status_code=exc.status_code, message=str(exc)) from None
         except VideoGenerateError as error:
+            if error.code in _REFUSED_BEFORE_WRITE_CODES:
+                # Both are raised before any Redis write, so the task provably never reached a worker.
+                # Without this ledger entry the refusal is classified ambiguous and the platform parks the
+                # task in submission_unknown instead of requeueing it.
+                attempt_outcomes.note(attempt_outcomes.NOT_SENT)
             status_code = 400 if error.code in {"invalid_params", "invalid_url"} else 503
             message = "invalid causyn video request" if status_code == 400 else "causyn video service unavailable"
             raise CustomLLMError(status_code=status_code, message=message) from None

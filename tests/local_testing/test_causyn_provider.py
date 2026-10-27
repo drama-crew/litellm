@@ -575,6 +575,74 @@ async def test_handler_redis_failures_are_stable_retryable_errors(operation: str
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["no_capacity_available", "no_worker_available"])
+async def test_admission_refusal_before_any_write_is_recorded_not_sent(
+    monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    """Both codes are raised before any Redis write: the ledger must prove the attempt was never sent."""
+    from litellm.proxy.video_endpoints.moderation_execution import failure_outcome, provider_proved_not_sent
+    from litellm.router_utils import attempt_outcomes
+
+    async def refuse(*_args: object, **_kwargs: object) -> str:
+        raise video_generate_module.VideoGenerateError(code, "refused before write")
+
+    monkeypatch.setattr(causyn_module, "enqueue_video_generate", refuse)
+    token = attempt_outcomes.start()
+    try:
+        mark = attempt_outcomes.begin_attempt()
+        with pytest.raises(CustomLLMError) as exc_info:
+            await handler(FakeRedis()).avideo_generation(**create_kwargs())
+        assert attempt_outcomes._LEDGER.get() == [attempt_outcomes.NOT_SENT]
+        attempt_outcomes.fail_attempt(mark)
+        assert provider_proved_not_sent(exc_info.value) is True
+        assert failure_outcome(exc_info.value) == "not_sent"
+    finally:
+        attempt_outcomes.stop(token)
+    assert exc_info.value.status_code == 503
+    assert str(exc_info.value) == "causyn video service unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["enqueue_ambiguous", "redis_error", "misconfigured"])
+async def test_other_video_generate_errors_stay_ambiguous(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
+    from litellm.proxy.video_endpoints.moderation_execution import failure_outcome
+    from litellm.router_utils import attempt_outcomes
+
+    async def fail(*_args: object, **_kwargs: object) -> str:
+        raise video_generate_module.VideoGenerateError(code, "after possible write")
+
+    monkeypatch.setattr(causyn_module, "enqueue_video_generate", fail)
+    token = attempt_outcomes.start()
+    try:
+        mark = attempt_outcomes.begin_attempt()
+        with pytest.raises(CustomLLMError) as exc_info:
+            await handler(FakeRedis()).avideo_generation(**create_kwargs())
+        attempt_outcomes.fail_attempt(mark)
+        assert attempt_outcomes._LEDGER.get() == [attempt_outcomes.UNKNOWN]
+        assert failure_outcome(exc_info.value) == "ambiguous"
+    finally:
+        attempt_outcomes.stop(token)
+
+
+@pytest.mark.asyncio
+async def test_unclassified_redis_exception_stays_ambiguous() -> None:
+    from litellm.proxy.video_endpoints.moderation_execution import failure_outcome
+    from litellm.router_utils import attempt_outcomes
+
+    redis = FakeRedis()
+    redis.xadd_error = RuntimeError("redis down")
+    token = attempt_outcomes.start()
+    try:
+        mark = attempt_outcomes.begin_attempt()
+        with pytest.raises(CustomLLMError) as exc_info:
+            await handler(redis).avideo_generation(**create_kwargs())
+        attempt_outcomes.fail_attempt(mark)
+        assert failure_outcome(exc_info.value) == "ambiguous"
+    finally:
+        attempt_outcomes.stop(token)
+
+
+@pytest.mark.asyncio
 async def test_handler_adapter_ordinary_failure_is_stable_retryable_error() -> None:
     class ExplodingAdapter:
         async def advance(self, *_args: object, **_kwargs: object) -> TopazAdvance:

@@ -390,6 +390,7 @@ class _RecordingMeter:
         self.manual = None
         self.not_submitted = None
         self.events = {}
+        self.bodies = []
 
     async def record_submission_failure(self, intent_id, code, status, message, attempt):
         self.marks.append((intent_id, code, status, message, attempt))
@@ -440,6 +441,7 @@ async def _post_submit(monkeypatch, error):
 
     async def platform(request):
         calls.append(request.url.path)
+        meter.bodies.append((request.url.path, json.loads(request.content or b"{}")))
         if request.url.path.endswith("/begin"):
             return httpx.Response(
                 200,
@@ -755,3 +757,96 @@ async def test_context_ir_collect_posts_integer_token_usage_in_the_output_facts(
 
 async def _done(value):
     return value
+
+
+def _causyn_admission_invoke(monkeypatch, code):
+    """Real CausynVideoHandler + real router attempt ledger + real metered entry; only Redis admission is faked."""
+    from unittest.mock import MagicMock
+
+    from litellm import Router
+    from litellm.llms.causyn import CausynVideoHandler
+    from litellm.llms.causyn import handler as causyn_module
+    from litellm.llms.libtv.video_generate import VideoGenerateError, VideoGenerateSettings
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+
+    monkeypatch.setenv("DRAMA_INTERNAL_VIDEO_ENABLED", "true")
+
+    async def refuse(*_args, **_kwargs):
+        raise VideoGenerateError(code, "refused before any write")
+
+    monkeypatch.setattr(causyn_module, "enqueue_video_generate", refuse)
+    provider = CausynVideoHandler(
+        redis_factory=lambda: MagicMock(),
+        settings_factory=lambda: VideoGenerateSettings(
+            source_hosts=frozenset({"source.example"}), target_hosts=frozenset({"target.example"})
+        ),
+        task_id_factory=lambda: "0123456789abcdef0123456789abcdef",
+        clock=lambda: 2_000_000_000.0,
+    )
+    kwargs = {
+        "model": "causyn-1.0",
+        "prompt": "animate the reference",
+        "api_key": None,
+        "api_base": None,
+        "optional_params": {
+            "seconds": "5",
+            "resolution": "768x512",
+            "aspect_ratio": "3:2",
+            "reference_images": ["https://source.example/reference.png"],
+            "generate_audio": True,
+            "seed": 7,
+            "model_info": {"id": "causyn-price-v1", "output_cost_per_second_768x512": 0.1},
+        },
+        "logging_obj": None,
+    }
+    router = Router(model_list=[{"model_name": "m", "litellm_params": {"model": "openai/x", "api_key": "k"}}])
+
+    async def invoke(request, auth, payload, route):
+        async def call(**_router_kwargs):
+            return await provider.avideo_generation(**kwargs)
+
+        async def attempt():
+            return await router.make_call(call, model="m")
+
+        return await entry.execute(request, auth, "avideo_generation", attempt())
+
+    return invoke
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["no_capacity_available", "no_worker_available"])
+async def test_causyn_admission_refusal_calls_not_sent_and_never_parks_the_task(monkeypatch, code):
+    from unittest.mock import MagicMock
+
+    from litellm.proxy.spend_tracking import budget_reservation
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+
+    scope = MagicMock()
+    scope.store.void_unsent = AsyncMock()
+    monkeypatch.setattr(entry, "scope_for", AsyncMock(return_value=scope))
+    monkeypatch.setattr(budget_reservation, "release_budget_reservation", AsyncMock())
+    invoke = _causyn_admission_invoke(monkeypatch, code)
+    meter, calls = await _post_submit(monkeypatch, invoke)
+    bodies = meter.bodies
+    assert meter.marks == []  # not parked as provider_submission_ambiguous
+    not_sent = [b for p, b in bodies if p.endswith("/not-sent")]
+    assert not_sent == [{"token": "attempt", "outcome": "not_sent"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["enqueue_ambiguous", "redis_error"])
+async def test_causyn_other_video_generate_errors_stay_parked_ambiguous(monkeypatch, code):
+    from unittest.mock import MagicMock
+
+    from litellm.proxy.spend_tracking import budget_reservation
+    from litellm.proxy.video_endpoints import moderation_metering_entry as entry
+
+    scope = MagicMock()
+    scope.store.void_unsent = AsyncMock()
+    monkeypatch.setattr(entry, "scope_for", AsyncMock(return_value=scope))
+    monkeypatch.setattr(budget_reservation, "release_budget_reservation", AsyncMock())
+    invoke = _causyn_admission_invoke(monkeypatch, code)
+    meter, calls = await _post_submit(monkeypatch, invoke)
+    bodies = meter.bodies
+    assert [m[1] for m in meter.marks] == ["provider_submission_ambiguous"]
+    assert not any(p.endswith("/not-sent") for p, _ in bodies)
