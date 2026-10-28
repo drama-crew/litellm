@@ -7,6 +7,7 @@ from litellm.llms.libtv.transfer import STATUS_TTL_SECONDS, status_key
 
 ACTIVE = "causyn:video:admitted"
 MAX_ADMITTED = 8
+PRODUCTION_MAX_ADMITTED_ENV = "CAUSYN_H3_MAX_ADMITTED"
 TEST_POOL = "test"
 TEST_POOL_MAX_ADMITTED_ENV = "CAUSYN_TEST_POOL_MAX_ADMITTED"
 TEST_POOL_MAX_ADMITTED_DEFAULT = 2
@@ -18,14 +19,14 @@ def active_key(pool: str | None = None) -> str:
 
 
 def max_admitted(pool: str | None = None) -> int:
-    """Admission cap: production is the fixed ``MAX_ADMITTED``; the test pool reads its env cap (default 2)."""
-    if pool is None:
-        return MAX_ADMITTED
+    """Bound queued plus claimed work independently for each worker pool."""
+    env = PRODUCTION_MAX_ADMITTED_ENV if pool is None else TEST_POOL_MAX_ADMITTED_ENV
+    default = MAX_ADMITTED if pool is None else TEST_POOL_MAX_ADMITTED_DEFAULT
     try:
-        value = int(os.getenv(TEST_POOL_MAX_ADMITTED_ENV, ""))
+        value = int(os.getenv(env, ""))
     except ValueError:
-        return TEST_POOL_MAX_ADMITTED_DEFAULT
-    return value if value >= 1 else TEST_POOL_MAX_ADMITTED_DEFAULT
+        return default
+    return value if value >= 1 else default
 
 
 class RedisPort(Protocol):

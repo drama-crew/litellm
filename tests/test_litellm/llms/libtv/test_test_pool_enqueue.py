@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -136,6 +137,7 @@ async def test_explicit_none_pool_is_the_production_path(redis):
 
 
 def test_admission_keys_and_caps_per_pool(monkeypatch):
+    monkeypatch.delenv("CAUSYN_H3_MAX_ADMITTED", raising=False)
     monkeypatch.delenv("CAUSYN_TEST_POOL_MAX_ADMITTED", raising=False)
     assert active_key(None) == ACTIVE == "causyn:video:admitted"
     assert active_key("test") == "causyn:video:admitted:test"
@@ -169,3 +171,37 @@ async def test_test_pool_cap_is_independent_and_releases_terminal_tasks(redis, m
     assert await redis.zcard("causyn:video:admitted:test") == 2
     assert await redis.zcard(ACTIVE) == MAX_ADMITTED
     assert set(await redis.zrange("causyn:video:admitted:test", 0, -1)) == {b"t2", b"t4"}
+
+
+@pytest.mark.parametrize("value", ("0", "-1", "abc", "", "2.5"))
+def test_invalid_production_cap_keeps_the_bounded_default(monkeypatch, value):
+    monkeypatch.setenv("CAUSYN_H3_MAX_ADMITTED", value)
+    assert max_admitted() == 8
+
+
+@pytest.mark.asyncio
+async def test_configured_backlog_is_atomic_shared_and_pool_isolated(redis, monkeypatch):
+    monkeypatch.setenv("CAUSYN_H3_MAX_ADMITTED", "24")
+    monkeypatch.delenv("CAUSYN_TEST_POOL_MAX_ADMITTED", raising=False)
+    await alive(redis, *ALL_TYPES)
+    results = await asyncio.gather(
+        *(submit(redis, f"mixed-{i}", "ref2va" if i % 2 else "t2va") for i in range(25)),
+        return_exceptions=True,
+    )
+    rejected = tuple(result for result in results if isinstance(result, VideoGenerateError))
+    assert len(rejected) == 1 and rejected[0].code == "no_capacity_available"
+    assert sum(isinstance(result, str) for result in results) == 24
+    admitted = await redis.zrange(ACTIVE, 0, -1)
+    assert len(admitted) == 24
+    assert await redis.xlen(stream_key("video_generate")) + await redis.xlen(stream_key("video_generate_ref2va")) == 24
+    await submit(redis, admitted[0].decode())
+    assert await redis.zcard(ACTIVE) == 24
+    await submit(redis, "isolated-1", pool="test")
+    await submit(redis, "isolated-2", pool="test")
+    with pytest.raises(VideoGenerateError):
+        await submit(redis, "isolated-over", pool="test")
+    await redis.set(status_key(admitted[0].decode()), "done")
+    await submit(redis, "replacement", "ref2va")
+    assert await redis.zcard(ACTIVE) == 24
+    assert await redis.zcard(active_key("test")) == 2
+    assert await redis.zscore(ACTIVE, "replacement") is not None
