@@ -91,3 +91,14 @@ def verdict_of(error: BaseException) -> bool:
     if isinstance(verdict, bool):
         return verdict
     return all_not_sent() and not provider_succeeded()
+
+
+def carry_verdict(source: BaseException, target: BaseException) -> None:
+    """Copy an explicit verdict onto an exception that re-wraps ``source`` (e.g. the proxy's
+    HTTPException -> ProxyException conversion), so the verdict survives the re-wrap.
+
+    Only an explicit boolean verdict is carried; the chain itself is still never consulted.
+    """
+    verdict = getattr(source, VERDICT_ATTR, None)
+    if isinstance(verdict, bool):
+        mark_verdict(target, verdict)

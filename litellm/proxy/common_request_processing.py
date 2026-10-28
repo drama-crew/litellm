@@ -2512,7 +2512,7 @@ class ProxyBaseLLMRequestProcessing:
                 merged_fields: Optional[dict] = {**existing_fields, **structured_fields}
             else:
                 merged_fields = existing_fields or None
-            raise ProxyException(
+            converted = ProxyException(
                 message=message,
                 type=getattr(e, "type", "None"),
                 param=getattr(e, "param", "None"),
@@ -2520,6 +2520,11 @@ class ProxyBaseLLMRequestProcessing:
                 provider_specific_fields=merged_fields,
                 headers=headers,
             )
+            # Drama contract §9: the not-sent verdict marked on the HTTPException must survive this re-wrap.
+            from litellm.router_utils import attempt_outcomes
+
+            attempt_outcomes.carry_verdict(e, converted)
+            raise converted
         elif isinstance(e, httpx.HTTPStatusError):
             # Handle httpx.HTTPStatusError - extract actual error from response
             # This matches the original behavior before the refactor in commit 511d435f6f
