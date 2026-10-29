@@ -813,7 +813,9 @@ async def test_terminal_rewrite_error_log_includes_the_error_message(caplog):
     async def failing_rewrite(request):
         raise RewriteError(message, 400)
 
-    service = ContextIRService(MagicMock(save=AsyncMock()), rewrite=failing_rewrite, settle=no_settle, deliver=AsyncMock())
+    service = ContextIRService(
+        MagicMock(save=AsyncMock()), rewrite=failing_rewrite, settle=no_settle, deliver=AsyncMock()
+    )
     service.fail = AsyncMock()
     running = ContextIRTask(
         id="t1", owner="o", request=spec(), created_at=1, updated_at=1, billing=BillingIdentity(), price=1.0
@@ -1315,6 +1317,47 @@ async def test_stored_error_records_upstream_status_and_redacted_detail(redis):
     # public status keeps exposing only the original short message
     assert stored.error == "H3 prompt rewrite provider unavailable"
     assert "upstream" not in json.dumps(stored.public())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "kind"),
+    (
+        (RewriteError("interrupted", retryable=True, detail="ReadTimeout"), "ReadTimeout"),
+        (RewriteError("interrupted", retryable=True, detail="ConnectError"), "ConnectError"),
+        (
+            RewriteError("unavailable", retryable=True, upstream_status=429, detail="private-provider-response"),
+            "upstream_http",
+        ),
+        (
+            RewriteError("invalid", retryable=False, validation=True, detail="private-provider-response"),
+            "validation",
+        ),
+        (RewriteError("pending", retryable=True, poll=True), "awaiting_result"),
+        (
+            RewriteError("interrupted", retryable=True, detail="ReadTimeout private-provider-response"),
+            "unclassified",
+        ),
+    ),
+)
+async def test_retry_log_categorizes_failure_without_exporting_provider_detail(redis, caplog, failure, kind):
+    import logging
+
+    async def fail_rewrite(request):
+        raise failure
+
+    service = ContextIRService(ContextIRStore(redis), rewrite=fail_rewrite, settle=no_settle)
+    task = await service.create(spec(model="causyn-1.1"), owner="owner", billing=BillingIdentity())
+    with caplog.at_level(logging.WARNING):
+        await service.process(task.id)
+    records = [v.getMessage() for v in caplog.records if "Context IR rewrite " in v.getMessage()]
+    assert len(records) == 1 and f"failure_kind={kind}" in records[0]
+    assert "private-provider-response" not in "\n".join(records)
+    stored = await service.store.get(task.id)
+    assert stored.status == ("running" if failure.poll else "queued")
+    assert stored.attempts == (0 if failure.poll else 1)
+    assert stored.validation_failures == int(failure.validation)
+    assert stored.result is None and not stored.settled
 
 
 @pytest.mark.asyncio

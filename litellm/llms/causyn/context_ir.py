@@ -65,6 +65,23 @@ DEFAULT_TASK_DEADLINE_S = 5400.0
 # 修复调用之后再整体重写，最多这么多次尝试（含第一次）。仍受重试窗口 / 渲染预留约束。
 DEFAULT_VALIDATION_MAX_ATTEMPTS = 3
 VALIDATION_RETRY_DELAY_S = 1.0
+_TRANSPORT_FAILURE_KINDS = frozenset(
+    (
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "TimeoutError",
+        "ConnectError",
+        "ReadError",
+        "WriteError",
+        "CloseError",
+        "RemoteProtocolError",
+        "LocalProtocolError",
+        "ProxyError",
+        "UnsupportedProtocol",
+    )
+)
 
 
 def validation_max_attempts() -> int:
@@ -127,6 +144,18 @@ def _violation_text(exc: RewriteError) -> str | None:
     from litellm.llms.causyn.h3_prompt import redact_provider_detail
 
     return redact_provider_detail("; ".join(exc.violations) if exc.violations else str(exc))
+
+
+def _retry_failure_kind(exc: RewriteError) -> str:
+    if exc.validation:
+        return "validation"
+    if exc.poll:
+        return "awaiting_result"
+    if exc.upstream_status is not None:
+        return "upstream_http"
+    if exc.detail is not None and exc.detail in _TRANSPORT_FAILURE_KINDS:
+        return exc.detail
+    return "unclassified"
 
 
 def task_deadline(task: ContextIRTask) -> float:
@@ -424,13 +453,15 @@ class ContextIRService:
             delay = policy.next_delay(attempted, exc)
             if delay is not None:
                 logger.warning(
-                    "Context IR rewrite %s for %s attempt=%s validation_failures=%s upstream_status=%s retry_in=%.1fs%s",
+                    "Context IR rewrite %s for %s attempt=%s validation_failures=%s "
+                    "upstream_status=%s retry_in=%.1fs failure_kind=%s%s",
                     "answer rejected by validators" if exc.validation else "transient failure",
                     task_id,
                     attempted.attempts,
                     attempted.validation_failures,
                     exc.upstream_status,
                     delay,
+                    _retry_failure_kind(exc),
                     f" violations={_violation_text(exc)}" if exc.validation else "",
                 )
                 if exc.poll and policy.max_attempts is None:
