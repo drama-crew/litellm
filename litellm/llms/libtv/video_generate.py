@@ -495,6 +495,7 @@ async def enqueue_video_generate(
             deadline=payload["deadline_ts"],
             stream=stream_key(task_type),
             pool=pool,
+            request=payload["request"],
         ):
             raise VideoGenerateError("no_capacity_available", "Causyn video queue is full")
         return task_id

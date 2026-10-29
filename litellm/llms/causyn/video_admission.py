@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from typing import Protocol
 
+from litellm.llms.causyn.video_priority import priority_route
 from litellm.llms.libtv.transfer import STATUS_TTL_SECONDS, status_key
 
 ACTIVE = "causyn:video:admitted"
@@ -49,6 +50,26 @@ redis.call('ZADD', KEYS[4], ARGV[7], ARGV[1])
 return 1
 """
 
+PRIORITY_ADMIT = (
+    """
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+local kind = redis.call('TYPE', KEYS[5]).ok
+if kind ~= 'none' and kind ~= 'zset' then return -1 end
+local stream_kind = redis.call('TYPE', KEYS[3]).ok
+if stream_kind ~= 'none' and stream_kind ~= 'stream' then return -1 end
+local function admit()
+"""
+    + ADMIT
+    + """
+end
+local result = admit()
+if result == 1 then
+    redis.call('ZADD', KEYS[5], ARGV[8], KEYS[3])
+end
+return result
+"""
+)
+
 
 async def admit_video(
     redis: RedisPort,
@@ -59,6 +80,7 @@ async def admit_video(
     deadline: float,
     stream: str = "worker:tasks:video_generate",
     pool: str | None = None,
+    request: object = None,
 ) -> bool:
     """Admit one causyn video task.
 
@@ -72,13 +94,14 @@ async def admit_video(
     ``pool`` selects the active set and its cap (``None`` = production, unchanged). The Lua script sweeps
     terminal tasks out of whichever set it is given, so a test task is released from the test set only.
     """
-    result = await redis.eval(
-        ADMIT,
-        4,
+    route = priority_route(stream, model="causyn-1.1", request=request, pool=pool)
+    keys = (
         status_key(task_id),
         f"worker:task:metadata:{task_id}",
-        stream,
+        route.stream,
         active_key(pool),
+    )
+    values = (
         task_id,
         metadata,
         envelope,
@@ -86,5 +109,10 @@ async def admit_video(
         status_key(""),
         max_admitted(pool),
         deadline,
+    )
+    result = (
+        await redis.eval(PRIORITY_ADMIT, 5, *keys, route.catalog_key, *values, route.priority)
+        if route.catalog_key is not None
+        else await redis.eval(ADMIT, 4, *keys, *values)
     )
     return result != -1
