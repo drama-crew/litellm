@@ -1514,6 +1514,7 @@ async def test_initial_length_guidance_announces_existing_limit_before_first_cal
     assert system.startswith(h3_prompt.system_prompt())
     assert "including all six sections, labels, punctuation and whitespace" in system
     assert "at most 7000 characters" in system
+    assert "planning target of 6000 characters or fewer" in system
     assert "exact provided labels and user-authored speech" in system
     assert body["model"] == h3_prompt.REF2VA_DEFAULT_MODEL and body["max_tokens"] == 3072
     assert body["provider"] == {"allow_fallbacks": False, "require_parameters": True}
@@ -1531,3 +1532,40 @@ async def test_initial_length_guidance_never_truncates_or_accepts_an_oversized_a
     assert len(provider.bodies) == 2
     assert caught.value.validation
     assert any("7001 characters" in v for v in caught.value.violations)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["true", "0"])
+async def test_length_margin_reaches_ref2va_repair_without_changing_result_or_budget(patched, monkeypatch, flag: str):
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", flag)
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider("x" * 7167, GOLD["R1"])
+    result = await run(provider, spec)
+    assert result.prompt == GOLD["R1"].strip() and len(provider.bodies) == 2
+    repair = provider.bodies[1]["messages"][-1]["content"]
+    assert "it has 7167 characters" in repair and "must contain 1 to 7000 characters" in repair
+    assert ("planning target of 6000 characters or fewer" in repair) == (flag == "true")
+    assert "keep every required section, label and spoken line" in repair
+    assert all(body["max_tokens"] == 3072 and body["model"] == h3_prompt.REF2VA_DEFAULT_MODEL for body in provider.bodies)
+
+
+@pytest.mark.parametrize("flag", [None, "0", "true"])
+@pytest.mark.parametrize("base", [False, True])
+def test_length_margin_preserves_default_and_base_repair_messages(monkeypatch, flag: str | None, base: bool):
+    if flag is not None:
+        monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", flag)
+    violation = f"{h3_prompt._V_LENGTH}: it has 7167 characters"
+    message = h3_prompt._repair_message((violation,), ("<Picture 1>",), base=base)
+    enabled = flag == "true" and not base
+    assert ("planning target of 6000 characters or fewer" in message) == enabled
+    if not enabled:
+        assert message.endswith(h3_prompt.SHORTEN_SENTENCE)
+
+
+@pytest.mark.parametrize("violation", ["A: x", h3_prompt._V_LENGTH])
+def test_length_margin_leaves_nonlength_and_empty_answer_repairs_unchanged(monkeypatch, violation: str):
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", "true")
+    message = h3_prompt._repair_message((violation,), ("<Picture 1>",))
+    assert "6000 characters" not in message
+    assert message.endswith(h3_prompt.KEEP_DETAIL_SENTENCE)

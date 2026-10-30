@@ -1008,7 +1008,8 @@ def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False) -
     if os.getenv(REF2VA_LENGTH_GUIDANCE_ENV, "false").strip().lower() in ("true", "1", "yes", "on"):
         parts.append(
             "The complete rewritten prompt, including all six sections, labels, punctuation and whitespace, "
-            "must be at most 7000 characters. Plan the space across all sections before writing, keeping the "
+            "must be at most 7000 characters. Use a planning target of 6000 characters or fewer to leave "
+            "counting headroom below that hard limit. Plan the space across all sections before writing, keeping the "
             "required detail, exact provided labels and user-authored speech. Avoid duplicate descriptions, "
             "and refer back to defined subjects rather than repeating long appearance descriptions."
         )
@@ -1052,6 +1053,15 @@ def _too_long(violation: str) -> bool:
 def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...], base: bool = False) -> str:
     listed = "\n".join(f"- {violation}" for violation in violations)
     closing = SHORTEN_SENTENCE if any(_too_long(v) for v in violations) else KEEP_DETAIL_SENTENCE
+    if (
+        not base
+        and any(_too_long(v) for v in violations)
+        and os.getenv(REF2VA_LENGTH_GUIDANCE_ENV, "false").strip().lower() in ("true", "1", "yes", "on")
+    ):
+        closing += (
+            " Use a planning target of 6000 characters or fewer; retain all six sections, "
+            "exact provided labels and user-authored speech."
+        )
     if base:
         return (
             "Your previous answer has these problems:\n"
