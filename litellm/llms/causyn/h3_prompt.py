@@ -66,6 +66,7 @@ BASE_REWRITE_DEFAULT_MODEL = "qwen/qwen3.8-flash"
 MODEL = BASE_REWRITE_DEFAULT_MODEL
 BASE_REWRITE_MODEL_ENV = "CAUSYN_H3_REWRITE_MODEL"
 BASE_ENDPOINT_FALLBACKS_ENV = "CAUSYN_H3_BASE_REWRITE_ENDPOINT_FALLBACKS"
+REF2VA_LENGTH_GUIDANCE_ENV = "CAUSYN_H3_REF2VA_LENGTH_GUIDANCE"
 # Default Ref2VA rewrite model (evaluated: omni needs fewer repairs, writes fuller descriptions and is the only one
 # that accepts audio at the same cost). Non-ref2va modes use CAUSYN_H3_REWRITE_MODEL (default MODEL).
 REF2VA_DEFAULT_MODEL = "qwen/qwen3.8-omni-flash"
@@ -1004,6 +1005,13 @@ def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False) -
         "Write retention lines in the form `<Label> (appears in [Shot ...]): marker - ...`. "
         "Every provided media label appears in `subject_definitions`, and no other media labels are used."
     )
+    if os.getenv(REF2VA_LENGTH_GUIDANCE_ENV, "false").strip().lower() in ("true", "1", "yes", "on"):
+        parts.append(
+            "The complete rewritten prompt, including all six sections, labels, punctuation and whitespace, "
+            "must be at most 7000 characters. Plan the space across all sections before writing, keeping the "
+            "required detail, exact provided labels and user-authored speech. Avoid duplicate descriptions, "
+            "and refer back to defined subjects rather than repeating long appearance descriptions."
+        )
     return "\n" + " ".join(parts)
 
 

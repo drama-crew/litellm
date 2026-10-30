@@ -40,6 +40,7 @@ def clean_state(monkeypatch):
     monkeypatch.delenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", raising=False)
     monkeypatch.delenv("CAUSYN_H3_REWRITE_SEND_VIDEO", raising=False)
     monkeypatch.delenv("CAUSYN_H3_BASE_REWRITE_ENDPOINT_FALLBACKS", raising=False)
+    monkeypatch.delenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", raising=False)
     # The optional fidelity critic is covered in test_h3_rewrite_fidelity.py; here it would add provider calls.
     monkeypatch.setenv("CAUSYN_H3_REWRITE_CRITIC", "0")
     # The observe/plan stage has its own tests (test_h3_ref2va_plan.py); here it would add provider calls.
@@ -1483,3 +1484,50 @@ async def test_base_endpoint_fallback_preserves_429_and_does_not_add_client_retr
     assert next(responses, None) is None
     assert caught.value.upstream_status == 429 and caught.value.retryable
     assert caught.value.retry_after == "17"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [None, "0", "invalid"])
+async def test_initial_length_guidance_preserves_default_request(patched, monkeypatch, flag: str | None):
+    if flag is not None:
+        monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", flag)
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(GOLD["R1"])
+    result = await run(provider, spec)
+    assert result.prompt == GOLD["R1"].strip() and len(provider.bodies) == 1
+    assert "7000 characters" not in provider.bodies[0]["messages"][0]["content"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["R1", "R2", "R3", "R4"])
+@pytest.mark.parametrize("flag", ["true", "1"])
+async def test_initial_length_guidance_announces_existing_limit_before_first_call(patched, monkeypatch, name: str, flag: str):
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", flag)
+    spec, facts = case(name)
+    patched(spec, facts)
+    provider = Provider(GOLD[name])
+    result = await run(provider, spec)
+    assert result.prompt == GOLD[name].strip() and len(provider.bodies) == 1
+    body = provider.bodies[0]
+    system = body["messages"][0]["content"]
+    assert system.startswith(h3_prompt.system_prompt())
+    assert "including all six sections, labels, punctuation and whitespace" in system
+    assert "at most 7000 characters" in system
+    assert "exact provided labels and user-authored speech" in system
+    assert body["model"] == h3_prompt.REF2VA_DEFAULT_MODEL and body["max_tokens"] == 3072
+    assert body["provider"] == {"allow_fallbacks": False, "require_parameters": True}
+
+
+@pytest.mark.asyncio
+async def test_initial_length_guidance_never_truncates_or_accepts_an_oversized_answer(patched, monkeypatch):
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", "true")
+    spec, facts = case("R1")
+    patched(spec, facts)
+    oversized = "x" * 7001
+    provider = Provider(oversized, oversized)
+    with pytest.raises(RewriteError) as caught:
+        await run(provider, spec)
+    assert len(provider.bodies) == 2
+    assert caught.value.validation
+    assert any("7001 characters" in v for v in caught.value.violations)
