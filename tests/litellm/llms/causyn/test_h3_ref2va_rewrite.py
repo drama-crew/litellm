@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+from collections.abc import Callable, Iterator
 import hashlib
 import json
 from pathlib import Path
@@ -8,9 +10,13 @@ import re
 
 import httpx
 import pytest
+from opentelemetry.sdk.trace import ReadableSpan, TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.trace import StatusCode
 from pydantic import JsonValue, TypeAdapter, ValidationError
 
-from litellm.llms.causyn import h3_media, h3_prompt
+from litellm.llms.causyn import h3_media, h3_prompt, task_telemetry
 from litellm.llms.causyn.h3_prompt import (
     ContextIRRequest,
     H3PromptRewriter,
@@ -22,7 +28,7 @@ from litellm.proxy.video_endpoints.minimax_h3_models import MediaURL
 from litellm.llms.causyn.ref_media_facts import AudioFacts, Keyframe, VideoFacts
 
 DATA = Path(__file__).parent / "data"
-PROMPTS = json.loads((DATA / "ref2va_prompts.json").read_text(encoding="utf-8"))
+PROMPTS = TypeAdapter(dict[str, dict[str, str]]).validate_json((DATA / "ref2va_prompts.json").read_bytes())
 GOLD, OLD = PROMPTS["gold"], PROMPTS["old"]
 
 IMG = "data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/"
@@ -305,10 +311,10 @@ class Provider:
     def __init__(self, *answers: str, model: str | None = None) -> None:
         self.answers = list(answers)
         self.model = model
-        self.bodies: list[dict] = []
+        self.bodies: list[dict[str, JsonValue]] = []
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
+        body = TypeAdapter(dict[str, JsonValue]).validate_json(request.content)
         self.bodies.append(body)
         answer = self.answers[len(self.bodies) - 1]
         return httpx.Response(
@@ -1778,3 +1784,150 @@ def test_measured_repair_does_not_change_base_or_nonlength_messages(monkeypatch,
     findings = (f"{h3_prompt._V_LENGTH}: it has 8622 characters",) if violation == "length" else ("A: structure",)
     original = h3_prompt._repair_message(findings, ("<Picture 1>",), base=base)
     assert h3_prompt._repair_message(findings, ("<Picture 1>",), base=base, previous_prompt=GOLD["R1"]) == original
+
+
+@pytest.fixture
+def prompt_span_exporter(monkeypatch: pytest.MonkeyPatch) -> Iterator[InMemorySpanExporter]:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(shutdown_on_exit=False)
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(task_telemetry, "_state", task_telemetry.ExporterState(provider=provider))
+    try:
+        with task_telemetry.task_scope("h3_ir_provider-trace-regression"):
+            yield exporter
+    finally:
+        provider.shutdown()
+
+
+def one_prompt_subspan(exporter: InMemorySpanExporter, name: str) -> ReadableSpan:
+    spans = tuple(span for span in exporter.get_finished_spans() if span.name == name)
+    assert len(spans) == 1
+    return spans[0]
+
+
+@pytest.mark.asyncio
+async def test_prompt_substage_success_preserves_payload_and_private_values(
+    prompt_span_exporter: InMemorySpanExporter,
+) -> None:
+    provider = Provider("private-provider-answer")
+    messages: list[dict[str, JsonValue]] = [{"role": "user", "content": "private-provider-prompt"}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        with task_telemetry.stage("causyn.prompt.rewrite"):
+            result = await H3PromptRewriter(client, "synthetic-provider-secret")._complete(
+                h3_prompt.BASE_REWRITE_DEFAULT_MODEL, messages, 90
+            )
+    assert result.choices[0].message.content == "private-provider-answer"
+    assert provider.bodies == [{
+        "model": h3_prompt.BASE_REWRITE_DEFAULT_MODEL,
+        "messages": messages,
+        "max_tokens": 3072,
+        "stream": False,
+        "temperature": 0,
+        "reasoning": {"enabled": False},
+        "provider": {"allow_fallbacks": False, "require_parameters": True},
+    }]
+    child = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.provider_http")
+    parent = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.rewrite")
+    assert child.parent is not None and parent.context is not None
+    assert child.parent.span_id == parent.context.span_id
+    assert child.context is not None and child.context.trace_id == parent.context.trace_id
+    assert child.attributes == {
+        "causyn.task_id": "provider-trace-regression",
+        "causyn.model": h3_prompt.BASE_REWRITE_DEFAULT_MODEL,
+        "causyn.tokens": 3072,
+    }
+    assert child.start_time is not None and child.end_time is not None and child.end_time >= child.start_time
+    assert child.events == ()
+    assert "private-provider" not in str(child.attributes) and "synthetic-provider-secret" not in str(child.attributes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.PoolTimeout, httpx.ConnectTimeout])
+async def test_prompt_substage_records_original_transport_failure_without_changing_retry_contract(
+    prompt_span_exporter: InMemorySpanExporter, error_type: type[httpx.TransportError],
+) -> None:
+    calls = iter((error_type("private-provider-content"),))
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        assert request.extensions["timeout"] == {name: 85 for name in ("connect", "read", "write", "pool")}
+        raise next(calls)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(RewriteError) as caught:
+            with task_telemetry.stage("causyn.prompt.rewrite"):
+                await H3PromptRewriter(client, "synthetic-provider-secret")._complete(
+                    h3_prompt.BASE_REWRITE_DEFAULT_MODEL, [], 90
+                )
+    child = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.provider_http")
+    parent = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.rewrite")
+    assert caught.value.retryable and caught.value.detail == error_type.__name__
+    assert isinstance(caught.value.__cause__, error_type)
+    assert child.status.status_code == StatusCode.ERROR
+    assert child.attributes is not None and child.attributes["causyn.error_type"] == error_type.__name__
+    assert parent.attributes is not None and parent.attributes["causyn.error_type"] == "RewriteError"
+    assert child.events == () and "private-provider-content" not in str(child.attributes)
+    assert tuple(calls) == ()
+
+
+@pytest.mark.asyncio
+async def test_prompt_substage_retains_total_timeout(prompt_span_exporter: InMemorySpanExporter) -> None:
+    calls = iter((0.01,))
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        budget = next(calls)
+        assert request.extensions["timeout"] == {name: budget for name in ("connect", "read", "write", "pool")}
+        await asyncio.sleep(1)
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "synthetic-provider-secret")._complete(
+                h3_prompt.BASE_REWRITE_DEFAULT_MODEL, [], 0.01
+            )
+    child = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.provider_http")
+    assert caught.value.retryable and caught.value.detail == "TimeoutError"
+    assert child.status.status_code == StatusCode.ERROR
+    assert child.attributes is not None and child.attributes["causyn.error_type"] == "TimeoutError"
+    assert tuple(calls) == ()
+
+
+@pytest.mark.asyncio
+async def test_prompt_substage_media_and_provider_boundaries(
+    prompt_span_exporter: InMemorySpanExporter, patched: Callable[[ContextIRRequest, RefFacts], None],
+) -> None:
+    spec, facts = case("R1")
+    patched(spec, facts)
+    provider = Provider(GOLD["R1"])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        result = await H3PromptRewriter(client, "synthetic-provider-secret").rewrite(spec)
+    assert result.prompt == GOLD["R1"] and len(provider.bodies) == 1
+    prepared = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.media_prepare")
+    perceived = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.media_facts")
+    completed = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.provider_http")
+    assert prepared.end_time is not None and perceived.start_time is not None
+    assert perceived.end_time is not None and completed.start_time is not None
+    assert prepared.end_time <= perceived.start_time <= perceived.end_time <= completed.start_time
+
+
+@pytest.mark.asyncio
+async def test_prompt_substage_facts_failure_keeps_original_exception_and_skips_provider(
+    prompt_span_exporter: InMemorySpanExporter,
+    patched: Callable[[ContextIRRequest, RefFacts], None], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec, facts = case("R1")
+    patched(spec, facts)
+
+    async def perceive(request: ContextIRRequest, raw: h3_media.PreparedRaw, key: str | None = None) -> RefFacts:
+        raise ValueError("private-media-content")
+
+    monkeypatch.setattr(h3_prompt, "perceive_media", perceive)
+    provider = Provider(GOLD["R1"])
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        with pytest.raises(ValueError, match="private-media-content"):
+            await H3PromptRewriter(client, "synthetic-provider-secret").rewrite(spec)
+    failed = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.media_facts")
+    assert failed.status.status_code == StatusCode.ERROR
+    assert failed.attributes is not None and failed.attributes["causyn.error_type"] == "ValueError"
+    assert failed.events == () and "private-media-content" not in str(failed.attributes)
+    assert provider.bodies == []
+    assert not any(span.name == "causyn.prompt.provider_http" for span in prompt_span_exporter.get_finished_spans())

@@ -52,6 +52,7 @@ from litellm.llms.causyn.ref_media_facts import (
     render_audio_facts,
     render_video_facts,
 )
+from litellm.llms.causyn.task_telemetry import stage
 from litellm.proxy.video_endpoints.minimax_h3_models import (
     AudioItem,
     ContentItem,
@@ -1279,14 +1280,15 @@ class H3PromptRewriter:
             "provider": dict(_provider_preferences(model)),
         }
         try:
-            async with asyncio.timeout(budget):
-                response = await self.client.post(
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    json=payload,
-                    timeout=min(85, budget),
-                    follow_redirects=False,
-                )
+            with stage("causyn.prompt.provider_http", model=model, tokens=max_tokens):
+                async with asyncio.timeout(budget):
+                    response = await self.client.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        json=payload,
+                        timeout=min(85, budget),
+                        follow_redirects=False,
+                    )
         except (httpx.TransportError, TimeoutError) as exc:
             raise RewriteError(
                 "H3 prompt rewrite provider interrupted", retryable=True, detail=type(exc).__name__
@@ -1491,10 +1493,12 @@ class H3PromptRewriter:
 
         ref2va = spec.mode == "ref2va"
         model = ref2va_model() if ref2va else base_model()  # a misconfigured model fails before any media is fetched
-        prepared, raw = await h3_media.prepare_media_with_raw(self.client, spec)
+        with stage("causyn.prompt.media_prepare", model=model):
+            prepared, raw = await h3_media.prepare_media_with_raw(self.client, spec)
         # One key per request (hashed off the event loop) serves both the facts memo and the first-answer cache.
         key = await asyncio.to_thread(media_key, prepared, raw.videos, raw.audios)
-        facts = await perceive_media(prepared, raw, key) if ref2va else None
+        with stage("causyn.prompt.media_facts", model=model):
+            facts = await perceive_media(prepared, raw, key) if ref2va else None
         # The provider clock starts once fetch and perception are done; the attempt deadline still bounds it.
         started = time.monotonic()
         system = system_prompt() + (
