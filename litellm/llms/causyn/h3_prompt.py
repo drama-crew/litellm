@@ -980,6 +980,14 @@ REPLACEMENT_APPEARANCE_RULE = (
     "it fully_preserved (or partially_preserved when the user changes the structure), never weak_reference."
 )
 
+REF2VA_SECTION_SPACE_GUIDANCE = (
+    "Planning allocations in characters: subject_definitions=1600; summary=200; retention_analysis=700; "
+    "detailed_description=2700; overall_soundscape=400; non_diegetic_music=200. "
+    "Keep the descriptive section within its existing word range. All required details, exact media labels "
+    "and verbatim user-authored speech take priority over these planning allocations. "
+    "Do not remove required content to meet an individual allocation; reduce repetition elsewhere."
+)
+
 
 def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False) -> str:
     """Perception rules appended to the Ref2VA system text; the video-only parts apply only with a reference video."""
@@ -1011,7 +1019,8 @@ def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False) -
             "must be at most 7000 characters. Use a planning target of 6000 characters or fewer to leave "
             "counting headroom below that hard limit. Plan the space across all sections before writing, keeping the "
             "required detail, exact provided labels and user-authored speech. Avoid duplicate descriptions, "
-            "and refer back to defined subjects rather than repeating long appearance descriptions."
+            "and refer back to defined subjects rather than repeating long appearance descriptions. "
+            + REF2VA_SECTION_SPACE_GUIDANCE
         )
     return "\n" + " ".join(parts)
 
@@ -1060,7 +1069,7 @@ def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...], base: 
     ):
         closing += (
             " Use a planning target of 6000 characters or fewer; retain all six sections, "
-            "exact provided labels and user-authored speech."
+            "exact provided labels and user-authored speech. " + REF2VA_SECTION_SPACE_GUIDANCE
         )
     if base:
         return (

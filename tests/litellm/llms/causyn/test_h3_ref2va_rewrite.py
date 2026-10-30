@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 from pathlib import Path
+import re
 
 import httpx
 import pytest
@@ -1516,6 +1517,7 @@ async def test_initial_length_guidance_announces_existing_limit_before_first_cal
     assert "at most 7000 characters" in system
     assert "planning target of 6000 characters or fewer" in system
     assert "exact provided labels and user-authored speech" in system
+    assert_section_space_plan(system)
     assert body["model"] == h3_prompt.REF2VA_DEFAULT_MODEL and body["max_tokens"] == 3072
     assert body["provider"] == {"allow_fallbacks": False, "require_parameters": True}
 
@@ -1546,6 +1548,10 @@ async def test_length_margin_reaches_ref2va_repair_without_changing_result_or_bu
     repair = provider.bodies[1]["messages"][-1]["content"]
     assert "it has 7167 characters" in repair and "must contain 1 to 7000 characters" in repair
     assert ("planning target of 6000 characters or fewer" in repair) == (flag == "true")
+    if flag == "true":
+        assert_section_space_plan(repair)
+    else:
+        assert "Planning allocations in characters:" not in repair
     assert "keep every required section, label and spoken line" in repair
     assert all(body["max_tokens"] == 3072 and body["model"] == h3_prompt.REF2VA_DEFAULT_MODEL for body in provider.bodies)
 
@@ -1569,3 +1575,44 @@ def test_length_margin_leaves_nonlength_and_empty_answer_repairs_unchanged(monke
     message = h3_prompt._repair_message((violation,), ("<Picture 1>",))
     assert "6000 characters" not in message
     assert message.endswith(h3_prompt.KEEP_DETAIL_SENTENCE)
+
+
+def assert_section_space_plan(message: str) -> None:
+    allocations = {
+        name: int(size)
+        for name, size in re.findall(r"\b([a-z_]+)=(\d+)\b", message)
+        if name in h3_prompt.REFERENCE_FIELDS
+    }
+    assert set(allocations) == set(h3_prompt.REFERENCE_FIELDS)
+    assert sum(allocations.values()) + sum(len(name) + 3 for name in allocations) <= 6000
+    assert allocations["detailed_description"] >= 200 * 6
+    assert allocations["subject_definitions"] >= 9 * 100
+    assert "existing word range" in message
+    assert "verbatim user-authored speech take priority over these planning allocations" in message
+    assert "Do not remove required content" in message
+
+
+@pytest.mark.asyncio
+async def test_nine_images_receive_space_plan_without_losing_labels_or_modifying_reply(patched, monkeypatch):
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", "true")
+    spec = ref_spec(*("image",) * 9, duration=5)
+    facts = RefFacts()
+    patched(spec, facts)
+    labels = tuple(f"<Picture {number}>" for number in range(1, 10))
+    description = "The nine subjects walk together while the camera follows their coordinated movement. " * 20
+    prompt = (
+        "subject_definitions:\n" + "\n".join(f"{label} is one distinct subject." for label in labels)
+        + "\nsummary:\nThe nine subjects walk together.\nretention_analysis:\n"
+        + "\n".join(f"{label} (appears in [Shot 1]): fully_preserved - keep its appearance." for label in labels)
+        + "\ndetailed_description:\n[Shot 1] At 00:00.000, " + description
+        + "\noverall_soundscape:\nSoft footsteps.\nnon_diegetic_music:\nNone."
+    )
+    validate_prompt(prompt, spec, facts)
+    provider = Provider(prompt)
+    result = await run(provider, spec)
+    assert result.prompt == prompt and len(provider.bodies) == 1
+    body = provider.bodies[0]
+    assert_section_space_plan(body["messages"][0]["content"])
+    text = json.dumps(body["messages"][1]["content"])
+    assert all(label in text for label in labels)
+    assert body["model"] == h3_prompt.REF2VA_DEFAULT_MODEL and body["max_tokens"] == 3072
