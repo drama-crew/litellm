@@ -987,6 +987,12 @@ REF2VA_SECTION_SPACE_GUIDANCE = (
     "Keep the descriptive section within its existing word range. All required details, exact media labels "
     "and verbatim user-authored speech take priority over these planning allocations. "
     "Do not remove required content to meet an individual allocation; reduce repetition elsewhere."
+    " English prose planning target: about 850 words across all six sections combined, excluding media labels. "
+    "Word allocations: subject_definitions: 240 words; summary: 30 words; retention_analysis: 100 words; "
+    "detailed_description: 400 words; overall_soundscape: 50 words; non_diegetic_music: 30 words. "
+    "These are soft planning targets, not additional acceptance limits: required details, exact labels and "
+    "verbatim user-authored speech take priority. Do not translate, shorten or omit quoted lines. "
+    "Keep ordinary prose concise, reuse the defined subject names and return every required section."
 )
 
 

@@ -1556,6 +1556,7 @@ async def test_initial_length_guidance_preserves_default_request(patched, monkey
     result = await run(provider, spec)
     assert result.prompt == GOLD["R1"].strip() and len(provider.bodies) == 1
     assert "7000 characters" not in provider.bodies[0]["messages"][0]["content"]
+    assert "English prose planning" not in json.dumps(provider.bodies[0])
 
 
 @pytest.mark.asyncio
@@ -1578,22 +1579,26 @@ async def test_initial_length_guidance_announces_existing_limit_before_first_cal
     assert "planning target of 6000 characters or fewer" in system
     assert "exact provided labels and user-authored speech" in system
     assert_section_space_plan(system)
+    assert_english_word_plan(json.dumps(body))
     assert body["model"] == h3_prompt.REF2VA_DEFAULT_MODEL and body["max_tokens"] == 3072
     assert body["provider"] == {"allow_fallbacks": False, "require_parameters": True}
 
 
 @pytest.mark.asyncio
-async def test_initial_length_guidance_never_truncates_or_accepts_an_oversized_answer(patched, monkeypatch):
+@pytest.mark.parametrize("size", [7001, 11717])
+async def test_initial_length_guidance_never_truncates_or_accepts_an_oversized_answer(
+    patched: Callable[[ContextIRRequest, RefFacts], None], monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
     monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", "true")
     spec, facts = case("R1")
     patched(spec, facts)
-    oversized = "x" * 7001
+    oversized = "x" * size
     provider = Provider(oversized, oversized)
     with pytest.raises(RewriteError) as caught:
         await run(provider, spec)
     assert len(provider.bodies) == 2
     assert caught.value.validation
-    assert any("7001 characters" in v for v in caught.value.violations)
+    assert any(f"{size} characters" in v for v in caught.value.violations)
 
 
 @pytest.mark.asyncio
@@ -1610,6 +1615,7 @@ async def test_length_margin_reaches_ref2va_repair_without_changing_result_or_bu
     assert ("planning target of 6000 characters or fewer" in repair) == (flag == "true")
     if flag == "true":
         assert_section_space_plan(repair)
+        assert_english_word_plan(json.dumps(provider.bodies[1]))
     else:
         assert "Planning allocations in characters:" not in repair
     assert "keep every required section, label and spoken line" in repair
@@ -1654,6 +1660,36 @@ def assert_section_space_plan(message: str) -> None:
     assert "Do not remove required content" in message
 
 
+def assert_english_word_plan(message: str) -> None:
+    allocations = {match.group(1): int(match.group(2)) for match in re.finditer(r"\b([a-z_]+): (\d+) words\b", message)}
+    assert set(allocations) == set(h3_prompt.REFERENCE_FIELDS)
+    assert sum(allocations.values()) == 850
+    assert h3_prompt.DESCRIPTION_WORDS[0] <= allocations["detailed_description"] <= h3_prompt.DESCRIPTION_WORDS[1]
+    assert allocations["subject_definitions"] >= 9 * 20
+    assert "soft planning targets, not additional acceptance limits" in message
+    assert "required details, exact labels and verbatim user-authored speech take priority" in message
+    assert "Do not translate, shorten or omit quoted lines" in message
+
+
+@pytest.mark.asyncio
+async def test_english_word_plan_does_not_reject_or_truncate_valid_prose_above_soft_target(
+    patched: Callable[[ContextIRRequest, RefFacts], None], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", "true")
+    spec, facts = case("R4")
+    patched(spec, facts)
+    prompt = GOLD["R4"].replace("\nnon_diegetic_music:", "\n" + "soft " * 100 + "\nnon_diegetic_music:", 1)
+    assert len(prompt.split()) > 850 and len(prompt) < 7000
+    validate_prompt(prompt, spec, facts)
+    provider = Provider(prompt)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        result = await H3PromptRewriter(client, "synthetic-key").rewrite(spec)
+    assert result.prompt == prompt.strip() and len(provider.bodies) == 1
+    assert_english_word_plan(json.dumps(provider.bodies[0]))
+    assert provider.bodies[0]["model"] == h3_prompt.REF2VA_DEFAULT_MODEL
+    assert provider.bodies[0]["max_tokens"] == 3072
+
+
 @pytest.mark.asyncio
 async def test_nine_images_receive_space_plan_without_losing_labels_or_modifying_reply(patched, monkeypatch):
     monkeypatch.setenv("CAUSYN_H3_REF2VA_LENGTH_GUIDANCE", "true")
@@ -1677,6 +1713,7 @@ async def test_nine_images_receive_space_plan_without_losing_labels_or_modifying
     assert result.prompt == prompt and len(provider.bodies) == 1
     body = provider.bodies[0]
     assert_section_space_plan(body["messages"][0]["content"])
+    assert_english_word_plan(json.dumps(body))
     text = json.dumps(body["messages"][1]["content"])
     assert all(label in text for label in labels)
     assert body["model"] == h3_prompt.REF2VA_DEFAULT_MODEL and body["max_tokens"] == 3072
@@ -1817,15 +1854,17 @@ async def test_prompt_substage_success_preserves_payload_and_private_values(
                 h3_prompt.BASE_REWRITE_DEFAULT_MODEL, messages, 90
             )
     assert result.choices[0].message.content == "private-provider-answer"
-    assert provider.bodies == [{
-        "model": h3_prompt.BASE_REWRITE_DEFAULT_MODEL,
-        "messages": messages,
-        "max_tokens": 3072,
-        "stream": False,
-        "temperature": 0,
-        "reasoning": {"enabled": False},
-        "provider": {"allow_fallbacks": False, "require_parameters": True},
-    }]
+    assert provider.bodies == [
+        {
+            "model": h3_prompt.BASE_REWRITE_DEFAULT_MODEL,
+            "messages": messages,
+            "max_tokens": 3072,
+            "stream": False,
+            "temperature": 0,
+            "reasoning": {"enabled": False},
+            "provider": {"allow_fallbacks": False, "require_parameters": True},
+        }
+    ]
     child = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.provider_http")
     parent = one_prompt_subspan(prompt_span_exporter, "causyn.prompt.rewrite")
     assert child.parent is not None and parent.context is not None
@@ -1844,7 +1883,8 @@ async def test_prompt_substage_success_preserves_payload_and_private_values(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [httpx.ReadTimeout, httpx.PoolTimeout, httpx.ConnectTimeout])
 async def test_prompt_substage_records_original_transport_failure_without_changing_retry_contract(
-    prompt_span_exporter: InMemorySpanExporter, error_type: type[httpx.TransportError],
+    prompt_span_exporter: InMemorySpanExporter,
+    error_type: type[httpx.TransportError],
 ) -> None:
     calls = iter((error_type("private-provider-content"),))
 
@@ -1893,7 +1933,8 @@ async def test_prompt_substage_retains_total_timeout(prompt_span_exporter: InMem
 
 @pytest.mark.asyncio
 async def test_prompt_substage_media_and_provider_boundaries(
-    prompt_span_exporter: InMemorySpanExporter, patched: Callable[[ContextIRRequest, RefFacts], None],
+    prompt_span_exporter: InMemorySpanExporter,
+    patched: Callable[[ContextIRRequest, RefFacts], None],
 ) -> None:
     spec, facts = case("R1")
     patched(spec, facts)
@@ -1912,7 +1953,8 @@ async def test_prompt_substage_media_and_provider_boundaries(
 @pytest.mark.asyncio
 async def test_prompt_substage_facts_failure_keeps_original_exception_and_skips_provider(
     prompt_span_exporter: InMemorySpanExporter,
-    patched: Callable[[ContextIRRequest, RefFacts], None], monkeypatch: pytest.MonkeyPatch,
+    patched: Callable[[ContextIRRequest, RefFacts], None],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec, facts = case("R1")
     patched(spec, facts)
