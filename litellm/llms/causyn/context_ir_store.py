@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, JsonValue, SerializerFunctionWrapHandler, model_serializer
+from pydantic import BaseModel, ConfigDict, JsonValue, SerializerFunctionWrapHandler, TypeAdapter, model_serializer
 
 from litellm.llms.causyn.h3_prompt import ContextIRRequest, RewriteError, RewriteResult
 
@@ -14,6 +15,38 @@ LEASE = 240
 PENDING = "causyn:context-ir:pending"
 READY = "causyn:context-ir:ready"
 PREFIX = "h3_ir_"
+PENDING_AGING_ENV = "CAUSYN_H3_PENDING_AGING_ENABLED"
+PENDING_AGING_SECONDS = 60
+PENDING_SCAN_LIMIT = 128
+_PENDING_AGED_DUE = """
+local now, age, count = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local rows = {}
+for i = 2, #KEYS do
+    local id = ARGV[i + 2]
+    local due = tonumber(redis.call('ZSCORE', KEYS[1], id))
+    if due and due <= now then
+        local raw = redis.pcall('GET', KEYS[i])
+        local created = type(raw) == 'string' and tonumber(raw) or nil
+        if not created or created ~= created or created <= 0 or created > now then
+            return redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, count)
+        end
+        rows[#rows + 1] = {id=id, due=due, created=created, aged=now-created >= age}
+    end
+end
+table.sort(rows, function(a, b)
+    if a.aged ~= b.aged then return a.aged end
+    if a.aged and a.created ~= b.created then return a.created < b.created end
+    if a.due ~= b.due then return a.due < b.due end
+    return a.id < b.id
+end)
+local selected = {}
+for i = 1, math.min(count, #rows) do selected[i] = rows[i].id end
+return selected
+"""
+
+
+def pending_aging_enabled() -> bool:
+    return os.getenv(PENDING_AGING_ENV, "false").strip().lower() in ("true", "1", "yes", "on")
 
 
 class RedisPort(Protocol):
@@ -108,6 +141,14 @@ def task_key(task_id: str) -> str:
     return f"causyn:context-ir:task:{task_id}"
 
 
+def created_key(task_id: str) -> str:
+    return f"{task_key(task_id)}:created_at"
+
+
+def aging_keys(task_id: str) -> tuple[str, ...]:
+    return (created_key(task_id),) if pending_aging_enabled() else ()
+
+
 def owner_key(owner: str) -> str:
     return f"causyn:context-ir:owner:{owner}"
 
@@ -122,6 +163,7 @@ class ContextIRStore:
         self.max_pending = max_pending
 
     async def create(self, task: ContextIRTask) -> ContextIRTask:
+        extra_keys = aging_keys(task.id)
         result = await self.redis.eval(
             "if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end "
             # 只计 PENDING（改写队列）。READY 里是"改写已完成、等 GPU"的任务；
@@ -134,12 +176,14 @@ class ContextIRStore:
             "redis.call('ZADD', KEYS[2], ARGV[3], ARGV[4]); "
             "if ARGV[5] == '1' then redis.call('ZREMRANGEBYSCORE', KEYS[3], '-inf', tonumber(ARGV[3])-tonumber(ARGV[2])); "
             "redis.call('ZADD', KEYS[3], ARGV[3], ARGV[4]); redis.call('EXPIRE', KEYS[3], ARGV[2]) end; "
-            "return 1",
-            4,
+            + ("redis.call('SET', KEYS[5], ARGV[3], 'EX', ARGV[2]); " if extra_keys else "")
+            + "return 1",
+            4 + len(extra_keys),
             task_key(task.id),
             PENDING,
             owner_key(task.owner),
             READY,
+            *extra_keys,
             task.model_dump_json(),
             TTL,
             task.created_at,
@@ -161,22 +205,47 @@ class ContextIRStore:
         return ContextIRTask.model_validate_json(raw) if raw is not None else None
 
     async def due(self, queue: str = PENDING, *, limit: int = 4) -> tuple[str, ...]:
-        return tuple(
-            text(item) for item in await self.redis.zrangebyscore(queue, "-inf", time.time(), start=0, num=limit)
+        if queue != PENDING or not pending_aging_enabled():
+            return tuple(
+                text(item) for item in await self.redis.zrangebyscore(queue, "-inf", time.time(), start=0, num=limit)
+            )
+        count = max(0, min(limit, PENDING_SCAN_LIMIT))
+        if count == 0:
+            return ()
+        now = time.time()
+        candidates = tuple(
+            text(item) for item in await self.redis.zrangebyscore(queue, "-inf", now, start=0, num=PENDING_SCAN_LIMIT)
         )
+        if not candidates:
+            return ()
+        selected = await self.redis.eval(
+            _PENDING_AGED_DUE,
+            1 + len(candidates),
+            queue,
+            *(created_key(task_id) for task_id in candidates),
+            now,
+            PENDING_AGING_SECONDS,
+            count,
+            *candidates,
+        )
+        return tuple(text(item) for item in TypeAdapter(tuple[bytes | str, ...]).validate_python(selected))
 
     async def claim(self, task_id: str, token: str) -> bool:
+        extra_keys = aging_keys(task_id)
         result = await self.redis.eval(
             "if redis.call('EXISTS', KEYS[1]) == 0 then "
-            "redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('ZREM', KEYS[4], ARGV[3]); return 0 end; "
+            "redis.call('ZREM', KEYS[3], ARGV[3]); redis.call('ZREM', KEYS[4], ARGV[3]); "
+            + ("redis.call('DEL', KEYS[5]); " if extra_keys else "")
+            + "return 0 end; "
             "if not redis.call('SET', KEYS[2], ARGV[1], 'NX', 'EX', ARGV[2]) then return 0 end; "
             "local queue = redis.call('ZSCORE', KEYS[4], ARGV[3]) and KEYS[4] or KEYS[3]; "
             "redis.call('ZADD', queue, ARGV[4], ARGV[3]); return 1",
-            4,
+            4 + len(extra_keys),
             task_key(task_id),
             task_key(task_id) + ":lease",
             PENDING,
             READY,
+            *extra_keys,
             token,
             LEASE,
             task_id,
@@ -185,24 +254,35 @@ class ContextIRStore:
         return result == 1
 
     async def save(self, task: ContextIRTask, token: str, *, done: bool = False) -> None:
+        extra_keys = aging_keys(task.id)
         result = await self.redis.eval(
             "if redis.call('GET', KEYS[2]) ~= ARGV[1] or redis.call('EXISTS', KEYS[1]) == 0 then return 0 end; "
             "redis.call('SET', KEYS[1], ARGV[2], 'KEEPTTL'); "
             "local due = redis.call('ZSCORE', KEYS[3], ARGV[4]) or redis.call('ZSCORE', KEYS[4], ARGV[4]); "
             "redis.call('ZREM', KEYS[3], ARGV[4]); redis.call('ZREM', KEYS[4], ARGV[4]); "
             "if ARGV[3] == '1' then redis.call('DEL', KEYS[2]); "
-            "else redis.call('ZADD', KEYS[tonumber(ARGV[5])], due or ARGV[6], ARGV[4]) end; return 1",
-            4,
+            "else redis.call('ZADD', KEYS[tonumber(ARGV[5])], due or ARGV[6], ARGV[4]) end; "
+            + (
+                "if ARGV[3] == '1' or ARGV[5] ~= '3' then redis.call('DEL', KEYS[5]); "
+                "else local ttl = redis.call('PTTL', KEYS[1]); "
+                "if ttl > 0 then redis.call('SET', KEYS[5], ARGV[7], 'NX', 'PX', ttl) end end; "
+                if extra_keys
+                else ""
+            )
+            + "return 1",
+            4 + len(extra_keys),
             task_key(task.id),
             task_key(task.id) + ":lease",
             PENDING,
             READY,
+            *extra_keys,
             token,
             task.model_dump_json(),
             "1" if done else "0",
             task.id,
             4 if task.result is not None or task.status in {"succeeded", "failed", "cancelled"} else 3,
             time.time() + LEASE,
+            *((task.created_at,) if extra_keys else ()),
         )
         if result != 1:
             raise RewriteError("Context IR task lease was lost", 503)
@@ -227,16 +307,20 @@ class ContextIRStore:
         return tuple(row for row in rows if row is not None and row.owner == owner and row.listed)
 
     async def delete(self, task: ContextIRTask, token: str) -> None:
+        extra_keys = aging_keys(task.id)
         result = await self.redis.eval(
             "if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end; "
             "redis.call('DEL', KEYS[1], KEYS[2]); redis.call('ZREM', KEYS[3], ARGV[2]); "
-            "redis.call('ZREM', KEYS[4], ARGV[2]); redis.call('ZREM', KEYS[5], ARGV[2]); return 1",
-            5,
+            "redis.call('ZREM', KEYS[4], ARGV[2]); redis.call('ZREM', KEYS[5], ARGV[2]); "
+            + ("redis.call('DEL', KEYS[6]); " if extra_keys else "")
+            + "return 1",
+            5 + len(extra_keys),
             task_key(task.id),
             task_key(task.id) + ":lease",
             PENDING,
             owner_key(task.owner),
             READY,
+            *extra_keys,
             token,
             task.id,
         )

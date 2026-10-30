@@ -256,7 +256,6 @@ async def test_automatic_rewrite_is_included_while_standalone_costs_four(redis, 
     import time
 
     import litellm.llms.causyn.context_ir as context_ir
-    from litellm.llms.causyn import video_prompt
     from litellm.llms.causyn.video_prompt import VideoSubmission, submit_video_prompt
 
     service = ContextIRService(ContextIRStore(redis), rewrite=rewrite, deliver=no_settle)
@@ -1515,3 +1514,281 @@ def test_redaction_covers_short_access_keys():
 
     out = redact_provider_detail("denied AccessKeyId=LTAI5tAbCdEf12 and api_key: abc123")
     assert "LTAI5tAbCdEf12" not in out and "abc123" not in out
+
+
+def _pending_aging_task(name: str, created_at: int, duration: int = 5):
+    from litellm.llms.causyn.context_ir_store import ContextIRTask
+
+    return ContextIRTask(
+        id="h3_ir_" + name,
+        owner="owner",
+        request=spec(duration=duration),
+        created_at=created_at,
+        updated_at=created_at,
+        billing=BillingIdentity(),
+        price=2.5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_prioritizes_old_due_retry_without_reading_payloads(redis, monkeypatch):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import PENDING
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    old = await store.create(_pending_aging_task("old-retry", now - 180, duration=15))
+    fresh = await store.create(_pending_aging_task("fresh-first", now - 20))
+    await redis.zadd(PENDING, {old.id: now - 1, fresh.id: now - 10})
+    await redis.set(task_key(old.id), "invalid multimedia payload")
+    await redis.set(task_key(fresh.id), "invalid multimedia payload")
+    assert await store.due(limit=2) == (old.id, fresh.id)
+
+
+@pytest.mark.parametrize("flag", [None, "false", "0", "off"])
+@pytest.mark.asyncio
+async def test_pending_aging_disabled_preserves_due_order_and_metadata_absence(redis, monkeypatch, flag):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import PENDING
+
+    if flag is None:
+        monkeypatch.delenv("CAUSYN_H3_PENDING_AGING_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", flag)
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    old = await store.create(_pending_aging_task("old", now - 180))
+    fresh = await store.create(_pending_aging_task("fresh", now - 20))
+    await redis.zadd(PENDING, {old.id: now - 1, fresh.id: now - 10})
+    assert await store.due(limit=2) == (fresh.id, old.id)
+    assert await redis.get(task_key(old.id) + ":created_at") is None
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_keeps_fresh_fifo_and_excludes_future_retries(redis, monkeypatch):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import PENDING
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "1")
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    old = await store.create(_pending_aging_task("future-old", now - 180))
+    first = await store.create(_pending_aging_task("first", now - 20))
+    second = await store.create(_pending_aging_task("second", now - 40))
+    await redis.zadd(PENDING, {old.id: now + 30, first.id: now - 10, second.id: now - 1})
+    assert await store.due(limit=3) == (first.id, second.id)
+
+
+@pytest.mark.parametrize("metadata", [None, "invalid", "nan", "inf", "-inf", "0", "9999999999"])
+@pytest.mark.asyncio
+async def test_pending_aging_missing_or_invalid_metadata_preserves_legacy_fifo(redis, monkeypatch, metadata):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import PENDING
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    old = await store.create(_pending_aging_task("old", now - 180))
+    fresh = await store.create(_pending_aging_task("fresh", now - 20))
+    await redis.zadd(PENDING, {old.id: now - 1, fresh.id: now - 10})
+    name = task_key(old.id) + ":created_at"
+    await redis.delete(name)
+    if metadata is not None:
+        await redis.set(name, metadata)
+    assert await store.due(limit=2) == (fresh.id, old.id)
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_metadata_follows_task_ttl_and_idempotent_creation(redis, monkeypatch):
+    import time
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    task = await store.create(_pending_aging_task("same", now - 180))
+    name = task_key(task.id) + ":created_at"
+    assert int(await redis.get(name)) == task.created_at
+    assert abs(await redis.pttl(name) - await redis.pttl(task_key(task.id))) < 100
+    again = await store.create(task.model_copy(update={"created_at": now}))
+    assert again.created_at == task.created_at
+    assert int(await redis.get(name)) == task.created_at
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_save_backfills_only_remaining_task_lifetime_and_keeps_original_age(redis, monkeypatch):
+    import time
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    task = await store.create(_pending_aging_task("legacy", now - 180))
+    name = task_key(task.id) + ":created_at"
+    await redis.delete(name)
+    await redis.pexpire(task_key(task.id), 5000)
+    assert await store.claim(task.id, "worker")
+    await store.save(task, "worker")
+    assert int(await redis.get(name)) == task.created_at
+    assert 0 < await redis.pttl(name) <= 5000
+    assert abs(await redis.pttl(name) - await redis.pttl(task_key(task.id))) < 100
+    await store.save(task.model_copy(update={"created_at": now}), "worker")
+    assert int(await redis.get(name)) == task.created_at
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_ready_delivery_keeps_fifo_and_drops_unneeded_metadata(redis, monkeypatch):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import READY
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    old = await store.create(_pending_aging_task("old", now - 180))
+    fresh = await store.create(_pending_aging_task("fresh", now - 20))
+    for task in (old, fresh):
+        assert await store.claim(task.id, task.id)
+        await store.save(task.model_copy(update={"result": RESULT}), task.id)
+        assert await redis.get(task_key(task.id) + ":created_at") is None
+    await redis.zadd(READY, {old.id: now - 1, fresh.id: now - 10})
+    assert await store.due(READY, limit=2) == (fresh.id, old.id)
+
+
+@pytest.mark.parametrize("operation", ["done", "delete", "missing"])
+@pytest.mark.asyncio
+async def test_pending_aging_cleanup_is_ownership_fenced(redis, monkeypatch, operation):
+    import time
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    store = ContextIRStore(redis)
+    task = await store.create(_pending_aging_task("cleanup", int(time.time()) - 180))
+    name = task_key(task.id) + ":created_at"
+    assert await redis.exists(name)
+    if operation == "missing":
+        await redis.delete(task_key(task.id))
+        assert not await store.claim(task.id, "worker")
+    else:
+        assert await store.claim(task.id, "worker")
+        with pytest.raises(RewriteError):
+            if operation == "done":
+                await store.save(task, "stale-worker", done=True)
+            else:
+                await store.delete(task, "stale-worker")
+        assert await redis.exists(name)
+        if operation == "done":
+            await store.save(task, "worker", done=True)
+        else:
+            await store.delete(task, "worker")
+    assert await redis.get(name) is None
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_concurrent_claims_and_recovery_keep_existing_lease_fences(redis, monkeypatch):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import PENDING
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    old = await store.create(_pending_aging_task("old", now - 180))
+    fresh = await store.create(_pending_aging_task("fresh", now - 20))
+    await redis.zadd(PENDING, {old.id: now - 1, fresh.id: now - 10})
+    selected = await asyncio.gather(*(store.due(limit=1) for _ in range(4)))
+    assert selected == [(old.id,)] * 4
+    claimed = await asyncio.gather(*(store.claim(old.id, str(n)) for n in range(4)))
+    assert sum(claimed) == 1
+    assert await store.due(limit=1) == (fresh.id,)
+    await redis.delete(task_key(old.id) + ":lease")
+    await redis.zadd(PENDING, {old.id: now - 1})
+    assert await store.claim(old.id, "replacement")
+    with pytest.raises(RewriteError, match="lease was lost"):
+        await store.save(old, str(claimed.index(True)))
+    assert int(await redis.get(task_key(old.id) + ":created_at")) == old.created_at
+
+
+class _AgingRedisProbe:
+    def __init__(self, inner, before_eval=None):
+        self.inner = inner
+        self.before_eval = before_eval
+        self.eval_calls = ()
+
+    async def get(self, name):
+        return await self.inner.get(name)
+
+    async def eval(self, script, numkeys, *values):
+        self.eval_calls = (*self.eval_calls, (numkeys, values))
+        if self.before_eval is not None:
+            await self.before_eval()
+        return await self.inner.eval(script, numkeys, *values)
+
+    async def zrangebyscore(self, name, minimum, maximum, *, start, num):
+        return await self.inner.zrangebyscore(name, minimum, maximum, start=start, num=num)
+
+    async def zrevrange(self, name, start, end):
+        return await self.inner.zrevrange(name, start, end)
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_scans_only_bounded_metadata_and_never_changes_ready_reads(redis, monkeypatch):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import PENDING, READY
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    ids = tuple("h3_ir_%03d" % n for n in range(140))
+    await redis.zadd(PENDING, {name: now - 10 + n / 1000 for n, name in enumerate(ids)})
+    await asyncio.gather(*(redis.set(task_key(name) + ":created_at", now - 180) for name in ids))
+    port = _AgingRedisProbe(redis)
+    store = ContextIRStore(port)
+    assert await store.due(limit=4) == ids[:4]
+    assert port.eval_calls[-1][0] == 129
+    assert len(port.eval_calls) == 1
+    assert await store.due(limit=0) == ()
+    assert len(port.eval_calls) == 1
+    await redis.zadd(READY, {"ready-task": now - 1})
+    assert await store.due(READY, limit=1) == ("ready-task",)
+    assert len(port.eval_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_rechecks_eligibility_after_the_bounded_candidate_read(redis, monkeypatch):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import PENDING
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    base = ContextIRStore(redis)
+    old = await base.create(_pending_aging_task("old", now - 180))
+    fresh = await base.create(_pending_aging_task("fresh", now - 20))
+    await redis.zadd(PENDING, {old.id: now - 20, fresh.id: now - 10})
+
+    async def another_worker_claimed_old():
+        await redis.zadd(PENDING, {old.id: now + 60})
+
+    store = ContextIRStore(_AgingRedisProbe(redis, before_eval=another_worker_claimed_old))
+    assert await store.due(limit=1) == (fresh.id,)
+
+
+@pytest.mark.asyncio
+async def test_pending_aging_wrong_metadata_key_type_keeps_queue_available(redis, monkeypatch):
+    import time
+
+    from litellm.llms.causyn.context_ir_store import PENDING
+
+    monkeypatch.setenv("CAUSYN_H3_PENDING_AGING_ENABLED", "true")
+    now = int(time.time())
+    store = ContextIRStore(redis)
+    old = await store.create(_pending_aging_task("old", now - 180))
+    fresh = await store.create(_pending_aging_task("fresh", now - 20))
+    await redis.zadd(PENDING, {old.id: now - 1, fresh.id: now - 10})
+    name = task_key(old.id) + ":created_at"
+    await redis.delete(name)
+    await redis.rpush(name, "unrelated-corrupt-value")
+    assert await store.due(limit=1) == (fresh.id,)
