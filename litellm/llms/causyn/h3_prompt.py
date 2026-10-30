@@ -65,6 +65,7 @@ from litellm.proxy.video_endpoints.minimax_h3_models import (
 BASE_REWRITE_DEFAULT_MODEL = "qwen/qwen3.8-flash"
 MODEL = BASE_REWRITE_DEFAULT_MODEL
 BASE_REWRITE_MODEL_ENV = "CAUSYN_H3_REWRITE_MODEL"
+BASE_ENDPOINT_FALLBACKS_ENV = "CAUSYN_H3_BASE_REWRITE_ENDPOINT_FALLBACKS"
 # Default Ref2VA rewrite model (evaluated: omni needs fewer repairs, writes fuller descriptions and is the only one
 # that accepts audio at the same cost). Non-ref2va modes use CAUSYN_H3_REWRITE_MODEL (default MODEL).
 REF2VA_DEFAULT_MODEL = "qwen/qwen3.8-omni-flash"
@@ -264,6 +265,17 @@ def base_model() -> str:
             _log.warning("%s is not an allow-listed rewrite model: %r", BASE_REWRITE_MODEL_ENV, chosen[:80])
         raise RewriteError("H3 prompt rewrite model is not configured", 503, retryable=False)
     return chosen
+
+
+def _provider_preferences(model: str) -> tuple[tuple[str, bool | tuple[str, ...]], ...]:
+    if model == BASE_REWRITE_DEFAULT_MODEL and os.getenv(BASE_ENDPOINT_FALLBACKS_ENV, "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return (("allow_fallbacks", True), ("require_parameters", True), ("only", ("alibaba",)))
+    return (("allow_fallbacks", False), ("require_parameters", True))
 
 
 def send_video_enabled() -> bool:
@@ -1198,7 +1210,7 @@ class H3PromptRewriter:
             "stream": False,
             "temperature": 0,
             "reasoning": reasoning,
-            "provider": {"allow_fallbacks": False, "require_parameters": True},
+            "provider": dict(_provider_preferences(model)),
         }
         try:
             async with asyncio.timeout(budget):

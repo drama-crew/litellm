@@ -7,7 +7,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from pydantic import ValidationError
+from pydantic import JsonValue, TypeAdapter, ValidationError
 
 from litellm.llms.causyn import h3_media, h3_prompt
 from litellm.llms.causyn.h3_prompt import (
@@ -39,6 +39,7 @@ def clean_state(monkeypatch):
     h3_prompt._warned_models.clear()
     monkeypatch.delenv("CAUSYN_H3_REF2VA_REWRITE_MODEL", raising=False)
     monkeypatch.delenv("CAUSYN_H3_REWRITE_SEND_VIDEO", raising=False)
+    monkeypatch.delenv("CAUSYN_H3_BASE_REWRITE_ENDPOINT_FALLBACKS", raising=False)
     # The optional fidelity critic is covered in test_h3_rewrite_fidelity.py; here it would add provider calls.
     monkeypatch.setenv("CAUSYN_H3_REWRITE_CRITIC", "0")
     # The observe/plan stage has its own tests (test_h3_ref2va_plan.py); here it would add provider calls.
@@ -1412,3 +1413,73 @@ async def test_one_repair_resolves_the_observed_regression(patched):
     assert len(provider.bodies) == 2
     assert h3_prompt._V_REPLACE in provider.bodies[1]["messages"][3]["content"]
     assert result.prompt == GOLD["R1"].strip() and result.soft_violations == ()
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", [None, "0", "invalid"])
+async def test_base_endpoint_fallback_is_disabled_without_explicit_opt_in(monkeypatch, flag: str | None):
+    if flag is not None:
+        monkeypatch.setenv("CAUSYN_H3_BASE_REWRITE_ENDPOINT_FALLBACKS", flag)
+    provider = Provider("ok")
+    messages: list[dict[str, JsonValue]] = [{"role": "user", "content": "A cat walks."}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        await H3PromptRewriter(client, "synthetic-key")._complete(h3_prompt.BASE_REWRITE_DEFAULT_MODEL, messages, 5)
+    assert len(provider.bodies) == 1
+    assert provider.bodies[0]["provider"] == {"allow_fallbacks": False, "require_parameters": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["true", "1"])
+async def test_base_endpoint_fallback_stays_with_alibaba_and_preserves_the_model_request(monkeypatch, flag: str):
+    monkeypatch.setenv("CAUSYN_H3_BASE_REWRITE_ENDPOINT_FALLBACKS", flag)
+    provider = Provider("ok")
+    messages: list[dict[str, JsonValue]] = [{"role": "user", "content": "A cat walks."}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        result = await H3PromptRewriter(client, "synthetic-key")._complete(
+            h3_prompt.BASE_REWRITE_DEFAULT_MODEL, messages, 5
+        )
+    assert result.model == h3_prompt.BASE_REWRITE_DEFAULT_MODEL
+    assert provider.bodies == [
+        {
+            "model": h3_prompt.BASE_REWRITE_DEFAULT_MODEL,
+            "messages": messages,
+            "max_tokens": 3072,
+            "stream": False,
+            "temperature": 0,
+            "reasoning": {"enabled": False},
+            "provider": {"allow_fallbacks": True, "require_parameters": True, "only": ["alibaba"]},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["qwen/qwen3.8-omni-flash", "qwen/qwen3.8-max-0902"])
+async def test_base_endpoint_fallback_does_not_change_other_models(monkeypatch, model: str):
+    monkeypatch.setenv("CAUSYN_H3_BASE_REWRITE_ENDPOINT_FALLBACKS", "true")
+    provider = Provider("ok")
+    messages: list[dict[str, JsonValue]] = [{"role": "user", "content": "A cat walks."}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        result = await H3PromptRewriter(client, "synthetic-key")._complete(model, messages, 5)
+    assert result.model == model
+    assert len(provider.bodies) == 1
+    assert provider.bodies[0]["provider"] == {"allow_fallbacks": False, "require_parameters": True}
+
+
+@pytest.mark.asyncio
+async def test_base_endpoint_fallback_preserves_429_and_does_not_add_client_retries(monkeypatch):
+    monkeypatch.setenv("CAUSYN_H3_BASE_REWRITE_ENDPOINT_FALLBACKS", "true")
+    responses = iter(
+        (httpx.Response(429, headers={"retry-after": "17"}, json={"error": {"message": "Provider returned error"}}),)
+    )
+
+    def provider(request: httpx.Request) -> httpx.Response:
+        body = TypeAdapter(dict[str, JsonValue]).validate_json(request.content)
+        assert body["provider"] == {"allow_fallbacks": True, "require_parameters": True, "only": ["alibaba"]}
+        return next(responses)
+
+    messages: list[dict[str, JsonValue]] = [{"role": "user", "content": "A cat walks."}]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+        with pytest.raises(RewriteError) as caught:
+            await H3PromptRewriter(client, "synthetic-key")._complete(h3_prompt.BASE_REWRITE_DEFAULT_MODEL, messages, 5)
+    assert next(responses, None) is None
+    assert caught.value.upstream_status == 429 and caught.value.retryable
+    assert caught.value.retry_after == "17"
