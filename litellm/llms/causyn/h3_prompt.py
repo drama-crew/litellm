@@ -997,6 +997,25 @@ def _ref2va_section_character_lengths(prompt: str) -> tuple[tuple[str, int], ...
     return tuple((match.group(1), end - match.start()) for match, end in zip(headers, ends))
 
 
+def _ref2va_structured_draft_guidance(draft: str) -> str:
+    text = draft.strip()
+    if not (
+        len(text) <= 7000
+        and _ref2va_section_character_lengths(text)
+        and all(_section(text, REFERENCE_FIELDS, name).strip() for name in REFERENCE_FIELDS)
+        and DESCRIPTION_WORDS[0]
+        <= len(_section(text, REFERENCE_FIELDS, "detailed_description").split())
+        <= DESCRIPTION_WORDS[1]
+    ):
+        return ""
+    return (
+        f" The user already supplied a complete six-section draft of {len(text)} characters. "
+        "Preserve its facts, role assignments and verbatim user-authored speech while correcting the "
+        "requested timing and output rules. Avoid expanding the existing draft or repeating its definitions "
+        "in other sections; consolidate repetition while retaining every required detail."
+    )
+
+
 def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False, draft: str = "") -> str:
     """Perception rules appended to the Ref2VA system text; the video-only parts apply only with a reference video."""
     parts = []
@@ -1029,22 +1048,8 @@ def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False, d
             "required detail, exact provided labels and user-authored speech. Avoid duplicate descriptions, "
             "and refer back to defined subjects rather than repeating long appearance descriptions. "
             + REF2VA_SECTION_SPACE_GUIDANCE
+            + _ref2va_structured_draft_guidance(draft)
         )
-        draft_text = draft.strip()
-        if (
-            len(draft_text) <= 7000
-            and _ref2va_section_character_lengths(draft_text)
-            and all(_section(draft_text, REFERENCE_FIELDS, name).strip() for name in REFERENCE_FIELDS)
-            and DESCRIPTION_WORDS[0]
-            <= len(_section(draft_text, REFERENCE_FIELDS, "detailed_description").split())
-            <= DESCRIPTION_WORDS[1]
-        ):
-            parts.append(
-                f"The user already supplied a complete six-section draft of {len(draft_text)} characters. "
-                "Preserve its facts, role assignments and verbatim user-authored speech while correcting the "
-                "requested timing and output rules. Avoid expanding the existing draft or repeating its definitions "
-                "in other sections; consolidate repetition while retaining every required detail."
-            )
     return "\n" + " ".join(parts)
 
 
