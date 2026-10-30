@@ -989,7 +989,15 @@ REF2VA_SECTION_SPACE_GUIDANCE = (
 )
 
 
-def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False) -> str:
+def _ref2va_section_character_lengths(prompt: str) -> tuple[tuple[str, int], ...]:
+    headers = tuple(re.finditer(r"(?m)^(" + "|".join(REFERENCE_FIELDS) + r"):[ \t]*", prompt))
+    if tuple(match.group(1) for match in headers) != REFERENCE_FIELDS or prompt[: headers[0].start()].strip():
+        return ()
+    ends = tuple(match.start() for match in headers[1:]) + (len(prompt),)
+    return tuple((match.group(1), end - match.start()) for match, end in zip(headers, ends))
+
+
+def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False, draft: str = "") -> str:
     """Perception rules appended to the Ref2VA system text; the video-only parts apply only with a reference video."""
     parts = []
     if has_video or has_audio:
@@ -1022,6 +1030,21 @@ def ref2va_addendum(has_video: bool, has_audio: bool, has_image: bool = False) -
             "and refer back to defined subjects rather than repeating long appearance descriptions. "
             + REF2VA_SECTION_SPACE_GUIDANCE
         )
+        draft_text = draft.strip()
+        if (
+            len(draft_text) <= 7000
+            and _ref2va_section_character_lengths(draft_text)
+            and all(_section(draft_text, REFERENCE_FIELDS, name).strip() for name in REFERENCE_FIELDS)
+            and DESCRIPTION_WORDS[0]
+            <= len(_section(draft_text, REFERENCE_FIELDS, "detailed_description").split())
+            <= DESCRIPTION_WORDS[1]
+        ):
+            parts.append(
+                f"The user already supplied a complete six-section draft of {len(draft_text)} characters. "
+                "Preserve its facts, role assignments and verbatim user-authored speech while correcting the "
+                "requested timing and output rules. Avoid expanding the existing draft or repeating its definitions "
+                "in other sections; consolidate repetition while retaining every required detail."
+            )
     return "\n" + " ".join(parts)
 
 
@@ -1059,7 +1082,9 @@ def _too_long(violation: str) -> bool:
     return False
 
 
-def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...], base: bool = False) -> str:
+def _repair_message(
+    violations: tuple[str, ...], labels: tuple[str, ...], base: bool = False, previous_prompt: str | None = None
+) -> str:
     listed = "\n".join(f"- {violation}" for violation in violations)
     closing = SHORTEN_SENTENCE if any(_too_long(v) for v in violations) else KEEP_DETAIL_SENTENCE
     if (
@@ -1071,6 +1096,15 @@ def _repair_message(violations: tuple[str, ...], labels: tuple[str, ...], base: 
             " Use a planning target of 6000 characters or fewer; retain all six sections, "
             "exact provided labels and user-authored speech. " + REF2VA_SECTION_SPACE_GUIDANCE
         )
+        if previous_prompt is not None:
+            closing += f" Measured previous total: {len(previous_prompt)} characters."
+            section_lengths = _ref2va_section_character_lengths(previous_prompt)
+            if section_lengths:
+                closing += (
+                    " Measured section characters, including headers and separators: "
+                    + "; ".join(f"{name}: {size}" for name, size in section_lengths)
+                    + ". Use these measured lengths to reduce repetition across sections."
+                )
     if base:
         return (
             "Your previous answer has these problems:\n"
@@ -1467,6 +1501,7 @@ class H3PromptRewriter:
                 any(isinstance(item, VideoItem) for item in spec.content),
                 any(isinstance(item, AudioItem) for item in spec.content),
                 any(isinstance(item, ImageItem) for item in spec.content),
+                draft=spec.prompt,
             )
             if ref2va
             else ""
@@ -1567,7 +1602,10 @@ class H3PromptRewriter:
             _remember(_FIRST_ANSWERS, answer_key, (prompt, usage))
             messages += [
                 {"role": "assistant", "content": prompt},
-                {"role": "user", "content": _repair_message(listed, _provided_labels(spec), base=not ref2va)},
+                {
+                    "role": "user",
+                    "content": _repair_message(listed, _provided_labels(spec), base=not ref2va, previous_prompt=prompt),
+                },
             ]
             try:
                 repaired = await self._complete(model, messages, remaining, ref2va)
